@@ -1,0 +1,29 @@
+[package]
+name = "sigrund"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sigrund-core = { path = "../sigrund-core" }
+
+[[bin]]
+name = "sigrund"
+path = "src/bin/sigrund.rs"
+
+[[bin]]
+name = "sigrun"
+path = "src/bin/sigrun.rs"
+
+[[bin]]
+name = "sigrundctl"
+path = "src/bin/sigrundctl.rs"
+
+[[bin]]
+name = "sigrund-collector"
+path = "src/bin/sigrund-collector.rs"
