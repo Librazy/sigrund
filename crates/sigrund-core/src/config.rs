@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use crate::{CoreError, Result};
@@ -82,6 +82,46 @@ pub struct DaemonConfig {
 pub struct PolicyGeneration {
     pub number: u64,
     pub config: Arc<DaemonConfig>,
+}
+
+pub struct PolicyStore {
+    current: RwLock<Arc<PolicyGeneration>>,
+}
+
+impl PolicyStore {
+    pub fn new(config: DaemonConfig) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(PolicyGeneration {
+                number: 1,
+                config: Arc::new(config),
+            })),
+        }
+    }
+
+    pub fn current(&self) -> Arc<PolicyGeneration> {
+        self.current.read().expect("policy lock poisoned").clone()
+    }
+
+    pub fn capture(&self) -> CapturedPolicy {
+        self.current().capture()
+    }
+
+    /// Validates the complete replacement before publishing it. Existing
+    /// callers retain their `Arc<PolicyGeneration>` snapshot.
+    pub fn reload(&self, replacement: DaemonConfig) -> Result<Arc<PolicyGeneration>> {
+        replacement.validate()?;
+        let mut guard = self.current.write().expect("policy lock poisoned");
+        let number = guard
+            .number
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Config("policy generation overflow".into()))?;
+        let generation = Arc::new(PolicyGeneration {
+            number,
+            config: Arc::new(replacement),
+        });
+        *guard = generation.clone();
+        Ok(generation)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +417,19 @@ mod tests {
         let mut cfg = valid();
         cfg.max_io_workers_global = 17;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reload_publishes_new_generation_without_mutating_old_snapshot() {
+        let store = PolicyStore::new(valid());
+        let old = store.current();
+        let mut replacement = valid();
+        replacement.max_active_hooks_global = 2;
+        let new = store.reload(replacement).unwrap();
+        assert_eq!(old.number, 1);
+        assert_eq!(old.config.max_active_hooks_global, 8);
+        assert_eq!(new.number, 2);
+        assert_eq!(new.config.max_active_hooks_global, 2);
     }
 }
 

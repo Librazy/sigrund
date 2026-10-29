@@ -135,6 +135,11 @@ impl<'a> Parser<'a> {
                 if value.len() > self.max_string_bytes {
                     return Err(CoreError::Json("JSON string exceeds size limit".into()));
                 }
+                if value.chars().any(is_forbidden_character) {
+                    return Err(CoreError::Json(
+                        "JSON string contains a control or BiDi character".into(),
+                    ));
+                }
                 return Ok(value);
             }
             if byte < 0x20 {
@@ -202,6 +207,17 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
+}
+
+fn is_forbidden_character(character: char) -> bool {
+    let code = character as u32;
+    (code <= 0x1f)
+        || (0x7f..=0x9f).contains(&code)
+        || character == '\u{061c}'
+        || character == '\u{200e}'
+        || character == '\u{200f}'
+        || (0x202a..=0x202e).contains(&code)
+        || (0x2066..=0x2069).contains(&code)
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::crypto::validate_uuidv7;
+use crate::crypto::{WARRANT_PAYLOAD_TYPE, strict_base64, validate_uuidv7};
 use crate::{CoreError, Result};
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -37,6 +37,50 @@ pub struct Decision {
     pub exec_id: String,
     pub message: String,
     pub status: String,
+}
+
+impl Decision {
+    pub fn validate(&self) -> Result<()> {
+        const STATUSES: &[&str] = &[
+            "READY_TO_EXEC",
+            "REJECTED",
+            "TIMEOUT_CSR",
+            "INVALID_REQUEST",
+            "INVALID_TTY_STDIN_COMBINATION",
+            "POLICY_VIOLATION",
+            "EXPIRED_OR_NOT_YET_VALID",
+            "REVOKED",
+            "REPLAY_DETECTED",
+            "EXECUTABLE_MUTATED_OR_TOO_LARGE",
+            "STDIN_HASH_MISMATCH",
+            "REMOTE_AUDIT_FAILED",
+            "REQUEST_TIMEOUT",
+            "RESOURCE_EXHAUSTED",
+            "SPAWN_FAILED",
+        ];
+        if !STATUSES.contains(&self.status.as_str()) || self.message.len() > 4096 {
+            return Err(CoreError::Protocol(
+                "invalid authorization decision bounds".into(),
+            ));
+        }
+        validate_uuidv7(&self.exec_id)?;
+        if self.status == "TIMEOUT_CSR" {
+            if self
+                .csr_payload
+                .as_ref()
+                .is_none_or(|payload| payload.len() > 65_536)
+            {
+                return Err(CoreError::Protocol(
+                    "TIMEOUT_CSR requires bounded csr_payload".into(),
+                ));
+            }
+        } else if self.csr_payload.is_some() {
+            return Err(CoreError::Protocol(
+                "csr_payload is only valid for TIMEOUT_CSR".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -99,8 +143,29 @@ pub struct ClientHello {
 
 impl ClientHello {
     pub fn validate_shape(&self) -> Result<()> {
+        if !matches!(self.tty_mode.as_str(), "stdio" | "pty") {
+            return Err(CoreError::Protocol("invalid tty_mode".into()));
+        }
         match self.mode.as_str() {
-            "signed" if self.dsse_envelope.is_some() && self.requested_command.is_none() => {}
+            "signed" if self.dsse_envelope.is_some() && self.requested_command.is_none() => {
+                let envelope = self.dsse_envelope.as_ref().unwrap();
+                if envelope.payload_type != WARRANT_PAYLOAD_TYPE
+                    || envelope.signatures.is_empty()
+                    || envelope.signatures.len() > 4
+                {
+                    return Err(CoreError::Protocol("invalid DSSE envelope shape".into()));
+                }
+                strict_base64(&envelope.payload, 65_536)?;
+                for signature in &envelope.signatures {
+                    if signature.keyid.is_empty()
+                        || signature.keyid.len() > 128
+                        || !signature.keyid.is_ascii()
+                    {
+                        return Err(CoreError::Protocol("invalid signer keyid".into()));
+                    }
+                    strict_base64(&signature.sig, 32_768)?;
+                }
+            }
             "unsigned_csr_request"
                 if self.dsse_envelope.is_none()
                     && self.requested_command.is_some()

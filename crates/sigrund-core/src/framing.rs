@@ -37,6 +37,27 @@ pub fn max_payload(frame: FrameType) -> usize {
     }
 }
 
+pub fn validate_client_frame(frame: FrameType, ready: bool, pty: bool) -> Result<()> {
+    match frame {
+        FrameType::ClientHello if !ready => Ok(()),
+        FrameType::ClientSignal if ready => Ok(()),
+        FrameType::ClientWinsize if ready && pty => Ok(()),
+        _ => Err(CoreError::Protocol(
+            "client frame is invalid in current state".into(),
+        )),
+    }
+}
+
+pub fn validate_server_frame(frame: FrameType, decided: bool, ready: bool) -> Result<()> {
+    match frame {
+        FrameType::ServerAuthDecision if !decided => Ok(()),
+        FrameType::ServerChildExit if ready => Ok(()),
+        _ => Err(CoreError::Protocol(
+            "server frame is invalid in current state".into(),
+        )),
+    }
+}
+
 pub fn encode_frame(frame: FrameType, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.is_empty() || payload.len() > max_payload(frame) {
         return Err(CoreError::Protocol("invalid frame payload length".into()));

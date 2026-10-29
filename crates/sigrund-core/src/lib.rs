@@ -8,7 +8,9 @@ pub mod crypto;
 pub mod framing;
 pub mod json;
 pub mod lifecycle;
+pub mod paths;
 pub mod protocol;
+pub mod snapshot;
 pub mod state;
 
 use thiserror::Error;

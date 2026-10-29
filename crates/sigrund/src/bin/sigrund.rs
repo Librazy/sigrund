@@ -1,7 +1,7 @@
 use std::{env, fs, process::ExitCode};
 
 use sigrund::startup::CgroupLayout;
-use sigrund_core::config::DaemonConfig;
+use sigrund_core::config::{DaemonConfig, SignerPolicyFile};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -15,7 +15,26 @@ fn main() -> ExitCode {
             return ExitCode::from(78);
         }
     };
-    if let Err(error) = DaemonConfig::from_toml(&bytes) {
+    let config = match DaemonConfig::from_toml(&bytes) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("sigrund: refusing invalid configuration: {error}");
+            return ExitCode::from(78);
+        }
+    };
+    let signer_path = env::var_os("SIGRUND_SIGNERS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/etc/sigrund/signers.toml".into());
+    let signer_bytes = match fs::read(&signer_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("sigrund: cannot read {}: {error}", signer_path.display());
+            return ExitCode::from(78);
+        }
+    };
+    if let Err(error) = SignerPolicyFile::from_toml(&signer_bytes)
+        .and_then(|signers| signers.validate_against(&config))
+    {
         eprintln!("sigrund: refusing invalid configuration: {error}");
         return ExitCode::from(78);
     }
@@ -31,6 +50,9 @@ fn main() -> ExitCode {
                 ExitCode::from(78)
             }
         };
+    }
+    if args.iter().any(|arg| arg == "--check-config") {
+        return ExitCode::SUCCESS;
     }
     eprintln!("sigrund: configuration validated; privileged runtime is not enabled in this build");
     ExitCode::from(78)

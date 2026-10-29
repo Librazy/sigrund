@@ -1,0 +1,18 @@
+[[signers]]
+signer_id = "mandator-alice-yubikey"
+type = "sk-ssh-ed25519"
+public_key = "sk-ssh-ed25519@openssh.com AAAA..."
+require_user_presence = true
+require_user_verification = false
+allowed_requester_uids = [1001]
+allowed_target_uids = [0, 33]
+allowed_target_gids = [0, 33]
+allowed_supplementary_gids = [33, 104]
+allow_same_uid_elevation = false
+allowed_capabilities = ["CAP_NET_BIND_SERVICE"]
+allowed_modes = ["one_time", "time_range"]
+max_ttl_secs = 3600
+allow_unrestricted_stdin = false
+allow_pty = false
+allow_interpreted_scripts = false
+allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]

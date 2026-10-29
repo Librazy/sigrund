@@ -1,0 +1,38 @@
+allow_same_uid_elevation = false
+require_remote_audit_ack = false
+csr_allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]
+
+sigrun_hook_uid = 65534
+sigrun_hook_gid = 65534
+max_active_hooks_per_uid = 1
+max_active_hooks_global = 8
+hook_invocations_per_uid = 5
+hook_window_secs = 60
+hook_timeout_ms = 25000
+
+max_active_sockets_global = 64
+max_active_sockets_per_uid = 4
+max_io_workers_global = 16
+max_io_workers_per_uid = 2
+snapshot_ram_global_bytes = 536870912
+snapshot_ram_per_uid_bytes = 134217728
+max_executable_bytes = 67108864
+max_stdin_bytes = 16777216
+request_deadline_ms = 5000
+
+job_memory_max_bytes = 268435456
+job_memory_swap_max_bytes = 0
+job_pids_max = 128
+
+collector_base_url = "https://collector.example.invalid"
+collector_server_name = "collector.example.invalid"
+collector_ca_file = "/etc/sigrund/collector-ca.pem"
+collector_client_cert_file = "/etc/sigrund/collector-client.crt"
+collector_client_key_file = "/etc/sigrund/collector-client.key"
+collector_key_id = "collector-v1"
+collector_public_key = "<strict-padded-base64-32-byte-ed25519-key>"
+collector_rpc_timeout_ms = 3000
+
+audit_record_max_bytes = 65536
+max_onetime_window_secs = 3600
+max_ttl_secs = 31536000

@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -23,9 +24,13 @@ impl CgroupLayout {
     }
 
     pub fn initialize(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.supervisor)?;
-        fs::create_dir_all(&self.jobs)?;
-        fs::create_dir_all(&self.hooks)?;
+        create_cgroup_directory(&self.supervisor)?;
+        create_cgroup_directory(&self.jobs)?;
+        create_cgroup_directory(&self.hooks)?;
+        write_exact(
+            self.supervisor.join("cgroup.procs"),
+            std::process::id().to_string().as_bytes(),
+        )?;
         let controllers = fs::read_to_string(self.root.join("cgroup.controllers"))?;
         if !controllers.split_whitespace().any(|v| v == "memory")
             || !controllers.split_whitespace().any(|v| v == "pids")
@@ -42,7 +47,7 @@ impl CgroupLayout {
     }
 
     pub fn verify_required_controls(&self) -> io::Result<()> {
-        for directory in [&self.root, &self.hooks] {
+        for directory in [&self.root, &self.jobs, &self.hooks] {
             for name in [
                 "memory.max",
                 "memory.swap.max",
@@ -71,6 +76,15 @@ impl CgroupLayout {
         let remove = fs::remove_dir(&probe);
         result.and(remove)
     }
+}
+
+fn create_cgroup_directory(path: &Path) -> io::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
 }
 
 fn write_exact(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
