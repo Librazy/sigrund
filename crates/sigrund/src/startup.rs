@@ -71,7 +71,7 @@ impl CgroupLayout {
             write_and_verify(&probe.join("memory.swap.max"), b"0\n")?;
             write_and_verify(&probe.join("memory.oom.group"), b"1\n")?;
             write_and_verify(&probe.join("pids.max"), b"32\n")?;
-            write_exact(&probe.join("cgroup.kill"), b"1\n")
+            write_exact(probe.join("cgroup.kill"), b"1\n")
         })();
         let remove = fs::remove_dir(&probe);
         result.and(remove)

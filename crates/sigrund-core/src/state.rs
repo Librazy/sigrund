@@ -21,6 +21,17 @@ pub enum AuthorizationResult {
     ReplayDetected,
 }
 
+pub struct AuthorizationRequest<'a> {
+    pub grant_id: &'a str,
+    pub payload: &'a [u8],
+    pub signer_id: &'a str,
+    pub requester_uid: u32,
+    pub mode: GrantMode,
+    pub not_before: i64,
+    pub not_after: Option<i64>,
+    pub now: i64,
+}
+
 pub struct StateStore {
     connection: Connection,
 }
@@ -53,28 +64,21 @@ impl StateStore {
         Ok(Self { connection })
     }
 
-    pub fn authorize(
-        &mut self,
-        grant_id: &str,
-        payload: &[u8],
-        signer_id: &str,
-        requester_uid: u32,
-        mode: GrantMode,
-        not_before: i64,
-        not_after: Option<i64>,
-        now: i64,
-    ) -> Result<AuthorizationResult> {
-        if mode == GrantMode::Permanent && not_after.is_some() {
+    pub fn authorize(&mut self, request: AuthorizationRequest<'_>) -> Result<AuthorizationResult> {
+        if request.mode == GrantMode::Permanent && request.not_after.is_some() {
             return Err(CoreError::Value(
                 "permanent grants require null not_after".into(),
             ));
         }
-        let digest = sha256_hex(payload);
+        let digest = sha256_hex(request.payload);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db)?;
-        if now < not_before || mode != GrantMode::Permanent && now > not_after.unwrap_or(i64::MIN) {
+        if request.now < request.not_before
+            || request.mode != GrantMode::Permanent
+                && request.now > request.not_after.unwrap_or(i64::MIN)
+        {
             transaction.rollback().map_err(db)?;
             return Ok(AuthorizationResult::ExpiredOrNotYetValid);
         }
@@ -85,7 +89,7 @@ impl StateStore {
                     OR (target_type = 'payload_sha256' AND target_value = ?2)
                     OR (target_type = 'signer_id' AND target_value = ?3)
                  LIMIT 1",
-                params![grant_id, digest, signer_id],
+                params![request.grant_id, digest, request.signer_id],
                 |_| Ok(()),
             )
             .optional()
@@ -95,18 +99,18 @@ impl StateStore {
             transaction.rollback().map_err(db)?;
             return Ok(AuthorizationResult::Revoked);
         }
-        if mode == GrantMode::OneTime {
+        if request.mode == GrantMode::OneTime {
             let inserted = transaction.execute(
                 "INSERT INTO consumed_grants
                  (grant_id, payload_sha256, signer_id, requester_uid, not_after, consumed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
-                    grant_id,
-                    payload,
-                    signer_id,
-                    requester_uid,
-                    not_after.unwrap_or(0),
-                    now
+                    request.grant_id,
+                    request.payload,
+                    request.signer_id,
+                    request.requester_uid,
+                    request.not_after.unwrap_or(0),
+                    request.now
                 ],
             );
             if inserted.is_err() {
@@ -159,28 +163,28 @@ mod tests {
     fn one_time_grants_are_consumed_once() {
         let mut store = StateStore::open(":memory:").unwrap();
         let first = store
-            .authorize(
-                "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
-                b"payload",
-                "signer",
-                1001,
-                GrantMode::OneTime,
-                1,
-                Some(10),
-                2,
-            )
+            .authorize(AuthorizationRequest {
+                grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
+                payload: b"payload",
+                signer_id: "signer",
+                requester_uid: 1001,
+                mode: GrantMode::OneTime,
+                not_before: 1,
+                not_after: Some(10),
+                now: 2,
+            })
             .unwrap();
         let second = store
-            .authorize(
-                "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
-                b"payload",
-                "signer",
-                1001,
-                GrantMode::OneTime,
-                1,
-                Some(10),
-                2,
-            )
+            .authorize(AuthorizationRequest {
+                grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
+                payload: b"payload",
+                signer_id: "signer",
+                requester_uid: 1001,
+                mode: GrantMode::OneTime,
+                not_before: 1,
+                not_after: Some(10),
+                now: 2,
+            })
             .unwrap();
         assert_eq!(first, AuthorizationResult::Allowed);
         assert_eq!(second, AuthorizationResult::ReplayDetected);
@@ -195,16 +199,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .authorize(
-                    "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
-                    b"payload",
-                    "signer",
-                    1001,
-                    GrantMode::TimeRange,
-                    1,
-                    Some(10),
-                    2
-                )
+                .authorize(AuthorizationRequest {
+                    grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
+                    payload: b"payload",
+                    signer_id: "signer",
+                    requester_uid: 1001,
+                    mode: GrantMode::TimeRange,
+                    not_before: 1,
+                    not_after: Some(10),
+                    now: 2,
+                })
                 .unwrap(),
             AuthorizationResult::Revoked
         );

@@ -175,6 +175,7 @@ impl PolicyGeneration {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignerPolicyFile {
     pub signers: Vec<SignerConfig>,
 }
@@ -242,22 +243,10 @@ impl SignerPolicyFile {
                     signer.signer_id
                 )));
             }
-            if signer
-                .allowed_requester_uids
-                .iter()
-                .any(|uid| *uid == u32::MAX)
-                || signer
-                    .allowed_target_uids
-                    .iter()
-                    .any(|uid| *uid == u32::MAX)
-                || signer
-                    .allowed_target_gids
-                    .iter()
-                    .any(|gid| *gid == u32::MAX)
-                || signer
-                    .allowed_supplementary_gids
-                    .iter()
-                    .any(|gid| *gid == u32::MAX)
+            if signer.allowed_requester_uids.contains(&u32::MAX)
+                || signer.allowed_target_uids.contains(&u32::MAX)
+                || signer.allowed_target_gids.contains(&u32::MAX)
+                || signer.allowed_supplementary_gids.contains(&u32::MAX)
             {
                 return Err(CoreError::Config(format!(
                     "signer {} contains overflow UID/GID",
@@ -364,6 +353,73 @@ fn safe_root_path(path: &Path) -> bool {
         .all(|component| matches!(component, Component::Normal(_)))
 }
 
+fn one() -> u32 {
+    1
+}
+fn two() -> u32 {
+    2
+}
+fn four() -> u32 {
+    4
+}
+fn five() -> u32 {
+    5
+}
+fn eight() -> u32 {
+    8
+}
+fn sixteen() -> u32 {
+    16
+}
+fn sixty() -> u32 {
+    60
+}
+fn sixty_four() -> u32 {
+    64
+}
+fn default_hook_uid() -> u32 {
+    65_534
+}
+fn default_hook_gid() -> u32 {
+    65_534
+}
+fn default_hook_timeout() -> u32 {
+    25_000
+}
+fn default_snapshot_global() -> u64 {
+    536_870_912
+}
+fn default_snapshot_uid() -> u64 {
+    134_217_728
+}
+fn default_executable() -> u64 {
+    67_108_864
+}
+fn default_stdin() -> u64 {
+    16_777_216
+}
+fn default_request_deadline() -> u32 {
+    5_000
+}
+fn default_memory() -> u64 {
+    268_435_456
+}
+fn default_pids() -> u64 {
+    128
+}
+fn default_collector_timeout() -> u32 {
+    3_000
+}
+fn audit_max() -> u64 {
+    65_536
+}
+fn default_onetime_window() -> u64 {
+    3_600
+}
+fn default_ttl() -> u64 {
+    31_536_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,71 +487,4 @@ mod tests {
         assert_eq!(new.number, 2);
         assert_eq!(new.config.max_active_hooks_global, 2);
     }
-}
-
-fn one() -> u32 {
-    1
-}
-fn two() -> u32 {
-    2
-}
-fn four() -> u32 {
-    4
-}
-fn five() -> u32 {
-    5
-}
-fn eight() -> u32 {
-    8
-}
-fn sixteen() -> u32 {
-    16
-}
-fn sixty() -> u32 {
-    60
-}
-fn sixty_four() -> u32 {
-    64
-}
-fn default_hook_uid() -> u32 {
-    65_534
-}
-fn default_hook_gid() -> u32 {
-    65_534
-}
-fn default_hook_timeout() -> u32 {
-    25_000
-}
-fn default_snapshot_global() -> u64 {
-    536_870_912
-}
-fn default_snapshot_uid() -> u64 {
-    134_217_728
-}
-fn default_executable() -> u64 {
-    67_108_864
-}
-fn default_stdin() -> u64 {
-    16_777_216
-}
-fn default_request_deadline() -> u32 {
-    5_000
-}
-fn default_memory() -> u64 {
-    268_435_456
-}
-fn default_pids() -> u64 {
-    128
-}
-fn default_collector_timeout() -> u32 {
-    3_000
-}
-fn audit_max() -> u64 {
-    65_536
-}
-fn default_onetime_window() -> u64 {
-    3_600
-}
-fn default_ttl() -> u64 {
-    31_536_000
 }
