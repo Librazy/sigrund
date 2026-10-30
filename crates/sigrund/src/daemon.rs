@@ -4,17 +4,15 @@ use crate::{
     linux::validate_absolute_path,
     startup::{StartupResources, check_root_metadata, open_pinned},
     transport::{
-        ApprovalReader, ControlReader, FrameWriter, PeerCredentials, disable_ancillary_credentials,
-        invalid, peer_credentials,
+        FrameWriter, PeerCredentials, disable_ancillary_credentials, invalid, peer_credentials,
     },
-    workers::{MetadataWorkers, ValidationHandle},
+    workers::{Completion, IoWorkers, RequestLease, ValidationHandle},
 };
 use sigrund_core::{
-    approval::ApprovalResponse,
     config::{DaemonConfig, SignerPolicyFile},
     crypto::new_uuidv7,
     framing::FrameType,
-    protocol::{ClientHello, Decision},
+    protocol::Decision,
 };
 use std::{
     collections::HashMap,
@@ -40,7 +38,7 @@ use std::{
 const CLIENT_LISTENER: u64 = 1;
 const APPROVAL_LISTENER: u64 = 2;
 const SIGNALS: u64 = 3;
-const METADATA_COMPLETE: u64 = 4;
+const IO_COMPLETE: u64 = 4;
 const FIRST_CONNECTION: u64 = 5;
 
 struct BoundSocket {
@@ -243,17 +241,15 @@ impl Drop for SignalSource {
 }
 
 enum Input {
-    Client(ControlReader),
-    Approval(ApprovalReader),
-    Validating {
-        reader: ControlReader,
-        _task: ValidationHandle,
-    },
+    Client,
+    Approval,
+    Validating { _task: ValidationHandle },
 }
 
 struct Connection {
     fd: OwnedFd,
     peer: PeerCredentials,
+    broker: bool,
     input: Input,
     output: Option<FrameWriter>,
     request_deadline: Option<Instant>,
@@ -266,17 +262,12 @@ impl Connection {
         if let Some(output) = &self.output {
             return Some(output.deadline());
         }
-        let frame = match &self.input {
-            Input::Client(reader) => reader.deadline(),
-            Input::Approval(reader) => reader.deadline(),
-            Input::Validating { reader, .. } => reader.deadline(),
-        };
-        self.request_deadline.into_iter().chain(frame).min()
+        self.request_deadline
     }
 
     fn reject(&mut self, status: &str, message: &str, now: Instant) -> io::Result<()> {
-        // Dropping the receiver closes all pending rights before sending.
-        self.input = Input::Client(ControlReader::new(false));
+        // Cancelling a task never closes its caller rights on this thread.
+        self.input = Input::Client;
         self.request_deadline = None;
         let decision = Decision {
             csr_payload: None,
@@ -295,7 +286,7 @@ impl Connection {
 
     fn finish_validation(
         &mut self,
-        result: io::Result<()>,
+        result: io::Result<RequestLease>,
         now: Instant,
         log: &SyncSender<String>,
     ) -> io::Result<()> {
@@ -304,22 +295,38 @@ impl Connection {
         if !matches!(self.input, Input::Validating { .. }) {
             return Ok(());
         }
+        if self.broker {
+            let _ = log.try_send("{\"event\":\"UNSOLICITED_APPROVAL_REJECTED\"}".into());
+            return Err(invalid("unsolicited approval response"));
+        }
         if self.deadline().is_some_and(|deadline| now >= deadline)
             || result
                 .as_ref()
                 .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
         {
             self.reject("REQUEST_TIMEOUT", "hello validation deadline expired", now)
-        } else if result.is_ok() {
+        } else if let Ok(lease) = &result {
+            if !lease.matches_admission(self.peer.uid, &self.policy) {
+                return Err(invalid("request admission mismatch"));
+            }
             let _ = log.try_send(serde_json::json!({"event":"CLIENT_HELLO_VALIDATED", "exec_id":self.exec_id,
-                "requester_pid":self.peer.pid,"requester_uid":self.peer.uid,"requester_gid":self.peer.gid}).to_string());
+                "requester_pid":self.peer.pid,"requester_uid":self.peer.uid,"requester_gid":self.peer.gid,"request_mode":lease.hello().mode}).to_string());
             self.reject(
                 "REJECTED",
                 "Phase 1 transport validated; snapshotting and authorization are not implemented",
                 now,
             )
+        } else if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+        {
+            self.reject("POLICY_VIOLATION", "unsupported MVP request", now)
         } else {
-            self.reject("INVALID_REQUEST", "invalid stdio descriptors", now)
+            self.reject(
+                "INVALID_REQUEST",
+                "invalid request or stdio descriptors",
+                now,
+            )
         }
     }
 
@@ -327,8 +334,8 @@ impl Connection {
         &mut self,
         token: u64,
         now: Instant,
-        workers: &mut MetadataWorkers,
-        log: &SyncSender<String>,
+        workers: &mut IoWorkers,
+        _log: &SyncSender<String>,
     ) -> io::Result<bool> {
         if let Some(output) = &mut self.output {
             return output
@@ -337,96 +344,38 @@ impl Connection {
         }
         if self.deadline().is_some_and(|deadline| now >= deadline) {
             return match self.input {
-                Input::Client(_) | Input::Validating { .. } => {
+                Input::Client | Input::Validating { .. } => {
                     self.reject("REQUEST_TIMEOUT", "hello assembly deadline expired", now)?;
                     Ok(true)
                 }
-                Input::Approval(_) => Ok(false),
+                Input::Approval => Ok(false),
             };
         }
-        match &mut self.input {
-            Input::Client(reader) => {
-                let result = reader.read(self.fd.as_raw_fd(), now);
-                match result {
-                    Ok(Some(frame)) => {
-                        let hello = ClientHello::parse_request(&frame.payload)
-                            .map_err(|e| invalid(e.to_string()))
-                            .and_then(|hello| {
-                                self.policy
-                                    .mvp
-                                    .as_ref()
-                                    .expect("startup requires MVP")
-                                    .validate_hello(&hello)
-                                    .map_err(|e| invalid(e.to_string()))?;
-                                Ok(hello)
-                            });
-                        // Parsing is part of the original cumulative deadline.
-                        let after = Instant::now();
-                        if self.deadline().is_some_and(|deadline| after >= deadline) {
-                            self.reject(
-                                "REQUEST_TIMEOUT",
-                                "hello validation deadline expired",
-                                after,
-                            )?;
-                        } else if let Ok(hello) = hello {
-                            match workers.submit(
-                                token,
-                                self.peer.uid,
-                                hello,
-                                frame.rights,
-                                self.deadline().expect("initial request has a deadline"),
-                            ) {
-                                Ok(task) => {
-                                    self.input = Input::Validating {
-                                        reader: ControlReader::new(false),
-                                        _task: task,
-                                    }
-                                }
-                                Err(_) => self.reject(
-                                    "RESOURCE_EXHAUSTED",
-                                    "descriptor validation worker quota exhausted",
-                                    Instant::now(),
-                                )?,
-                            }
-                        } else {
-                            self.reject(
-                                "INVALID_REQUEST",
-                                "invalid hello or stdio descriptors",
-                                after,
-                            )?;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        match &self.input {
+            Input::Client | Input::Approval => {
+                let deadline = self
+                    .request_deadline
+                    .unwrap_or(now + crate::transport::FRAME_TIMEOUT);
+                match workers.submit(
+                    token,
+                    self.peer.uid,
+                    &self.fd,
+                    self.policy.clone(),
+                    self.broker,
+                    deadline,
+                ) {
+                    Ok(task) => self.input = Input::Validating { _task: task },
+                    Err(_) if self.broker => return Ok(false),
                     Err(_) => self.reject(
-                        "INVALID_REQUEST",
-                        "invalid framing or ancillary data",
-                        Instant::now(),
+                        "RESOURCE_EXHAUSTED",
+                        "request I/O worker quota exhausted",
+                        now,
                     )?,
                 }
             }
-            Input::Approval(reader) => {
-                if let Some(payload) = reader.read(self.fd.as_raw_fd(), now)? {
-                    // No Phase 1 request is awaiting a signature. Even a valid
-                    // root response cannot authorize an unsolicited request.
-                    let _ = ApprovalResponse::parse_jcs(&payload);
-                    let _ = log.try_send("{\"event\":\"UNSOLICITED_APPROVAL_REJECTED\"}".into());
-                    return Ok(false);
-                }
-            }
-            Input::Validating { reader, .. } => {
-                // Keep observing disconnects and ancillary protocol errors
-                // while a worker owns the hello's descriptors.
-                match reader.read(self.fd.as_raw_fd(), now) {
-                    Ok(None) => {}
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-                    _ => self.reject(
-                        "INVALID_REQUEST",
-                        "unexpected frame during descriptor validation",
-                        Instant::now(),
-                    )?,
-                }
-            }
+            // EPOLLIN is disabled while the worker receives/validates. The
+            // remaining socket events are disconnect/error notifications.
+            Input::Validating { .. } => return Ok(false),
         }
         Ok(true)
     }
@@ -469,7 +418,7 @@ impl ForegroundDaemon {
         let signals = SignalSource::new()?;
         // Threads inherit the blocked signal mask, leaving shutdown handling
         // on signalfd even when a metadata syscall cannot be interrupted.
-        let mut workers = MetadataWorkers::new(&self.config)?;
+        let mut workers = IoWorkers::new(&self.config)?;
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
@@ -479,9 +428,16 @@ impl ForegroundDaemon {
             (self.client.fd.as_raw_fd(), CLIENT_LISTENER),
             (self.approval.fd.as_raw_fd(), APPROVAL_LISTENER),
             (signals.fd.as_raw_fd(), SIGNALS),
-            (workers.fd(), METADATA_COMPLETE),
+            (workers.fd(), IO_COMPLETE),
         ] {
-            register(epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, token, false)?;
+            register(
+                epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                fd,
+                token,
+                false,
+                true,
+            )?;
         }
         // Diagnostic writes are off-loop and bounded. They are not audit
         // records; authorization/audit sequencing is introduced in Phase 4.
@@ -535,22 +491,37 @@ impl ForegroundDaemon {
                         }
                         let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is outside the Phase 1 MVP\"}".into());
                     }
-                } else if token == METADATA_COMPLETE {
+                } else if token == IO_COMPLETE {
                     for completion in workers.drain() {
-                        let _ = log.try_send(serde_json::json!({"event":"FD_VALIDATION_COMPLETE", "worker_task":completion.token}).to_string());
-                        if let Some(mut connection) = connections.remove(&completion.token)
-                            && connection
-                                .finish_validation(completion.result, Instant::now(), &log)
+                        let (token, result) = match completion {
+                            Completion::Released { token } => {
+                                let _ = log.try_send(serde_json::json!({"event":"FD_VALIDATION_COMPLETE", "worker_task":token}).to_string());
+                                continue;
+                            }
+                            Completion::Validated { token, result } => {
+                                if result.is_err() {
+                                    let _ = log.try_send(serde_json::json!({"event":"FD_VALIDATION_COMPLETE", "worker_task":token}).to_string());
+                                }
+                                (token, result)
+                            }
+                        };
+                        if let Some(mut connection) = connections.remove(&token) {
+                            if connection
+                                .finish_validation(result, Instant::now(), &log)
                                 .is_ok()
-                        {
-                            register(
-                                epoll.as_raw_fd(),
-                                libc::EPOLL_CTL_MOD,
-                                connection.fd.as_raw_fd(),
-                                completion.token,
-                                connection.output.is_some(),
-                            )?;
-                            connections.insert(completion.token, connection);
+                            {
+                                register(
+                                    epoll.as_raw_fd(),
+                                    libc::EPOLL_CTL_MOD,
+                                    connection.fd.as_raw_fd(),
+                                    token,
+                                    connection.output.is_some(),
+                                    false,
+                                )?;
+                                connections.insert(token, connection);
+                            } else {
+                                unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
+                            }
                         }
                     }
                 } else if token == CLIENT_LISTENER || token == APPROVAL_LISTENER {
@@ -576,9 +547,7 @@ impl ForegroundDaemon {
                         if broker && peer.uid != 0 {
                             continue;
                         }
-                        let clients = connections
-                            .values()
-                            .filter(|c| !matches!(c.input, Input::Approval(_)));
+                        let clients = connections.values().filter(|c| !c.broker);
                         let client_count = clients.clone().count();
                         let uid_count = clients.filter(|c| c.peer.uid == peer.uid).count();
                         if !broker
@@ -587,11 +556,7 @@ impl ForegroundDaemon {
                         {
                             continue;
                         }
-                        if broker
-                            && connections
-                                .values()
-                                .any(|c| matches!(c.input, Input::Approval(_)))
-                        {
+                        if broker && connections.values().any(|c| c.broker) {
                             continue;
                         }
                         if disable_ancillary_credentials(fd.as_raw_fd()).is_err() {
@@ -600,10 +565,11 @@ impl ForegroundDaemon {
                         let connection = Connection {
                             fd,
                             peer,
+                            broker,
                             input: if broker {
-                                Input::Approval(ApprovalReader::default())
+                                Input::Approval
                             } else {
-                                Input::Client(ControlReader::new(true))
+                                Input::Client
                             },
                             output: None,
                             request_deadline: (!broker).then_some(
@@ -623,27 +589,32 @@ impl ForegroundDaemon {
                             connection.fd.as_raw_fd(),
                             id,
                             false,
+                            true,
                         )?;
                         let _ = log.try_send(
-                            serde_json::json!({"event":"SOCKET_ADMITTED", "broker":broker,"requester_pid":peer.pid,
+                            serde_json::json!({"event":"SOCKET_ADMITTED", "worker_task":id, "broker":broker,"requester_pid":peer.pid,
                             "requester_uid":peer.uid,"requester_gid":peer.gid})
                             .to_string(),
                         );
                         connections.insert(id, connection);
                     }
-                } else if let Some(mut connection) = connections.remove(&token)
-                    && connection
+                } else if let Some(mut connection) = connections.remove(&token) {
+                    if connection
                         .dispatch(token, Instant::now(), &mut workers, &log)
                         .unwrap_or(false)
-                {
-                    register(
-                        epoll.as_raw_fd(),
-                        libc::EPOLL_CTL_MOD,
-                        connection.fd.as_raw_fd(),
-                        token,
-                        connection.output.is_some(),
-                    )?;
-                    connections.insert(token, connection);
+                    {
+                        register(
+                            epoll.as_raw_fd(),
+                            libc::EPOLL_CTL_MOD,
+                            connection.fd.as_raw_fd(),
+                            token,
+                            connection.output.is_some(),
+                            !matches!(connection.input, Input::Validating { .. }),
+                        )?;
+                        connections.insert(token, connection);
+                    } else {
+                        unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
+                    }
                 }
             }
             // Expiry is independent of socket readiness and read progress.
@@ -657,31 +628,54 @@ impl ForegroundDaemon {
                 })
                 .collect();
             for id in expired {
-                if let Some(mut connection) = connections.remove(&id)
-                    && connection
+                if let Some(mut connection) = connections.remove(&id) {
+                    if connection
                         .dispatch(id, now, &mut workers, &log)
                         .unwrap_or(false)
-                {
-                    register(
-                        epoll.as_raw_fd(),
-                        libc::EPOLL_CTL_MOD,
-                        connection.fd.as_raw_fd(),
-                        id,
-                        connection.output.is_some(),
-                    )?;
-                    connections.insert(id, connection);
+                    {
+                        register(
+                            epoll.as_raw_fd(),
+                            libc::EPOLL_CTL_MOD,
+                            connection.fd.as_raw_fd(),
+                            id,
+                            connection.output.is_some(),
+                            !matches!(connection.input, Input::Validating { .. }),
+                        )?;
+                        connections.insert(id, connection);
+                    } else {
+                        unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
+                    }
                 }
             }
         }
     }
 }
 
-fn register(epoll: RawFd, operation: i32, fd: RawFd, token: u64, writing: bool) -> io::Result<()> {
+fn unregister(epoll: RawFd, fd: RawFd) -> io::Result<()> {
+    // A worker can retain a duplicate during blocked caller-FD disposal.
+    // Closing only the coordinator's copy does not remove the registration
+    // until every duplicate closes, so explicitly stop HUP/error delivery.
+    if unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn register(
+    epoll: RawFd,
+    operation: i32,
+    fd: RawFd,
+    token: u64,
+    writing: bool,
+    reading: bool,
+) -> io::Result<()> {
     let mut event = libc::epoll_event {
         events: (if writing {
             libc::EPOLLOUT
-        } else {
+        } else if reading {
             libc::EPOLLIN
+        } else {
+            0
         }) as u32
             | libc::EPOLLRDHUP as u32,
         u64: token,

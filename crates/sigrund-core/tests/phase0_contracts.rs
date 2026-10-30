@@ -556,3 +556,79 @@ fn mvp_signer_policy_rejects_nonssh_adapters() {
     policy.validate_against(&config("").unwrap()).unwrap();
     assert!(policy.validate_against(&config("[mvp]").unwrap()).is_err());
 }
+
+#[test]
+fn phase15_profile_restrictions_apply_to_signed_and_unsigned_requests() {
+    let profile = MvpProfile::default();
+    let signed_hello = |warrant| -> ClientHello {
+        parse_strict(&serde_json::to_vec(&json!({
+            "mode": "signed", "tty_mode": "stdio", "caller_env": {}, "dsse_envelope": signed(warrant)
+        })).unwrap()).unwrap()
+    };
+    for mode in ["null", "sha256"] {
+        let mut warrant = fixture();
+        warrant.command.stdin_policy = mode.into();
+        warrant.command.stdin_sha256 = (mode == "sha256").then(|| "00".repeat(32));
+        profile
+            .validate_for_peer(&signed_hello(warrant), 1001)
+            .unwrap();
+        let mut hello = unsigned();
+        hello.requested_command.as_mut().unwrap().stdin_policy = mode.into();
+        profile.validate_for_peer(&hello, 1001).unwrap();
+    }
+    for field in [
+        "script",
+        "stdin",
+        "allowlist",
+        "time_range",
+        "permanent",
+        "same_uid",
+    ] {
+        let mut warrant = fixture();
+        match field {
+            "script" => warrant.command.allow_interpreted_script = true,
+            "stdin" => warrant.command.stdin_policy = "unrestricted_interactive".into(),
+            "allowlist" => warrant
+                .execution_context
+                .caller_env_allowlist
+                .push("LANG".into()),
+            "time_range" => warrant.policy.mode = "time_range".into(),
+            "permanent" => {
+                warrant.policy.mode = "permanent".into();
+                warrant.policy.not_after = None;
+            }
+            "same_uid" => warrant.execution_context.target_uid = 1001,
+            _ => unreachable!(),
+        }
+        // Keep allowlisted names disjoint from exact names so rejection proves
+        // the profile restriction rather than a generic schema failure.
+        if field == "allowlist" {
+            warrant.execution_context.env_exact.remove("LANG");
+        }
+        let mut hello = unsigned();
+        hello.requested_command = Some(warrant.command.requested());
+        hello.requested_execution_context = Some(warrant.execution_context.clone());
+        hello.requested_policy.as_mut().unwrap().mode = warrant.policy.mode.clone();
+        hello.validate_request().unwrap();
+        assert!(
+            profile.validate_for_peer(&hello, 1001).is_err(),
+            "unsigned {field}"
+        );
+        let hello = signed_hello(warrant);
+        hello.validate_request().unwrap();
+        assert!(
+            profile.validate_for_peer(&hello, 1001).is_err(),
+            "signed {field}"
+        );
+    }
+    // Same-UID gating uses the actual peer, even if signed requester_uid lies.
+    assert!(
+        profile
+            .validate_for_peer(&signed_hello(fixture()), 0)
+            .is_err()
+    );
+    for mut hello in [unsigned(), signed_hello(fixture())] {
+        hello.caller_env.insert("LANG".into(), "C".into());
+        assert!(profile.validate_for_peer(&hello, 1001).is_err());
+    }
+}

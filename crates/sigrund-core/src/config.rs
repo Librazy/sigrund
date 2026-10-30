@@ -115,8 +115,74 @@ impl MvpProfile {
     pub fn validate_hello(&self, hello: &crate::protocol::ClientHello) -> Result<()> {
         self.validate()?;
         hello.validate_request()?;
-        if hello.tty_mode != "stdio" {
-            return Err(CoreError::Protocol("MVP supports stdio only".into()));
+        let supported = |script: bool, stdin: &str, allowlist: &[String], mode: &str| {
+            hello.tty_mode == "stdio"
+                && !script
+                && matches!(stdin, "null" | "sha256")
+                && allowlist.is_empty()
+                && hello.caller_env.is_empty()
+                && mode == "one_time"
+        };
+        let valid = if let Some(command) = &hello.requested_command {
+            supported(
+                command.allow_interpreted_script,
+                &command.stdin_policy,
+                &hello
+                    .requested_execution_context
+                    .as_ref()
+                    .expect("validated shape")
+                    .caller_env_allowlist,
+                &hello
+                    .requested_policy
+                    .as_ref()
+                    .expect("validated shape")
+                    .mode,
+            )
+        } else {
+            let canonical = hello
+                .dsse_envelope
+                .as_ref()
+                .expect("validated shape")
+                .warrant()?;
+            let warrant = canonical.warrant();
+            supported(
+                warrant.command.allow_interpreted_script,
+                &warrant.command.stdin_policy,
+                &warrant.execution_context.caller_env_allowlist,
+                &warrant.policy.mode,
+            )
+        };
+        if !valid {
+            return Err(CoreError::Protocol(
+                "POLICY_VIOLATION: unsupported MVP request".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Call before metadata/snapshot work, using SO_PEERCRED rather than JSON.
+    pub fn validate_for_peer(
+        &self,
+        hello: &crate::protocol::ClientHello,
+        requester_uid: u32,
+    ) -> Result<()> {
+        self.validate_hello(hello)?;
+        let target = if let Some(context) = &hello.requested_execution_context {
+            context.target_uid
+        } else {
+            hello
+                .dsse_envelope
+                .as_ref()
+                .expect("validated shape")
+                .warrant()?
+                .warrant()
+                .execution_context
+                .target_uid
+        };
+        if target == requester_uid {
+            return Err(CoreError::Protocol(
+                "POLICY_VIOLATION: MVP forbids same-UID execution".into(),
+            ));
         }
         Ok(())
     }
