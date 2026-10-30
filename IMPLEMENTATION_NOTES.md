@@ -212,9 +212,12 @@ fixtures cover software keys, encrypted private-key passphrase entry and
 public keys backed by an SSH agent. Physical FIDO signing remains unverified;
 existing simulated SK verification does not establish hardware operation.
 
-The Phase 3 boundary deliberately rejects a successfully verified approval
-with `Snapshots verified; execution authorization requires Phase 4`. No grant
-is consumed, authorization audit record appended or elevated child created.
+The Phase 3 boundary now hands a successfully verified approval to the Phase 4
+authorization executor. The executor revalidates retained snapshots, signer,
+peer, environment, validity, and policy, consumes one-time grants in SQLite,
+and appends authenticated `AUTH_COMMIT`/`AUTH_ABORTED_POST_COMMIT` records.
+The local profile then returns `SPAWN_FAILED` with an explicit Phase 5 handoff;
+no elevated child or readiness frame is created.
 
 ## Deliberately incomplete runtime
 

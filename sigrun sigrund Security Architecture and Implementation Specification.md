@@ -1296,27 +1296,22 @@ Each case runs in a fresh isolated daemon state with test signing keys and actua
 
 This specification is the target runtime contract. The current repository
 contains tested protocol, policy, snapshot, lifecycle, state, audit, framing,
-path, memfd, and cgroup helper primitives. Completed roadmap Phases 0/1 also
-provide typed MVP/broker contracts and a foreground socket daemon that validates
-hellos and explicitly rejects execution. Phase 1.5 extends that service with
-reserved off-loop frame reception/FD disposal, retained request and snapshot
-ownership, directory/file-open separation, streaming sealed-snapshot builders
-and the restricted request-profile gate. Its helper and transport regressions
-do not establish the remaining common-snapshot coordinator, approval, cgroup,
-authorization or execution guarantees. Normal `sigrun`,
-`sigrund-approve` and `sigrund-collector` paths still report unavailable runtime
-with status `78`. Diagnostic probes and helper tests are not substitutes for
-the end-to-end gates. Section 6.3 signer selection, prompting and signing, and
-the remaining midpoint roadmap corrections are requirements for subsequent
-phases, not completed runtime functionality.
+path, memfd, and cgroup helper primitives. Phases 0–3 provide typed request and
+broker contracts, bounded foreground transport, retained sealed snapshots,
+root-TTY approval, and SSH signing. Phase 4 now integrates the local thin
+profile authorization predicate, one bounded off-loop SQLite/audit sequencer,
+one-time consumption, authenticated `AUTH_COMMIT`/rejection records, and
+post-commit abort reconciliation. The local profile intentionally stops at the
+Phase 5 handoff: it returns `SPAWN_FAILED` after durable authorization when
+child setup is unavailable, and never reports readiness or creates a child.
+The collector, hooks, reload, remote ACK, and child execution remain pending.
 
 The following integrations are required before claiming v1.0 conformance:
 
-1. `sigrund` must perform startup audit recovery, identity and root pinning,
-   cgroup initialization, socket admission, bounded transport, policy reload,
-   common snapshots, authorization/SQLite commit, hooks, collector
-   replication, child setup, PTY transfer, central reaping, and disconnect
-   teardown.
+1. `sigrund` still must complete policy reload, hooks, collector replication,
+   cgroup initialization, child setup, PTY transfer, central reaping, and
+   disconnect teardown. Startup recovery, root pinning, common snapshots,
+   bounded transport, and local authorization/SQLite commit are integrated.
 2. `sigrun` must implement the `CLIENT_HELLO` descriptor contract, signed and
    unsigned request construction, snapshot handoff, status-fd reporting,
    server PTY transfer, frame deadlines, signal/window relaying, and terminal

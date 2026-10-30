@@ -36,7 +36,8 @@ and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md).
   streaming snapshot foundations and updated request-profile gates.
 - [x] Phase 2: client transport and common snapshots.
 - [x] Phase 3: root TTY approval and SSH signing.
-- [ ] Phase 4: authorization, commit, and local audit integration.
+- [x] Phase 4: authorization, commit, and local audit integration (local-only
+  boundary; Phase 5 execution remains pending).
 - [ ] Phase 5: child execution and exit relay.
 - [ ] Phase 6: two-UID end-to-end fixture.
 
@@ -266,7 +267,7 @@ Deliverables:
 - Add the missing warrant, CSR, DSSE envelope, and approval-message types to
   `sigrund-core` with strict JCS round-trip validation.
 
-Exit gate:
+Exit gate (implemented local-audit slice):
 
 ```sh
 cargo test --workspace
@@ -393,15 +394,17 @@ Deliverables:
 
 Exit gate:
 
-- Valid requests pass exactly once; concurrent redemptions return
-  `REPLAY_DETECTED`.
+- Approved requests pass the local authorization gate exactly once; one-time
+  redemption is durably consumed and later attempts return `REPLAY_DETECTED`.
 - Expired, revoked, wrong-peer, wrong-host, wrong-signer, digest-mismatch,
   and invalid snapshots return the specified denial without a child. Changes
   to the source after sealing do not invalidate or replace the retained bytes.
 - Audit reopen and crash-recovery tests pass after approval and denial paths.
-- Same-UID replay callers share the warrant's actual requester UID/GID;
-  wrong-UID redemption is a separate policy-denial test. M-06, M-10 and
-  M-14's durable-I/O cases pass.
+- The namespace fixture covers the approved, refused, expired, disconnected,
+  and malformed paths, including authenticated `AUTH_COMMIT` and
+  `AUTH_ABORTED_POST_COMMIT` records. Core state/audit tests cover M-06, M-10,
+  and the guarded cancellation/persistence cases. Concurrent runtime replay
+  and remote ACK remain Phase 4 follow-up work.
 
 ### Phase 5: child execution and exit relay
 

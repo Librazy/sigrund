@@ -199,8 +199,7 @@ fn namespace_fixture() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("execution authorization requires Phase 4"),
+        String::from_utf8_lossy(&output.stderr).contains("execution requires Phase 5"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -240,12 +239,36 @@ fn namespace_fixture() {
     slow_signing_cancellation(&fixture, &identity);
     successful_agent_and_encrypted_identity(&fixture, &identity);
     encrypted_signing_cancellation_restores_terminal(&fixture, &identity);
+    // The preserved approval gate now reaches Phase 4's durable boundary.
+    // Each successful approval consumes a fresh grant, records its abort, and
+    // still cannot claim child readiness before Phase 5.
+    let log = fs::read(&fixture.log).unwrap();
+    assert!(log.starts_with(&initial_log));
+    let events: Vec<serde_json::Value> = String::from_utf8(log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(
-        fs::read(&fixture.log).unwrap(),
-        initial_log,
-        "Phase 3 must not consume/audit authorization or spawn"
+        events
+            .iter()
+            .filter(|r| r["event_type"] == "AUTH_COMMIT")
+            .count(),
+        4
     );
-    assert!(!fixture.state.join("state.sqlite").exists());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|r| r["event_type"] == "AUTH_ABORTED_POST_COMMIT")
+            .count(),
+        4
+    );
+    assert!(
+        events
+            .iter()
+            .all(|r| !r["event_type"].as_str().unwrap().starts_with("EXEC_"))
+    );
+    assert!(fixture.state.join("state.sqlite").exists());
     daemon.stop();
 }
 
@@ -485,7 +508,7 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
     let request = broker_request(&mut broker);
     let response = signed_response(&request, identity, |_| {});
     broker_send(&mut broker, &response);
-    assert!(decision(&mut client).message.contains("requires Phase 4"));
+    assert!(decision(&mut client).message.contains("requires Phase 5"));
     drop(client);
     fixture.wait_for_cleanup(before);
     broker_send(&mut broker, &response);
@@ -695,7 +718,7 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
             assert!(text.contains("Enter passphrase"));
             terminal.write_all(b"phase3-test\n").unwrap();
         }
-        assert!(decision(&mut client).message.contains("requires Phase 4"));
+        assert!(decision(&mut client).message.contains("requires Phase 5"));
         assert!(
             !askpass_marker.exists(),
             "askpass must never receive a signing passphrase request"

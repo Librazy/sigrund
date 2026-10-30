@@ -1037,7 +1037,7 @@ fn verify_audit_directory_replacement() {
             genesis["host_id"].as_str().unwrap(),
         )
         .unwrap();
-        assert_eq!(audit.state().seq, if recovery == "partial" { 2 } else { 3 });
+        assert_eq!(audit.state().seq, if recovery == "partial" { 3 } else { 4 });
     }
 }
 
@@ -1111,8 +1111,8 @@ fn verify_blocked_metadata() {
     let baseline = fd_count();
     let baseline_threads = thread_count();
     assert_eq!(
-        baseline_threads, 4,
-        "expected coordinator, diagnostics, and two fixed workers"
+        baseline_threads, 5,
+        "expected coordinator, diagnostics, two fixed workers, and authorization executor"
     );
     let null = OpenOptions::new()
         .read(true)
