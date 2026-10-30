@@ -42,6 +42,8 @@ struct Parser<'a, 'b> {
     path: Vec<String>,
 }
 
+const MAX_ARRAY_ELEMENTS: usize = 256;
+
 impl Parser<'_, '_> {
     fn ws(&mut self) {
         while self
@@ -111,7 +113,14 @@ impl Parser<'_, '_> {
             self.pos += 1;
             return Ok(());
         }
+        let mut count = 0usize;
         loop {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| CoreError::Json("JSON array length overflow".into()))?;
+            if count > MAX_ARRAY_ELEMENTS {
+                return Err(CoreError::Json("JSON array exceeds maximum length".into()));
+            }
             self.path.push("*".into());
             self.value(depth)?;
             self.path.pop();
@@ -228,5 +237,7 @@ mod tests {
         assert!(preflight(br#"{"a":1,"a":2}"#, 8, 4096).is_err());
         assert!(preflight(br#"[[[[[[[[[0]]]]]]]]]"#, 8, 4096).is_err());
         assert!(preflight(br#"{"a":"x"}"#, 8, 4096).is_ok());
+        let oversized = format!("[{}]", (0..257).map(|_| "0").collect::<Vec<_>>().join(","));
+        assert!(preflight(oversized.as_bytes(), 8, 4096).is_err());
     }
 }

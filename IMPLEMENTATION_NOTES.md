@@ -23,9 +23,15 @@ The repository currently contains tested building blocks for:
 - bounded frame encoding/decoding and the exact `CLIENT_HELLO`, decision,
   child-exit, and remote-batch shape validators.
 
-The current unit suite has 31 tests and Clippy is clean. These tests exercise
+The current unit suite has 36 tests and Clippy is clean. These tests exercise
 the primitives above; they are not substitutes for the verification matrix in
 Section 8 of the specification.
+
+The SSHSIG verifier now parses raw `SSHSIG` envelopes for `ssh-ed25519` and
+`sk-ssh-ed25519`, checks the warrant namespace and SHA-512 envelope, matches
+the configured public-key algorithm, and enforces the configured FIDO user
+presence and verification flags. OpenPGP and Sigstore adapters remain future
+integration work.
 
 ## Deliberately incomplete runtime
 

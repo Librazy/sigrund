@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::PathBuf,
     process::ExitCode,
 };
@@ -41,6 +41,10 @@ fn main() -> ExitCode {
 }
 
 fn init_host(args: &[String]) -> ExitCode {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("sigrundctl: init-host requires effective UID 0");
+        return ExitCode::from(77);
+    }
     let state_dir =
         option_path(args, "--state-dir").unwrap_or_else(|| PathBuf::from("/var/lib/sigrund"));
     let log_path = option_path(args, "--log-path")
@@ -58,6 +62,13 @@ fn init_host(args: &[String]) -> ExitCode {
             .unwrap_or_else(|| Ok(()))
     }) {
         eprintln!("sigrundctl: cannot create provisioning directories: {error}");
+        return ExitCode::from(73);
+    }
+    let log_parent = log_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if !root_owned_dir(&state_dir) || !root_owned_dir(log_parent) {
+        eprintln!("sigrundctl: provisioning directories must be owned by root:root");
         return ExitCode::from(73);
     }
     let mut host_secret = [0u8; 32];
@@ -109,6 +120,7 @@ fn init_host(args: &[String]) -> ExitCode {
             .create_new(true)
             .write(true)
             .mode(0o400)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&key_path)?;
         key_file.write_all(&host_secret)?;
         key_file.write_all(&public_key)?;
@@ -117,19 +129,30 @@ fn init_host(args: &[String]) -> ExitCode {
             .create_new(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&log_path)?;
         log_file.write_all(&record_bytes)?;
         log_file.write_all(b"\n")?;
         log_file.sync_all()?;
+        let state_tmp_path = state_path.with_extension("state.tmp");
         let mut state_file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(&state_path)?;
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&state_tmp_path)?;
         state_file.write_all(&serde_json::to_vec(&state).expect("state serialization"))?;
         state_file.sync_all()?;
+        drop(state_file);
+        fs::rename(&state_tmp_path, &state_path)?;
         if let Some(parent) = state_path.parent() {
             File::open(parent)?.sync_all()?;
+        }
+        if !root_owned(&key_path) || !root_owned(&log_path) || !root_owned(&state_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "provisioned output is not root:root",
+            ));
         }
         Ok(())
     })();
@@ -153,6 +176,18 @@ fn init_host(args: &[String]) -> ExitCode {
             ExitCode::from(74)
         }
     }
+}
+
+fn root_owned(path: &std::path::Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.uid() == 0 && metadata.gid() == 0)
+        .unwrap_or(false)
+}
+
+fn root_owned_dir(path: &std::path::Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir() && metadata.uid() == 0 && metadata.gid() == 0)
+        .unwrap_or(false)
 }
 
 fn option_path(args: &[String], name: &str) -> Option<PathBuf> {

@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
+use ssh_key::{Algorithm, PublicKey};
 use std::{
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
@@ -305,10 +306,12 @@ impl SignerPolicyFile {
                 }
             } else {
                 let valid = match signer.signature_type.as_str() {
-                    "ssh-ed25519" => signer.public_key.starts_with("ssh-ed25519 "),
-                    "sk-ssh-ed25519" => {
-                        signer.public_key.starts_with("sk-ssh-ed25519@openssh.com ")
-                    }
+                    "ssh-ed25519" => PublicKey::from_openssh(&signer.public_key)
+                        .map(|key| key.algorithm() == Algorithm::Ed25519)
+                        .unwrap_or(false),
+                    "sk-ssh-ed25519" => PublicKey::from_openssh(&signer.public_key)
+                        .map(|key| key.algorithm() == Algorithm::SkEd25519)
+                        .unwrap_or(false),
                     "openpgp-v4-ed25519" => {
                         matches!(signer.public_key.len(), 40 | 64)
                             && signer
@@ -431,15 +434,8 @@ impl DaemonConfig {
                 .collector_key_id
                 .bytes()
                 .any(|byte| byte.is_ascii_control())
-            || !self.collector_base_url.starts_with("https://")
-            || self.collector_base_url.contains(['#', '@'])
-            || self.collector_server_name.is_empty()
-            || self.collector_server_name.len() > 255
-            || !self.collector_server_name.is_ascii()
-            || self
-                .collector_server_name
-                .bytes()
-                .any(|byte| byte.is_ascii_control())
+            || !valid_https_url(&self.collector_base_url)
+            || !valid_dns_name(&self.collector_server_name)
             || !self.collector_ca_file.is_absolute()
             || !self.collector_client_cert_file.is_absolute()
             || !self.collector_client_key_file.is_absolute()
@@ -536,6 +532,55 @@ fn safe_root_path(path: &Path) -> bool {
     path.components()
         .skip(1)
         .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn valid_https_url(value: &str) -> bool {
+    let Some(authority_and_path) = value.strip_prefix("https://") else {
+        return false;
+    };
+    if authority_and_path.is_empty()
+        || authority_and_path.contains(['#', '@', ' ', '\t', '\r', '\n'])
+    {
+        return false;
+    }
+    let authority = authority_and_path
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return false;
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let Ok(port) = port.parse::<u16>() else {
+                return false;
+            };
+            if port == 0 {
+                return false;
+            }
+            host
+        }
+        Some((_, _)) if authority.matches(':').count() == 1 => return false,
+        _ => authority,
+    };
+    valid_dns_name(host)
+}
+
+fn valid_dns_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 255 || value.starts_with('.') || value.ends_with('.') {
+        return false;
+    }
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 fn one() -> u32 {
@@ -657,6 +702,19 @@ mod tests {
         assert!(cfg.validate().is_err());
         let mut cfg = valid();
         cfg.max_io_workers_global = 17;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_collector_endpoint_and_server_name() {
+        let mut cfg = valid();
+        cfg.collector_base_url = "https://".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg = valid();
+        cfg.collector_server_name = "collector host".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg = valid();
+        cfg.collector_base_url = "https://collector.example.invalid:0".into();
         assert!(cfg.validate().is_err());
     }
 

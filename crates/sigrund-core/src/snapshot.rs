@@ -44,11 +44,16 @@ pub fn copy_bounded<R: Read>(
             return Err(CoreError::Value("snapshot exceeded configured size".into()));
         }
     }
-    if reader
+    if cancelled() {
+        return Err(CoreError::Protocol("snapshot cancelled".into()));
+    }
+    let trailing = reader
         .read(&mut [0u8; 1])
-        .map_err(|error| CoreError::Value(format!("snapshot EOF check failed: {error}")))?
-        != 0
-    {
+        .map_err(|error| CoreError::Value(format!("snapshot EOF check failed: {error}")))?;
+    if cancelled() {
+        return Err(CoreError::Protocol("snapshot cancelled".into()));
+    }
+    if trailing != 0 {
         return Err(CoreError::Value(
             "snapshot source changed after st_size".into(),
         ));
@@ -83,7 +88,11 @@ pub fn read_exact_bounded<R: Read>(reader: &mut R, max_size: usize) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[test]
     fn copies_exact_size_and_detects_mutation() {
@@ -93,5 +102,32 @@ mod tests {
         assert_eq!(snapshot.sha256.len(), 64);
         let mut changed = Cursor::new(b"hello!".to_vec());
         assert!(copy_bounded(&mut changed, 5, 10, || false).is_err());
+    }
+
+    struct CancelsAtEof {
+        inner: Cursor<Vec<u8>>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl Read for CancelsAtEof {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            if count == 0 {
+                self.cancelled.store(true, Ordering::Release);
+            }
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn cancellation_after_final_chunk_is_reported() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut reader = CancelsAtEof {
+            inner: Cursor::new(b"hello".to_vec()),
+            cancelled: cancelled.clone(),
+        };
+        assert!(
+            copy_bounded(&mut reader, 5, 10, || { cancelled.load(Ordering::Acquire) }).is_err()
+        );
     }
 }

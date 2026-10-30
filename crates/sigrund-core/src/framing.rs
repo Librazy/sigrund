@@ -51,7 +51,7 @@ pub fn validate_client_frame(frame: FrameType, ready: bool, pty: bool) -> Result
 pub fn validate_server_frame(frame: FrameType, decided: bool, ready: bool) -> Result<()> {
     match frame {
         FrameType::ServerAuthDecision if !decided => Ok(()),
-        FrameType::ServerChildExit if ready => Ok(()),
+        FrameType::ServerChildExit if decided && ready => Ok(()),
         _ => Err(CoreError::Protocol(
             "server frame is invalid in current state".into(),
         )),
@@ -152,5 +152,7 @@ mod tests {
     fn rejects_unknown_and_oversized_headers() {
         assert!(decode_header([0xff, 0, 0, 0, 1]).is_err());
         assert!(decode_header([1, 0, 3, 0, 1]).is_err());
+        assert!(validate_server_frame(FrameType::ServerChildExit, false, true).is_err());
+        assert!(validate_server_frame(FrameType::ServerChildExit, true, true).is_ok());
     }
 }
