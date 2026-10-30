@@ -1,12 +1,25 @@
 use std::{env, fs, process::ExitCode};
 
+use sigrund::cli::{DAEMON_HELP, DaemonArgs, DaemonMode};
 use sigrund::startup::CgroupLayout;
 use sigrund_core::config::{DaemonConfig, SignerPolicyFile};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    let config_path = env::var_os("SIGRUND_CONFIG")
-        .map(std::path::PathBuf::from)
+    let args: Vec<String> = env::args().skip(1).collect();
+    let args = match DaemonArgs::parse(&args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("sigrund: {error}\n{DAEMON_HELP}");
+            return ExitCode::from(64);
+        }
+    };
+    if args.mode == DaemonMode::Help {
+        println!("{DAEMON_HELP}");
+        return ExitCode::SUCCESS;
+    }
+    let config_path = args
+        .config
+        .or_else(|| env::var_os("SIGRUND_CONFIG").map(Into::into))
         .unwrap_or_else(|| "/etc/sigrund/config.toml".into());
     let bytes = match fs::read(&config_path) {
         Ok(bytes) => bytes,
@@ -22,8 +35,9 @@ fn main() -> ExitCode {
             return ExitCode::from(78);
         }
     };
-    let signer_path = env::var_os("SIGRUND_SIGNERS")
-        .map(std::path::PathBuf::from)
+    let signer_path = args
+        .signers
+        .or_else(|| env::var_os("SIGRUND_SIGNERS").map(Into::into))
         .unwrap_or_else(|| "/etc/sigrund/signers.toml".into());
     let signer_bytes = match fs::read(&signer_path) {
         Ok(bytes) => bytes,
@@ -38,11 +52,7 @@ fn main() -> ExitCode {
         eprintln!("sigrund: refusing invalid configuration: {error}");
         return ExitCode::from(78);
     }
-    if let Some(index) = args.iter().position(|arg| arg == "--check-cgroup") {
-        let Some(root) = args.get(index + 1) else {
-            eprintln!("sigrund: --check-cgroup requires a delegated cgroup path");
-            return ExitCode::from(64);
-        };
+    if let DaemonMode::CheckCgroup(root) = args.mode {
         return match CgroupLayout::from_root(root).initialize() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -51,7 +61,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    if args.iter().any(|arg| arg == "--check-config") {
+    if args.mode == DaemonMode::CheckConfig {
         return ExitCode::SUCCESS;
     }
     eprintln!("sigrund: configuration validated; privileged runtime is not enabled in this build");

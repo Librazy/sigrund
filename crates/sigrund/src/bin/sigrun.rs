@@ -1,17 +1,25 @@
+use sigrund::cli::{CLIENT_HELP, ClientArgs};
 use std::{env, fs, process::ExitCode};
 
 use sigrund_core::{
     framing::{FrameType, encode_frame},
-    protocol::{ClientHello, parse_strict},
+    protocol::ClientHello,
 };
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if let Some(index) = args.iter().position(|arg| arg == "--validate-hello") {
-        let Some(path) = args.get(index + 1) else {
-            eprintln!("sigrun: --validate-hello requires a JSON path");
+    let args: Vec<String> = env::args().skip(1).collect();
+    let command = match ClientArgs::parse(&args) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("sigrun: {error}\n{CLIENT_HELP}");
             return ExitCode::from(64);
-        };
+        }
+    };
+    if command == ClientArgs::Help {
+        println!("{CLIENT_HELP}");
+        return ExitCode::SUCCESS;
+    }
+    if let ClientArgs::ValidateHello(path) = &command {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -19,22 +27,15 @@ fn main() -> ExitCode {
                 return ExitCode::from(66);
             }
         };
-        return match parse_strict::<ClientHello>(&bytes).and_then(|hello| hello.validate_shape()) {
-            Ok(()) => ExitCode::SUCCESS,
+        return match ClientHello::parse_request(&bytes) {
+            Ok(_) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("sigrun: invalid CLIENT_HELLO: {error}");
                 ExitCode::from(65)
             }
         };
     }
-    if let Some(index) = args.iter().position(|arg| arg == "--encode-signal") {
-        let Some(signal) = args
-            .get(index + 1)
-            .and_then(|value| value.parse::<u8>().ok())
-        else {
-            eprintln!("sigrun: --encode-signal requires an integer");
-            return ExitCode::from(64);
-        };
+    if let ClientArgs::EncodeSignal(signal) = command {
         let payload = format!(r#"{{"signal":{signal}}}"#);
         match encode_frame(FrameType::ClientSignal, payload.as_bytes()) {
             Ok(frame) => println!(

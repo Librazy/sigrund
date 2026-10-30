@@ -34,3 +34,7 @@ path = "src/bin/sigrundctl.rs"
 [[bin]]
 name = "sigrund-collector"
 path = "src/bin/sigrund-collector.rs"
+
+[[bin]]
+name = "sigrund-approve"
+path = "src/bin/sigrund-approve.rs"
