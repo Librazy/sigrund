@@ -3,7 +3,7 @@ use serde::Deserialize;
 use ssh_key::{Algorithm, PublicKey};
 use std::{
     collections::BTreeSet,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
@@ -526,12 +526,13 @@ fn safe_root_path(path: &Path) -> bool {
     let Some(raw) = path.to_str() else {
         return false;
     };
-    if !path.is_absolute() || path == Path::new("/") || raw.ends_with('/') || raw.contains("//") {
+    // Inspect the original spelling: Path::components normalizes away `.`.
+    let Some(relative) = raw.strip_prefix('/') else {
         return false;
-    }
-    path.components()
-        .skip(1)
-        .all(|component| matches!(component, Component::Normal(_)))
+    };
+    relative
+        .split('/')
+        .all(|component| !matches!(component, "" | "." | ".."))
 }
 
 fn valid_https_url(value: &str) -> bool {
@@ -692,6 +693,31 @@ mod tests {
             audit_record_max_bytes: 65_536,
             max_onetime_window_secs: 3_600,
             max_ttl_secs: 31_536_000,
+        }
+    }
+
+    #[test]
+    fn validates_executable_root_spelling_without_normalization() {
+        for root in ["/usr/bin", "/usr/sbin", "/opt/bin"] {
+            let mut cfg = valid();
+            cfg.csr_allowed_executable_dirs = vec![PathBuf::from(root)];
+            assert!(cfg.validate().is_ok(), "valid root: {root}");
+        }
+        for root in [
+            "/usr/./bin",
+            "/./usr/bin",
+            "/usr/bin/.",
+            "/usr/../bin",
+            "/usr//bin",
+            "//usr/bin",
+            "/usr/bin/",
+            "/",
+            "usr/bin",
+            "",
+        ] {
+            let mut cfg = valid();
+            cfg.csr_allowed_executable_dirs = vec![PathBuf::from(root)];
+            assert!(cfg.validate().is_err(), "invalid root: {root}");
         }
     }
 
