@@ -1,6 +1,6 @@
 # `sigrun` & `sigrund` Security Architecture and Implementation Specification (v1.0)
 
-This document is the complete, self-contained v1.0 specification for `sigrun` (unprivileged CLI client) and `sigrund` (root execution daemon). It defines the trust boundaries, cgroup v2 hierarchy initialization, admission and quota controls, wire protocol, cryptographic envelopes, unified authorization predicate (including same-UID injection prevention), child credential and mount transitions, hook sandboxing, contiguous audit replication and collector deduplication, audit crash-recovery state machine, and cumulative verification matrix.
+This document is the complete, self-contained v1.0 specification for `sigrun` (unprivileged CLI client) and `sigrund` (root execution daemon). It defines the trust boundaries, cgroup v2 hierarchy initialization, admission and quota controls, wire protocol, cryptographic envelopes, unified authorization predicate (including same-UID injection prevention), child credential and mount transitions, hook sandboxing, contiguous audit replication and collector deduplication, audit crash-recovery state machine, and cumulative verification matrix. Section 8.3 records the current implementation boundary and release gate; a validated helper or command-line probe is not an implementation of the runtime contract by itself.
 
 ---
 
@@ -918,6 +918,7 @@ if ((stv.f_flag & req) != req)
 ```json
 {
   "key_hex": "<64-char-hex-K_1>",
+  "initial_key_hex": "<64-char-hex-K_0>",
   "last_record_sha256": "<64-char-hex-SHA256-of-record-0-jcs-bytes>",
   "remote_acked_seq": 0,
   "seq": 1
@@ -941,6 +942,19 @@ To write event `seq = i` ($i \ge 1$) using current state $S = (\text{seq} = i, K
 3. Compute $K_{i+1} = \text{SHA-256}(K_i \parallel \text{"sigrun-ratchet-v1"})$ and `record_i_sha256 = hex(SHA256(record_i_bytes))`.
 4. Write `{ "key_hex": "<K_{i+1}>", "last_record_sha256": "<record_i_sha256>", "remote_acked_seq": S.remote_acked_seq, "seq": i + 1 }` to `/var/lib/sigrund/audit_ratchet.state.tmp` (`0600 root:root`), call `fsync(tmp_fd)`, close `tmp_fd`, call `rename("audit_ratchet.state.tmp", "audit_ratchet.state")`, and call `fsync(var_lib_dir_fd)`.
 5. Zero $K_i$ in memory (`explicit_bzero`).
+
+The state file also carries `initial_key_hex`, the protected 64-character
+hexadecimal encoding of $K_0$, unchanged for the lifetime of the host. It is
+needed to verify the genesis record and replay the ratchet during startup
+recovery. It is never used as a request-time signing key and remains covered
+by the state file's `0600` ownership and permission requirements.
+
+If the record and log `fsync()` succeed but any temporary-state creation,
+state write, rename, or directory `fsync()` fails, the in-memory writer is
+poisoned immediately. It must reject every later append until a startup-style
+verified reconciliation has established whether the log is synchronized or
+one record ahead and has published a matching state file. Reusing the old
+sequence and ratchet key after a durable log write is forbidden.
 
 ### 7.3 Startup Crash-Recovery & Integrity Gate
 
@@ -1115,3 +1129,40 @@ Each case runs in a fresh isolated daemon state with test signing keys and actua
 <br>2. Only canonical lowercase UUIDv7 and bounded UID/GID/timestamp/integer values pass; overflow is rejected without allocation, commit, or spawn.<br>
 
 <br>3. Verified denials map to `EXPIRED_OR_NOT_YET_VALID`, `REVOKED`, and `REPLAY_DETECTED` respectively, append the post-commit abort, and never spawn. Corrupt receipts fail as `REMOTE_AUDIT_FAILED` without cursor advancement. Rollback failure stops accepting requests and fails closed without ratcheting. |
+
+### 8.3 Implementation Status and Release Gate
+
+This specification is the target runtime contract. The current repository
+contains tested protocol, policy, snapshot, lifecycle, state, audit, framing,
+path, memfd, and cgroup helper primitives, but the production control loops
+are not implied by those helpers. Until the integration work is complete, the
+normal `sigrund`, `sigrun`, and `sigrund-collector` entry points may expose only
+their documented validation/provisioning probes and may exit with the service
+unavailable status (`78`). Such probes do not open `/run/sigrund.sock`, accept
+requests, authorize warrants, spawn jobs, or provide a security guarantee.
+
+The following integrations are required before claiming v1.0 conformance:
+
+1. `sigrund` must perform startup audit recovery, identity and root pinning,
+   cgroup initialization, socket admission, bounded transport, policy reload,
+   common snapshots, authorization/SQLite commit, hooks, collector
+   replication, child setup, PTY transfer, central reaping, and disconnect
+   teardown.
+2. `sigrun` must implement the `CLIENT_HELLO` descriptor contract, signed and
+   unsigned request construction, snapshot handoff, status-fd reporting,
+   server PTY transfer, frame deadlines, signal/window relaying, and terminal
+   cleanup.
+3. `sigrund-collector` must implement authenticated TLS transport, exact
+   HTTP/DSSE framing, contiguous batch verification, host binding,
+   deduplication, durable cursor advancement, and the denial mappings in
+   Section 4.4.
+4. `sigrundctl` must complete provisioning and operator workflows, including
+   the anchor-output contract and safe administrative revocation operations.
+5. V-01 through V-19 must run in isolated Linux fixtures with deterministic
+   gates for cancellation, commit/spawn reservations, crash recovery, and
+   descriptor transfer. Unit tests, `cargo test`, and Clippy alone do not
+   satisfy this matrix.
+
+An implementation may claim a row of the matrix only when the end-to-end
+observable behavior in that row passes. A helper unit test may support a row,
+but cannot waive a missing daemon, client, collector, or operator integration.
