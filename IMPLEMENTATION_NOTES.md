@@ -5,6 +5,10 @@ branch. The security specification remains the normative contract. A helper is
 described as implemented only when its behavior is covered by a focused test;
 the helper alone does not establish the end-to-end daemon guarantee.
 
+The executable delivery plan is in [MVP_ROADMAP.md](MVP_ROADMAP.md). It
+defines the thin `stdio` approval/signing workflow and the gates required
+before expanding to the full v1.0 surface.
+
 ## Current implementation
 
 The repository currently contains tested building blocks for:
