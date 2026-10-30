@@ -482,11 +482,52 @@ fn quote(value: &str) -> String {
     result.push('"');
     result
 }
-struct Helper(Child);
-impl Drop for Helper {
+struct Helper<'a> {
+    process: Child,
+    tty: &'a File,
+    settings: Option<libc::termios>,
+}
+impl<'a> Helper<'a> {
+    fn spawn(command: &mut Command, tty: &'a File) -> io::Result<Self> {
+        let mut settings = unsafe { std::mem::zeroed() };
+        loop {
+            if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut settings) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(Self {
+            process: command.spawn()?,
+            tty,
+            settings: Some(settings),
+        })
+    }
+    fn restore_terminal(&mut self) -> io::Result<()> {
+        if let Some(settings) = &self.settings {
+            loop {
+                if unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, settings) } == 0 {
+                    self.settings = None;
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for Helper<'_> {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // A killed OpenSSH passphrase reader cannot restore its own termios.
+        // Reap first so it cannot change the terminal again after restoration.
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        let _ = self.restore_terminal();
     }
 }
 fn sign_payload(
@@ -549,9 +590,9 @@ fn sign_with_helper(
             Ok(())
         });
     }
-    let mut child = Helper(command.spawn()?);
-    let mut input = child.0.stdin.take();
-    let mut output = child.0.stdout.take().expect("helper stdout");
+    let mut child = Helper::spawn(&mut command, tty)?;
+    let mut input = child.process.stdin.take();
+    let mut output = child.process.stdout.take().expect("helper stdout");
     nonblocking(input.as_ref().unwrap().as_raw_fd())?;
     nonblocking(output.as_raw_fd())?;
     let message = pae(WARRANT_PAYLOAD_TYPE, payload);
@@ -593,7 +634,7 @@ fn sign_with_helper(
             Err(e) => return Err(e),
         }
         if status.is_none() {
-            status = child.0.try_wait()?;
+            status = child.process.try_wait()?;
         }
         if status.is_some_and(|s| !s.success()) {
             return Err(invalid("SSH signing helper failed"));
@@ -606,6 +647,7 @@ fn sign_with_helper(
             Some(Instant::now() + Duration::from_millis(20)),
         )?;
     }
+    child.restore_terminal()?;
     check()?;
     if sent != message.len() {
         return Err(invalid("incomplete SSH signing input"));
@@ -633,8 +675,32 @@ fn sign_with_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::{fd::FromRawFd, unix::fs::PermissionsExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn terminal() -> (File, File) {
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let pair = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+        for fd in [master, slave] {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        pair
+    }
 
     fn identity(dir: &Path, name: &str) -> (File, SignerConfig) {
         let path = dir.join(name);
@@ -661,7 +727,7 @@ mod tests {
     fn openssh_signs_exact_dsse_pae_and_rejects_other_keys_namespaces_and_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let (key, signer) = identity(dir.path(), "key");
-        let tty = tempfile::tempfile().unwrap();
+        let (_master, tty) = terminal();
         let payload = b"exact canonical CSR bytes";
         let signature = sign_payload(&key, &tty, &signer, payload, || Ok(())).unwrap();
         let verify = |signature: &str, payload: &[u8], signer: &SignerConfig| {
@@ -710,13 +776,13 @@ mod tests {
     fn helper_abort_kills_and_reaps_child_and_bounds_input_output() {
         let dir = tempfile::tempdir().unwrap();
         let (key, signer) = identity(dir.path(), "key");
-        let tty = tempfile::tempfile().unwrap();
+        let (_master, tty) = terminal();
         let pid_path = dir.path().join("pid");
         let helper = dir.path().join("helper");
         fs::write(
             &helper,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec /usr/bin/sleep 60\n",
+                "#!/bin/sh\n/usr/bin/stty -echo <&2\necho $$ > '{}'\nexec /usr/bin/sleep 60\n",
                 pid_path.display()
             ),
         )
@@ -727,6 +793,12 @@ mod tests {
             io::ErrorKind::TimedOut,
             io::ErrorKind::UnexpectedEof,
         ] {
+            let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut original) },
+                0
+            );
+            assert_ne!(original.c_lflag & libc::ECHO, 0);
             let start = Instant::now();
             let checks = AtomicUsize::new(0);
             let result =
@@ -755,6 +827,12 @@ mod tests {
                 Some(libc::ECHILD)
             );
             assert!(!Path::new(&format!("/proc/{pid}")).exists());
+            let mut restored = unsafe { std::mem::zeroed::<libc::termios>() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut restored) },
+                0
+            );
+            assert_eq!(restored.c_lflag, original.c_lflag);
         }
         fs::write(
             &helper,

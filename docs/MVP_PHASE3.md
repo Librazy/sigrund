@@ -37,6 +37,13 @@ before slot reservation, bounded helper I/O and checked cleanup under agent
 backpressure. A test-fixture FD leak discovered during TTY-loss testing was
 fixed by applying close-on-exec to both PTY ends.
 
+Encrypted-key review probes additionally verified that cancelling a passphrase
+read used to leave terminal echo disabled. The helper now captures terminal
+attributes before spawning and restores them only after reaping, on both
+success and failure. The real PTY gate checks full attribute restoration after
+broker cancellation and local termination; the bounded-helper gate also covers
+timeout and I/O-error cleanup with echo disabled.
+
 Reproducible checks:
 
 ```sh

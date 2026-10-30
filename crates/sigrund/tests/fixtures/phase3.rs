@@ -239,6 +239,7 @@ fn namespace_fixture() {
     wrong_operator_identity(&fixture);
     slow_signing_cancellation(&fixture, &identity);
     successful_agent_and_encrypted_identity(&fixture, &identity);
+    encrypted_signing_cancellation_restores_terminal(&fixture, &identity);
     assert_eq!(
         fs::read(&fixture.log).unwrap(),
         initial_log,
@@ -736,4 +737,84 @@ fn wrong_operator_identity(fixture: &Fixture) {
             .contains("identity does not match requested signer")
     );
     fixture.wait_for_cleanup(before);
+}
+
+fn tty_attributes(terminal: &File) -> libc::termios {
+    let mut attributes = unsafe { zeroed() };
+    assert_eq!(
+        unsafe { libc::tcgetattr(terminal.as_raw_fd(), &mut attributes) },
+        0
+    );
+    attributes
+}
+fn assert_tty_attributes_restored(terminal: &File, original: &libc::termios) {
+    let restored = tty_attributes(terminal);
+    assert_eq!(restored.c_iflag, original.c_iflag);
+    assert_eq!(restored.c_oflag, original.c_oflag);
+    assert_eq!(restored.c_cflag, original.c_cflag);
+    assert_eq!(restored.c_lflag, original.c_lflag);
+    assert_eq!(restored.c_cc, original.c_cc);
+    assert_eq!(unsafe { libc::cfgetispeed(&restored) }, unsafe {
+        libc::cfgetispeed(original)
+    });
+    assert_eq!(unsafe { libc::cfgetospeed(&restored) }, unsafe {
+        libc::cfgetospeed(original)
+    });
+}
+fn encrypted_signing_cancellation_restores_terminal(fixture: &Fixture, identity: &Path) {
+    // The preceding encrypted-key test leaves this identity encrypted. Stop
+    // OpenSSH while it has changed the real controlling terminal for a secret
+    // read, then inspect the same PTY after the approver and helper are gone.
+    for local_signal in [false, true] {
+        let admission = fixture.diagnostic_count();
+        let (mut terminal, mut approver) = launch_approver_with(fixture, identity, |command| {
+            command
+                .env_remove("SSH_AUTH_SOCK")
+                .env("SSH_ASKPASS_REQUIRE", "never");
+        });
+        let original = tty_attributes(&terminal);
+        assert_ne!(original.c_lflag & libc::ECHO, 0);
+        wait_for(|| {
+            fs::read_to_string(&fixture.diagnostics)
+                .unwrap()
+                .lines()
+                .skip(admission)
+                .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
+        });
+        let before = fixture.diagnostic_count();
+        let mut client = connect(&fixture.socket);
+        send_hello(&mut client, &fixture.executable);
+        prompt(&mut terminal);
+        terminal.write_all(b"yes\n").unwrap();
+        let text = tty_until(&mut terminal, b": ");
+        assert!(text.contains("Enter passphrase"));
+        wait_for(|| tty_attributes(&terminal).c_lflag & libc::ECHO == 0);
+        let children = format!(
+            "/proc/{}/task/{}/children",
+            approver.0.id(),
+            approver.0.id()
+        );
+        let helper: u32 = fs::read_to_string(children)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        if local_signal {
+            assert_eq!(
+                unsafe { libc::kill(approver.0.id() as _, libc::SIGTERM) },
+                0
+            );
+            assert_eq!(decision(&mut client).status, "TIMEOUT_CSR");
+        }
+        drop(client);
+        wait_for(|| approver.0.try_wait().unwrap().is_some());
+        assert!(
+            !Path::new(&format!("/proc/{helper}")).exists(),
+            "signing helper survived"
+        );
+        assert_tty_attributes_restored(&terminal, &original);
+        fixture.wait_for_cleanup(before);
+    }
 }
