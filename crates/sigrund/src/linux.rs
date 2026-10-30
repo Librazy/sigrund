@@ -36,6 +36,40 @@ pub fn validate_absolute_path(path: &Path) -> io::Result<()> {
 }
 
 pub fn openat2_root(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd> {
+    open_relative(
+        root_fd,
+        relative_path,
+        libc::O_PATH | libc::O_DIRECTORY,
+        false,
+    )
+}
+
+/// Read a configured file without following links, permitting mount crossing.
+pub fn openat2_file(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd> {
+    open_relative(
+        root_fd,
+        relative_path,
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        false,
+    )
+}
+
+/// Executable sources are resolved beneath a pinned directory, on its mount.
+pub fn openat2_executable(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd> {
+    open_relative(
+        root_fd,
+        relative_path,
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        true,
+    )
+}
+
+fn open_relative(
+    root_fd: RawFd,
+    relative_path: &Path,
+    flags: i32,
+    no_xdev: bool,
+) -> io::Result<OwnedFd> {
     let text = relative_path
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "relative path is not UTF-8"))?;
@@ -53,11 +87,14 @@ pub fn openat2_root(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd>
     let path = CString::new(text)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
+        flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
         mode: 0,
         // Root pinning must cross mount boundaries (for example a separate
         // /usr mount). NO_XDEV is reserved for executable-relative opens.
-        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+        resolve: RESOLVE_BENEATH
+            | RESOLVE_NO_SYMLINKS
+            | RESOLVE_NO_MAGICLINKS
+            | if no_xdev { 0x01 } else { 0 },
     };
     let fd = unsafe {
         libc::syscall(

@@ -10,22 +10,42 @@ use std::{
 };
 
 use crate::{
-    linux::{openat2_root, validate_absolute_path},
+    linux::{openat2_file, openat2_root, validate_absolute_path},
     transport::invalid,
 };
 use sigrund_core::{audit::AuditLog, config::DaemonConfig, crypto::sha256_hex};
 
 /// Pin a no-symlink path below /, allowing configured roots on other mounts.
 pub fn open_pinned(path: &Path) -> io::Result<fs::File> {
+    open_pinned_with(path, false)
+}
+
+pub fn pin_directory(path: &Path) -> io::Result<fs::File> {
+    open_pinned_with(path, true)
+}
+
+fn open_pinned_with(path: &Path, directory: bool) -> io::Result<fs::File> {
     validate_absolute_path(path)?;
     if path == Path::new("/") {
-        return fs::File::open("/");
+        return fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(if directory {
+                libc::O_PATH | libc::O_DIRECTORY
+            } else {
+                0
+            })
+            .open("/");
     }
     let relative = path
         .strip_prefix("/")
         .map_err(|_| invalid("path must be absolute"))?;
     let root = fs::File::open("/")?;
-    openat2_root(root.as_raw_fd(), relative).map(Into::into)
+    if directory {
+        openat2_root(root.as_raw_fd(), relative)
+    } else {
+        openat2_file(root.as_raw_fd(), relative)
+    }
+    .map(Into::into)
 }
 
 pub fn check_root_metadata(file: &fs::File, directory: bool, mode: Option<u32>) -> io::Result<()> {
@@ -137,7 +157,7 @@ impl StartupResources {
         }
         let mut roots = Vec::new();
         for path in &config.csr_allowed_executable_dirs {
-            let root = open_pinned(path)?;
+            let root = pin_directory(path)?;
             check_root_metadata(&root, true, None)?;
             roots.push(root);
         }

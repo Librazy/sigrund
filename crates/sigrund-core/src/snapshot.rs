@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256};
 
@@ -22,50 +22,115 @@ pub fn copy_bounded<R: Read>(
         ));
     }
     let mut output = Vec::with_capacity(expected_size as usize);
-    let mut digest = Sha256::new();
-    let mut chunk = [0u8; 65_536];
-    while output.len() < expected_size as usize {
+    let summary = copy_stream(reader, &mut output, Some(expected_size), max_size, || {
         if cancelled() {
-            return Err(CoreError::Protocol("snapshot cancelled".into()));
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "snapshot cancelled",
+            ))
+        } else {
+            Ok(())
         }
-        let remaining = expected_size as usize - output.len();
-        let read_limit = remaining.min(chunk.len());
-        let count = reader
-            .read(&mut chunk[..read_limit])
-            .map_err(|error| CoreError::Value(format!("snapshot read failed: {error}")))?;
-        if count == 0 {
-            return Err(CoreError::Value(
-                "snapshot source ended before st_size".into(),
-            ));
+    })
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::Interrupted {
+            CoreError::Protocol("snapshot cancelled".into())
+        } else {
+            CoreError::Value(format!("snapshot read failed: {error}"))
         }
-        output.extend_from_slice(&chunk[..count]);
-        digest.update(&chunk[..count]);
-        if output.len() as u64 > max_size {
-            return Err(CoreError::Value("snapshot exceeded configured size".into()));
-        }
-    }
-    if cancelled() {
-        return Err(CoreError::Protocol("snapshot cancelled".into()));
-    }
-    let trailing = reader
-        .read(&mut [0u8; 1])
-        .map_err(|error| CoreError::Value(format!("snapshot EOF check failed: {error}")))?;
-    if cancelled() {
-        return Err(CoreError::Protocol("snapshot cancelled".into()));
-    }
-    if trailing != 0 {
-        return Err(CoreError::Value(
-            "snapshot source changed after st_size".into(),
-        ));
-    }
-    let sha256 = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    })?;
     Ok(SnapshotBytes {
         bytes: output,
-        sha256,
+        sha256: summary.sha256,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotDigest {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Streams to an owned sink with fixed 64-KiB scratch storage. `Some(size)`
+/// requires exact positive executable size; `None` permits empty stdin and
+/// reads through EOF. The caller's check includes deadline and cancellation.
+pub fn copy_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    expected_size: Option<u64>,
+    max_size: u64,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<SnapshotDigest> {
+    if max_size == 0 || expected_size.is_some_and(|size| size == 0 || size > max_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot size outside bounds",
+        ));
+    }
+    let limit = expected_size.unwrap_or(max_size);
+    let mut total = 0u64;
+    let mut digest = Sha256::new();
+    let mut chunk = [0u8; 65_536];
+    loop {
+        check()?;
+        // At the limit, one byte is sufficient to detect excess input. Never
+        // allocate or copy an unbounded final read into the destination.
+        let read_limit = if total == limit {
+            1
+        } else {
+            (limit - total).min(chunk.len() as u64) as usize
+        };
+        let count = match reader.read(&mut chunk[..read_limit]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                check()?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        check()?;
+        if count == 0 {
+            if expected_size.is_some_and(|size| total != size) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot ended before st_size",
+                ));
+            }
+            break;
+        }
+        if total == limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot exceeded size bound",
+            ));
+        }
+        let mut offset = 0;
+        while offset < count {
+            check()?;
+            match writer.write(&chunk[offset..count]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "snapshot sink returned zero",
+                    ));
+                }
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            check()?;
+        }
+        total += count as u64;
+        digest.update(&chunk[..count]);
+    }
+    check()?;
+    Ok(SnapshotDigest {
+        bytes: total,
+        sha256: digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
     })
 }
 

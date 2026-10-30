@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
@@ -21,19 +21,29 @@ pub fn create_sealed(
     executable: bool,
     mode: libc::mode_t,
 ) -> io::Result<OwnedFd> {
-    let mut name_bytes = name.as_bytes().to_vec();
-    name_bytes.push(0);
+    let mut file = create(name, executable)?;
+    file.write_all(bytes)?;
+    seal(file, mode)
+}
+
+pub(crate) fn create(name: &str, executable: bool) -> io::Result<File> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in memfd name"))?;
     let flags = MFD_CLOEXEC | MFD_ALLOW_SEALING | if executable { MFD_EXEC } else { 0 };
-    let raw_fd =
-        unsafe { libc::syscall(libc::SYS_memfd_create, name_bytes.as_ptr(), flags) as libc::c_int };
-    if raw_fd < 0 {
+    let raw = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) as libc::c_int };
+    if raw < 0 {
         return Err(io::Error::last_os_error());
     }
-    // Keep a single owner on every error path, including failed writes/seals.
-    let mut file = unsafe { File::from_raw_fd(raw_fd) };
-    file.write_all(bytes)?;
+    Ok(unsafe { File::from_raw_fd(raw) })
+}
+
+pub(crate) fn seal(mut file: File, mode: libc::mode_t) -> io::Result<OwnedFd> {
     file.sync_all()?;
+    file.seek(SeekFrom::Start(0))?;
     let fd: OwnedFd = file.into();
+    if unsafe { libc::fchown(fd.as_raw_fd(), libc::geteuid(), libc::getegid()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     if unsafe { libc::fchmod(fd.as_raw_fd(), mode) } != 0 {
         return Err(io::Error::last_os_error());
     }

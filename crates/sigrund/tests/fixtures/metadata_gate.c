@@ -26,12 +26,19 @@ static void gate(uint64_t inode, uint64_t device) {
 
 int fstat(int fd, struct stat *metadata) {
     int result = syscall(SYS_fstat, fd, metadata);
-    if (result == 0) gate(metadata->st_ino, metadata->st_dev);
+    if (result == 0 && !getenv("SIGRUND_GATE_CLOSE")) gate(metadata->st_ino, metadata->st_dev);
     return result;
 }
 
 int fstat64(int fd, struct stat64 *metadata) {
     int result = syscall(SYS_fstat, fd, metadata);
-    if (result == 0) gate(metadata->st_ino, metadata->st_dev);
+    if (result == 0 && !getenv("SIGRUND_GATE_CLOSE")) gate(metadata->st_ino, metadata->st_dev);
     return result;
+}
+
+int close(int fd) {
+    struct stat metadata;
+    if (getenv("SIGRUND_GATE_CLOSE") && syscall(SYS_fstat, fd, &metadata) == 0)
+        gate(metadata.st_ino, metadata.st_dev);
+    return syscall(SYS_close, fd);
 }
