@@ -18,6 +18,9 @@ ssh-key.workspace = true
 serde.workspace = true
 sigrund-core = { path = "../sigrund-core" }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tempfile = "3"
 rusqlite.workspace = true

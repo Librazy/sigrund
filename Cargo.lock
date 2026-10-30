@@ -842,6 +842,7 @@ name = "sigrund"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "cc",
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",
  "hmac",

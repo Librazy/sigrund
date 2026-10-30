@@ -4,15 +4,15 @@
 //! syscall-only child transition and its parent-side sync-pipe classifier.
 //! Live authorization integration is deliberately a later wiring step; these
 //! primitives are usable by both job and hook launchers.
+use crate::startup::CgroupLayout;
 use std::{
-    ffi::{CStr, CString},
+    ffi::CString,
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    path::Path,
     time::{Duration, Instant},
 };
 
-use crate::{sequencer::CommittedJob, startup::CgroupLayout};
+use crate::sequencer::CommittedJob;
 
 pub(crate) struct JobSupervisor {
     layout: Option<CgroupLayout>,
@@ -71,499 +71,427 @@ impl JobSupervisor {
     }
 }
 
-const CLONE_INTO_CGROUP: u64 = 0x200000000;
-const CLONE_PIDFD: u64 = 0x00001000;
-const SYNC_FRAME: usize = 8;
+/// Exact parent-owned storage used by the C-only clone/exec transition.
+/// Pointer tables are built immediately before dispatch and remain live until
+/// clone returns; the child receives independent copies (no CLONE_VM/FILES).
+pub struct PreparedChild {
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+    cwd: CString,
+    groups: Vec<u32>,
+    uid: u32,
+    gid: u32,
+    mask: u32,
+    capabilities: u64,
+    last_cap: u32,
+    mountinfo: Vec<u8>,
+    group_check: Vec<u32>,
+}
 
 #[repr(C)]
-#[derive(Default)]
-struct CloneArgs {
-    flags: u64,
-    pidfd: u64,
-    child_tid: u64,
-    parent_tid: u64,
-    exit_signal: u64,
-    stack: u64,
-    stack_size: u64,
-    tls: u64,
-    set_tid: u64,
-    set_tid_size: u64,
-    cgroup: u64,
+struct ChildSpec {
+    input: i32,
+    output: i32,
+    error: i32,
+    executable: i32,
+    sync: i32,
+    uid: u32,
+    gid: u32,
+    mask: u32,
+    last_cap: u32,
+    capabilities: u64,
+    groups: *const u32,
+    groups_len: usize,
+    cwd: *const libc::c_char,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+    mountinfo: *mut u8,
+    mountinfo_capacity: usize,
+    group_check: *mut u32,
+    isolated: i32,
+}
+unsafe extern "C" {
+    fn sigrund_spawn(spec: *const ChildSpec, cgroup: i32, pidfd: *mut i32) -> i32;
+}
+
+#[must_use = "register and reap every returned child; dropping pidfd does not stop it"]
+pub struct ChildProcess {
+    pub pid: libc::pid_t,
+    pub pidfd: OwnedFd,
+    pub sync: OwnedFd,
+    pub deadline: Instant,
+}
+
+impl PreparedChild {
+    pub fn new(warrant: &sigrund_core::warrant::Warrant, envp: Vec<CString>) -> io::Result<Self> {
+        let last_cap: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+            .trim()
+            .parse()
+            .map_err(|_| io::Error::other("invalid cap_last_cap"))?;
+        if last_cap >= 64
+            || warrant.command.tty_mode != "stdio"
+            || warrant.command.allow_interpreted_script
+        {
+            return Err(io::Error::other("unsupported child execution profile"));
+        }
+        let mut capabilities = 0u64;
+        for name in &warrant.execution_context.capabilities {
+            let cap = crate::authorization::capability_number(name)
+                .filter(|cap| *cap <= last_cap)
+                .ok_or_else(|| io::Error::other("unsupported capability"))?;
+            capabilities |= 1u64 << cap;
+        }
+        Ok(Self {
+            argv: warrant
+                .command
+                .argv
+                .iter()
+                .map(|arg| CString::new(arg.as_str()).map_err(|_| io::Error::other("NUL in argv")))
+                .collect::<io::Result<_>>()?,
+            envp,
+            cwd: CString::new(warrant.command.cwd.as_str())
+                .map_err(|_| io::Error::other("NUL in cwd"))?,
+            groups: warrant.execution_context.supplementary_gids.clone(),
+            uid: warrant.execution_context.target_uid,
+            gid: warrant.execution_context.target_gid,
+            mask: warrant.execution_context.umask,
+            capabilities,
+            last_cap,
+            mountinfo: vec![0; 1_048_576],
+            group_check: vec![0; warrant.execution_context.supplementary_gids.len()],
+        })
+    }
+
+    /// Both returned descriptors have a single parent owner. No Rust code
+    /// runs in the child, including when clone succeeds but setup fails early.
+    /// Call only on a reserved executor after cancellation/expiry/liveness
+    /// checks and after establishing the coordinator's registration barrier.
+    /// Startup probes instead run before admission, with no concurrent reaper.
+    pub fn spawn(&mut self, cgroup_fd: RawFd, fds: [RawFd; 4]) -> io::Result<ChildProcess> {
+        self.spawn_inner(cgroup_fd, fds)
+    }
+
+    fn spawn_inner(&mut self, cgroup_fd: RawFd, fds: [RawFd; 4]) -> io::Result<ChildProcess> {
+        let (sync, writer) = sync_pipe()?;
+        let mut argv: Vec<_> = self.argv.iter().map(|v| v.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let mut envp: Vec<_> = self.envp.iter().map(|v| v.as_ptr()).collect();
+        envp.push(std::ptr::null());
+        let spec = ChildSpec {
+            input: fds[0],
+            output: fds[1],
+            error: fds[2],
+            executable: fds[3],
+            sync: writer.as_raw_fd(),
+            uid: self.uid,
+            gid: self.gid,
+            mask: self.mask,
+            last_cap: self.last_cap,
+            capabilities: self.capabilities,
+            groups: self.groups.as_ptr(),
+            groups_len: self.groups.len(),
+            cwd: self.cwd.as_ptr(),
+            argv: argv.as_ptr(),
+            envp: envp.as_ptr(),
+            mountinfo: self.mountinfo.as_mut_ptr(),
+            mountinfo_capacity: self.mountinfo.len(),
+            group_check: self.group_check.as_mut_ptr(),
+            isolated: i32::from(self.capabilities & (1 << 21) == 0),
+        };
+        let mut pidfd = -1;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pid = unsafe { sigrund_spawn(&spec, cgroup_fd, &mut pidfd) };
+        if pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // CLONE_PIDFD guarantees a descriptor on success. A violation is an
+        // internal/kernel ABI failure; do not pretend that no child exists.
+        assert!(pid > 0 && pidfd >= 0, "clone3 violated pidfd contract");
+        drop(writer);
+        Ok(ChildProcess {
+            pid,
+            pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
+            sync,
+            deadline,
+        })
+    }
+}
+
+pub fn sync_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    if unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((read, write))
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum SyncOutcome {
     ReadyToExec,
     SetupFailed { step: u32, errno: i32 },
+    ExecFailed { errno: i32 },
     SpawnFailed,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum SyncReadError {
-    Io(io::ErrorKind),
-    Malformed,
-    TimedOut,
+/// The reader is finite even if an erroneous child never closes its pipe.
+/// Classify only on EOF and reject excess/partial bytes immediately.
+#[derive(Default)]
+pub struct Handshake {
+    bytes: [u8; 16],
+    used: usize,
 }
-
-/// A fixed descriptor plan.  The sync writer is duplicated first and is
-/// tracked independently from its eventual descriptor number (FD 4).
-pub struct DescriptorPlan {
-    pub stdin: OwnedFd,
-    pub stdout: OwnedFd,
-    pub stderr: OwnedFd,
-    pub executable: OwnedFd,
-    pub sync: OwnedFd,
-    pub exec_cloexec: bool,
-}
-
-impl DescriptorPlan {
-    pub fn duplicate(&self) -> io::Result<TemporaryDescriptors> {
-        let sync = duplicate_at_least(self.sync.as_raw_fd(), 5)?;
-        let stdin = duplicate_at_least(self.stdin.as_raw_fd(), 5)?;
-        let stdout = duplicate_at_least(self.stdout.as_raw_fd(), 5)?;
-        let stderr = duplicate_at_least(self.stderr.as_raw_fd(), 5)?;
-        let executable = duplicate_at_least(self.executable.as_raw_fd(), 5)?;
-        Ok(TemporaryDescriptors {
-            sync,
-            stdin,
-            stdout,
-            stderr,
-            executable,
-            exec_cloexec: self.exec_cloexec,
-        })
-    }
-
-    /// Install directly from the inherited sources.  This is the child path:
-    /// the sync source is duplicated first and remains the error writer until
-    /// FD 4 has been installed successfully.
-    ///
-    /// # Safety
-    ///
-    /// The caller must invoke this only in the child returned by `clone3`.
-    /// The source descriptors must remain open and refer to the intended
-    /// request-owned files; this function never returns.
-    pub unsafe fn install_in_child(&self) -> ! {
-        let mut tracked = self.sync.as_raw_fd();
-        let duplicate = |source: RawFd| duplicate_at_least(source, 5);
-        if unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_FILES as libc::c_ulong) } < 0 {
-            let errno = io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO);
-            let _ = write_setup_frame(tracked, 1, errno);
-            unsafe { libc::_exit(127) }
+impl Handshake {
+    pub fn read(
+        &mut self,
+        fd: RawFd,
+        now: Instant,
+        deadline: Instant,
+    ) -> io::Result<Option<SyncOutcome>> {
+        if now >= deadline {
+            return Ok(Some(SyncOutcome::SpawnFailed));
         }
-        let sync = match duplicate(tracked) {
-            Ok(fd) => fd,
-            Err(error) => {
-                let _ = write_setup_frame(tracked, 1, error.raw_os_error().unwrap_or(libc::EIO));
-                unsafe { libc::_exit(127) }
+        let mut buf = [0u8; 17];
+        for _ in 0..4 {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n == 0 {
+                return Ok(Some(classify_sync(&self.bytes[..self.used], true)));
             }
-        };
-        tracked = sync.as_raw_fd();
-        let stdin = match duplicate(self.stdin.as_raw_fd()) {
-            Ok(fd) => fd,
-            Err(error) => {
-                let _ = write_setup_frame(tracked, 1, error.raw_os_error().unwrap_or(libc::EIO));
-                unsafe { libc::_exit(127) }
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
             }
-        };
-        let stdout = match duplicate(self.stdout.as_raw_fd()) {
-            Ok(fd) => fd,
-            Err(error) => {
-                let _ = write_setup_frame(tracked, 1, error.raw_os_error().unwrap_or(libc::EIO));
-                unsafe { libc::_exit(127) }
+            let n = n as usize;
+            if self.used + n > 16 {
+                return Ok(Some(SyncOutcome::SpawnFailed));
             }
-        };
-        let stderr = match duplicate(self.stderr.as_raw_fd()) {
-            Ok(fd) => fd,
-            Err(error) => {
-                let _ = write_setup_frame(tracked, 1, error.raw_os_error().unwrap_or(libc::EIO));
-                unsafe { libc::_exit(127) }
-            }
-        };
-        let executable = match duplicate(self.executable.as_raw_fd()) {
-            Ok(fd) => fd,
-            Err(error) => {
-                let _ = write_setup_frame(tracked, 1, error.raw_os_error().unwrap_or(libc::EIO));
-                unsafe { libc::_exit(127) }
-            }
-        };
-        let temporary = TemporaryDescriptors {
-            sync,
-            stdin,
-            stdout,
-            stderr,
-            executable,
-            exec_cloexec: self.exec_cloexec,
-        };
-        unsafe { install_descriptors(temporary) }
-    }
-}
-
-pub struct TemporaryDescriptors {
-    sync: OwnedFd,
-    stdin: OwnedFd,
-    stdout: OwnedFd,
-    stderr: OwnedFd,
-    executable: OwnedFd,
-    exec_cloexec: bool,
-}
-
-fn duplicate_at_least(fd: RawFd, minimum: i32) -> io::Result<OwnedFd> {
-    let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
-    if raw < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-    }
-}
-
-fn write_all_raw(fd: RawFd, mut bytes: &[u8]) -> bool {
-    while !bytes.is_empty() {
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if n > 0 {
-            bytes = &bytes[n as usize..];
-        } else if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        } else {
-            return false;
+            self.bytes[self.used..self.used + n].copy_from_slice(&buf[..n]);
+            self.used += n;
         }
+        Ok(None)
     }
-    true
-}
-
-/// Emit one native-endian setup frame.  This helper never allocates and is
-/// safe to call after clone3 in the child path.
-pub fn write_setup_frame(fd: RawFd, step: u32, errno: i32) -> bool {
-    let mut frame = [0u8; SYNC_FRAME];
-    frame[..4].copy_from_slice(&step.to_ne_bytes());
-    frame[4..].copy_from_slice(&errno.to_ne_bytes());
-    write_all_raw(fd, &frame)
 }
 
 pub fn classify_sync(bytes: &[u8], eof: bool) -> SyncOutcome {
-    if !eof {
-        return SyncOutcome::SpawnFailed;
-    }
-    if bytes.is_empty() {
-        return SyncOutcome::SpawnFailed;
-    }
-    if bytes.len() != SYNC_FRAME {
+    if !eof || !matches!(bytes.len(), 8 | 16) {
         return SyncOutcome::SpawnFailed;
     }
     let step = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
-    let errno = i32::from_ne_bytes(bytes[4..].try_into().unwrap());
-    if step == 0 && errno == 0 {
-        SyncOutcome::ReadyToExec
-    } else if (1..=10).contains(&step) && errno > 0 {
-        SyncOutcome::SetupFailed { step, errno }
-    } else {
-        SyncOutcome::SpawnFailed
-    }
-}
-
-/// Read until EOF, bounded by the two-second setup deadline and 16 bytes of
-/// storage. Any partial, excess, or late frame is a spawn failure.
-pub fn read_sync(fd: RawFd, deadline: Instant) -> Result<SyncOutcome, SyncReadError> {
-    let mut bytes = [0u8; 16];
-    let mut used = 0usize;
-    loop {
-        if Instant::now() >= deadline {
-            return Err(SyncReadError::TimedOut);
+    let errno = i32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+    if bytes.len() == 8 {
+        if step == 0 && errno == 0 {
+            return SyncOutcome::ReadyToExec;
         }
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(50))
-            .as_millis()
-            .max(1) as i32;
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        };
-        let polled = unsafe { libc::poll(&mut pollfd, 1, timeout) };
-        if polled < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(SyncReadError::Io(error.kind()));
+        if (1..=10).contains(&step) && errno > 0 {
+            return SyncOutcome::SetupFailed { step, errno };
         }
-        if polled == 0 {
-            continue;
-        }
-        let mut chunk = [0u8; 16];
-        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n == 0 {
-            return Ok(classify_sync(&bytes[..used], true));
-        }
-        if n < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(SyncReadError::Io(error.kind()));
-        }
-        let n = n as usize;
-        if used.saturating_add(n) > bytes.len() {
-            return Ok(SyncOutcome::SpawnFailed);
-        }
-        bytes[used..used + n].copy_from_slice(&chunk[..n]);
-        used += n;
-    }
-}
-
-/// Minimal clone3 wrapper.  The child transition itself is kept in a small
-/// syscall-only function so it can be audited independently of request
-/// parsing and durable state.
-pub fn clone3_job(cgroup_fd: RawFd, pidfd: &mut RawFd) -> io::Result<libc::pid_t> {
-    let mut args = CloneArgs {
-        flags: CLONE_INTO_CGROUP | CLONE_PIDFD,
-        pidfd: (pidfd as *mut RawFd) as u64,
-        exit_signal: libc::SIGCHLD as u64,
-        cgroup: cgroup_fd as u64,
-        ..CloneArgs::default()
-    };
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_clone3,
-            (&mut args as *mut CloneArgs).cast::<libc::c_void>(),
-            std::mem::size_of::<CloneArgs>(),
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as libc::pid_t)
-    }
-}
-
-pub fn clone3_job_isolated(
-    cgroup_fd: RawFd,
-    pidfd: &mut RawFd,
-    isolate_mounts: bool,
-) -> io::Result<libc::pid_t> {
-    let mut args = CloneArgs {
-        flags: CLONE_INTO_CGROUP
-            | CLONE_PIDFD
-            | if isolate_mounts {
-                libc::CLONE_NEWNS as u64 | libc::CLONE_NEWCGROUP as u64
-            } else {
-                0
-            },
-        pidfd: (pidfd as *mut RawFd) as u64,
-        exit_signal: libc::SIGCHLD as u64,
-        cgroup: cgroup_fd as u64,
-        ..CloneArgs::default()
-    };
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_clone3,
-            (&mut args as *mut CloneArgs).cast::<libc::c_void>(),
-            std::mem::size_of::<CloneArgs>(),
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as libc::pid_t)
-    }
-}
-
-/// Child-side descriptor installation used by the clone3 caller.  The
-/// tracked sync descriptor is switched to FD 4 only after that dup3 succeeds.
-///
-/// # Safety
-///
-/// This must run only in the child branch of `clone3`; it exits with `_exit`
-/// on every path and assumes the descriptor set is still the inherited one.
-pub unsafe fn install_descriptors(temporary: TemporaryDescriptors) -> ! {
-    let fail = |step: u32| -> ! {
-        let errno = io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO);
-        let _ = write_setup_frame(temporary.sync.as_raw_fd(), step, errno);
-        unsafe { libc::_exit(127) }
-    };
-    if unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_FILES as libc::c_ulong) } < 0 {
-        fail(1);
-    }
-    if unsafe { libc::dup2(temporary.stdin.as_raw_fd(), 0) } < 0 {
-        fail(1);
-    }
-    if unsafe { libc::dup2(temporary.stdout.as_raw_fd(), 1) } < 0 {
-        fail(1);
-    }
-    if unsafe { libc::dup2(temporary.stderr.as_raw_fd(), 2) } < 0 {
-        fail(1);
-    }
-    let exec_flags = if temporary.exec_cloexec {
-        libc::O_CLOEXEC
-    } else {
-        0
-    };
-    if unsafe { libc::dup3(temporary.executable.as_raw_fd(), 3, exec_flags) } < 0 {
-        fail(1);
-    }
-    if unsafe { libc::dup3(temporary.sync.as_raw_fd(), 4, libc::O_CLOEXEC) } < 0 {
-        fail(1);
-    }
-    if unsafe { libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0u32) } < 0 {
-        fail(1);
-    }
-    unsafe { libc::_exit(127) }
-}
-
-pub fn cwd(path: &str) -> io::Result<CString> {
-    CString::new(path).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in cwd"))
-}
-
-pub fn validate_cwd(path: &Path) -> io::Result<()> {
-    if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cwd must be absolute",
-        ));
-    }
-    Ok(())
-}
-
-pub struct ExecSpec<'a> {
-    pub cwd: &'a CStr,
-    pub target_uid: libc::uid_t,
-    pub target_gid: libc::gid_t,
-    pub supplementary_gids: &'a [libc::gid_t],
-    pub umask: libc::mode_t,
-    pub argv: &'a [*const libc::c_char],
-    pub envp: &'a [*const libc::c_char],
-}
-
-/// Complete the parent-prepared, syscall-only transition after descriptor
-/// installation.  All pointers and arrays must have been built before
-/// clone3; this function performs no allocation and exits on every failure.
-///
-/// # Safety
-///
-/// Call only in the child branch after FD 3 (the executable) and FD 4 (the
-/// sync writer) have been installed. The C strings and pointer arrays must be
-/// valid for the duration of this call.
-pub unsafe fn setup_and_exec(spec: &ExecSpec<'_>) -> ! {
-    let fail = |step: u32| -> ! {
-        let errno = io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO);
-        let _ = write_setup_frame(4, step, errno);
-        unsafe { libc::_exit(127) }
-    };
-    if unsafe { libc::setsid() } < 0 {
-        fail(1);
-    }
-    if unsafe { libc::chdir(spec.cwd.as_ptr()) } < 0 {
-        fail(2);
-    }
-    unsafe { libc::umask(spec.umask) };
-    if unsafe {
-        libc::setgroups(
-            spec.supplementary_gids.len(),
-            spec.supplementary_gids.as_ptr(),
-        )
-    } < 0
+    } else if step == 0 && errno == 0 && u32::from_ne_bytes(bytes[8..12].try_into().unwrap()) == 11
     {
-        fail(5);
+        let errno = i32::from_ne_bytes(bytes[12..].try_into().unwrap());
+        if errno > 0 {
+            return SyncOutcome::ExecFailed { errno };
+        }
     }
-    if unsafe { libc::setresgid(spec.target_gid, spec.target_gid, spec.target_gid) } < 0 {
-        fail(5);
+    SyncOutcome::SpawnFailed
+}
+
+/// Exercise actual clone3 + cgroup placement, pidfds, unshare, close_range,
+/// recursive mount_setattr and mountinfo verification before listeners exist.
+/// The child always exits inside its new namespaces; parent mounts are never
+/// modified and no weaker-flags fallback exists.
+pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
+    let id = sigrund_core::crypto::new_uuidv7().to_string();
+    let cgroup = layout.create_job(&id, 67_108_864, 0, 32)?;
+    // Exercise execveat and the complete credential path, not just namespace
+    // creation. Pin a trusted, bounded ELF and execute only its sealed bytes.
+    let result = (|| {
+        use std::io::Read;
+        let file = crate::startup::open_pinned(std::path::Path::new("/usr/bin/true"))?;
+        crate::startup::check_root_metadata(&file, false, None)?;
+        let mut bytes = Vec::new();
+        file.take(67_108_865).read_to_end(&mut bytes)?;
+        if bytes.len() > 67_108_864 || !bytes.starts_with(b"\x7fELF") {
+            return Err(io::Error::other(
+                "startup probe requires a bounded trusted ELF /usr/bin/true",
+            ));
+        }
+        let executable = crate::memfd::create_sealed("startup-probe", &bytes, true, 0o111)?;
+        let null = std::fs::File::open("/dev/null")?;
+        let last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|cap| *cap < 64)
+            .ok_or_else(|| io::Error::other("invalid cap_last_cap"))?;
+        let mut command = PreparedChild {
+            argv: vec![CString::new("/usr/bin/true").unwrap()],
+            envp: vec![],
+            cwd: CString::new("/").unwrap(),
+            groups: vec![],
+            uid: 0,
+            gid: 0,
+            mask: 0o077,
+            capabilities: 0,
+            last_cap,
+            mountinfo: vec![0; 1_048_576],
+            group_check: vec![],
+        };
+        let child = command.spawn(
+            cgroup.fd(),
+            [
+                null.as_raw_fd(),
+                null.as_raw_fd(),
+                null.as_raw_fd(),
+                executable.as_raw_fd(),
+            ],
+        )?;
+        let mut handshake = Handshake::default();
+        let outcome = loop {
+            if let Some(outcome) =
+                handshake.read(child.sync.as_raw_fd(), Instant::now(), child.deadline)?
+            {
+                break outcome;
+            }
+            let mut p = libc::pollfd {
+                fd: child.sync.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut p, 1, 10) } < 0
+                && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+            {
+                return Err(io::Error::last_os_error());
+            }
+        };
+        if outcome != SyncOutcome::ReadyToExec {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    child.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    0usize,
+                    0,
+                )
+            };
+        }
+        // Only this known probe is reaped; startup has no other children.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            if unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    child.pidfd.as_raw_fd() as u32,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { info.si_pid() } != 0 {
+                break;
+            }
+            if Instant::now() >= child.deadline + Duration::from_secs(2) {
+                return Err(io::Error::other("startup clone/mount probe did not exit"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if outcome != SyncOutcome::ReadyToExec
+            || info.si_code != libc::CLD_EXITED
+            || unsafe { info.si_status() } != 0
+        {
+            return Err(io::Error::other(format!(
+                "startup clone/mount probe failed: {outcome:?}"
+            )));
+        }
+        Ok(())
+    })();
+    match cgroup.cleanup() {
+        Ok(()) => result,
+        Err((_owner, error)) => Err(error),
     }
-    if unsafe { libc::setresuid(spec.target_uid, spec.target_uid, spec.target_uid) } < 0 {
-        fail(6);
-    }
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
-        fail(9);
-    }
-    if !write_setup_frame(4, 0, 0) {
-        unsafe { libc::_exit(127) }
-    }
-    let empty = b"\0";
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_execveat,
-            3,
-            empty.as_ptr(),
-            spec.argv.as_ptr(),
-            spec.envp.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        )
-    };
-    if result < 0 {
-        fail(10);
-    }
-    unsafe { libc::_exit(127) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
-
     #[test]
-    fn sync_classifier_requires_exact_eof_framing() {
-        assert_eq!(classify_sync(&[], true), SyncOutcome::SpawnFailed);
-        assert_eq!(classify_sync(&[0; 7], true), SyncOutcome::SpawnFailed);
-        assert_eq!(classify_sync(&[0; 8], false), SyncOutcome::SpawnFailed);
-        let mut ready = [0u8; 8];
-        assert_eq!(classify_sync(&ready, true), SyncOutcome::ReadyToExec);
-        ready[..4].copy_from_slice(&1u32.to_ne_bytes());
-        ready[4..].copy_from_slice(&libc::EPERM.to_ne_bytes());
-        assert_eq!(
-            classify_sync(&ready, true),
-            SyncOutcome::SetupFailed {
-                step: 1,
-                errno: libc::EPERM
-            }
-        );
+    fn framing_accepts_only_documented_evidence() {
+        for n in 0..=24 {
+            assert_eq!(
+                classify_sync(&vec![0; n], true),
+                if n == 8 {
+                    SyncOutcome::ReadyToExec
+                } else {
+                    SyncOutcome::SpawnFailed
+                }
+            );
+            assert_eq!(classify_sync(&vec![0; n], false), SyncOutcome::SpawnFailed);
+        }
+        for step in 1u32..=11 {
+            let mut b = step.to_ne_bytes().to_vec();
+            b.extend(libc::EPERM.to_ne_bytes());
+            assert_eq!(
+                classify_sync(&b, true),
+                if step <= 10 {
+                    SyncOutcome::SetupFailed {
+                        step,
+                        errno: libc::EPERM,
+                    }
+                } else {
+                    SyncOutcome::SpawnFailed
+                }
+            );
+            let mut two = vec![0; 8];
+            two.extend(&b);
+            assert_eq!(
+                classify_sync(&two, true),
+                if step == 11 {
+                    SyncOutcome::ExecFailed { errno: libc::EPERM }
+                } else {
+                    SyncOutcome::SpawnFailed
+                }
+            );
+        }
     }
-
     #[test]
-    fn setup_frame_round_trips_native_fields() {
-        let mut pair = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pair.as_mut_ptr()) }, 0);
-        assert!(write_setup_frame(pair[1], 10, libc::EACCES));
-        let mut frame = [0u8; 8];
+    fn nonblocking_handshake_keeps_original_deadline() {
+        let (r, w) = sync_pipe().unwrap();
+        let mut h = Handshake::default();
+        let now = Instant::now();
         assert_eq!(
-            unsafe { libc::read(pair[0], frame.as_mut_ptr().cast(), 8) },
+            h.read(r.as_raw_fd(), now, now + Duration::from_secs(2))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            unsafe { libc::write(w.as_raw_fd(), [0u8; 8].as_ptr().cast(), 8) },
             8
         );
-        assert_eq!(u32::from_ne_bytes(frame[..4].try_into().unwrap()), 10);
         assert_eq!(
-            i32::from_ne_bytes(frame[4..].try_into().unwrap()),
-            libc::EACCES
+            h.read(r.as_raw_fd(), now, now + Duration::from_secs(2))
+                .unwrap(),
+            None
         );
-        unsafe {
-            libc::close(pair[0]);
-            libc::close(pair[1]);
-        }
-    }
-
-    #[test]
-    fn descriptor_duplication_starts_at_safe_range() {
-        let file = std::fs::File::open("/dev/null").unwrap();
-        let plan = DescriptorPlan {
-            stdin: file.try_clone().unwrap().into(),
-            stdout: file.try_clone().unwrap().into(),
-            stderr: file.try_clone().unwrap().into(),
-            executable: file.try_clone().unwrap().into(),
-            sync: file.into(),
-            exec_cloexec: true,
-        };
-        let temporary = plan.duplicate().unwrap();
-        for fd in [
-            temporary.sync.as_raw_fd(),
-            temporary.stdin.as_raw_fd(),
-            temporary.stdout.as_raw_fd(),
-            temporary.stderr.as_raw_fd(),
-            temporary.executable.as_raw_fd(),
-        ] {
-            assert!(fd >= 5);
-        }
+        drop(w);
+        assert_eq!(
+            h.read(r.as_raw_fd(), now, now + Duration::from_secs(2))
+                .unwrap(),
+            Some(SyncOutcome::ReadyToExec)
+        );
+        assert_eq!(
+            h.read(r.as_raw_fd(), now, now).unwrap(),
+            Some(SyncOutcome::SpawnFailed)
+        );
     }
 }

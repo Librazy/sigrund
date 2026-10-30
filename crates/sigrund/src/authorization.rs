@@ -264,7 +264,7 @@ fn verify_fd(
     Ok(())
 }
 
-fn capability_number(name: &str) -> Option<u32> {
+pub(crate) fn capability_number(name: &str) -> Option<u32> {
     const NAMES: &[&str] = &[
         "CAP_CHOWN",
         "CAP_DAC_OVERRIDE",
