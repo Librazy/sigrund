@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 pub const RATCHET_DOMAIN: &[u8] = b"sigrun-ratchet-v1";
+const MAX_RECORD_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -45,7 +46,7 @@ pub fn record_hash(record_without_newline: &[u8]) -> String {
 }
 
 pub fn validate_record_bytes(record: &[u8]) -> Result<()> {
-    if record.is_empty() || record.len() > 65_536 || record.contains(&b'\n') {
+    if record.is_empty() || record.len() > MAX_RECORD_BYTES || record.contains(&b'\n') {
         return Err(CoreError::Value(
             "audit record must be one bounded line".into(),
         ));
@@ -110,19 +111,7 @@ impl AuditLog {
                     })?;
                 writer.append_recovery("RATCHET_PARTIAL_WRITE_TRUNCATED")?;
             }
-            RecoveryAction::Forward {
-                last_hash,
-                truncate_offset,
-            } => {
-                if let Some(offset) = truncate_offset {
-                    writer
-                        .log
-                        .set_len(offset)
-                        .and_then(|_| writer.log.sync_all())
-                        .map_err(|e| {
-                            CoreError::Database(format!("truncate partial audit record: {e}"))
-                        })?;
-                }
+            RecoveryAction::Forward { last_hash } => {
                 let next_key = next_ratchet_key(&writer.key);
                 writer.state.seq = writer
                     .state
@@ -282,17 +271,12 @@ impl AuditLog {
     }
 }
 
-/// Only a synchronized log/state pair is writable through this primitive.
-/// Crash recovery must reconcile other pairs before opening a new writer.
+/// A partial tail and one complete unratcheted record are distinct recovery
+/// cases. No action may combine truncation with a forward ratchet transition.
 enum RecoveryAction {
     None,
-    Truncate {
-        offset: u64,
-    },
-    Forward {
-        last_hash: String,
-        truncate_offset: Option<u64>,
-    },
+    Truncate { offset: u64 },
+    Forward { last_hash: String },
 }
 
 struct RecoveryResult {
@@ -305,50 +289,64 @@ fn recover_log_state(
     state: &RatchetState,
     initial_key: Option<&[u8; 32]>,
 ) -> Result<RecoveryResult> {
+    log.seek(SeekFrom::Start(0))
+        .map_err(|e| CoreError::Database(format!("seek audit log: {e}")))?;
+    scan_log_state(&mut BufReader::new(log), state, initial_key)
+}
+
+fn scan_log_state(
+    reader: &mut impl BufRead,
+    state: &RatchetState,
+    initial_key: Option<&[u8; 32]>,
+) -> Result<RecoveryResult> {
     if state.seq == 0 || state.remote_acked_seq >= state.seq {
         return Err(CoreError::Database(
             "AUDIT_TAMPER_OR_CORRUPTION: invalid state sequence".into(),
-        ));
-    }
-    let mut bytes = Vec::new();
-    log.seek(SeekFrom::Start(0))
-        .map_err(|e| CoreError::Database(format!("seek audit log: {e}")))?;
-    log.read_to_end(&mut bytes)
-        .map_err(|e| CoreError::Database(format!("read audit log: {e}")))?;
-    let last_newline = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|position| position + 1)
-        .unwrap_or(0);
-    let complete = &bytes[..last_newline];
-    let partial = last_newline < bytes.len();
-    let records: Vec<&[u8]> = complete
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .collect();
-    if records.is_empty() || (records.len() as u64) < state.seq.saturating_sub(1) {
-        return Err(CoreError::Database(
-            "AUDIT_TAMPER_OR_CORRUPTION: log is missing history".into(),
         ));
     }
     let initial = initial_key.ok_or_else(|| {
         CoreError::Database("AUDIT_TAMPER_OR_CORRUPTION: state has no initial ratchet key".into())
     })?;
     let mut key = *initial;
-    let mut key_at_state = None;
+    let state_key = decode_hex_32(&state.key_hex)?;
     let mut previous_hash = "0".repeat(64);
     let mut host_id: Option<String> = None;
-    for (index, record) in records.iter().enumerate() {
-        if index as u64 == state.seq {
-            key_at_state = Some(key);
+    let mut complete_count = 0u64;
+    let mut valid_eof = 0u64;
+    let mut record = Vec::with_capacity(MAX_RECORD_BYTES + 1);
+    let partial = loop {
+        record.clear();
+        // read_until alone is unbounded on a corrupt/unterminated line. Take
+        // at most one record plus its delimiter, reusing this buffer for the
+        // entire history, and verify it before reading the next record.
+        let read = Read::by_ref(reader)
+            .take((MAX_RECORD_BYTES + 1) as u64)
+            .read_until(b'\n', &mut record)
+            .map_err(|e| CoreError::Database(format!("read audit log: {e}")))?;
+        if read == 0 {
+            break false;
         }
-        let (seq, previous) = record_metadata(record)?;
-        if seq != index as u64 || previous != previous_hash {
+        if record.last() != Some(&b'\n') {
+            if record.len() > MAX_RECORD_BYTES {
+                return Err(CoreError::Database(
+                    "AUDIT_TAMPER_OR_CORRUPTION: oversized audit record".into(),
+                ));
+            }
+            break true;
+        }
+        record.pop();
+        if complete_count > state.seq {
+            return Err(CoreError::Database(
+                "AUDIT_TAMPER_OR_CORRUPTION: log ahead of state".into(),
+            ));
+        }
+        let (seq, previous) = record_metadata(&record)?;
+        if seq != complete_count || previous != previous_hash {
             return Err(CoreError::Database(
                 "AUDIT_TAMPER_OR_CORRUPTION: audit chain mismatch".into(),
             ));
         }
-        let record_host = record_host_id(record)?;
+        let record_host = record_host_id(&record)?;
         if let Some(expected_host) = host_id.as_deref() {
             if record_host != expected_host {
                 return Err(CoreError::Database(
@@ -358,52 +356,51 @@ fn recover_log_state(
         } else {
             host_id = Some(record_host);
         }
-        verify_record_hmac(record, &key)?;
-        previous_hash = record_hash(record);
+        verify_record_hmac(&record, &key)?;
+        previous_hash = record_hash(&record);
         key = next_ratchet_key(&key);
-    }
-    let complete_count = records.len() as u64;
-    if complete_count == state.seq {
-        if previous_hash != state.last_record_sha256 || key != decode_hex_32(&state.key_hex)? {
+        complete_count = complete_count
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Database("audit sequence overflow".into()))?;
+        valid_eof = valid_eof
+            .checked_add(read as u64)
+            .ok_or_else(|| CoreError::Database("audit offset overflow".into()))?;
+        // Check the persisted checkpoint as soon as we reach it. Only the
+        // current key/hash and final byte offset need survive the next read.
+        if complete_count == state.seq
+            && (previous_hash != state.last_record_sha256 || key != state_key)
+        {
             return Err(CoreError::Database(
                 "AUDIT_TAMPER_OR_CORRUPTION: log/state mismatch".into(),
             ));
         }
+    };
+    let host_id = host_id.ok_or_else(|| {
+        CoreError::Database("AUDIT_TAMPER_OR_CORRUPTION: log is missing history".into())
+    })?;
+    if complete_count == state.seq {
         if partial {
             return Ok(RecoveryResult {
-                action: RecoveryAction::Truncate {
-                    offset: last_newline as u64,
-                },
-                host_id: host_id.expect("audit log has at least one record"),
+                action: RecoveryAction::Truncate { offset: valid_eof },
+                host_id,
             });
         }
         return Ok(RecoveryResult {
             action: RecoveryAction::None,
-            host_id: host_id.expect("audit log has at least one record"),
+            host_id,
         });
     }
-    if complete_count == state.seq + 1 {
-        if records
-            .get(records.len() - 2)
-            .map(|record| record_hash(record))
-            != Some(state.last_record_sha256.clone())
-        {
+    if complete_count.checked_sub(state.seq) == Some(1) {
+        if partial {
             return Err(CoreError::Database(
-                "AUDIT_TAMPER_OR_CORRUPTION: forward recovery hash mismatch".into(),
-            ));
-        }
-        let state_key = decode_hex_32(&state.key_hex)?;
-        if key_at_state != Some(state_key) {
-            return Err(CoreError::Database(
-                "AUDIT_TAMPER_OR_CORRUPTION: state key mismatch before forward recovery".into(),
+                "AUDIT_TAMPER_OR_CORRUPTION: partial tail after unratcheted record".into(),
             ));
         }
         return Ok(RecoveryResult {
             action: RecoveryAction::Forward {
-                last_hash: record_hash(records.last().unwrap()),
-                truncate_offset: partial.then_some(last_newline as u64),
+                last_hash: previous_hash,
             },
-            host_id: host_id.expect("audit log has at least one record"),
+            host_id,
         });
     }
     Err(CoreError::Database(
@@ -649,6 +646,106 @@ mod tests {
         )
         .unwrap();
         // The last record still matches state; its predecessor no longer does.
+        assert!(AuditLog::open(&fixture.log, &fixture.state).is_err());
+    }
+
+    #[test]
+    fn partial_tail_after_unratcheted_record_is_corruption_and_remains_untouched() {
+        let fixture = Fixture::new();
+        let state_before = std::fs::read(&fixture.state).unwrap();
+        let log_before = [
+            append_line_bytes(&fixture.genesis).unwrap(),
+            append_line_bytes(&fixture.record()).unwrap(),
+            b"partial next record".to_vec(),
+        ]
+        .concat();
+        std::fs::write(&fixture.log, &log_before).unwrap();
+        assert!(AuditLog::open(&fixture.log, &fixture.state).is_err());
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), log_before);
+        assert_eq!(std::fs::read(&fixture.state).unwrap(), state_before);
+    }
+
+    #[test]
+    fn streaming_scan_authenticates_each_record_before_reading_more_history() {
+        struct FailAfterRecord(std::io::Cursor<Vec<u8>>);
+        impl Read for FailAfterRecord {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.position() == self.0.get_ref().len() as u64 {
+                    return Err(std::io::Error::other("later history must not be read"));
+                }
+                self.0.read(buffer)
+            }
+        }
+        let fixture = Fixture::new();
+        let state: RatchetState =
+            serde_json::from_slice(&std::fs::read(&fixture.state).unwrap()).unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&fixture.genesis).unwrap();
+        record["entry_hmac"] = "00".repeat(32).into();
+        let bytes = append_line_bytes(&serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut reader = BufReader::new(FailAfterRecord(std::io::Cursor::new(bytes)));
+        let error = scan_log_state(&mut reader, &state, Some(&[7; 32]))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("invalid entry_hmac"), "{error}");
+    }
+
+    #[test]
+    fn streaming_scan_bounds_unterminated_records_and_rejects_blank_lines() {
+        let fixture = Fixture::new();
+        let state: RatchetState =
+            serde_json::from_slice(&std::fs::read(&fixture.state).unwrap()).unwrap();
+        let source_limit = (MAX_RECORD_BYTES * 2) as u64;
+        let mut source = std::io::repeat(b'x').take(source_limit);
+        let mut reader = BufReader::with_capacity(8192, &mut source);
+        let error = scan_log_state(&mut reader, &state, Some(&[7; 32]))
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("oversized audit record"),
+            "{error}"
+        );
+        drop(reader);
+        assert!(source_limit - source.limit() <= (MAX_RECORD_BYTES + 1 + 8192) as u64);
+        let bytes = [append_line_bytes(&fixture.genesis).unwrap(), b"\n".to_vec()].concat();
+        std::fs::write(&fixture.log, &bytes).unwrap();
+        assert!(AuditLog::open(&fixture.log, &fixture.state).is_err());
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), bytes);
+    }
+
+    #[test]
+    fn streaming_recovery_handles_history_larger_than_its_record_buffer() {
+        let fixture = Fixture::new();
+        let mut state: RatchetState =
+            serde_json::from_slice(&std::fs::read(&fixture.state).unwrap()).unwrap();
+        let mut key = decode_hex_32(&state.key_hex).unwrap();
+        let mut log = OpenOptions::new().append(true).open(&fixture.log).unwrap();
+        for seq in 1..=512 {
+            let mut record = serde_json::json!({
+                "event_type": "TEST", "host_id": "host", "seq": seq,
+                "prev_record_sha256": state.last_record_sha256, "data": "x".repeat(4096),
+            });
+            record["entry_hmac"] = entry_hmac(&key, &serde_json::to_vec(&record).unwrap()).into();
+            let bytes = serde_json::to_vec(&record).unwrap();
+            log.write_all(&append_line_bytes(&bytes).unwrap()).unwrap();
+            key = next_ratchet_key(&key);
+            state.key_hex = encode_hex(&key);
+            state.last_record_sha256 = record_hash(&bytes);
+            state.seq = seq + 1;
+        }
+        log.sync_all().unwrap();
+        assert!(log.metadata().unwrap().len() > 2_000_000);
+        std::fs::write(&fixture.state, serde_json::to_vec(&state).unwrap()).unwrap();
+        let reopened = AuditLog::open(&fixture.log, &fixture.state).unwrap();
+        assert_eq!(reopened.state(), &state);
+        // Corruption in old history must still fail, even when the final
+        // record and persisted checkpoint remain unchanged.
+        use std::os::unix::fs::FileExt;
+        OpenOptions::new()
+            .write(true)
+            .open(&fixture.log)
+            .unwrap()
+            .write_at(b"!", 10)
+            .unwrap();
         assert!(AuditLog::open(&fixture.log, &fixture.state).is_err());
     }
 
