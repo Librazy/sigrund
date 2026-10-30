@@ -1,6 +1,7 @@
 //! One bounded, off-loop SQLite/audit owner. Request leases keep their original
 //! worker/FD/RAM reservation until the original worker actually disposes them.
 use crate::{
+    admission::AuditLease,
     authorization::{self, Denial},
     preparation::Context,
     startup::StartupResources,
@@ -30,6 +31,7 @@ pub(crate) struct AuthorizationTask {
     pub lifecycle: Arc<Lifecycle>,
     pub lease: RequestLease,
     pub control: OwnedFd,
+    pub audit: AuditLease,
 }
 pub(crate) enum Work {
     Authorize(AuthorizationTask),
@@ -38,6 +40,7 @@ pub(crate) enum Work {
         event_type: &'static str,
         fields: serde_json::Value,
         limit: usize,
+        _audit: AuditLease,
     },
 }
 pub(crate) enum Completion {
@@ -50,8 +53,9 @@ pub(crate) enum Completion {
         lease: RequestLease,
         denial: Denial,
     },
-    Audited {
+    Denied {
         token: u64,
+        denial: Denial,
     },
     Fatal(String),
 }
@@ -64,6 +68,7 @@ impl Sequencer {
     pub fn new(
         mut resources: StartupResources,
         context: Arc<Context>,
+        policy: Arc<sigrund_core::config::DaemonConfig>,
         capacity: usize,
     ) -> io::Result<Self> {
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -117,9 +122,18 @@ impl Sequencer {
                                 event_type,
                                 fields,
                                 limit,
-                            } => match resources.audit.append_event(event_type, fields, limit) {
+                                _audit,
+                            } => match append_event(
+                                &mut resources,
+                                &policy,
+                                event_type,
+                                fields,
+                                limit,
+                            ) {
                                 Ok(_) => {
-                                    notify(&completed, &thread_wake, Completion::Audited { token })
+                                    drop(_audit);
+                                    let _ = token;
+                                    true
                                 }
                                 Err(error) => {
                                     notify(
@@ -225,18 +239,39 @@ fn authorize(
     let verified = match authorization::verify(request, context, task.gid) {
         Ok(verified) => verified,
         Err(denial) => {
-            resources
-                .audit
-                .append_event(
-                    "AUTH_REJECTED",
-                    serde_json::json!({"exec_id":task.exec_id,
+            publish_denial(completed, wake, task.token, &denial)?;
+            append_event(
+                resources,
+                &request.policy,
+                "AUTH_REJECTED",
+                serde_json::json!({"exec_id":task.exec_id,
                 "requester_uid":request.requester_uid, "status":denial.status}),
-                    request.policy.audit_record_max_bytes as usize,
-                )
-                .map_err(|e| e.to_string())?;
+                request.policy.audit_record_max_bytes as usize,
+            )
+            .map_err(|e| e.to_string())?;
             return Ok(denial);
         }
     };
+    if !resources
+        .storage
+        .check(&request.policy)
+        .map_err(|e| e.to_string())?
+    {
+        let denial = Denial::new(
+            "RESOURCE_EXHAUSTED",
+            "audit storage pressure; restart required",
+        );
+        publish_denial(completed, wake, task.token, &denial)?;
+        append_event(
+            resources,
+            &request.policy,
+            "AUTH_REJECTED",
+            serde_json::json!({"exec_id":task.exec_id,"status":denial.status}),
+            request.policy.audit_record_max_bytes as usize,
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(denial);
+    }
     let w = verified.warrant.warrant();
     let candidates: Vec<_> = verified.signer_ids.iter().map(String::as_str).collect();
     let (result, signer_id) = resources
@@ -296,10 +331,14 @@ fn authorize(
         {
             return Err("lost commit reservation after durable consumption".into());
         }
-        resources
-            .audit
-            .append_event("AUTH_COMMIT", fields.clone(), limit)
-            .map_err(|e| e.to_string())?;
+        append_event(
+            resources,
+            &request.policy,
+            "AUTH_COMMIT",
+            fields.clone(),
+            limit,
+        )
+        .map_err(|e| e.to_string())?;
         let cancelled = request.check().is_err()
             || task.lifecycle.cancelled.load(Ordering::Acquire)
             || !connection_live(task.control.as_raw_fd());
@@ -324,10 +363,14 @@ fn authorize(
         let mut fields = fields;
         fields["status"] = denial.status.into();
         fields["reason"] = denial.message.into();
-        resources
-            .audit
-            .append_event("AUTH_ABORTED_POST_COMMIT", fields, limit)
-            .map_err(|e| e.to_string())?;
+        append_event(
+            resources,
+            &request.policy,
+            "AUTH_ABORTED_POST_COMMIT",
+            fields,
+            limit,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(denial)
     } else {
         if task.lifecycle.state().0 == Phase::Committing && !task.lifecycle.rolled_back_commit() {
@@ -348,12 +391,47 @@ fn authorize(
             }
             AuthorizationResult::Allowed => unreachable!(),
         };
+        publish_denial(completed, wake, task.token, &denial)?;
         let mut fields = fields;
         fields["status"] = denial.status.into();
-        resources
-            .audit
-            .append_event("AUTH_REJECTED", fields, limit)
+        append_event(resources, &request.policy, "AUTH_REJECTED", fields, limit)
             .map_err(|e| e.to_string())?;
         Ok(denial)
     }
+}
+
+fn publish_denial(
+    completed: &SyncSender<Completion>,
+    wake: &OwnedFd,
+    token: u64,
+    denial: &Denial,
+) -> std::result::Result<(), String> {
+    if notify(
+        completed,
+        wake,
+        Completion::Denied {
+            token,
+            denial: denial.clone(),
+        },
+    ) {
+        Ok(())
+    } else {
+        Err("coordinator stopped before rejection auditing".into())
+    }
+}
+fn append_event(
+    resources: &mut StartupResources,
+    policy: &sigrund_core::config::DaemonConfig,
+    event_type: &str,
+    fields: serde_json::Value,
+    limit: usize,
+) -> sigrund_core::Result<u64> {
+    resources.storage.check(policy).map_err(|e| {
+        sigrund_core::CoreError::Database(format!("audit capacity query failed: {e}"))
+    })?;
+    let sequence = resources.audit.append_event(event_type, fields, limit)?;
+    resources.storage.latch_after_append(policy).map_err(|e| {
+        sigrund_core::CoreError::Database(format!("audit capacity query failed after append: {e}"))
+    })?;
+    Ok(sequence)
 }

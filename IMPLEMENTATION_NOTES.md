@@ -230,6 +230,28 @@ and sidecars stay under a verified directory FD; metadata verification closes
 its separate database FD before SQLite locks it so it cannot release SQLite's
 process-wide POSIX locks and hide later administrative revocations.
 
+## Completed roadmap Phase 4.5
+
+Phase 4.5 closes the pre-execution response deadline gap. Each admitted
+request reserves one bounded audit lease at accept time, separately from its
+socket, worker and snapshot ownership. Timeout, refusal, policy and resource
+denials enqueue their record without waiting for SQLite or fsync, then publish
+one decision through the control socket. Closing the socket cannot discard the
+lease; the durable executor owns it until append completion or fail-closed
+shutdown. Admission counters use fixed monotonic windows with bounded UID
+state, and refused attempts are coalesced into one diagnostic slot.
+
+`StoragePressure` checks the pinned audit/state filesystems with checked
+`fstatvfs` arithmetic and enforces the configured log high-water and free-space
+floors. Capacity checks run in the durable executor and startup; pressure is
+sticky until verified restart. ENOSPC/EIO and failed capacity queries stop the
+service without retrying uncertain authorization. The Phase 4 namespace gate
+reads `REQUEST_TIMEOUT` and `RESOURCE_EXHAUSTED` while a WAL/audit sync remains
+blocked, then verifies replay and shutdown behavior after releasing the gate.
+The pre-FD-4 child setup, pending-spawn reaper barrier and active-job shutdown
+contracts are frozen in the specification for Phase 5 and remain unimplemented
+runtime surfaces.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated
@@ -253,7 +275,7 @@ provide any runtime security guarantee.
 
 Follow [MVP_ROADMAP.md](MVP_ROADMAP.md) as the delivery order: preserve the
 completed transport, snapshot and root-approval gates (Phases 0–3), then add
-the completed authorization/commit/local-audit gates (Phase 4), followed by
+the completed authorization/commit/local-audit gates (Phases 4–4.5), followed by
 cgroup startup/child setup/reaping (Phase 5) and execution fixtures (Phase 6).
 Implement the applicable security subcases alongside each phase. PTY, hooks,
 remote replication, reload and additional signature adapters follow the thin

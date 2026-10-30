@@ -60,6 +60,22 @@ pub struct DaemonConfig {
     pub max_stdin_bytes: u64,
     #[serde(default = "default_request_deadline")]
     pub request_deadline_ms: u32,
+    #[serde(default = "default_admissions_global")]
+    pub request_admissions_global: u32,
+    #[serde(default = "sixteen")]
+    pub request_admissions_per_uid: u32,
+    #[serde(default = "sixty")]
+    pub admission_window_secs: u32,
+    #[serde(default = "default_pending_audits")]
+    pub max_pending_audits_global: u32,
+    #[serde(default = "eight")]
+    pub max_pending_audits_per_uid: u32,
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace_ms: u32,
+    #[serde(default = "default_audit_high_water")]
+    pub audit_log_high_water_bytes: u64,
+    #[serde(default = "default_audit_free")]
+    pub audit_min_free_bytes: u64,
     #[serde(default = "default_memory")]
     pub job_memory_max_bytes: u64,
     pub job_memory_swap_max_bytes: u64,
@@ -235,6 +251,13 @@ impl PolicyStore {
     pub fn reload(&self, replacement: DaemonConfig) -> Result<Arc<PolicyGeneration>> {
         replacement.validate()?;
         let mut guard = self.current.write().expect("policy lock poisoned");
+        if replacement.admission_window_secs != guard.config.admission_window_secs
+            || replacement.shutdown_grace_ms != guard.config.shutdown_grace_ms
+        {
+            return Err(CoreError::Config(
+                "admission window and shutdown grace require restart".into(),
+            ));
+        }
         let number = guard
             .number
             .checked_add(1)
@@ -572,6 +595,20 @@ impl DaemonConfig {
                 "value exceeds immutable protocol ceiling".into(),
             ));
         }
+        if !(1..=4096).contains(&self.request_admissions_global)
+            || !(1..=self.request_admissions_global).contains(&self.request_admissions_per_uid)
+            || !(1..=3600).contains(&self.admission_window_secs)
+            || !(2..=128).contains(&self.max_pending_audits_global)
+            || !(1..=8).contains(&self.max_pending_audits_per_uid)
+            || self.max_pending_audits_per_uid >= self.max_pending_audits_global
+            || !(1..=60000).contains(&self.shutdown_grace_ms)
+            || self.audit_log_high_water_bytes < self.audit_record_max_bytes
+            || self.audit_min_free_bytes < self.audit_record_max_bytes
+        {
+            return Err(CoreError::Config(
+                "invalid admission, audit storage or shutdown bounds".into(),
+            ));
+        }
         if self.max_executable_bytes == 0
             || self.max_executable_bytes > 67_108_864
             || self.max_stdin_bytes == 0
@@ -807,6 +844,22 @@ fn default_ttl() -> u64 {
     31_536_000
 }
 
+fn default_admissions_global() -> u32 {
+    256
+}
+fn default_pending_audits() -> u32 {
+    128
+}
+fn default_shutdown_grace() -> u32 {
+    10_000
+}
+fn default_audit_high_water() -> u64 {
+    1_073_741_824
+}
+fn default_audit_free() -> u64 {
+    67_108_864
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +889,14 @@ mod tests {
             max_executable_bytes: 67_108_864,
             max_stdin_bytes: 16_777_216,
             request_deadline_ms: 5_000,
+            request_admissions_global: 256,
+            request_admissions_per_uid: 16,
+            admission_window_secs: 60,
+            max_pending_audits_global: 128,
+            max_pending_audits_per_uid: 8,
+            shutdown_grace_ms: 10_000,
+            audit_log_high_water_bytes: 1_073_741_824,
+            audit_min_free_bytes: 67_108_864,
             job_memory_max_bytes: 268_435_456,
             job_memory_swap_max_bytes: 0,
             job_pids_max: 128,

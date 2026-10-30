@@ -12,8 +12,9 @@ workflow that can be demonstrated on one Linux host:
    authorized target identity, and returns the child's exit status to
    `sigrun`.
 
-The first vertical slice uses `stdio`, local audit, one signed request at a
-time, and `require_remote_audit_ack = false`. It excludes PTY transfer,
+The first vertical slice uses `stdio`, local audit, one interactive approval
+at a time, and `require_remote_audit_ack = false`. Pre-signed requests may run
+concurrently within the same admission and ownership limits. It excludes PTY transfer,
 hooks, OpenPGP, Sigstore, remote collector ACKs, reload, and the full quota
 stress matrix until the slice is working. Excluding those features is an MVP
 scope decision. Section 6.3 of the specification defines the optional local
@@ -30,6 +31,12 @@ Phase 5 handoff and consumed-grant message. Child execution remains pending.
 Evidence and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md)
 and [docs/MVP_PHASE4.md](docs/MVP_PHASE4.md).
 
+The pre-execution recap identified a Phase 4 conformance gap: pre-commit
+responses had waited for rejection auditing. Phase 4.5 now publishes those
+responses independently and retains bounded audit ownership. Its gate reads
+those frames while durable I/O is still blocked. No child-execution gate has
+passed yet.
+
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
 - [x] Raw `ssh-ed25519` and `sk-ssh-ed25519` SSHSIG verification helpers.
@@ -39,9 +46,14 @@ and [docs/MVP_PHASE4.md](docs/MVP_PHASE4.md).
   streaming snapshot foundations and updated request-profile gates.
 - [x] Phase 2: client transport and common snapshots.
 - [x] Phase 3: root TTY approval and SSH signing.
-- [x] Phase 4: local authorization, commit and audit, with concurrent replay,
-  deterministic cancellation, recovery and blocked durable-I/O gates.
-- [ ] Phase 5: child execution and exit relay.
+- [x] Phase 4: local authorization, commit and audit integration, concurrent
+  replay and recovery; response-deadline conformance requires Phase 4.5.
+- [x] Phase 4.5: independent denial delivery, bounded audit admission and
+  storage-pressure handling; freeze the execution ownership contracts.
+- [ ] Phase 5A: execution startup and committed-job ownership.
+- [ ] Phase 5B: child setup and sync-pipe classification.
+- [ ] Phase 5C: central reaping, teardown and daemon shutdown.
+- [ ] Phase 5D: execution failure and race verification.
 - [ ] Phase 6: two-UID end-to-end fixture.
 
 ### Midpoint review and follow-through
@@ -53,8 +65,9 @@ evidence supports the completed phases, but does not establish snapshot,
 authorization, or execution conformance. Their fixtures use namespace-root;
 they do not verify the host-root cgroup/credential execution path.
 
-The following corrections are required work in the remaining phases. They are
-planned contracts, not claims about currently available CLI options or behavior.
+The following table preserves the earlier midpoint findings and their owning
+phases. Current status and phase evidence above identify the completed portions;
+execution and follow-on features remain planned contracts.
 
 | Finding or ambiguity | Delivery phase | Acceptance evidence |
 | --- | --- | --- |
@@ -71,6 +84,21 @@ planned contracts, not claims about currently available CLI options or behavior.
 Do not reopen completed phases merely to relabel them. Extend their contracts
 and tests in the owning phase above, documenting any change from the frozen
 Phase 0 interface. Preserve the Phase 1 regression fixtures as required gates.
+
+### Pre-execution recap and corrective gates
+
+The verified Phase 0–4 building blocks remain in use. The following are
+outstanding requirements, not claims that the runtime already implements them.
+
+| Finding | Owner | Acceptance evidence |
+| --- | --- | --- |
+| Rejection auditing delays unrelated deadline replies | 4.5 | [implemented]  Receive timeout, refusal and resource-denial decisions on writable sockets while WAL/audit I/O remains gated; late audit completion cannot send a second decision. |
+| Concurrency ceilings do not bound repeated rejection logging or cumulative disk use | 4.5 | [implemented]  Per-UID/global admission windows, bounded retained audit ownership, storage high-water checks, and ENOSPC tests; no silent loss of committed authorization records. |
+| The current authorization completion always returns a denial | 5A | A typed committed-job handoff retains the selected signer, exact warrant, snapshots, envp, captured policy and reservations; no recopy, re-signing or second consumption. |
+| Step 1 failures may occur before FD 4 names the sync pipe | 5B | Inject unshare/duplication/remap failures and EMFILE with a sentinel at inherited FD 4; only the actual sync pipe receives error bytes. |
+| An off-loop clone may exit before its PID reaches the reaper registry | 5C | Gate publication after clone returns; the central reaper preserves that child's status and continues servicing registered primaries. |
+| Immediate daemon exit cannot safely handle active or in-flight children | 5C–5D | Foreground SIGINT/SIGTERM, fatal storage failure and forced supervisor stop retain ownership through reconciliation or external cgroup cleanup; no new readiness during shutdown. |
+| The operator walkthrough depends on unspecified provisioning/delegation | 6 | Executable harness and copyable service/foreground recipes generate valid local configuration, discover the delegated hierarchy, and demonstrate both interactive approval and pre-signed input. |
 
 ## The target interaction
 
@@ -120,13 +148,18 @@ The MVP is complete only when all of these statements hold:
   umask, script permission, tty/stdin mode and digests, grant/host/execution IDs,
   validity window, and signer identity/key fingerprint. Values are sanitized
   according to Section 3.3; argv entries are indexed and quoted independently.
-- A refusal, timeout, disconnect, signature failure, policy mismatch, or
-  snapshot mutation produces no child and no successful authorization.
+- A pre-reservation refusal, timeout, disconnect, signature failure, policy
+  mismatch, or snapshot failure cannot consume a grant or create a child.
+  Cancellation during a reserved commit/spawn reconciles the actual result:
+  a grant may remain consumed and a returned child must be registered and
+  torn down without readiness. Never describe such an outcome as rollback.
 - The private key remains in the root process or its SSH agent. `sigrund`
   receives only the SSHSIG signature and verifies it against the configured
   public key and `sigrun.warrant.v1` namespace.
-- A successful child produces `READY_TO_EXEC`, then exactly one
-  `SERVER_CHILD_EXIT`. `sigrun` returns the child's exit code or `128 + signal`.
+- A setup-ready classification produces `READY_TO_EXEC`, then exactly one
+  `SERVER_CHILD_EXIT` while the client remains connected. Readiness does not
+  prove exec succeeded. `sigrun` returns the primary child's exit code or
+  `128 + signal` after draining its output.
 - Every accepted authorization and child outcome is written to the local
   hash-chained audit log. A remote collector is not part of this first slice.
 
@@ -206,6 +239,16 @@ wire decision or implying authorization succeeded.
   exec or `_exit`; no allocator, formatting, locks, panics or Rust destructors.
 - Treat cancellation, stale completions and backpressure as normal typed
   outcomes. Do not grow `daemon::run` into the implementation of every phase.
+- Replace the temporary Phase 4 denial-only completion with distinct owned
+  committed, rejected and fatal results. A committed result transfers the
+  selected unrevoked signer and all execution inputs; an authorization worker
+  cannot independently advance it to spawning. Give pending-spawn, live-job
+  and cleanup states explicit ownership types rather than additional flags
+  on a connection. A disconnected socket never owns the only copy of a job.
+- Keep cgroup setup/disposal, the syscall-only child path, handshake parsing,
+  central reaping and shutdown in focused modules. Existing state/audit I/O in
+  `sigrund-core` remains behind its storage APIs; pure protocol/crypto helpers
+  must not acquire runtime side effects. No crate-wide rewrite is required.
 
 ### Supported stories and limits
 
@@ -240,15 +283,19 @@ portion with its focused fixture; the complete real-binary case gates Phase 6.
 | 2 | Client transport and sealed snapshots | 2–3 days |
 | 3 | Root TTY approval and SSH signing | 2–3 days |
 | 4 | Authorization, one-time commit, and local audit | 2–3 days |
-| 5 | `clone3`, credentials, reaping, and exit relay | 3–5 days |
+| 4.5 | Pre-execution corrective gate | Re-estimate from its acceptance tests |
+| 5A–5D | Startup/ownership, child setup, reaping/shutdown, failure gates | Original 3–5 days; re-estimate after 4.5 |
 | 6 | Two-UID integration fixture and hardening | 2–3 days |
-| **Total** | **Thin end-to-end MVP** | **13–20 person-days** |
+| **Original total** | **Thin end-to-end MVP, excluding later corrective gates** | **13–20 person-days** |
 
 The estimate assumes the existing primitives remain usable and a Linux
 engineer familiar with Rust, Unix sockets, namespaces, cgroups, and SSHSIG.
 The estimates are original planning ranges, not a measured completion date.
 Phases 2–6 total 11–17 person-days before contingency for the additional gates
 above. Re-estimate after the client and real OpenSSH signing slice works.
+That slice is now implemented; the original total is not a forecast for the
+remaining work. Phase 4.5 and real delegated-cgroup evidence must inform the
+remaining estimate. Phases 5A–5D are sequential review gates within Phase 5.
 PTY, hooks, remote collectors, and the complete V-01–V-19 matrix are a
 follow-on effort; security cases applicable to the thin path run before MVP
 completion, even when their V row also covers deferred features.
@@ -378,6 +425,8 @@ Exit gate:
 
 ### Phase 4: authorization, commit, and local audit
 
+Integrated, with the response-deadline correction tracked in Phase 4.5.
+
 Deliverables:
 
 - Implement the complete local Section 4.2 authorization predicate for the
@@ -412,23 +461,145 @@ Exit gate:
   M-06, M-10 and applicable M-07/M-14 cancellation/persistence subcases.
   Remote ACK remains a separate post-MVP milestone.
 
-### Phase 5: child execution and exit relay
+### Phase 4.5: pre-execution corrective gate
+
+Complete this gate before adding a child execution path. The corrective gate is
+implemented in the current worktree and verified before Phase 5 work proceeds.
+
+Deliverables:
+
+- [x] Apply specification Section 1.3.2: reserve bounded rejection-audit ownership
+  at admission, publish pre-commit terminal replies independently of fsync,
+  and retain the audit charge after socket closure until its owner finishes.
+  Commit/spawn reservations keep Section 1.3.1's reconciliation requirements.
+- [x] Implement Section 1.4's per-UID/global request-admission windows and
+  Section 7.2.1's log high-water/free-space policy. Checks that touch
+  filesystems stay off-loop. Excess connections cannot create an unbounded
+  rejection queue or one durable record per rate-limited attempt.
+- [x] Distinguish active socket ownership, pending audit ownership and pinned
+  worker/FD/RAM ownership. Release each only at its actual completion; a late
+  audit acknowledgement cannot resurrect a retired connection.
+- [x] Freeze the typed committed-job handoff, pre-FD-4 error reporting,
+  pending-spawn registration barrier, and shutdown state transitions against
+  specification Sections 1.3.2, 2.4.1 and 5.3 before implementing them. The
+  latter three remain Phase 5 execution contracts; this gate records their
+  required ownership and test boundaries without claiming child execution.
+
+Exit gate:
+
+- [x] Extend `blocked_io_remains_bounded_and_responsive` to receive unrelated
+  `REQUEST_TIMEOUT` and `RESOURCE_EXHAUSTED` replies **before** releasing the
+  durable gate. Exercise refusal and no-approver replies similarly. Verify
+  the original phase deadline triggers publication and the normal five-second
+  send deadline applies without waiting for audit completion.
+- [x] Hold that gate across repeated disconnect/reconnect attempts and rate-window
+  boundaries. Memory, queued records and UID accounting remain bounded; excess
+  admission closes promptly; releasing the gate restores capacity exactly once.
+- [x] Exhaust a per-UID window while another UID retains allowance; exhaust the
+  global window with many UIDs; test expiration, reload debt, restart-only
+  settings, checked arithmetic and the bounded UID table. No rejected admission
+  reaches snapshots or crypto.
+- [x] Cross the audit high-water mark and each filesystem's free-space floor,
+  including a stream of denials with no successful authorizations; inject
+  ENOSPC/EIO. Stop new authorization without truncating history,
+  recreating consumption state, retrying uncertain commits or enabling execution.
+- [x] Preserve Phase 0–4 regression gates and update the evidence documents to
+  identify the new wire-level deadline proof.
+
+Phase 4.5 evidence is recorded in `docs/MVP_PHASE4.md` and the focused
+`admission` and `storage` unit tests. The namespace `phase4::exit_gate` holds
+WAL/audit synchronization while unrelated timeout and resource-denial frames
+are read from their sockets, then releases the durable gate. It also checks
+that a redeemed one-time grant remains consumed and that shutdown stays
+responsive. Admission tests cover fixed windows, reload debt, bounded UID
+state, diagnostic coalescing, and retained audit ownership. Storage tests cover
+checked `fstatvfs` arithmetic, all pinned filesystems, high-water/free-space
+thresholds, and sticky fail-closed pressure.
+
+### Phase 5A: execution startup and committed-job ownership
 
 Deliverables:
 
 - Complete Section 1.2 startup hierarchy and required kernel-interface probes
   before accepting execution requests; `--check-cgroup` alone is insufficient.
-- Create the per-job cgroup and apply memory, swap, OOM, and PID limits.
+- Discover and pin the actual delegated service cgroup `G` before migration
+  to `G/supervisor`. Use `G/jobs` and `G/hooks`, including for foreground
+  fixtures; do not hardcode a particular systemd unit's absolute path.
+- Implement the owned committed-job handoff after durable `AUTH_COMMIT`.
+  Replace the temporary unconditional Phase 5 abort only when execution
+  admission is wired. Keep explicit post-commit aborts on cancellation/failure.
+- Create each job cgroup off-loop and apply/read back memory, swap, OOM and
+  PID limits. Retain its cleanup ownership even if the requester disconnects.
+- Block SIGCHLD before starting threads, preserve its default disposition,
+  register the subreaper and establish the pending-spawn barrier. Define the
+  supported supervising service and shutdown policy before permitting clones.
+
+Exit gate:
+
+- Missing delegation, controllers, required syscalls or accepted limits fail
+  before execution admission. Actual `clone3`/mount probes run in isolation,
+  never by silently falling back to weaker flags.
+- Snapshot descriptors, selected signer, argv/envp, policy and quota owners
+  survive the commit-to-job handoff unchanged. Cancelled or stale handoffs
+  cannot spawn; failed cgroup setup leaves consumption and audit consistent.
+
+### Phase 5B: child setup and sync-pipe classification
+
+Deliverables:
+
 - Implement `clone3()` with `CLONE_INTO_CGROUP`, `CLONE_PIDFD`, and the
   namespace/credential transition required for the selected MVP target.
 - Build the deterministic descriptor table for stdin/stdout/stderr and the
-  sync-pipe readiness/error handshake.
+  sync-pipe readiness/error handshake. Follow Section 5.3's tracked error-FD
+  rules before FD 4 installation; no inherited descriptor number is assumed.
+- Implement the parent-prepared syscall-only child path, all ten setup steps,
+  bounded mountinfo verification and post-exec credential/capability probes.
+
+Exit gate:
+
+- Inject failure into every initial duplication/remap, including EMFILE and
+  initially closed descriptors 0–4. Inherited FD 4 sentinel data stays intact;
+  the parent receives a valid setup error or safely classifies missing/partial
+  evidence as `SPAWN_FAILED`, never readiness.
+- Exercise all 0/8/16-byte handshake classifications, partial/excess frames,
+  exec errors and the two-second deadline. Kill after the readiness token but
+  before exec to verify the documented unknown-exec outcome.
+- Real root and service-UID probes verify identities, groups, P/E/I/ambient/
+  bounding capabilities, securebits, no_new_privs, signal state, umask, cwd,
+  descriptors and mount isolation after exec. Parent mounts stay unchanged.
+
+### Phase 5C: central reaping, teardown and daemon shutdown
+
+Deliverables:
+
 - Add the central reaper, disconnect cancellation, cgroup teardown, and
   `SERVER_CHILD_EXIT` serialization.
 - Keep the commit and spawn reservation phases intact when cancellation wins.
-- Implement the parent-prepared syscall-only child path. Register PID/pidfd
-  ownership before dispatching any pending reaper event, preserving an early
-  exit until sync-pipe classification and the decision have completed.
+- Apply Section 2.4's registration barrier: a reserved off-loop spawn has a
+  coordinator-owned pending context before dispatch. No `P_ALL` sweep may
+  consume its child before registration; known primaries remain serviceable
+  through their registered pidfds. Serialize clone dispatch and drain the
+  deferred sweep before the next clone so new spawns cannot prolong the barrier.
+  Preserve early exit through classification.
+- Implement Section 2.4.1 shutdown for SIGINT/SIGTERM and fatal durable errors:
+  stop admission, close control sockets, cancel/reconcile in-flight work,
+  kill jobs and reap children. Cleanup ownership outlives connections and
+  deadlines. The supervisor provides escalation and abrupt-death cleanup.
+
+Exit gate:
+
+- Gate a successful clone before parent-result publication, exit its child,
+  and concurrently exit another registered primary. Both statuses reach the
+  correct contexts once; unknown children are not discarded during the barrier.
+- Test shutdown before/after commit and spawn reservations, before readiness,
+  during running jobs and blocked cleanup. No new readiness appears after
+  shutdown begins; all returned children remain tracked. Healthy audit records
+  outcomes; poisoned audit never resumes appending.
+- Test foreground interruption, service stop/restart and forced daemon death
+  under the specified supervisor. Verify cgroup emptiness, lock ownership,
+  orphan recovery and accurate handling of unreapable prior-instance children.
+
+### Phase 5D: execution failure and race verification
 
 Exit gate:
 
@@ -439,6 +610,9 @@ Exit gate:
 - M-08, M-14 and M-15 pass on a real delegated cgroup v2 hierarchy, including
   missing swap/clone/mount support, actual credential/capability read-back,
   concurrent child exits, and setup failures at each step.
+- All Phase 5A–5C gates pass together with Phase 4.5's response and storage
+  gates. Record syscall traces and actual post-exec observations; namespace-only
+  transport tests and mocked status frames cannot substitute for execution.
 
 ### Phase 6: end-to-end MVP fixture
 
@@ -452,8 +626,37 @@ Add an isolated Linux fixture with:
 - deterministic gates around approval, commit, clone, readiness, and exit.
 
 The fixture must ship an executable harness with prerequisite diagnostics,
-temporary provisioning/configuration and cleanup, plus a manual two-terminal
-walkthrough. Missing kernel/delegation requirements fail the execution gate;
+temporary provisioning/configuration and cleanup, plus a copyable walkthrough
+for two root terminals and a separate requester login. It must:
+
+- Provision host state and a disposable software SSH key, construct a matching
+  signer policy and `[mvp]` configuration, and explicitly handle the mandatory
+  collector settings/files while network use remains disabled. Select existing
+  canonical executable roots rather than assuming a distribution's symlink
+  aliases are acceptable. Do not claim physical FIDO evidence from this key.
+- Supply exact packaged-service and foreground `systemd-run` recipes in a
+  dedicated delegated service, with `KillMode=control-group`, `SendSIGKILL=yes`
+  and a stop timeout longer than `shutdown_grace_ms`, plus watchdog/escalation
+  for internally initiated fatal shutdown or a stalled daemon. Discover and
+  verify `G`; define every `TEST_*` variable below. A bare root shell does not
+  establish delegation or cleanup after daemon death.
+- Include a supported pre-signed-envelope recipe/helper: capture canonical
+  CSR bytes, form DSSE PAE, sign with OpenSSH, decode raw SSHSIG, build the
+  envelope and redeem with `sigrun --warrant`. Never regenerate the grant,
+  validity, command or other signed bytes when packaging a signature.
+- Demonstrate root and service-UID commands, exact binary hashed stdin,
+  redirected and terminal output, normal and signal exits, denial/replay, and
+  interruption/restart. Preserve separate machine-readable status records.
+- Explain that readiness proves setup only, a post-commit failure may consume
+  the grant, and a lost connection can leave execution uncertain. Never retry
+  automatically or reset state; inspect available audit/consumption evidence
+  before obtaining a fresh approval. Grant deduplication does not make command
+  effects exactly-once across external failures or VM memory restoration.
+- Provide storage-pressure recovery and cleanup instructions that preserve
+  identity, full audit history and consumption state, and remove only fixture
+  processes, units, cgroups and temporary resources.
+
+Missing kernel/delegation requirements fail the execution gate;
 namespace-only transport tests cannot substitute for it. The following are
 target commands after Phases 2–5, not commands that execute successfully today.
 Run the root terminals in a provisioned disposable host with a delegated
@@ -491,15 +694,15 @@ scope:
 | M-04 | CSR mutation after approval | Signature or field binding fails; no spawn. |
 | M-05 | Executable mutation during snapshot | Size/EOF violations deny; same-size writes bind only the resulting sealed bytes. An approval cannot substitute another snapshot. |
 | M-06 | Same one-time warrant from concurrent connections with matching UID/GID | Exactly one commit; all others replay-denied. Wrong-UID requests are separately policy-denied. |
-| M-07 | Client disconnect during approval/commit/spawn | Reservation reconciliation and cleanup complete. |
-| M-08 | Child exits normally, by signal, and before readiness | Exact decision and exit contract. |
+| M-07 | Client disconnect and daemon shutdown during approval/commit/spawn/running | Reservation reconciliation, supervisor escalation and cleanup complete; uncertain consumption is not reported as rollback. |
+| M-08 | Child exits normally, by signal, before readiness, or before spawn-result registration | Exact decision/exit contract; registration barrier prevents status theft. |
 | M-09 | Descriptor truncation/extra FD and oversized frame | Connection closes; no leaked FD or child. |
 | M-10 | Audit restart after partial and forward-recovery windows | Startup succeeds only for valid recoverable states. |
 | M-11 | Requester TTY, file/pipe output, large output, blocked/broken sink, null/hashed stdin | Default terminal invocation works using pipes; bounded queues, exact separate output/status, complete drain and responsive cancellation. |
 | M-12 | CLI defaults, complete approval display, real SSH signing | Exact CSR/PAE binding; no hidden environment or ambiguous argv; wrong key, namespace, payload, blank confirmation and non-TTY approver fail closed. |
 | M-13 | No approver, busy slot, slow signing, stale/duplicate response, broker loss/reconnect | Section 6.3 outcomes; original deadline preserved; no old execution resurrected; helper and snapshot ownership reconciled. |
-| M-14 | Blocked open/fstat/read/close, SQLite/fsync and job cleanup | Other control traffic/deadlines remain responsive; bounded admission; no early quota release, replacement workers or late readiness. |
-| M-15 | Root and service-UID execution; unsupported kernel/cgroup features; post-clone setup | Actual namespace, FD, signal, group, capability and cgroup behavior verified; fail closed before readiness on every setup error. |
+| M-14 | Blocked open/fstat/read/close, SQLite/fsync, rejection auditing and job cleanup; rate/storage exhaustion | Unrelated pre-commit replies arrive while durable I/O remains blocked; admission/audit ownership stays bounded through disconnect and rate-window changes; storage failure stops authorization; no early quota release or late readiness. |
+| M-15 | Root and service-UID execution; unsupported kernel/cgroup features; every post-clone setup step | Actual namespace, FD, signal, group, capability and cgroup behavior verified; early error reporting cannot write inherited FD 4; fail closed before readiness on every setup error. |
 
 Record command, platform/kernel, test result and artifact for each M case.
 Use this traceability when selecting the applicable V subcases for the thin path:
@@ -524,7 +727,8 @@ The thin MVP is ready for review when:
 
 1. M-01 through M-15 and the applicable V subcases pass on a disposable Linux
    host with distinct requester/root/service UIDs and actual cgroup delegation.
-2. `cargo test --workspace`, Clippy, formatting, and the integration fixture
+2. Phase 4.5 and all Phase 5A–5D gates have evidence.
+   `cargo test --workspace`, Clippy, formatting, and the integration fixture
    pass from a clean checkout.
 3. The normal binaries no longer exit with the service-unavailable status for
    the documented MVP commands.

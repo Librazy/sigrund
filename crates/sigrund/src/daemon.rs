@@ -1,6 +1,7 @@
 //! Foreground coordinator for snapshots, approval and durable authorization.
 //! Child setup and readiness remain the Phase 5 execution boundary.
 use crate::{
+    admission::{Admission, AuditLease},
     linux::validate_absolute_path,
     preparation::{self, Context, Document, PinnedRoot},
     sequencer::{self, Sequencer},
@@ -261,8 +262,7 @@ struct Connection {
     broker: bool,
     input: Input,
     output: Option<FrameWriter>,
-    pending_decision: Option<Decision>,
-    audit_submitted: bool,
+    audit: Option<AuditLease>,
     request_deadline: Option<Instant>,
     exec_id: String,
     policy: Arc<DaemonConfig>,
@@ -282,9 +282,6 @@ struct ApprovalAvailability {
 
 impl Connection {
     fn deadline(&self) -> Option<Instant> {
-        if self.pending_decision.is_some() {
-            return None;
-        }
         if let Some(output) = &self.output {
             return Some(output.deadline());
         }
@@ -333,27 +330,27 @@ impl Connection {
             message: message.into(),
         };
         decision.validate().map_err(|e| invalid(e.to_string()))?;
-        self.pending_decision = Some(decision);
-        if audited {
-            self.publish_decision(now)
-        } else {
-            self.queue_decision_audit()
+        if !audited {
+            self.queue_decision_audit(&decision)?;
         }
+        self.output = Some(FrameWriter::control(
+            FrameType::ServerAuthDecision,
+            &serde_json::to_vec(&decision).map_err(|e| invalid(e.to_string()))?,
+            now,
+        )?);
+        Ok(())
     }
 
     fn reading(&self) -> bool {
-        self.pending_decision.is_none()
+        self.output.is_none()
             && !matches!(
                 self.input,
                 Input::Validating { .. } | Input::Authorizing { .. } | Input::Serving { .. }
             )
     }
 
-    fn queue_decision_audit(&mut self) -> io::Result<()> {
-        if self.audit_submitted {
-            return Ok(());
-        }
-        let Some(decision) = &self.pending_decision else {
+    fn queue_decision_audit(&mut self, decision: &Decision) -> io::Result<()> {
+        let Some(audit) = self.audit.take() else {
             return Ok(());
         };
         let work = sequencer::Work::Event {
@@ -362,28 +359,11 @@ impl Connection {
             fields: serde_json::json!({"exec_id":self.exec_id,"requester_uid":self.peer.uid,
                 "requester_gid":self.peer.gid,"status":decision.status,"message":decision.message}),
             limit: self.policy.audit_record_max_bytes as usize,
+            _audit: audit,
         };
-        match self.durable.try_send(work) {
-            Ok(()) => self.audit_submitted = true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => (),
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                return Err(invalid("audit executor stopped"));
-            }
-        }
-        Ok(())
-    }
-
-    fn publish_decision(&mut self, now: Instant) -> io::Result<()> {
-        let decision = self
-            .pending_decision
-            .take()
-            .ok_or_else(|| invalid("no audited decision"))?;
-        self.output = Some(FrameWriter::control(
-            FrameType::ServerAuthDecision,
-            &serde_json::to_vec(&decision).map_err(|e| invalid(e.to_string()))?,
-            now,
-        )?);
-        Ok(())
+        self.durable
+            .try_send(work)
+            .map_err(|_| invalid("reserved audit executor capacity unavailable"))
     }
 
     fn finish_validation(
@@ -487,8 +467,21 @@ impl Connection {
                             lifecycle: self.lifecycle.clone(),
                             lease,
                             control: self.fd.try_clone()?,
+                            audit: self
+                                .audit
+                                .take()
+                                .ok_or_else(|| invalid("missing audit reservation"))?,
                         });
-                        if self.durable.try_send(work).is_err() {
+                        if let Err(error) = self.durable.try_send(work) {
+                            let work = match error {
+                                std::sync::mpsc::TrySendError::Full(work) => work,
+                                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                                    return Err(invalid("audit executor stopped"));
+                                }
+                            };
+                            if let sequencer::Work::Authorize(task) = work {
+                                self.audit = Some(task.audit);
+                            }
                             return self.reject(
                                 "RESOURCE_EXHAUSTED",
                                 "authorization executor is full",
@@ -574,9 +567,6 @@ impl Connection {
         workers: &mut IoWorkers,
         log: &SyncSender<String>,
     ) -> io::Result<bool> {
-        if self.pending_decision.is_some() {
-            return Ok(false);
-        }
         if let Some(output) = &mut self.output {
             return output
                 .write(self.fd.as_raw_fd(), now)
@@ -641,6 +631,15 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.lifecycle.cancel();
+        if self.audit.is_some() {
+            let decision = Decision {
+                csr_payload: None,
+                exec_id: self.exec_id.clone(),
+                status: "REJECTED".into(),
+                message: "request disconnected before authorization".into(),
+            };
+            let _ = self.queue_decision_audit(&decision);
+        }
     }
 }
 
@@ -695,11 +694,16 @@ impl ForegroundDaemon {
         // Threads inherit the blocked signal mask, leaving shutdown handling
         // on signalfd even when a metadata syscall cannot be interrupted.
         let mut workers = IoWorkers::new(&self.config)?;
+        let storage_closed = self._resources.storage.closed.clone();
+        let mut admission = Admission::new(&self.config, Instant::now());
+        let sequencer_capacity = (self.config.max_pending_audits_global as usize)
+            .checked_mul(2)
+            .ok_or_else(|| invalid("sequencer capacity overflow"))?;
         let sequencer = Sequencer::new(
             self._resources,
             context.clone(),
-            (self.config.max_active_sockets_global + self.config.max_io_workers_global + 2)
-                as usize,
+            self.config.clone(),
+            sequencer_capacity,
         )?;
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if raw < 0 {
@@ -796,7 +800,9 @@ impl ForegroundDaemon {
                                 lease,
                                 denial,
                             } => {
-                                if let Some(c) = connections.get_mut(&token) {
+                                if let Some(c) = connections.get_mut(&token)
+                                    && c.lifecycle.state().1 == LifecycleDecision::Undecided
+                                {
                                     c.respond_inner(
                                         denial.status,
                                         denial.message,
@@ -815,9 +821,17 @@ impl ForegroundDaemon {
                                 }
                                 drop(lease);
                             }
-                            sequencer::Completion::Audited { token } => {
-                                if let Some(c) = connections.get_mut(&token) {
-                                    c.publish_decision(Instant::now())?;
+                            sequencer::Completion::Denied { token, denial } => {
+                                if let Some(c) = connections.get_mut(&token)
+                                    && c.lifecycle.state().1 == LifecycleDecision::Undecided
+                                {
+                                    c.respond_inner(
+                                        denial.status,
+                                        denial.message,
+                                        None,
+                                        Instant::now(),
+                                        true,
+                                    )?;
                                     register(
                                         epoll.as_raw_fd(),
                                         libc::EPOLL_CTL_MOD,
@@ -952,6 +966,7 @@ impl ForegroundDaemon {
                             && (client_count >= self.config.max_active_sockets_global as usize
                                 || uid_count >= self.config.max_active_sockets_per_uid as usize)
                         {
+                            admission.refuse();
                             continue;
                         }
                         if broker && connections.values().any(|c| c.broker) {
@@ -960,6 +975,19 @@ impl ForegroundDaemon {
                         if disable_ancillary_credentials(fd.as_raw_fd()).is_err() {
                             continue;
                         }
+                        let audit = if broker {
+                            None
+                        } else {
+                            if storage_closed.load(std::sync::atomic::Ordering::Acquire) {
+                                admission.refuse();
+                                continue;
+                            }
+                            let Some(lease) = admission.admit(peer.uid, &self.config, accepted)
+                            else {
+                                continue;
+                            };
+                            Some(lease)
+                        };
                         let connection = Connection {
                             token: next_token,
                             fd,
@@ -971,8 +999,7 @@ impl ForegroundDaemon {
                                 Input::Client
                             },
                             output: None,
-                            pending_decision: None,
-                            audit_submitted: false,
+                            audit,
                             request_deadline: (!broker).then_some(
                                 accepted
                                     + Duration::from_millis(self.config.request_deadline_ms.into()),
@@ -1024,27 +1051,27 @@ impl ForegroundDaemon {
                     }
                 }
             }
-            // A full durable queue applies bounded backpressure: keep each
-            // pending decision in its admitted connection until it can enqueue.
-            for connection in connections.values_mut() {
-                connection.queue_decision_audit()?;
-            }
-            if reload_diagnostic_pending {
-                // Coalesce repeated unsupported reload signals while the
-                // sequencer is busy; retain one bounded durable diagnostic.
+            // One diagnostic slot is reserved separately from requester
+            // ownership. Reconnect floods cannot allocate a durable side queue.
+            if let Some((audit, refused)) =
+                admission.diagnostic(Instant::now(), reload_diagnostic_pending)
+            {
                 let work = sequencer::Work::Event {
                     token: 0,
-                    event_type: "RELOAD_UNAVAILABLE",
-                    fields: serde_json::json!({"reason":"reload is disabled in the MVP profile"}),
+                    event_type: if reload_diagnostic_pending {
+                        "RELOAD_UNAVAILABLE"
+                    } else {
+                        "ADMISSION_REFUSED"
+                    },
+                    fields: serde_json::json!({"refused":refused,"reload_supported":false}),
                     limit: self.config.audit_record_max_bytes as usize,
+                    _audit: audit,
                 };
-                match sequencer.sender().try_send(work) {
-                    Ok(()) => reload_diagnostic_pending = false,
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => (),
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        return Err(invalid("audit executor stopped"));
-                    }
-                }
+                reload_diagnostic_pending = false;
+                sequencer
+                    .sender()
+                    .try_send(work)
+                    .map_err(|_| invalid("reserved diagnostic capacity unavailable"))?;
             }
             // Expiry is independent of socket readiness and read progress.
             let now = Instant::now();
@@ -1231,8 +1258,7 @@ mod approval_tests {
                 broker: false,
                 input: Input::Validating { _task: task },
                 output: None,
-                pending_decision: None,
-                audit_submitted: false,
+                audit: Admission::new(&config, Instant::now()).admit(1001, &config, Instant::now()),
                 request_deadline: Some(deadline),
                 exec_id: new_uuidv7().to_string(),
                 policy: config.clone(),
@@ -1258,7 +1284,6 @@ mod approval_tests {
             } else {
                 assert!(connection.dispatch(42, now, &mut workers, &log).unwrap());
             }
-            connection.publish_decision(now).unwrap();
             assert!(!connection.dispatch(42, now, &mut workers, &log).unwrap());
             let mut header = [0; 5];
             peer.read_exact(&mut header).unwrap();

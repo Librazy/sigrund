@@ -86,6 +86,7 @@ pub struct StartupResources {
     pub audit: AuditLog,
     pub store: StateStore,
     pub roots: Vec<fs::File>,
+    pub(crate) storage: crate::storage::StoragePressure,
     _collector_files: Vec<fs::File>,
     _lock: fs::File,
 }
@@ -232,6 +233,10 @@ impl StartupResources {
         let store = StateStore::open_in_directory(state_directory.try_clone()?)
             .map_err(|e| invalid(format!("database startup failed: {e}")))?;
         state_directory.sync_all()?;
+        let storage = crate::storage::StoragePressure::new(
+            log_file.try_clone()?,
+            vec![log_directory, state_directory.try_clone()?],
+        );
         let audit = AuditLog::from_verified_files(
             log_file,
             state_file,
@@ -240,7 +245,13 @@ impl StartupResources {
             Some(&host_id),
         )
         .map_err(|e| invalid(format!("audit recovery failed: {e}")))?;
+        if !storage.check(config)? {
+            return Err(invalid(
+                "audit storage pressure; remediation and restart required",
+            ));
+        }
         Ok(Self {
+            storage,
             host_id,
             audit,
             store,

@@ -19,6 +19,12 @@ snapshot_ram_per_uid_bytes = 134217728
 max_executable_bytes = 67108864
 max_stdin_bytes = 16777216
 request_deadline_ms = 5000
+request_admissions_global = 256
+request_admissions_per_uid = 16
+admission_window_secs = 60
+max_pending_audits_global = 128
+max_pending_audits_per_uid = 8
+shutdown_grace_ms = 10000
 
 job_memory_max_bytes = 268435456
 job_memory_swap_max_bytes = 0
@@ -34,6 +40,8 @@ collector_public_key = "<strict-padded-base64-32-byte-ed25519-key>"
 collector_rpc_timeout_ms = 3000
 
 audit_record_max_bytes = 65536
+audit_log_high_water_bytes = 1073741824
+audit_min_free_bytes = 67108864
 max_onetime_window_secs = 3600
 max_ttl_secs = 31536000
 

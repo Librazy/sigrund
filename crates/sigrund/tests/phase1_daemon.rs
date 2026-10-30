@@ -169,7 +169,17 @@ impl Fixture {
                 "max_active_sockets_per_uid = 4",
                 "max_active_sockets_per_uid = 2",
             )
-            .replace("request_deadline_ms = 5000", "request_deadline_ms = 1500");
+            .replace("request_deadline_ms = 5000", "request_deadline_ms = 1500")
+            // This regression fixture deliberately exceeds production-default
+            // rate windows; dedicated Phase 4.5 cases test those defaults.
+            .replace(
+                "request_admissions_global = 256",
+                "request_admissions_global = 4096",
+            )
+            .replace(
+                "request_admissions_per_uid = 16",
+                "request_admissions_per_uid = 4096",
+            );
         for name in [
             "collector-ca.pem",
             "collector-client.crt",

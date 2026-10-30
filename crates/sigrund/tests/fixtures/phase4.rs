@@ -737,13 +737,17 @@ fn blocked_io_remains_bounded_and_responsive() {
             retained, 1,
             "{point}: snapshots released before durable reconciliation"
         );
-        gate.release();
+        // Both decisions must arrive while the durable operation is STILL
+        // gated. This is the wire-level deadline proof missing from Phase 4.
         assert_eq!(decision(&mut partial).status, "REQUEST_TIMEOUT", "{point}");
         assert_eq!(
             decision(&mut excess).status,
             "RESOURCE_EXHAUSTED",
             "{point}"
         );
+        expect_closed(&mut partial);
+        expect_closed(&mut excess);
+        gate.release();
         drop((partial, excess));
         assert_eq!(count(&f), 1);
         assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");

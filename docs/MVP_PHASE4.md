@@ -24,6 +24,25 @@ test-process environment settings under `LD_PRELOAD`, with no production test
 switches. A close after the final COMMIT check may still consume the grant;
 the fixture expects reconciliation, not an impossible check/syscall guarantee.
 
+Phase 4.5 corrective gate evidence:
+
+- `phase4::blocked_io_remains_bounded_and_responsive` reads `REQUEST_TIMEOUT`
+  and `RESOURCE_EXHAUSTED` frames before releasing a blocked WAL/audit sync.
+  The denial path publishes through the control socket immediately while its
+  reserved audit lease remains queued and bounded; a later audit completion
+  cannot publish a second decision.
+- `admission` tests exercise fixed per-UID/global windows, bounded UID state,
+  reload debt, diagnostic coalescing and ownership release after delayed
+  persistence. `storage` tests exercise checked `fstatvfs` arithmetic, log
+  high-water and free-space floors, all pinned filesystems, and sticky
+  fail-closed pressure.
+- The sequencer performs capacity checks off the event loop before every
+  append. Startup validates the same thresholds before listeners are exposed.
+  Phase 5 remains responsible for the pre-FD-4 setup implementation, the
+  pending-spawn/reaper barrier, and shutdown reconciliation; those contracts
+  are frozen in the specification and roadmap but are not claimed as runtime
+  features here.
+
 The implement/verify/fix loop also corrected these issues:
 
 - Final authorization now rehashes the actual sealed bytes, checks retained
