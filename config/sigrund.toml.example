@@ -44,3 +44,4 @@ max_ttl_secs = 31536000
 # hooks_enabled = false
 # pty_enabled = false
 # max_active_approval_requests = 1
+# approval_signer_id = "mandator-alice-yubikey"

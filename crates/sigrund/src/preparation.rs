@@ -6,6 +6,7 @@ use crate::{
     workers::{MeasuredSnapshots, ValidatedRequest},
 };
 use sigrund_core::{
+    approval::{ApprovalRequest, ApprovalResponse},
     config::{SignerConfig, SignerPolicyFile},
     crypto::{new_uuidv7, verify_ssh_signature},
     paths::select_root,
@@ -34,16 +35,19 @@ pub(crate) struct Context {
 #[derive(Debug)]
 pub(crate) struct Failure {
     pub status: &'static str,
-    message: &'static str,
+    message: String,
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for Failure {}
-fn fail(status: &'static str, message: &'static str) -> io::Error {
-    io::Error::other(Failure { status, message })
+fn fail(status: &'static str, message: impl Into<String>) -> io::Error {
+    io::Error::other(Failure {
+        status,
+        message: message.into(),
+    })
 }
 fn snapshot_error(error: io::Error, status: &'static str) -> io::Error {
     match error.kind() {
@@ -81,10 +85,9 @@ pub(crate) struct Prepared {
     pub null_stdin: Option<OwnedFd>,
 }
 
-pub(crate) fn prepare(
+pub(crate) fn check_unsigned_policy(
     request: &mut ValidatedRequest,
     context: &Context,
-    budget: &SnapshotBudget,
     gid: u32,
 ) -> io::Result<()> {
     request.check()?;
@@ -95,6 +98,76 @@ pub(crate) fn prepare(
         .is_some_and(|p| p.ttl_secs > request.policy.max_ttl_secs)
     {
         return Err(fail("POLICY_VIOLATION", "TTL exceeds captured policy"));
+    }
+    if request.hello.mode == "unsigned_csr_request"
+        && let Some(profile) = &request.policy.mvp
+        && !profile.approval_signer_id.is_empty()
+    {
+        let now = realtime()?;
+        let candidate = Csr::from_unsigned(
+            &request.hello,
+            CsrIdentity {
+                grant_id: new_uuidv7().to_string(),
+                host_id: context.host_id.clone(),
+                requester_uid: request.requester_uid,
+                requester_gid: gid,
+                now,
+            },
+            SnapshotDigests {
+                executable_sha256: "0".repeat(64),
+                stdin_sha256: request
+                    .hello
+                    .requested_command
+                    .as_ref()
+                    .filter(|c| c.stdin_policy == "sha256")
+                    .map(|_| "0".repeat(64)),
+            },
+            request.policy.max_ttl_secs,
+        )
+        .map_err(|_| fail("POLICY_VIOLATION", "request exceeds policy bounds"))?;
+        let signer = context
+            .signers
+            .signers
+            .iter()
+            .find(|s| s.signer_id == profile.approval_signer_id)
+            .ok_or_else(|| fail("POLICY_VIOLATION", "approval signer unavailable"))?;
+        select_root(
+            std::path::Path::new(&candidate.warrant().command.executable_path),
+            &signer.allowed_executable_dirs,
+        )
+        .map_err(|_| {
+            fail(
+                "POLICY_VIOLATION",
+                "executable outside approval signer roots",
+            )
+        })?;
+        if !static_policy(
+            signer,
+            candidate.warrant(),
+            request.requester_uid,
+            gid,
+            &context.host_id,
+            &request.policy,
+        ) {
+            return Err(fail(
+                "POLICY_VIOLATION",
+                "request exceeds approval signer policy",
+            ));
+        }
+    }
+    request.unsigned_policy_checked = true;
+    request.check()
+}
+
+pub(crate) fn prepare(
+    request: &mut ValidatedRequest,
+    context: &Context,
+    budget: &SnapshotBudget,
+    gid: u32,
+) -> io::Result<()> {
+    request.check()?;
+    if request.hello.mode == "unsigned_csr_request" && !request.unsigned_policy_checked {
+        check_unsigned_policy(request, context, gid)?;
     }
     let signed = if let Some(envelope) = &request.hello.dsse_envelope {
         let warrant = envelope
@@ -294,6 +367,139 @@ fn static_policy(
         })
 }
 
+fn realtime() -> io::Result<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .ok_or_else(|| fail("INVALID_REQUEST", "clock outside timestamp bounds"))
+}
+
+/// Broker transport, parsing and crypto remain on the original reserved worker.
+/// The coordinator owns the slot, deadline and cancellation handle.
+pub(crate) fn approve(
+    request: &mut ValidatedRequest,
+    context: &Context,
+    gid: u32,
+    approval: ApprovalRequest,
+    socket: OwnedFd,
+) -> io::Result<()> {
+    use crate::transport::{ApprovalReader, FrameWriter};
+    let exchange = (|| -> io::Result<ApprovalResponse> {
+        let mut writer = FrameWriter::approval(
+            &approval
+                .to_jcs()
+                .map_err(|e| io::Error::other(e.to_string()))?,
+            std::time::Instant::now(),
+        )?;
+        loop {
+            request.check()?;
+            if writer.write(socket.as_raw_fd(), std::time::Instant::now())? {
+                break;
+            }
+            broker_poll(socket.as_raw_fd(), libc::POLLOUT)?;
+        }
+        let mut reader = ApprovalReader::default();
+        loop {
+            request.check()?;
+            if let Some(bytes) = reader.read(socket.as_raw_fd(), std::time::Instant::now())? {
+                request.check()?;
+                return ApprovalResponse::parse_jcs(&bytes)
+                    .map_err(|e| io::Error::other(e.to_string()));
+            }
+            broker_poll(socket.as_raw_fd(), libc::POLLIN)?;
+        }
+    })()
+    .map_err(|_| {
+        fail(
+            "TIMEOUT_CSR",
+            "approval connection lost, expired or malformed",
+        )
+    })?;
+    request
+        .check()
+        .map_err(|_| fail("TIMEOUT_CSR", "approval deadline expired"))?;
+    let warrant = approval
+        .bind_response(&exchange)
+        .map_err(|_| fail("POLICY_VIOLATION", "approval differs from retained request"))?;
+    let Some(warrant) = warrant else {
+        let ApprovalResponse::Rejected { reason, .. } = exchange else {
+            unreachable!()
+        };
+        return Err(fail("REJECTED", crate::client::escaped(&reason)));
+    };
+    let ApprovalResponse::Approved { dsse_envelope, .. } = exchange else {
+        unreachable!()
+    };
+    let signer = context
+        .signers
+        .signers
+        .iter()
+        .find(|s| s.signer_id == approval.signer_id)
+        .ok_or_else(|| fail("POLICY_VIOLATION", "approval signer unavailable"))?;
+    if !static_policy(
+        signer,
+        warrant.warrant(),
+        request.requester_uid,
+        gid,
+        &context.host_id,
+        &request.policy,
+    ) {
+        return Err(fail(
+            "POLICY_VIOLATION",
+            "approved request exceeds captured signer policy",
+        ));
+    }
+    let sig = &dsse_envelope.signatures[0];
+    verify_ssh_signature(
+        &signer.signature_type,
+        &signer.public_key,
+        &sig.sig,
+        &dsse_envelope.payload_type,
+        warrant.as_bytes(),
+        signer.require_user_presence,
+        signer.require_user_verification,
+    )
+    .map_err(|_| fail("POLICY_VIOLATION", "approval signature verification failed"))?;
+    let now = realtime()?;
+    if now < warrant.warrant().policy.not_before
+        || warrant
+            .warrant()
+            .policy
+            .not_after
+            .is_none_or(|end| now > end)
+    {
+        return Err(fail(
+            "EXPIRED_OR_NOT_YET_VALID",
+            "approved warrant expired or not yet valid",
+        ));
+    }
+    request.check()?;
+    let prepared = request
+        .prepared
+        .as_mut()
+        .expect("retained snapshots and CSR");
+    prepared.document = Document::Signed {
+        warrant,
+        signer_id: signer.signer_id.clone(),
+    };
+    Ok(())
+}
+
+fn broker_poll(fd: i32, events: i16) -> io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut descriptor, 1, 20) } < 0
+        && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +645,7 @@ mod tests {
                 hello,
                 rights,
                 snapshots: None,
+                unsigned_policy_checked: false,
                 prepared: None,
                 policy: self.config.clone(),
                 requester_uid: 1001,

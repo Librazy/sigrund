@@ -21,9 +21,11 @@ approval profile; the remaining v1.0 features retain their existing requirements
 
 ## Current status
 
-Phases 0 and 1 provide the contracts and foreground socket service. The daemon
-validates requests and returns an explicit rejection while execution awaits
-Phases 2–5. The client and approver execution paths remain unavailable.
+Phases 0–3 provide the contracts, foreground socket service, requester relays,
+sealed snapshots and root TTY approval with OpenSSH signing. The daemon verifies
+the returned signature and exact CSR, then returns an explicit rejection while
+durable authorization and command execution await Phases 4–5. Phase 3 evidence
+and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md).
 
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
@@ -33,7 +35,7 @@ Phases 2–5. The client and approver execution paths remain unavailable.
 - [x] Phase 1.5: cleanup isolation, retained request ownership, root pinning,
   streaming snapshot foundations and updated request-profile gates.
 - [x] Phase 2: client transport and common snapshots.
-- [ ] Phase 3: root TTY approval and SSH signing.
+- [x] Phase 3: root TTY approval and SSH signing.
 - [ ] Phase 4: authorization, commit, and local audit integration.
 - [ ] Phase 5: child execution and exit relay.
 - [ ] Phase 6: two-UID end-to-end fixture.
@@ -142,9 +144,9 @@ enforces the profile for hand-crafted requests.
 | `--status-fd N`, `--auth-fail-exit-code CODE` | Implement Section 2.1 status JSON and exit semantics; default denial exit 255, protocol/disconnect failure 254, ordinary usage error 64. Keep status output separate from child output. |
 
 For the unsigned human-approval path, the daemon uses a root-configured
-`mvp.approval_signer_id` selecting exactly one SSH signer. Phase 3 adds that
-required execution-profile setting and tests it; it is not accepted by today's
-Phase 0 parser. The approver gains `--signers PATH` and `--identity PATH`:
+`mvp.approval_signer_id` selecting exactly one SSH signer. Phase 3 implements
+and tests that setting. An empty value preserves CSR-only behavior; execution
+requires an explicit signer. The approver accepts `--signers PATH` and `--identity PATH`:
 the former loads the same root-owned public signer policy, and the latter
 selects a private key or public key backed by root's SSH agent. There is no
 first-key-in-agent fallback. The selected key must match the requested signer.
@@ -308,8 +310,9 @@ separate directory pinning from file opens, retain validated request and quota
 ownership across continuations, supply bounded streaming/sealed snapshot
 builders, and enforce the expanded thin-profile restrictions before metadata.
 Run the focused probes, fix failures, then run the full Phase 0/1 regressions
-and minimum-toolchain/Clippy/formatting gates. Signing-key selection remains
-Phase 3 work; the normal client and authorization runtime remain unavailable.
+and minimum-toolchain/Clippy/formatting gates. At that phase boundary, client
+transport and signing-key selection remained Phases 2–3 work. Those phases
+are now complete; durable authorization and execution remain Phases 4–5.
 
 ### Phase 2: client hello and common snapshots
 

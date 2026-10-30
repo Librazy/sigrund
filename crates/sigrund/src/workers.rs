@@ -30,6 +30,7 @@ pub(crate) struct ValidatedRequest {
     pub rights: Vec<OwnedFd>,
     pub snapshots: Option<MeasuredSnapshots>,
     pub prepared: Option<crate::preparation::Prepared>,
+    pub unsigned_policy_checked: bool,
     pub policy: Arc<DaemonConfig>,
     pub requester_uid: u32,
     pub deadline: Instant,
@@ -73,6 +74,16 @@ impl RequestLease {
     }
     pub fn prepared(&self) -> Option<&crate::preparation::Prepared> {
         self.request.as_ref().expect("live lease").prepared.as_ref()
+    }
+    pub fn unsigned_policy_checked(&self) -> bool {
+        self.request
+            .as_ref()
+            .expect("live lease")
+            .unsigned_policy_checked
+    }
+    /// Only the coordinator calls this after winning the snapshot handoff CAS.
+    pub fn begin_approval(&mut self, deadline: Instant) {
+        self.request.as_mut().expect("live lease").deadline = deadline;
     }
     pub fn continue_on_worker(
         mut self,
@@ -226,6 +237,7 @@ fn read_request(
         rights: frame.rights,
         snapshots: None,
         prepared: None,
+        unsigned_policy_checked: false,
         policy,
         requester_uid: uid,
         deadline,

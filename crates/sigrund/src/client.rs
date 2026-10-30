@@ -26,12 +26,12 @@ use std::{
     time::Instant,
 };
 
-struct Signals {
-    fd: OwnedFd,
+pub(crate) struct Signals {
+    pub(crate) fd: OwnedFd,
     previous: libc::sigset_t,
 }
 impl Signals {
-    fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         let mut mask = unsafe { zeroed() };
         let mut previous = unsafe { zeroed() };
         unsafe {
@@ -56,7 +56,7 @@ impl Signals {
             previous,
         })
     }
-    fn next(&self) -> io::Result<Option<u8>> {
+    pub(crate) fn next(&self) -> io::Result<Option<u8>> {
         let mut info: libc::signalfd_siginfo = unsafe { zeroed() };
         let n = unsafe {
             libc::read(
@@ -143,7 +143,7 @@ fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Result<()> {
     }
     Ok(())
 }
-fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
+pub(crate) fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
     let bytes = path.as_os_str().as_bytes();
     if bytes.len() >= 108 || bytes.contains(&0) {
         return Err(io::Error::other("invalid socket path"));
@@ -340,7 +340,7 @@ impl Writer {
         Ok(())
     }
 }
-fn escaped(message: &str) -> String {
+pub(crate) fn escaped(message: &str) -> String {
     let mut out = String::new();
     for ch in message.chars() {
         if (' '..='~').contains(&ch) && ch != '\\' && ch != '"' {

@@ -632,3 +632,37 @@ fn phase15_profile_restrictions_apply_to_signed_and_unsigned_requests() {
         assert!(profile.validate_for_peer(&hello, 1001).is_err());
     }
 }
+
+#[test]
+fn approval_signer_selection_is_explicit_bounded_and_unambiguous() {
+    let mut policy =
+        SignerPolicyFile::from_toml(include_bytes!("../../../config/signers.toml.example"))
+            .unwrap();
+    policy.signers[0].signature_type = "ssh-ed25519".into();
+    policy.signers[0].require_user_presence = false;
+    policy.signers[0].public_key = ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(
+        SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes(),
+    ))
+    .to_openssh()
+    .unwrap();
+    let selected = format!(
+        "[mvp]\napproval_signer_id = {:?}",
+        policy.signers[0].signer_id
+    );
+    let cfg = config(&selected).unwrap();
+    policy.validate_against(&cfg).unwrap();
+    assert!(
+        policy
+            .validate_against(&config("[mvp]\napproval_signer_id = 'absent'").unwrap())
+            .is_err()
+    );
+    policy.signers.push(policy.signers[0].clone());
+    assert!(policy.validate_against(&cfg).is_err());
+    for id in ["x".repeat(129), "λ".into(), "bad\nidentity".into()] {
+        let profile = MvpProfile {
+            approval_signer_id: id,
+            ..MvpProfile::default()
+        };
+        assert!(profile.validate().is_err());
+    }
+}

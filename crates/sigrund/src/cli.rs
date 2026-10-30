@@ -10,9 +10,9 @@ use std::{
 
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
-pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nPhase 1 accepts and validates requests; execution requires roadmap Phases 2–5.";
-pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nPhase 2 returns a canonical CSR; approval and execution require Phases 3–5.";
-pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH]\nDefaults: /run/sigrund-approve.sock and /dev/tty.\nTTY approval and SSH signing are scheduled for roadmap Phase 3.";
+pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nPhase 3 verifies snapshots and root approval; execution requires roadmap Phases 4–5.";
+pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nPhase 3 supports root approval; execution requires Phases 4–5.";
+pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty and /etc/sigrund/signers.toml.\nOnly UID 0 with a controlling TTY may approve and sign.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonMode {
@@ -294,6 +294,8 @@ fn identity(value: &str) -> Result<u32> {
 pub struct ApprovalArgs {
     pub socket: PathBuf,
     pub tty: PathBuf,
+    pub signers: PathBuf,
+    pub identity: Option<PathBuf>,
 }
 
 impl ApprovalArgs {
@@ -301,6 +303,8 @@ impl ApprovalArgs {
         let mut result = Self {
             socket: APPROVAL_SOCKET.into(),
             tty: "/dev/tty".into(),
+            signers: "/etc/sigrund/signers.toml".into(),
+            identity: None,
         };
         let mut seen = BTreeSet::new();
         let mut args = args.iter();
@@ -311,8 +315,13 @@ impl ApprovalArgs {
             match arg.as_str() {
                 "--socket" => result.socket = path_value(&mut args)?,
                 "--tty" => result.tty = path_value(&mut args)?,
+                "--signers" => result.signers = path_value(&mut args)?,
+                "--identity" => result.identity = Some(path_value(&mut args)?),
                 _ => return Err(invalid("unknown approval option")),
             }
+        }
+        if result.identity.is_none() {
+            return Err(invalid("--identity is required"));
         }
         Ok(result)
     }

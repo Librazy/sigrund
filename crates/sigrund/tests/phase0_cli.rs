@@ -29,6 +29,8 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
         "/tmp/approve.sock",
         "--tty",
         "/dev/pts/1",
+        "--identity",
+        "/root/.ssh/id_ed25519",
     ]))
     .unwrap();
     assert_eq!(approver.socket.to_str(), Some("/tmp/approve.sock"));
@@ -56,7 +58,10 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
         ClientArgs::Run { .. }
     ));
     assert_eq!(
-        ApprovalArgs::parse(&[]).unwrap().tty.to_str(),
+        ApprovalArgs::parse(&args(&["--identity", "/root/.ssh/id_ed25519"]))
+            .unwrap()
+            .tty
+            .to_str(),
         Some("/dev/tty")
     );
 }
@@ -112,7 +117,7 @@ fn invalid_or_ambiguous_cli_forms_are_rejected() {
 }
 
 #[test]
-fn shipped_binaries_expose_help_and_do_not_claim_runtime_is_available() {
+fn shipped_binaries_expose_help_and_reject_invalid_or_unavailable_invocations() {
     for binary in [
         env!("CARGO_BIN_EXE_sigrun"),
         env!("CARGO_BIN_EXE_sigrund"),
@@ -147,7 +152,7 @@ fn shipped_binaries_expose_help_and_do_not_claim_runtime_is_available() {
             .unwrap()
             .status
             .code(),
-        Some(78)
+        Some(64)
     );
 }
 
@@ -223,4 +228,28 @@ fn validate_hello_rejects_noncanonical_signed_warrant_through_cli() {
             .code(),
         Some(65)
     );
+}
+
+#[test]
+fn approver_requires_operator_controlled_identity_and_policy_options() {
+    let parsed = ApprovalArgs::parse(&args(&[
+        "--signers",
+        "/root/policy.toml",
+        "--identity",
+        "/root/.ssh/id_ed25519.pub",
+    ]))
+    .unwrap();
+    assert_eq!(parsed.signers.to_str(), Some("/root/policy.toml"));
+    assert_eq!(
+        parsed.identity.unwrap().to_str(),
+        Some("/root/.ssh/id_ed25519.pub")
+    );
+    for argv in [
+        vec!["--identity"],
+        vec!["--identity", "relative"],
+        vec!["--signers", "/a", "--signers", "/b"],
+        vec!["--identity", "/a", "--identity", "/b"],
+    ] {
+        assert!(ApprovalArgs::parse(&args(&argv)).is_err());
+    }
 }

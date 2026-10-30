@@ -89,6 +89,9 @@ pub struct MvpProfile {
     pub hooks_enabled: bool,
     pub pty_enabled: bool,
     pub max_active_approval_requests: u32,
+    /// Empty preserves the Phase 2 no-approver behavior; Phase 3 execution
+    /// requires an explicit configured signer identity.
+    pub approval_signer_id: String,
 }
 
 impl Default for MvpProfile {
@@ -98,13 +101,24 @@ impl Default for MvpProfile {
             hooks_enabled: false,
             pty_enabled: false,
             max_active_approval_requests: 1,
+            approval_signer_id: String::new(),
         }
     }
 }
 
 impl MvpProfile {
     pub fn validate(&self) -> Result<()> {
-        if self != &Self::default() {
+        if self.tty_mode != "stdio"
+            || self.hooks_enabled
+            || self.pty_enabled
+            || self.max_active_approval_requests != 1
+            || self.approval_signer_id.len() > 128
+            || !self.approval_signer_id.is_ascii()
+            || self
+                .approval_signer_id
+                .bytes()
+                .any(|b| b.is_ascii_control())
+        {
             return Err(CoreError::Config(
                 "MVP requires stdio, disabled hooks/PTY, and one active approval".into(),
             ));
@@ -332,6 +346,19 @@ impl SignerPolicyFile {
     }
 
     pub fn validate_against(&self, daemon: &DaemonConfig) -> Result<()> {
+        if let Some(profile) = &daemon.mvp
+            && !profile.approval_signer_id.is_empty()
+            && self
+                .signers
+                .iter()
+                .filter(|s| s.signer_id == profile.approval_signer_id)
+                .count()
+                != 1
+        {
+            return Err(CoreError::Config(
+                "approval_signer_id must select exactly one configured signer".into(),
+            ));
+        }
         let mut signer_ids = BTreeSet::new();
         for signer in &self.signers {
             if daemon.mvp.is_some()

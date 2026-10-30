@@ -187,6 +187,29 @@ fn bounded_transport_fragmentation_ancillary_ownership_and_deadlines() {
             .kind(),
         io::ErrorKind::TimedOut
     );
+    // Human waiting precedes the first broker byte. Once framing starts,
+    // additional bytes cannot extend the independent five-second deadline.
+    let (mut sender, receiver) = pair();
+    let mut reader = ApprovalReader::default();
+    assert!(reader.read(receiver.as_raw_fd(), now).unwrap().is_none());
+    assert!(reader.deadline().is_none());
+    sender.write_all(&[0]).unwrap();
+    assert!(reader.read(receiver.as_raw_fd(), now).unwrap().is_none());
+    sender.write_all(&[0]).unwrap();
+    assert!(
+        reader
+            .read(receiver.as_raw_fd(), now + Duration::from_secs(1))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(reader.deadline(), Some(now + FRAME_TIMEOUT));
+    assert_eq!(
+        reader
+            .read(receiver.as_raw_fd(), now + FRAME_TIMEOUT)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
     // Hostile advertised sizes are rejected without waiting for the body.
     for header in [[1, 0, 3, 0, 1], [1, 0, 0, 0, 0], [255, 0, 0, 0, 1]] {
         let (mut sender, receiver) = pair();

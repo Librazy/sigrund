@@ -15,9 +15,9 @@ post-clone safety gates. Specification Section 6.3 now defines the target
 local-approval profile, including a required execution-time
 `mvp.approval_signer_id`. Phase 1.5 implements received-FD cleanup, retained
 request/snapshot ownership, root pinning, streaming snapshot builders and
-request-profile restrictions. The configuration parser still accepts only
-the original four `[mvp]` fields; signer selection, client/approval options
-and runtime integration belong to Phases 2–5.
+request-profile restrictions. Phases 2–3 add client options and relays, common
+snapshots, explicit signer/key selection, and foreground root approval. Durable
+authorization and execution remain Phases 4–5.
 M-01–M-15 and applicable V subcases gate the revised MVP. The Phase 0/1 evidence
 documents remain records of what was actually implemented and tested.
 
@@ -70,8 +70,8 @@ capacity to one. The profile is retained in captured policy generations. Only
 SSH Ed25519 signer adapters are accepted under that profile. The shared CLI
 parser defines daemon/client/approver commands and separate socket overrides;
 all three commands expose `--help`. The `sigrun` runtime now implements the
-Phase 2 requester path; `sigrund-approve` still reports its unavailable runtime
-with status 78 until Phase 3.
+Phase 2 requester path; `sigrund-approve` implements the Phase 3 root-TTY
+approval and SSH signing path described below.
 
 The implement/verify/fix loop exercised golden canonical bytes, UTF-16 key
 ordering, maximum-size round trips, invalid schema and encoding cases,
@@ -193,6 +193,29 @@ rejection after preparation.
 Focused implementation–verification–fix evidence is recorded in
 [docs/MVP_PHASE2.md](docs/MVP_PHASE2.md).
 
+## Completed roadmap Phase 3
+
+[docs/MVP_PHASE3.md](docs/MVP_PHASE3.md) maps each deliverable to its
+verification evidence. The daemon reserves one unsigned approval slot after
+static policy checks and before snapshots. It uses the same reserved worker,
+sealed executable/stdin, captured policy and exact CSR for broker exchange and
+SSH verification. No approver, refusal, busy admission, expiry and disconnect
+have bounded outcomes; cancellation invalidates the prompt and retains worker,
+FD and RAM reservations through cleanup.
+
+`sigrund-approve` validates UID 0, its foreground controlling TTY, the trusted
+broker and root-controlled policy/identity. It displays every CSR field with
+escaped indexed arguments and signs only explicit `y`/`yes`. OpenSSH receives
+fixed arguments and DSSE PAE on stdin; the helper is bounded, killed and reaped
+on abort, and its signature is verified locally before delivery. Actual PTY
+fixtures cover software keys, encrypted private-key passphrase entry and
+public keys backed by an SSH agent. Physical FIDO signing remains unverified;
+existing simulated SK verification does not establish hardware operation.
+
+The Phase 3 boundary deliberately rejects a successfully verified approval
+with `Snapshots verified; execution authorization requires Phase 4`. No grant
+is consumed, authorization audit record appended or elevated child created.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated
@@ -200,9 +223,9 @@ as production functionality:
 
 | Surface | Current behavior | Required integration |
 | --- | --- | --- |
-| `sigrund` | Runs the Phase 2 foreground socket service under `[mvp]`; unsigned requests snapshot and return a canonical `TIMEOUT_CSR`, while signed requests verify, snapshot, and return a bounded rejection. | Approval request dispatch, authorization/SQLite commit, cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
-| `sigrun` | `--validate-hello` and `--encode-signal` remain available; the normal command now implements Phase 2 hello transport, stdio relay, status reporting and signal/deadline handling. | Root approval/signing, PTY/window transport, authorization and child execution. |
-| `sigrund-approve` | Parses the frozen command form and provides `--help`; normal invocation exits with status 78. | Root peer/TTY verification, broker transport, sanitized prompting, SSH-agent/key signing, and bounded approval delivery. |
+| `sigrund` | Runs the Phase 3 foreground service under `[mvp]`; unsigned requests snapshot, dispatch root approval when configured/connected and verify the returned warrant. Successful verification still returns a bounded rejection. | Authorization/SQLite commit, cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
+| `sigrun` | `--validate-hello` and `--encode-signal` remain available; the normal command now implements Phase 2 hello transport, stdio relay, status reporting and signal/deadline handling. | PTY/window transport, authorization and child execution. |
+| `sigrund-approve` | Root peer/TTY verification, bounded broker transport, complete escaped prompting, OpenSSH key/agent signing and cancellation are implemented. | Physical FIDO signing evidence; native agent adapter is optional follow-on work. |
 | `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |
 | `sigrundctl` | UUID validation/generation and `init-host` provisioning are available. | Sealing/template commands, revocation administration, anchor-file output, safe ownership checks, and complete operator error handling. |
 | Verification matrix | No V-01 through V-19 end-to-end harness exists. | Linux integration fixtures and deterministic race gates required by every row of Section 8. |
@@ -215,8 +238,8 @@ provide any runtime security guarantee.
 ## Implementation order
 
 Follow [MVP_ROADMAP.md](MVP_ROADMAP.md) as the delivery order: preserve the
-completed transport gates and Phase 1.5 foundations, then add client/relay/snapshots (Phase 2), root
-approval/signing (Phase 3), authorization/commit/local audit (Phase 4), cgroup
+completed transport, snapshot and root-approval gates (Phases 0–3), then add
+authorization/commit/local audit (Phase 4), cgroup
 startup/child setup/reaping (Phase 5), and complete execution fixtures (Phase 6).
 Implement the applicable security subcases alongside each phase. PTY, hooks,
 remote replication, reload and additional signature adapters follow the thin

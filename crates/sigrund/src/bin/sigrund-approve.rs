@@ -7,12 +7,22 @@ fn main() -> ExitCode {
         println!("{APPROVAL_HELP}");
         return ExitCode::SUCCESS;
     }
-    if let Err(error) = ApprovalArgs::parse(&args) {
-        eprintln!("sigrund-approve: {error}\n{APPROVAL_HELP}");
-        return ExitCode::from(64);
+    let parsed = match ApprovalArgs::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("sigrund-approve: {error}\n{APPROVAL_HELP}");
+            return ExitCode::from(64);
+        }
+    };
+    match sigrund::approver::run(&parsed) {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("sigrund-approve: {error}");
+            ExitCode::from(if error.kind() == std::io::ErrorKind::InvalidInput {
+                64
+            } else {
+                78
+            })
+        }
     }
-    eprintln!(
-        "sigrund-approve: TTY approval and SSH signing are not enabled; see MVP_ROADMAP.md Phase 3"
-    );
-    ExitCode::from(78)
 }

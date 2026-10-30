@@ -1695,3 +1695,6 @@ fn phase1_peer_probe() {
         role => panic!("unexpected role {role}"),
     }
 }
+
+#[path = "fixtures/phase3.rs"]
+mod phase3;

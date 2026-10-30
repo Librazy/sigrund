@@ -1,3 +1,4 @@
+pub mod approver;
 pub mod cli;
 pub mod client;
 pub mod daemon;
