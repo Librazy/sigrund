@@ -27,9 +27,9 @@ The repository currently contains tested building blocks for:
 - bounded frame encoding/decoding and the exact `CLIENT_HELLO`, decision,
   child-exit, and remote-batch shape validators.
 
-The current workspace suite has 67 tests and Clippy is clean. These tests exercise
-the primitives above; they are not substitutes for the verification matrix in
-Section 8 of the specification.
+The workspace suite includes the primitives above and a Phase 1 real-daemon
+fixture with namespace-root and non-root peers. These tests are not substitutes
+for the complete verification matrix in Section 8 of the specification.
 
 The minimum supported Rust version is 1.89, matching the active Linux locked
 dependencies (including `uuid` 1.29). The complete workspace test suite is
@@ -74,6 +74,48 @@ on output, and the raw hello parser checks original wire lengths before
 deserialization and the unsigned limit after mode selection. Exact-ceiling
 tests cover both request modes and the unsigned serialized body.
 
+## Phase 1: foreground startup and sockets
+
+The normal daemon path now runs a nonblocking epoll loop under the opt-in MVP
+profile. It verifies root ownership and permissions, pins executable roots and
+collector files, derives and checks the provisioned host identity, locks the
+state directory, removes a safe stale ratchet temporary file, and completes
+host-bound audit recovery before binding the sockets. The client endpoint is
+`root:root 0666`; the separate approval broker is `root:root 0600` and checks
+`SO_PEERCRED.uid == 0` before allocating a broker parser or receiving bytes.
+
+Admission enforces configured global/per-UID socket limits at `accept4()`.
+Every control receive uses `recvmsg(MSG_CMSG_CLOEXEC | MSG_DONTWAIT)` with
+bounded ancillary storage. Framing retains cumulative receive/send deadlines,
+checks the exact stdio FD matrix, and closes all pending/delivered rights on
+failure. A valid hello produces a `CLIENT_HELLO_VALIDATED` diagnostic with the
+kernel peer identity and one explicit `REJECTED` decision. Unsolicited broker
+responses never authorize a request. Diagnostics use a bounded off-loop queue;
+they are separate from the Phase 4 authorization audit records.
+
+Descriptor metadata validation runs on fixed off-loop workers, since even
+`fstat()` can block on FUSE or remote filesystems. Global/per-UID worker quotas
+and received FDs remain owned by a task after timeout/disconnect until actual
+cleanup; cancellation checks surround the metadata calls. Completion arrives
+through eventfd, and late results cannot change a terminal decision. Shutdown
+never joins a stalled worker. Invalid `SO_PEERCRED` results, including PID zero
+from an ancestor PID namespace, reject only the individual connection.
+
+The implement/verify/fix loop added socketpair probes and a real-daemon fixture
+inside an unprivileged user namespace, with mapped UID 0, 65533, and 65534.
+Verification caught an inaccessible test executable for non-root peers and
+missing context on audit startup errors; both were corrected. Final inspection
+also added raw path-component validation before `Path` can normalize spelling
+and replaced timing guesses in admission tests with observed admission events.
+The fixture checks both audit recovery cases, host binding, startup refusal,
+actual quotas/deadlines, shutdown cleanup, and unchanged daemon FD counts after
+hostile requests. See [docs/MVP_PHASE1.md](docs/MVP_PHASE1.md) for the gate and
+its prerequisites.
+Review regressions additionally gate `fstat()` in the real daemon to verify
+worker isolation, quota pinning, late-result suppression, and responsive
+shutdown. A child PID-namespace fixture verifies that unmappable peers cannot
+stop either listener and that valid peers still work afterward.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated
@@ -81,7 +123,7 @@ as production functionality:
 
 | Surface | Current behavior | Required integration |
 | --- | --- | --- |
-| `sigrund` | Reads and validates configuration and signer policy, optionally runs the cgroup check, then exits with status 78. | Startup recovery, root pinning, socket creation, epoll ownership, admission quotas, authorization, hooks, audit replication, `clone3`, child reaping, and reload handling. |
+| `sigrund` | Runs the Phase 1 foreground socket service under `[mvp]`; validated hellos receive an explicit rejection. Validation/cgroup probes remain available. | Common snapshots, approval request dispatch, authorization/SQLite commit, cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
 | `sigrun` | `--validate-hello` and `--encode-signal` are available; the normal command exits with status 78. | SCM_RIGHTS/PTY transport, hello construction, snapshots, status-fd output, signal/window relaying, deadline handling, and terminal cleanup. |
 | `sigrund-approve` | Parses the frozen command form and provides `--help`; normal invocation exits with status 78. | Root peer/TTY verification, broker transport, sanitized prompting, SSH-agent/key signing, and bounded approval delivery. |
 | `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |

@@ -67,8 +67,9 @@ sigrun --encode-signal 15
 TTY equality, and caller environment as well as its outer shape. It does not
 verify signatures or grant authorization. The signal diagnostic accepts only
 the specification's five forwarding signals: 1, 2, 10, 12, and 15.
-Normal daemon/client/approver commands currently return status 78 because
-transport, prompting, and execution belong to Phases 1–5.
+Normal client/approver commands currently return status 78. The daemon now
+provides the Phase 1 socket service described in [MVP_PHASE1.md](MVP_PHASE1.md);
+prompting and execution still belong to subsequent phases.
 
 ## Canonical warrant and CSR
 
@@ -179,6 +180,6 @@ explicit config paths, invalid profiles, and signed-hello validation, and
 tests exact argv/socket parsing. The SSH unit tests also verify successful
 software and simulated security-key SSHSIG signatures with UP/UV enforcement.
 
-Passing these gates completes Phase 0. A working socket, root TTY prompt,
-two-UID execution, and the M-01–M-10 runtime matrix remain the exit gates of
-the subsequent roadmap phases.
+Passing these gates completes Phase 0. Phase 1 adds working sockets; a root
+TTY prompt, two-UID execution, and the M-01–M-10 runtime matrix remain gates
+of the subsequent roadmap phases.

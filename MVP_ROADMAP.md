@@ -20,15 +20,15 @@ scope decision; it does not change the v1.0 specification.
 
 ## Current status
 
-The repository is at the foundation stage. The normal daemon and client
-commands below are target interfaces for the roadmap; they are not available
-until Phases 1–5 are complete.
+Phases 0 and 1 provide the contracts and foreground socket service. The daemon
+validates requests and returns an explicit rejection while execution awaits
+Phases 2–5. The client and approver execution paths remain unavailable.
 
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
 - [x] Raw `ssh-ed25519` and `sk-ssh-ed25519` SSHSIG verification helpers.
 - [x] Phase 0: thin-MVP types and profile.
-- [ ] Phase 1: daemon and approval-broker sockets.
+- [x] Phase 1: daemon and approval-broker sockets.
 - [ ] Phase 2: client transport and common snapshots.
 - [ ] Phase 3: root TTY approval and SSH signing.
 - [ ] Phase 4: authorization, commit, and local audit integration.
@@ -140,6 +140,10 @@ The new types must reject unknown fields, duplicate keys, non-integer numbers,
 oversized strings/arrays, and mismatched CSR/warrant fields before any spawn.
 
 ### Phase 1: daemon startup and local sockets
+
+Completed. Startup, transport behavior, isolated two-UID verification, and
+operator commands are documented in [docs/MVP_PHASE1.md](docs/MVP_PHASE1.md).
+The service cannot yet authorize or execute a command.
 
 Deliverables:
 
