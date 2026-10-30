@@ -61,8 +61,10 @@ def main():
     try:
         group_fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
-            for control in ("cgroup.procs", "cgroup.kill", "cgroup.events"):
-                fd = os.open(control, os.O_RDONLY | os.O_CLOEXEC, dir_fd=group_fd)
+            for control, flags in (("cgroup.procs", os.O_WRONLY),
+                                   ("cgroup.kill", os.O_WRONLY),
+                                   ("cgroup.events", os.O_RDONLY)):
+                fd = os.open(control, flags | os.O_CLOEXEC, dir_fd=group_fd)
                 os.close(fd)
             pid = os.fork()
             if pid == 0:
