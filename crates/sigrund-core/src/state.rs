@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 use crate::{CoreError, Result, crypto::sha256_hex};
 
@@ -10,8 +11,6 @@ pub enum GrantMode {
     TimeRange,
     Permanent,
 }
-
-impl GrantMode {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorizationResult {
@@ -71,6 +70,7 @@ impl StateStore {
             ));
         }
         let digest = sha256_hex(request.payload);
+        let digest_bytes = Sha256::digest(request.payload);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -106,16 +106,27 @@ impl StateStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     request.grant_id,
-                    request.payload,
+                    digest_bytes.as_slice(),
                     request.signer_id,
                     request.requester_uid,
                     request.not_after.unwrap_or(0),
                     request.now
                 ],
             );
-            if inserted.is_err() {
+            if let Err(error) = inserted {
                 transaction.rollback().map_err(db)?;
-                return Ok(AuthorizationResult::ReplayDetected);
+                return match error {
+                    rusqlite::Error::SqliteFailure(ref code, _)
+                        if matches!(
+                            code.extended_code,
+                            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                                | rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        ) =>
+                    {
+                        Ok(AuthorizationResult::ReplayDetected)
+                    }
+                    _ => Err(db(error)),
+                };
             }
         }
         transaction.commit().map_err(db)?;
@@ -158,6 +169,79 @@ fn db(error: rusqlite::Error) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(grant_id: &str) -> AuthorizationRequest<'_> {
+        AuthorizationRequest {
+            grant_id,
+            payload: b"sensitive warrant payload",
+            signer_id: "signer",
+            requester_uid: 1001,
+            mode: GrantMode::OneTime,
+            not_before: 1,
+            not_after: Some(10),
+            now: 2,
+        }
+    }
+
+    #[test]
+    fn consumption_stores_raw_sha256_and_deduplicates_across_grant_ids() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        assert_eq!(
+            store.authorize(request("first")).unwrap(),
+            AuthorizationResult::Allowed
+        );
+        let (kind, stored): (String, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT typeof(payload_sha256), payload_sha256 FROM consumed_grants",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "blob");
+        assert_eq!(
+            stored,
+            Sha256::digest(b"sensitive warrant payload").to_vec()
+        );
+        assert_eq!(stored.len(), 32);
+        assert_eq!(
+            store.authorize(request("second")).unwrap(),
+            AuthorizationResult::ReplayDetected
+        );
+    }
+
+    #[test]
+    fn non_unique_insertion_failure_is_a_database_error() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        // A trigger produces a constraint error distinct from PK/UNIQUE.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_insert BEFORE INSERT ON consumed_grants
+             BEGIN SELECT RAISE(ABORT, 'injected store failure'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.authorize(request("unused")),
+            Err(CoreError::Database(_))
+        ));
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_insert;")
+            .unwrap();
+        assert_eq!(
+            store.authorize(request("unused")).unwrap(),
+            AuthorizationResult::Allowed
+        );
+        store
+            .connection
+            .execute_batch("DROP TABLE consumed_grants;")
+            .unwrap();
+        assert!(matches!(
+            store.authorize(request("another")),
+            Err(CoreError::Database(_))
+        ));
+    }
 
     #[test]
     fn one_time_grants_are_consumed_once() {

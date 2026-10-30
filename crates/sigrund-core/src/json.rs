@@ -6,6 +6,16 @@ use crate::{CoreError, Result};
 /// cannot provide: duplicate object members and maximum nesting/string sizes.
 /// Typed deserialization still runs after this preflight.
 pub fn preflight(bytes: &[u8], max_depth: usize, max_string_bytes: usize) -> Result<()> {
+    preflight_with_string_limits(bytes, max_depth, &|_| max_string_bytes)
+}
+
+/// Selects a decoded UTF-8 string limit by schema path. Array elements use
+/// `*`; object member names retain the ordinary 4096-byte ceiling.
+pub fn preflight_with_string_limits(
+    bytes: &[u8],
+    max_depth: usize,
+    string_limit: &dyn Fn(&[String]) -> usize,
+) -> Result<()> {
     if bytes.len() > 1_048_576 {
         return Err(CoreError::Json("JSON exceeds bounded input size".into()));
     }
@@ -13,7 +23,8 @@ pub fn preflight(bytes: &[u8], max_depth: usize, max_string_bytes: usize) -> Res
         bytes,
         pos: 0,
         max_depth,
-        max_string_bytes,
+        string_limit,
+        path: Vec::new(),
     };
     parser.value(0)?;
     parser.ws();
@@ -23,14 +34,15 @@ pub fn preflight(bytes: &[u8], max_depth: usize, max_string_bytes: usize) -> Res
     Ok(())
 }
 
-struct Parser<'a> {
+struct Parser<'a, 'b> {
     bytes: &'a [u8],
     pos: usize,
     max_depth: usize,
-    max_string_bytes: usize,
+    string_limit: &'b dyn Fn(&[String]) -> usize,
+    path: Vec<String>,
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_, '_> {
     fn ws(&mut self) {
         while self
             .bytes
@@ -49,7 +61,7 @@ impl<'a> Parser<'a> {
         match self.bytes.get(self.pos).copied() {
             Some(b'{') => self.object(depth + 1),
             Some(b'[') => self.array(depth + 1),
-            Some(b'"') => self.string().map(|_| ()),
+            Some(b'"') => self.string((self.string_limit)(&self.path)).map(|_| ()),
             Some(b't') => self.literal(b"true"),
             Some(b'f') => self.literal(b"false"),
             Some(b'n') => self.literal(b"null"),
@@ -68,8 +80,8 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.ws();
-            let key = self.string()?;
-            if !keys.insert(key) {
+            let key = self.string(4096)?;
+            if !keys.insert(key.clone()) {
                 return Err(CoreError::Json("duplicate object key".into()));
             }
             self.ws();
@@ -77,7 +89,9 @@ impl<'a> Parser<'a> {
                 return Err(CoreError::Json("object key is not followed by ':'".into()));
             }
             self.pos += 1;
+            self.path.push(key);
             self.value(depth)?;
+            self.path.pop();
             self.ws();
             match self.bytes.get(self.pos).copied() {
                 Some(b',') => self.pos += 1,
@@ -98,7 +112,9 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         loop {
+            self.path.push("*".into());
             self.value(depth)?;
+            self.path.pop();
             self.ws();
             match self.bytes.get(self.pos).copied() {
                 Some(b',') => self.pos += 1,
@@ -111,7 +127,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn string(&mut self) -> Result<String> {
+    fn string(&mut self, max_string_bytes: usize) -> Result<String> {
         let start = self.pos;
         if self.bytes.get(self.pos) != Some(&b'"') {
             return Err(CoreError::Json("expected JSON string".into()));
@@ -132,7 +148,7 @@ impl<'a> Parser<'a> {
                 let raw = &self.bytes[start..self.pos];
                 let value: String = serde_json::from_slice(raw)
                     .map_err(|e| CoreError::Json(format!("invalid string: {e}")))?;
-                if value.len() > self.max_string_bytes {
+                if value.len() > max_string_bytes {
                     return Err(CoreError::Json("JSON string exceeds size limit".into()));
                 }
                 if value.chars().any(is_forbidden_character) {
@@ -172,35 +188,18 @@ impl<'a> Parser<'a> {
             _ => return Err(CoreError::Json("invalid JSON number".into())),
         }
         if self.bytes.get(self.pos) == Some(&b'.') {
-            self.pos += 1;
-            let before = self.pos;
-            while self.bytes.get(self.pos).is_some_and(|b| b.is_ascii_digit()) {
-                self.pos += 1;
-            }
-            if before == self.pos {
-                return Err(CoreError::Json("invalid JSON fraction".into()));
-            }
+            return Err(CoreError::Json(
+                "protocol numbers must be decimal integers".into(),
+            ));
         }
         if self
             .bytes
             .get(self.pos)
             .is_some_and(|b| *b == b'e' || *b == b'E')
         {
-            self.pos += 1;
-            if self
-                .bytes
-                .get(self.pos)
-                .is_some_and(|b| *b == b'+' || *b == b'-')
-            {
-                self.pos += 1;
-            }
-            let before = self.pos;
-            while self.bytes.get(self.pos).is_some_and(|b| b.is_ascii_digit()) {
-                self.pos += 1;
-            }
-            if before == self.pos {
-                return Err(CoreError::Json("invalid JSON exponent".into()));
-            }
+            return Err(CoreError::Json(
+                "protocol numbers must be decimal integers".into(),
+            ));
         }
         if self.pos == start {
             return Err(CoreError::Json("empty JSON number".into()));

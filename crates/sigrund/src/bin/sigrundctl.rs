@@ -99,6 +99,7 @@ fn init_host(args: &[String]) -> ExitCode {
     let next_key = next_ratchet_key(&ratchet_key);
     let state = serde_json::json!({
         "key_hex": next_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "initial_key_hex": ratchet_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "last_record_sha256": sha256_hex(&record_bytes),
         "remote_acked_seq": 0,
         "seq": 1

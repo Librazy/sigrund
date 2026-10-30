@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use std::{
     collections::BTreeSet,
@@ -57,7 +58,6 @@ pub struct DaemonConfig {
     pub request_deadline_ms: u32,
     #[serde(default = "default_memory")]
     pub job_memory_max_bytes: u64,
-    #[serde(default)]
     pub job_memory_swap_max_bytes: u64,
     #[serde(default = "default_pids")]
     pub job_pids_max: u64,
@@ -220,8 +220,14 @@ impl SignerPolicyFile {
     }
 
     pub fn validate_against(&self, daemon: &DaemonConfig) -> Result<()> {
+        let mut signer_ids = BTreeSet::new();
         for signer in &self.signers {
+            if !signer_ids.insert(&signer.signer_id) {
+                return Err(CoreError::Config("duplicate signer_id".into()));
+            }
             if signer.signer_id.is_empty()
+                || signer.signer_id.len() > 128
+                || !signer.signer_id.is_ascii()
                 || signer.allowed_executable_dirs != daemon.csr_allowed_executable_dirs
             {
                 return Err(CoreError::Config(format!(
@@ -250,6 +256,110 @@ impl SignerPolicyFile {
             {
                 return Err(CoreError::Config(format!(
                     "signer {} contains overflow UID/GID",
+                    signer.signer_id
+                )));
+            }
+            if !matches!(
+                signer.signature_type.as_str(),
+                "raw-ed25519"
+                    | "ssh-ed25519"
+                    | "sk-ssh-ed25519"
+                    | "openpgp-v4-ed25519"
+                    | "sigstore-bundle-v0.3"
+            ) {
+                return Err(CoreError::Config(format!(
+                    "signer {} uses unsupported signature type",
+                    signer.signer_id
+                )));
+            }
+            if (signer.require_user_presence || signer.require_user_verification)
+                && signer.signature_type != "sk-ssh-ed25519"
+            {
+                return Err(CoreError::Config(format!(
+                    "signer {} requests hardware flags for a non-SK signature",
+                    signer.signer_id
+                )));
+            }
+            if signer.public_key.is_empty()
+                || signer.public_key.len() > 65_536
+                || !signer.public_key.is_ascii()
+                || signer.public_key.chars().any(|c| c.is_control())
+            {
+                return Err(CoreError::Config(format!(
+                    "signer {} has invalid public key text",
+                    signer.signer_id
+                )));
+            }
+            if signer.signature_type == "raw-ed25519" {
+                let key = STANDARD.decode(&signer.public_key).map_err(|_| {
+                    CoreError::Config(format!(
+                        "signer {} has invalid Ed25519 key Base64",
+                        signer.signer_id
+                    ))
+                })?;
+                if key.len() != 32 || STANDARD.encode(&key) != signer.public_key {
+                    return Err(CoreError::Config(format!(
+                        "signer {} has non-canonical Ed25519 key Base64",
+                        signer.signer_id
+                    )));
+                }
+            } else {
+                let valid = match signer.signature_type.as_str() {
+                    "ssh-ed25519" => signer.public_key.starts_with("ssh-ed25519 "),
+                    "sk-ssh-ed25519" => {
+                        signer.public_key.starts_with("sk-ssh-ed25519@openssh.com ")
+                    }
+                    "openpgp-v4-ed25519" => {
+                        matches!(signer.public_key.len(), 40 | 64)
+                            && signer
+                                .public_key
+                                .bytes()
+                                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    }
+                    // Sigstore trust is anchored in trusted_root.json; the
+                    // configured value is a pinned printable identity/key.
+                    "sigstore-bundle-v0.3" => signer.public_key.len() >= 16,
+                    _ => false,
+                };
+                if !valid {
+                    return Err(CoreError::Config(format!(
+                        "signer {} has malformed public key",
+                        signer.signer_id
+                    )));
+                }
+            }
+            if signer.max_ttl_secs == 0
+                || signer.max_ttl_secs > daemon.max_ttl_secs
+                || signer.allowed_modes.is_empty()
+                || signer.allowed_modes.len() > 3
+                || signer
+                    .allowed_modes
+                    .iter()
+                    .any(|mode| !matches!(mode.as_str(), "one_time" | "time_range" | "permanent"))
+                || signer
+                    .allowed_modes
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || signer.allowed_capabilities.len() > 64
+                || signer
+                    .allowed_capabilities
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || signer
+                    .allowed_capabilities
+                    .iter()
+                    .any(|cap| !valid_capability(cap))
+                || signer.allowed_requester_uids.len() > 64
+                || signer.allowed_target_uids.len() > 64
+                || signer.allowed_target_gids.len() > 64
+                || signer.allowed_supplementary_gids.len() > 64
+                || !sorted_unique(&signer.allowed_requester_uids)
+                || !sorted_unique(&signer.allowed_target_uids)
+                || !sorted_unique(&signer.allowed_target_gids)
+                || !sorted_unique(&signer.allowed_supplementary_gids)
+            {
+                return Err(CoreError::Config(format!(
+                    "signer {} has invalid ceiling lists",
                     signer.signer_id
                 )));
             }
@@ -316,17 +426,41 @@ impl DaemonConfig {
             || self.audit_record_max_bytes != 65_536
             || self.collector_key_id.is_empty()
             || self.collector_key_id.len() > 128
+            || !self.collector_key_id.is_ascii()
+            || self
+                .collector_key_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
             || !self.collector_base_url.starts_with("https://")
             || self.collector_base_url.contains(['#', '@'])
             || self.collector_server_name.is_empty()
             || self.collector_server_name.len() > 255
             || !self.collector_server_name.is_ascii()
+            || self
+                .collector_server_name
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
             || !self.collector_ca_file.is_absolute()
             || !self.collector_client_cert_file.is_absolute()
             || !self.collector_client_key_file.is_absolute()
+            || self.max_active_hooks_per_uid == 0
+            || self.max_active_hooks_global == 0
+            || self.hook_invocations_per_uid == 0
+            || self.hook_window_secs == 0
+            || self.max_onetime_window_secs == 0
+            || self.max_ttl_secs == 0
         {
             return Err(CoreError::Config(
                 "invalid quota or collector bounds".into(),
+            ));
+        }
+        let collector_key = STANDARD
+            .decode(&self.collector_public_key)
+            .map_err(|_| CoreError::Config("collector_public_key is not Base64".into()))?;
+        if collector_key.len() != 32 || STANDARD.encode(&collector_key) != self.collector_public_key
+        {
+            return Err(CoreError::Config(
+                "collector_public_key must be canonical Base64 for 32 bytes".into(),
             ));
         }
         let mut unique = BTreeSet::new();
@@ -339,6 +473,57 @@ impl DaemonConfig {
         }
         Ok(())
     }
+}
+
+fn sorted_unique<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn valid_capability(capability: &str) -> bool {
+    const CAPS: &[&str] = &[
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_DAC_READ_SEARCH",
+        "CAP_FOWNER",
+        "CAP_FSETID",
+        "CAP_KILL",
+        "CAP_SETGID",
+        "CAP_SETUID",
+        "CAP_SETPCAP",
+        "CAP_LINUX_IMMUTABLE",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_NET_BROADCAST",
+        "CAP_NET_ADMIN",
+        "CAP_NET_RAW",
+        "CAP_IPC_LOCK",
+        "CAP_IPC_OWNER",
+        "CAP_SYS_MODULE",
+        "CAP_SYS_RAWIO",
+        "CAP_SYS_CHROOT",
+        "CAP_SYS_PTRACE",
+        "CAP_SYS_PACCT",
+        "CAP_SYS_ADMIN",
+        "CAP_SYS_BOOT",
+        "CAP_SYS_NICE",
+        "CAP_SYS_RESOURCE",
+        "CAP_SYS_TIME",
+        "CAP_SYS_TTY_CONFIG",
+        "CAP_MKNOD",
+        "CAP_LEASE",
+        "CAP_AUDIT_WRITE",
+        "CAP_AUDIT_CONTROL",
+        "CAP_SETFCAP",
+        "CAP_MAC_OVERRIDE",
+        "CAP_MAC_ADMIN",
+        "CAP_SYSLOG",
+        "CAP_WAKE_ALARM",
+        "CAP_BLOCK_SUSPEND",
+        "CAP_AUDIT_READ",
+        "CAP_PERFMON",
+        "CAP_BPF",
+        "CAP_CHECKPOINT_RESTORE",
+    ];
+    CAPS.contains(&capability)
 }
 
 fn safe_root_path(path: &Path) -> bool {
@@ -457,7 +642,7 @@ mod tests {
             collector_client_cert_file: "/etc/sigrund/collector-client.crt".into(),
             collector_client_key_file: "/etc/sigrund/collector-client.key".into(),
             collector_key_id: "collector-v1".into(),
-            collector_public_key: "key".into(),
+            collector_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             collector_rpc_timeout_ms: 3_000,
             audit_record_max_bytes: 65_536,
             max_onetime_window_secs: 3_600,

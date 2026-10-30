@@ -12,7 +12,6 @@ struct OpenHow {
     resolve: u64,
 }
 
-const RESOLVE_NO_XDEV: u64 = 0x01;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
@@ -37,7 +36,9 @@ pub fn openat2_root(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd>
     let how = OpenHow {
         flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
         mode: 0,
-        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV,
+        // Root pinning must cross mount boundaries (for example a separate
+        // /usr mount). NO_XDEV is reserved for executable-relative opens.
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
     };
     let fd = unsafe {
         libc::syscall(

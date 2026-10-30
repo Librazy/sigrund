@@ -1,12 +1,12 @@
 use std::{
     fs::File,
     io::{self, Write},
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
 const MFD_CLOEXEC: libc::c_uint = 0x0001;
 const MFD_ALLOW_SEALING: libc::c_uint = 0x0002;
-const MFD_EXEC: libc::c_uint = 0x0004;
+const MFD_EXEC: libc::c_uint = 0x0010;
 const F_ADD_SEALS: libc::c_int = 1033;
 const F_GET_SEALS: libc::c_int = 1034;
 const F_SEAL_SEAL: libc::c_int = 0x0001;
@@ -29,13 +29,11 @@ pub fn create_sealed(
     if raw_fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    let mut file = unsafe { File::from_raw_fd(fd.as_raw_fd()) };
-    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-        let _ = file.into_raw_fd();
-        return Err(error);
-    }
-    std::mem::forget(file);
+    // Keep a single owner on every error path, including failed writes/seals.
+    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let fd: OwnedFd = file.into();
     if unsafe { libc::fchmod(fd.as_raw_fd(), mode) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -51,4 +49,25 @@ pub fn create_sealed(
         ));
     }
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn executable_memfd_uses_normal_pages_and_rejects_writes() {
+        let fd = create_sealed("executable-test", b"\x7fELFsmall-payload", true, 0o111).unwrap();
+        let mut file = File::from(fd);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"\x7fELFsmall-payload");
+        assert_eq!(
+            file.write(b"x").unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(MFD_EXEC, libc::MFD_EXEC);
+    }
 }
