@@ -39,7 +39,7 @@ fn policy() -> Denial {
 /// later child setup. Success is not a durable grant or readiness decision.
 pub(crate) struct Authorized {
     pub warrant: CanonicalWarrant,
-    pub signer_id: String,
+    pub signer_ids: Vec<String>,
     pub envp: Vec<CString>,
 }
 
@@ -59,45 +59,57 @@ pub(crate) fn verify(
         .validate_for_peer(&request.hello, request.requester_uid)
         .map_err(|_| policy())?;
     let prepared = request.prepared.as_ref().ok_or_else(policy)?;
-    let Document::Signed { warrant, signer_id } = &prepared.document else {
+    let Document::Signed {
+        warrant,
+        signer_ids,
+    } = &prepared.document
+    else {
         return Err(policy());
     };
     let w = warrant.warrant();
     w.validate().map_err(|_| policy())?;
-    let signer = context
-        .signers
-        .signers
-        .iter()
-        .find(|s| s.signer_id == *signer_id)
-        .ok_or_else(policy)?;
-    if !preparation::static_policy(
-        signer,
-        w,
-        request.requester_uid,
-        gid,
-        &context.host_id,
-        &request.policy,
-    ) || w.command.tty_mode != request.hello.tty_mode
-    {
+    if w.command.tty_mode != request.hello.tty_mode {
         return Err(policy());
     }
     // The profile forbids same-UID elevation, scripts, PTY and unsigned caller
     // environment inheritance, even if a broader signer policy allows them.
-    let selected = select_root(
-        std::path::Path::new(&w.command.executable_path),
-        &signer.allowed_executable_dirs,
-    )
-    .map_err(|_| policy())?;
-    let pinned = context
-        .roots
+    // Retain only independently eligible signers. Snapshot checks below are
+    // common to the payload; no ceiling may be satisfied by combining keys.
+    let signer_ids: Vec<_> = signer_ids
         .iter()
-        .find(|r| r.path == selected.root)
-        .ok_or_else(policy)?;
-    let identity = pinned.directory.metadata().map_err(|_| policy())?;
-    if selected.root != prepared.root_path
-        || identity.dev() != prepared.root_identity.device
-        || identity.ino() != prepared.root_identity.inode
-    {
+        .filter(|id| {
+            let Some(signer) = context.signers.signers.iter().find(|s| s.signer_id == **id) else {
+                return false;
+            };
+            if !preparation::static_policy(
+                signer,
+                w,
+                request.requester_uid,
+                gid,
+                &context.host_id,
+                &request.policy,
+            ) {
+                return false;
+            }
+            let Ok(selected) = select_root(
+                std::path::Path::new(&w.command.executable_path),
+                &signer.allowed_executable_dirs,
+            ) else {
+                return false;
+            };
+            let Some(pinned) = context.roots.iter().find(|r| r.path == selected.root) else {
+                return false;
+            };
+            let Ok(identity) = pinned.directory.metadata() else {
+                return false;
+            };
+            selected.root == prepared.root_path
+                && identity.dev() == prepared.root_identity.device
+                && identity.ino() == prepared.root_identity.inode
+        })
+        .cloned()
+        .collect();
+    if signer_ids.is_empty() {
         return Err(policy());
     }
     let snapshots = request.snapshots.as_ref().ok_or_else(policy)?;
@@ -173,7 +185,7 @@ pub(crate) fn verify(
         .map_err(|_| Denial::new("REQUEST_TIMEOUT", "authorization cancelled"))?;
     Ok(Authorized {
         warrant: warrant.clone(),
-        signer_id: signer_id.clone(),
+        signer_ids,
         envp,
     })
 }

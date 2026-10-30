@@ -109,6 +109,26 @@ impl StateStore {
         reserve_commit: impl FnOnce() -> Result<bool>,
         permit_commit: impl FnOnce() -> Result<bool>,
     ) -> Result<AuthorizationResult> {
+        self.authorize_candidates_guarded(request, &[], clock, reserve_commit, permit_commit)
+            .map(|(result, _)| result)
+    }
+
+    /// The request's signer and any additional candidates must each independently
+    /// satisfy cryptographic and complete policy verification. Select one
+    /// unrevoked signer under the same write transaction as consumption; never
+    /// combine their permissions. The returned signer is the identity used for
+    /// consumption and audit, or None when no signer was selected.
+    pub fn authorize_candidates_guarded<'a>(
+        &mut self,
+        request: AuthorizationRequest<'a>,
+        additional_signer_ids: &[&'a str],
+        clock: impl FnOnce() -> Result<i64>,
+        reserve_commit: impl FnOnce() -> Result<bool>,
+        permit_commit: impl FnOnce() -> Result<bool>,
+    ) -> Result<(AuthorizationResult, Option<&'a str>)> {
+        if additional_signer_ids.len() > 3 {
+            return Err(CoreError::Value("expected 1..=4 eligible signers".into()));
+        }
         if request.mode == GrantMode::Permanent && request.not_after.is_some() {
             return Err(CoreError::Value(
                 "permanent grants require null not_after".into(),
@@ -125,16 +145,15 @@ impl StateStore {
             || request.mode != GrantMode::Permanent && now > request.not_after.unwrap_or(i64::MIN)
         {
             transaction.rollback().map_err(db)?;
-            return Ok(AuthorizationResult::ExpiredOrNotYetValid);
+            return Ok((AuthorizationResult::ExpiredOrNotYetValid, None));
         }
         let revoked = transaction
             .query_row(
                 "SELECT 1 FROM revocations
                  WHERE (target_type = 'grant_id' AND target_value = ?1)
                     OR (target_type = 'payload_sha256' AND target_value = ?2)
-                    OR (target_type = 'signer_id' AND target_value = ?3)
                  LIMIT 1",
-                params![request.grant_id, digest, request.signer_id],
+                params![request.grant_id, digest],
                 |_| Ok(()),
             )
             .optional()
@@ -142,8 +161,30 @@ impl StateStore {
             .is_some();
         if revoked {
             transaction.rollback().map_err(db)?;
-            return Ok(AuthorizationResult::Revoked);
+            return Ok((AuthorizationResult::Revoked, None));
         }
+        let mut signer_id = None;
+        for candidate in
+            std::iter::once(request.signer_id).chain(additional_signer_ids.iter().copied())
+        {
+            let revoked = transaction
+                .query_row(
+                    "SELECT 1 FROM revocations WHERE target_type = 'signer_id' AND target_value = ?1",
+                    [candidate],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(db)?
+                .is_some();
+            if !revoked {
+                signer_id = Some(candidate);
+                break;
+            }
+        }
+        let Some(signer_id) = signer_id else {
+            transaction.rollback().map_err(db)?;
+            return Ok((AuthorizationResult::Revoked, None));
+        };
         if request.mode == GrantMode::OneTime {
             let inserted = transaction.execute(
                 "INSERT INTO consumed_grants
@@ -152,7 +193,7 @@ impl StateStore {
                 params![
                     request.grant_id,
                     digest_bytes.as_slice(),
-                    request.signer_id,
+                    signer_id,
                     request.requester_uid,
                     request.not_after.unwrap_or(0),
                     now
@@ -168,7 +209,7 @@ impl StateStore {
                                 | rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         ) =>
                     {
-                        Ok(AuthorizationResult::ReplayDetected)
+                        Ok((AuthorizationResult::ReplayDetected, Some(signer_id)))
                     }
                     _ => Err(db(error)),
                 };
@@ -176,10 +217,10 @@ impl StateStore {
         }
         if !reserve_commit()? || !permit_commit()? {
             transaction.rollback().map_err(db)?;
-            return Ok(AuthorizationResult::Cancelled);
+            return Ok((AuthorizationResult::Cancelled, Some(signer_id)));
         }
         transaction.commit().map_err(db)?;
-        Ok(AuthorizationResult::Allowed)
+        Ok((AuthorizationResult::Allowed, Some(signer_id)))
     }
 
     pub fn revoke(

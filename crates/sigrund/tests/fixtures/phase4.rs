@@ -77,6 +77,9 @@ fn ssh_string(input: &[u8], output: &mut Vec<u8>) {
     output.extend_from_slice(input);
 }
 fn envelope(w: Warrant, key: u8) -> DsseEnvelope {
+    envelope_for(w, key, "mandator-alice-yubikey")
+}
+fn envelope_for(w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
     let w = CanonicalWarrant::new(w).unwrap();
     let signing = ed25519_dalek::SigningKey::from_bytes(&[key; 32]);
     let mut public = Vec::new();
@@ -103,7 +106,7 @@ fn envelope(w: Warrant, key: u8) -> DsseEnvelope {
     DsseEnvelope::from_warrant(
         &w,
         vec![DsseSignature {
-            keyid: "mandator-alice-yubikey".into(),
+            keyid: signer_id.into(),
             sig: STANDARD.encode(packet),
         }],
     )
@@ -274,8 +277,142 @@ fn namespace_fixture() {
     assert_eq!(redeem(&f, &valid).status, "REVOKED");
     daemon.stop();
     signed_cli_and_restart();
+    multisignature_revocation();
     cancellation_and_durable_failures();
     blocked_io_remains_bounded_and_responsive();
+}
+
+fn multisignature_revocation() {
+    let f = fixture();
+    let first_id = "mandator-alice-yubikey";
+    let second_id = "mandator-bob";
+    let first = fs::read_to_string(&f.signers).unwrap();
+    let parsed = sigrund_core::config::SignerPolicyFile::from_toml(first.as_bytes()).unwrap();
+    let mut public = Vec::new();
+    ssh_string(b"ssh-ed25519", &mut public);
+    ssh_string(
+        &ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+            .verifying_key()
+            .to_bytes(),
+        &mut public,
+    );
+    let second = first.replace(first_id, second_id).replace(
+        &parsed.signers[0].public_key,
+        &format!("ssh-ed25519 {}", STANDARD.encode(public)),
+    );
+    fs::write(&f.signers, format!("{first}\n{second}")).unwrap();
+    let both = |w: Warrant| {
+        let mut signed = envelope(w.clone(), 7);
+        signed
+            .signatures
+            .extend(envelope_for(w, 8, second_id).signatures);
+        signed
+    };
+    let (mut gate, daemon) = Gate::launch(&f, "predicate-before");
+    let store = sigrund_core::state::StateStore::open(f.state.join("state.sqlite")).unwrap();
+    let signed = both(warrant(&f, 0));
+    let before = f.diagnostic_count();
+    gate.arm();
+    let mut client = connect(&f.socket);
+    send_signed(&client, &signed);
+    gate.arrive(&daemon);
+    // Revoke after preparation, while final authorization is rehashing the
+    // retained snapshot. Selecting an unrevoked key before preparation is
+    // insufficient: the serialized transaction must choose the winner.
+    store
+        .revoke("signer_id", first_id, now(), "first signer revoked")
+        .unwrap();
+    gate.release();
+    assert_eq!(decision(&mut client).status, "SPAWN_FAILED");
+    drop(client);
+    f.wait_for_cleanup(before);
+    assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");
+    let mut signed = both(warrant(&f, 0));
+    signed.signatures.reverse();
+    assert_eq!(redeem(&f, &signed).status, "SPAWN_FAILED");
+    assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");
+    assert_eq!(count(&f), 2);
+    let db = rusqlite::Connection::open(f.state.join("state.sqlite")).unwrap();
+    let other_signers: u64 = db
+        .query_row(
+            "SELECT count(*) FROM consumed_grants WHERE signer_id != ?1",
+            [second_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(other_signers, 0);
+    let data = records(&f);
+    let committed: Vec<_> = data
+        .iter()
+        .filter(|r| {
+            r["event_type"] == "AUTH_COMMIT" || r["event_type"] == "AUTH_ABORTED_POST_COMMIT"
+        })
+        .collect();
+    assert_eq!(committed.len(), 4);
+    for record in committed {
+        assert_eq!(record["signer_id"], second_id);
+    }
+    // An unrevoked key must still have a valid signature over this payload.
+    let mut invalid = envelope(warrant(&f, 0), 7);
+    invalid
+        .signatures
+        .extend(envelope_for(warrant(&f, 0), 8, second_id).signatures);
+    assert_eq!(redeem(&f, &invalid).status, "REVOKED");
+    assert_eq!(redeem(&f, &envelope(warrant(&f, 0), 7)).status, "REVOKED");
+    // Payload/grant revocations deny the entire warrant, regardless of keys.
+    for kind in ["grant_id", "payload_sha256"] {
+        let w = warrant(&f, 0);
+        let target = if kind == "grant_id" {
+            w.grant_id.clone()
+        } else {
+            sha256_hex(CanonicalWarrant::new(w.clone()).unwrap().as_bytes())
+        };
+        store
+            .revoke(kind, &target, now(), "entire warrant revoked")
+            .unwrap();
+        assert_eq!(redeem(&f, &both(w)).status, "REVOKED");
+    }
+    assert_eq!(count(&f), 2);
+    daemon.stop();
+    // The fallback signature cannot borrow the revoked key's UID ceiling.
+    fs::write(
+        &f.signers,
+        format!(
+            "{first}\n{}",
+            second.replace("allowed_target_uids = [0, 33]", "allowed_target_uids = [0]")
+        ),
+    )
+    .unwrap();
+    let daemon = f.launch();
+    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "REVOKED");
+    assert_eq!(count(&f), 2);
+    daemon.stop();
+    // Neither signer independently authorizes this UID/GID pair. Combining
+    // one's UID ceiling with the other's GID ceiling must never authorize it.
+    fs::write(
+        &f.signers,
+        format!(
+            "{}\n{}",
+            first.replace("allowed_target_uids = [0, 33]", "allowed_target_uids = [0]"),
+            second.replace(
+                "allowed_target_gids = [0, 33]",
+                "allowed_target_gids = [33]"
+            )
+        ),
+    )
+    .unwrap();
+    let daemon = f.launch();
+    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "POLICY_VIOLATION");
+    assert_eq!(count(&f), 2);
+    daemon.stop();
+    fs::write(&f.signers, format!("{first}\n{second}")).unwrap();
+    let daemon = f.launch();
+    store
+        .revoke("signer_id", second_id, now(), "all signers revoked")
+        .unwrap();
+    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "REVOKED");
+    assert_eq!(count(&f), 2);
+    daemon.stop();
 }
 
 fn signed_cli_and_restart() {

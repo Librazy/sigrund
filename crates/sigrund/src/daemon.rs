@@ -472,9 +472,12 @@ impl Connection {
                         });
                         Ok(())
                     }
-                    Document::Signed { warrant, signer_id } => {
+                    Document::Signed {
+                        warrant,
+                        signer_ids,
+                    } => {
                         self.approval_reusable = self.approval_csr.is_some();
-                        let _ = log.try_send(serde_json::json!({"event":"SIGNED_SNAPSHOTS_BOUND", "exec_id":self.exec_id, "grant_id":warrant.warrant().grant_id,"signer_id":signer_id}).to_string());
+                        let _ = log.try_send(serde_json::json!({"event":"SIGNED_SNAPSHOTS_BOUND", "exec_id":self.exec_id, "grant_id":warrant.warrant().grant_id,"candidate_signer_ids":signer_ids}).to_string());
                         let mut lease = result.expect("verified signed snapshots");
                         lease.begin_authorization();
                         let work = sequencer::Work::Authorize(sequencer::AuthorizationTask {

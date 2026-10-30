@@ -38,6 +38,17 @@ The implement/verify/fix loop also corrected these issues:
 - The concurrent state test opens both connections before its barrier and
   bounds result waits, so a setup failure cannot hang the test indefinitely.
 
+Multi-signature review follow-up: preparation retains every independently
+verified, policy-compliant signer. Final authorization rechecks each candidate's
+complete ceilings and pinned root; the SQLite transaction then selects an
+unrevoked candidate before consumption. Grant/payload revocations still deny
+the entire warrant. Consumption and commit/abort audit records name the selected
+signer. `multisignature_revocation` in the Phase 4 namespace gate uses two distinct
+keys and revokes the first after snapshot preparation. It checks fallback in
+both signature orders, replay, exact consumption/audit identity, invalid or
+policy-ineligible fallback signatures, all-signers-revoked denial, whole-warrant
+revocation, and rejection when only combined permissions could satisfy policy.
+
 Reproducible checks (all pass):
 
 ```sh

@@ -238,13 +238,14 @@ fn authorize(
         }
     };
     let w = verified.warrant.warrant();
-    let result = resources
+    let candidates: Vec<_> = verified.signer_ids.iter().map(String::as_str).collect();
+    let (result, signer_id) = resources
         .store
-        .authorize_guarded(
+        .authorize_candidates_guarded(
             AuthorizationRequest {
                 grant_id: &w.grant_id,
                 payload: verified.warrant.as_bytes(),
-                signer_id: &verified.signer_id,
+                signer_id: candidates[0],
                 requester_uid: request.requester_uid,
                 mode: match w.policy.mode.as_str() {
                     "one_time" => GrantMode::OneTime,
@@ -256,6 +257,7 @@ fn authorize(
                 not_after: w.policy.not_after,
                 now: 0,
             },
+            &candidates[1..],
             realtime,
             || {
                 let (permit, reply) = sync_channel(1);
@@ -280,7 +282,7 @@ fn authorize(
         .map_err(|e| format!("authorization database failed; reconciliation required: {e}"))?;
     let limit = request.policy.audit_record_max_bytes as usize;
     let fields = serde_json::json!({"exec_id":task.exec_id, "grant_id":w.grant_id,
-        "payload_sha256":sha256_hex(verified.warrant.as_bytes()), "signer_id":verified.signer_id,
+        "payload_sha256":sha256_hex(verified.warrant.as_bytes()), "signer_id":signer_id,
         "policy_mode":w.policy.mode,"not_before":w.policy.not_before,"not_after":w.policy.not_after,
         "requester_uid":w.requester_uid,"requester_gid":w.requester_gid,
         "target_uid":w.execution_context.target_uid,"target_gid":w.execution_context.target_gid,

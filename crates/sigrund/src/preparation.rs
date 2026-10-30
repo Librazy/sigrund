@@ -75,7 +75,7 @@ pub(crate) enum Document {
     Unsigned(Csr),
     Signed {
         warrant: CanonicalWarrant,
-        signer_id: String,
+        signer_ids: Vec<String>,
     },
 }
 pub(crate) struct Prepared {
@@ -174,11 +174,11 @@ pub(crate) fn prepare(
         let warrant = envelope
             .warrant()
             .map_err(|_| fail("INVALID_REQUEST", "invalid canonical warrant"))?;
-        let signer = context
+        let signer_ids: Vec<_> = context
             .signers
             .signers
             .iter()
-            .find(|signer| {
+            .filter(|signer| {
                 static_policy(
                     signer,
                     warrant.warrant(),
@@ -200,13 +200,15 @@ pub(crate) fn prepare(
                         .is_ok()
                 })
             })
-            .ok_or_else(|| {
-                fail(
-                    "POLICY_VIOLATION",
-                    "no verified signer satisfies static policy",
-                )
-            })?;
-        Some((warrant, signer.signer_id.clone()))
+            .map(|signer| signer.signer_id.clone())
+            .collect();
+        if signer_ids.is_empty() {
+            return Err(fail(
+                "POLICY_VIOLATION",
+                "no verified signer satisfies static policy",
+            ));
+        }
+        Some((warrant, signer_ids))
     } else {
         None
     };
@@ -281,7 +283,7 @@ pub(crate) fn prepare(
     request.check()?;
     let snapshots = request.snapshots.as_ref().expect("snapshot owner");
     let stdin_digest = snapshots.stdin.as_ref().map(|s| s.digest.sha256.clone());
-    let document = if let Some((warrant, signer_id)) = signed {
+    let document = if let Some((warrant, signer_ids)) = signed {
         if !bool::from(
             warrant
                 .warrant()
@@ -303,7 +305,10 @@ pub(crate) fn prepare(
         if !stdin_matches {
             return Err(fail("STDIN_HASH_MISMATCH", "signed stdin digest differs"));
         }
-        Document::Signed { warrant, signer_id }
+        Document::Signed {
+            warrant,
+            signer_ids,
+        }
     } else {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -494,7 +499,7 @@ pub(crate) fn approve(
         .expect("retained snapshots and CSR");
     prepared.document = Document::Signed {
         warrant,
-        signer_id: signer.signer_id.clone(),
+        signer_ids: vec![signer.signer_id.clone()],
     };
     Ok(())
 }
@@ -790,10 +795,10 @@ mod tests {
                 "root_inode" => prepared.root_identity.inode ^= 1,
                 "root_device" => prepared.root_identity.device ^= 1,
                 "signer" => {
-                    let Document::Signed { signer_id, .. } = &mut prepared.document else {
+                    let Document::Signed { signer_ids, .. } = &mut prepared.document else {
                         panic!()
                     };
-                    *signer_id = "unconfigured".into();
+                    *signer_ids = vec!["unconfigured".into()];
                 }
                 "cached_digest" => {
                     let Document::Signed { warrant, .. } = &mut prepared.document else {
@@ -846,7 +851,7 @@ mod tests {
         let mut request = fixture.request(signed_hello(&warrant, "sigrun.warrant.v1", 7), None);
         prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap();
         assert!(
-            matches!(&request.prepared.as_ref().unwrap().document, Document::Signed { signer_id, .. } if signer_id=="mandator-alice-yubikey")
+            matches!(&request.prepared.as_ref().unwrap().document, Document::Signed { signer_ids, .. } if signer_ids==&["mandator-alice-yubikey"])
         );
         drop(request);
         // Digest failures happen after authenticated candidate selection.
