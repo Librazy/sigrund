@@ -25,6 +25,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+// These gates intentionally exercise short real deadlines and durable I/O.
+// Serialize their outer namespace processes so one fsync/fault fixture cannot
+// starve another fixture's admission probes before they begin assertions.
+static NAMESPACE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
@@ -386,6 +391,7 @@ impl Drop for DaemonChild {
 
 #[test]
 fn phase1_exit_gate_in_user_namespace() {
+    let _gate = NAMESPACE_GATE.lock().unwrap();
     let output = Command::new("unshare")
         .args(["--user", "--map-auto", "--map-root-user"])
         .arg(std::env::current_exe().unwrap())

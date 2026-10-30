@@ -3,6 +3,7 @@ use super::*;
 
 #[test]
 fn exit_gate() {
+    let _gate = NAMESPACE_GATE.lock().unwrap();
     let output = Command::new("unshare")
         .args(["--user", "--map-auto", "--map-root-user"])
         .arg(std::env::current_exe().unwrap())
