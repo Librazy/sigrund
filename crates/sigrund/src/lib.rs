@@ -1,6 +1,7 @@
 mod admission;
 pub mod approver;
 mod authorization;
+mod cgroup;
 pub mod cli;
 pub mod client;
 pub mod daemon;
@@ -8,6 +9,7 @@ pub mod execution;
 pub mod linux;
 pub mod memfd;
 mod preparation;
+pub mod reaper;
 mod sequencer;
 pub mod snapshot;
 pub mod startup;
