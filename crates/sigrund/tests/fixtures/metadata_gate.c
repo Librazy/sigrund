@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -33,6 +34,13 @@ int fstat(int fd, struct stat *metadata) {
 int fstat64(int fd, struct stat64 *metadata) {
     int result = syscall(SYS_fstat, fd, metadata);
     if (result == 0 && !getenv("SIGRUND_GATE_CLOSE")) gate(metadata->st_ino, metadata->st_dev);
+    return result;
+}
+
+int statx(int fd, const char *path, int flags, unsigned int mask, struct statx *metadata) {
+    int result = syscall(SYS_statx, fd, path, flags, mask, metadata);
+    if (result == 0 && !getenv("SIGRUND_GATE_CLOSE"))
+        gate(metadata->stx_ino, makedev(metadata->stx_dev_major, metadata->stx_dev_minor));
     return result;
 }
 

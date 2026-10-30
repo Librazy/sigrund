@@ -4,9 +4,13 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::CString,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -62,7 +66,8 @@ pub fn append_line_bytes(record: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub struct AuditLog {
-    state_path: PathBuf,
+    state_directory: File,
+    state_name: PathBuf,
     log: File,
     state: RatchetState,
     key: [u8; 32],
@@ -90,9 +95,54 @@ impl AuditLog {
         state_path: &Path,
         expected_host: Option<&str>,
     ) -> Result<Self> {
-        let log_path = log_path.to_owned();
-        let state_path = state_path.to_owned();
-        let state_bytes = std::fs::read(&state_path)
+        let state_directory = File::open(
+            state_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+        .map_err(|e| CoreError::Database(format!("open audit state directory: {e}")))?;
+        let state_file = File::open(state_path)
+            .map_err(|e| CoreError::Database(format!("read audit state: {e}")))?;
+        let log = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(log_path)
+            .map_err(|e| CoreError::Database(format!("open audit log: {e}")))?;
+        Self::from_verified_files(
+            log,
+            state_file,
+            state_directory,
+            Path::new(
+                state_path
+                    .file_name()
+                    .ok_or_else(|| CoreError::Value("audit state needs a filename".into()))?,
+            ),
+            expected_host,
+        )
+    }
+
+    /// Recover using the exact files and directory checked by the caller.
+    /// The directory must be readable for fsync and trusted against entry
+    /// replacement. No original pathname is resolved during recovery/appends.
+    pub fn from_verified_files(
+        log: File,
+        mut state_file: File,
+        state_directory: File,
+        state_name: &Path,
+        expected_host: Option<&str>,
+    ) -> Result<Self> {
+        if state_name.as_os_str().is_empty()
+            || state_name.as_os_str().as_bytes().contains(&b'/')
+            || matches!(state_name.to_str(), Some("." | ".."))
+        {
+            return Err(CoreError::Value(
+                "audit state must be a single filename".into(),
+            ));
+        }
+        let mut state_bytes = Vec::new();
+        state_file
+            .read_to_end(&mut state_bytes)
             .map_err(|e| CoreError::Database(format!("read audit state: {e}")))?;
         let state: RatchetState = serde_json::from_slice(&state_bytes)
             .map_err(|e| CoreError::Database(format!("parse audit state: {e}")))?;
@@ -102,13 +152,9 @@ impl AuditLog {
             .as_deref()
             .map(decode_hex_32)
             .transpose()?;
-        let log = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|e| CoreError::Database(format!("open audit log: {e}")))?;
         let mut writer = Self {
-            state_path,
+            state_directory,
+            state_name: state_name.to_owned(),
             log,
             state,
             key,
@@ -212,30 +258,7 @@ impl AuditLog {
         // Once the log is durable, any failure leaves disk potentially one
         // record ahead of state. Do not reuse the key/sequence on this writer.
         self.usable = false;
-        let temp_path = self.state_path.with_extension("state.tmp");
-        let mut temp = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp_path)
-            .map_err(|e| CoreError::Database(format!("open audit state temporary file: {e}")))?;
-        // mode() applies only to a new file. Secure a stale temporary inode
-        // before truncating or putting a ratchet key in it.
-        temp.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .and_then(|_| temp.set_len(0))
-            .map_err(|e| CoreError::Database(format!("secure audit state temporary file: {e}")))?;
-        temp.write_all(&state_bytes)
-            .and_then(|_| temp.sync_all())
-            .map_err(|e| CoreError::Database(format!("flush audit state: {e}")))?;
-        drop(temp);
-        std::fs::rename(&temp_path, &self.state_path)
-            .map_err(|e| CoreError::Database(format!("rename audit state: {e}")))?;
-        if let Some(parent) = self.state_path.parent() {
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| CoreError::Database(format!("sync audit state directory: {e}")))?;
-        }
+        self.publish_state(&state_bytes)?;
         self.state = next_state;
         self.key = next_key;
         self.usable = true;
@@ -266,31 +289,71 @@ impl AuditLog {
     }
 
     fn persist_state(&self) -> Result<()> {
-        let temp_path = self.state_path.with_extension("state.tmp");
         let state_bytes = serde_json::to_vec(&self.state)
             .map_err(|e| CoreError::Database(format!("serialize audit state: {e}")))?;
-        let mut temp = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp_path)
-            .map_err(|e| CoreError::Database(format!("open audit state temporary file: {e}")))?;
+        self.publish_state(&state_bytes)
+    }
+
+    fn publish_state(&self, state_bytes: &[u8]) -> Result<()> {
+        let temp_name = self.state_name.with_extension("state.tmp");
+        let temp_name = CString::new(temp_name.as_os_str().as_bytes())
+            .map_err(|_| CoreError::Value("NUL in audit state filename".into()))?;
+        let state_name = CString::new(self.state_name.as_os_str().as_bytes())
+            .map_err(|_| CoreError::Value("NUL in audit state filename".into()))?;
+        let directory = self.state_directory.as_raw_fd();
+        let fd = unsafe {
+            libc::openat(
+                directory,
+                temp_name.as_ptr(),
+                libc::O_CREAT
+                    | libc::O_WRONLY
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(CoreError::Database(format!(
+                "open audit state temporary file: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut temp = unsafe { File::from_raw_fd(fd) };
+        if !temp
+            .metadata()
+            .map_err(|e| CoreError::Database(format!("stat audit temporary file: {e}")))?
+            .is_file()
+        {
+            return Err(CoreError::Database(
+                "audit temporary file is not regular".into(),
+            ));
+        }
+        // mode applies only on creation; secure stale temporary files too.
         temp.set_permissions(std::fs::Permissions::from_mode(0o600))
             .and_then(|_| temp.set_len(0))
             .map_err(|e| CoreError::Database(format!("secure audit state temporary file: {e}")))?;
-        temp.write_all(&state_bytes)
+        temp.write_all(state_bytes)
             .and_then(|_| temp.sync_all())
             .map_err(|e| CoreError::Database(format!("flush audit state: {e}")))?;
         drop(temp);
-        std::fs::rename(&temp_path, &self.state_path)
-            .map_err(|e| CoreError::Database(format!("rename audit state: {e}")))?;
-        if let Some(parent) = self.state_path.parent() {
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| CoreError::Database(format!("sync audit state directory: {e}")))?;
+        if unsafe {
+            libc::renameat(
+                directory,
+                temp_name.as_ptr(),
+                directory,
+                state_name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(CoreError::Database(format!(
+                "rename audit state: {}",
+                std::io::Error::last_os_error()
+            )));
         }
-        Ok(())
+        self.state_directory
+            .sync_all()
+            .map_err(|e| CoreError::Database(format!("sync audit state directory: {e}")))
     }
 }
 
@@ -586,6 +649,32 @@ mod tests {
             );
             serde_json::to_vec(&record).unwrap()
         }
+    }
+
+    #[test]
+    fn appends_and_state_publication_retain_the_open_directory_after_rename() {
+        let fixture = Fixture::new();
+        let mut writer = AuditLog::open(&fixture.log, &fixture.state).unwrap();
+        let relocated = tempfile::tempdir().unwrap();
+        let pinned = relocated.path().join("verified");
+        std::fs::rename(fixture._dir.path(), &pinned).unwrap();
+        std::fs::create_dir(fixture._dir.path()).unwrap();
+        std::fs::write(&fixture.log, b"replacement log").unwrap();
+        std::fs::write(&fixture.state, b"replacement state").unwrap();
+        writer.append_raw(&fixture.record()).unwrap();
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), b"replacement log");
+        assert_eq!(std::fs::read(&fixture.state).unwrap(), b"replacement state");
+        assert!(!fixture.state.with_extension("state.tmp").exists());
+        let reopened = AuditLog::open(
+            pinned.join("audit.jsonl"),
+            pinned.join("audit_ratchet.state"),
+        )
+        .unwrap();
+        assert_eq!(reopened.state().seq, 2);
+        assert_eq!(
+            reopened.state().last_record_sha256,
+            record_hash(&fixture.record())
+        );
     }
 
     #[test]

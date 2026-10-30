@@ -95,3 +95,15 @@ closed without receiving its queued rights. Idle sockets reserve no worker;
 once frame reception begins, partial input consumes a slot through timeout and
 actual disposal. This stricter admission behavior prevents cleanup capacity from
 being multiplied independently of metadata and snapshot workers.
+
+## Post-1.5 fixups
+
+Audit recovery now consumes the exact verified state/log descriptors and retains
+the verified state-directory descriptor. Identity/state/log opens, stale temporary
+cleanup, temporary state creation, atomic rename and directory fsync use those
+directory identities. Renaming an attacker-writable ancestor cannot redirect
+recovery or later state publication to replacement paths. The real-daemon
+namespace gate pauses after verification, replaces both directory paths, and
+requires partial-tail and forward recovery to modify only the verified files.
+A core audit test also replaces the directory after opening the writer and
+verifies a subsequent append and state publication remain on the original files.

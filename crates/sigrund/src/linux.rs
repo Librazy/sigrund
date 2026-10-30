@@ -54,6 +54,16 @@ pub fn openat2_file(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd>
     )
 }
 
+/// Open an existing audit log relative to its verified parent directory.
+pub fn openat2_audit_log(root_fd: RawFd, name: &Path) -> io::Result<OwnedFd> {
+    open_relative(
+        root_fd,
+        name,
+        libc::O_RDWR | libc::O_APPEND | libc::O_NONBLOCK,
+        false,
+    )
+}
+
 /// Executable sources are resolved beneath a pinned directory, on its mount.
 pub fn openat2_executable(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd> {
     open_relative(

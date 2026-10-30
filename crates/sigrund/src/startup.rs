@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    linux::{openat2_file, openat2_root, validate_absolute_path},
+    linux::{openat2_audit_log, openat2_file, openat2_root, validate_absolute_path},
     transport::invalid,
 };
 use sigrund_core::{audit::AuditLog, config::DaemonConfig, crypto::sha256_hex};
@@ -66,7 +66,10 @@ pub fn check_root_metadata(file: &fs::File, directory: bool, mode: Option<u32>) 
 }
 
 pub fn read_root_file(path: &Path, mode: Option<u32>, max: u64) -> io::Result<Vec<u8>> {
-    let mut file = open_pinned(path)?;
+    read_root_descriptor(open_pinned(path)?, mode, max)
+}
+
+fn read_root_descriptor(mut file: fs::File, mode: Option<u32>, max: u64) -> io::Result<Vec<u8>> {
     check_root_metadata(&file, false, mode)?;
     let mut bytes = Vec::new();
     (&mut file).take(max + 1).read_to_end(&mut bytes)?;
@@ -124,7 +127,11 @@ impl StartupResources {
                 "host state is already in use",
             ));
         }
-        let mut identity = read_root_file(&state_dir.join("host_identity.key"), Some(0o400), 64)?;
+        let mut identity = read_root_descriptor(
+            openat2_file(state_directory.as_raw_fd(), Path::new("host_identity.key"))?.into(),
+            Some(0o400),
+            64,
+        )?;
         if identity.len() != 64 {
             return Err(invalid(
                 "host identity must contain a 32-byte secret and public key",
@@ -140,16 +147,35 @@ impl StartupResources {
         }
         identity.fill(0);
         let host_id = format!("sigrun-host:sha256:{}", sha256_hex(&public));
-        let state_path = state_dir.join("audit_ratchet.state");
-        check_root_metadata(&open_pinned(&state_path)?, false, Some(0o600))?;
-        check_root_metadata(&open_pinned(log_path)?, false, Some(0o600))?;
-        // Only remove a regular, private, provisioned temporary file. Never
-        // follow an attacker-controlled symlink or recursively remove a path.
-        let temporary = state_dir.join("audit_ratchet.state.tmp");
-        match fs::symlink_metadata(&temporary) {
-            Ok(_) => {
-                check_root_metadata(&open_pinned(&temporary)?, false, Some(0o600))?;
-                fs::remove_file(&temporary)?;
+        let state_name = Path::new("audit_ratchet.state");
+        let state_file: fs::File = openat2_file(state_directory.as_raw_fd(), state_name)?.into();
+        check_root_metadata(&state_file, false, Some(0o600))?;
+        validate_absolute_path(log_path)?;
+        let log_name = Path::new(
+            log_path
+                .file_name()
+                .ok_or_else(|| invalid("log needs a filename"))?,
+        );
+        let log_file: fs::File = openat2_audit_log(log_directory.as_raw_fd(), log_name)?.into();
+        check_root_metadata(&log_file, false, Some(0o600))?;
+        // All state entry access stays relative to the checked directory,
+        // including stale temporary cleanup and future state publication.
+        match openat2_file(
+            state_directory.as_raw_fd(),
+            Path::new("audit_ratchet.state.tmp"),
+        ) {
+            Ok(temporary) => {
+                check_root_metadata(&temporary.into(), false, Some(0o600))?;
+                if unsafe {
+                    libc::unlinkat(
+                        state_directory.as_raw_fd(),
+                        c"audit_ratchet.state.tmp".as_ptr(),
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
                 state_directory.sync_all()?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -171,8 +197,14 @@ impl StartupResources {
             check_root_metadata(&file, false, None)?;
             collector_files.push(file);
         }
-        let audit = AuditLog::open_for_host(log_path, state_path, &host_id)
-            .map_err(|e| invalid(format!("audit recovery failed: {e}")))?;
+        let audit = AuditLog::from_verified_files(
+            log_file,
+            state_file,
+            state_directory,
+            state_name,
+            Some(&host_id),
+        )
+        .map_err(|e| invalid(format!("audit recovery failed: {e}")))?;
         Ok(Self {
             host_id,
             audit,
