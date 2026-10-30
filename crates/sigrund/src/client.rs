@@ -98,6 +98,28 @@ fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
         Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 }
+
+/// `fstat()` identifies the same inode, but cannot distinguish two independent
+/// opens from a shell alias such as `3>&1`. Linux `kcmp(KCMP_FILE)` compares
+/// the underlying open file descriptions, which is the separation required for
+/// the status stream. Fail closed if the kernel cannot perform that check.
+fn same_open_file_description(left: RawFd, right: RawFd) -> io::Result<bool> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            libc::getpid(),
+            libc::getpid(),
+            0usize, // KCMP_FILE
+            left as usize,
+            right as usize,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result == 0)
+    }
+}
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut pair = [-1; 2];
     if unsafe { libc::pipe2(pair.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -361,6 +383,12 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "status FD must be an open writable descriptor",
+                ));
+            }
+            if same_open_file_description(fd, 1)? || same_open_file_description(fd, 2)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "status FD must not alias stdout or stderr",
                 ));
             }
             duplicate(fd)

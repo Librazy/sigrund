@@ -1,5 +1,5 @@
 use sigrund::cli::{ClientArgs, RequestOptions};
-use std::{path::Path, process::Command};
+use std::{os::unix::process::CommandExt, path::Path, process::Command};
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| s.to_string()).collect()
 }
@@ -151,4 +151,26 @@ fn invalid_client_values_fail_before_connecting() {
             .code(),
         Some(64)
     );
+
+    // A distinct descriptor number may still be a shell alias (`3>&1`).
+    // The client must reject it before opening the daemon connection.
+    let alias_socket = tempfile::tempdir().unwrap().path().join("never.sock");
+    let mut alias = Command::new(env!("CARGO_BIN_EXE_sigrun"));
+    alias.args([
+        "--socket",
+        alias_socket.to_str().unwrap(),
+        "--status-fd",
+        "99",
+        "--",
+        "/usr/bin/id",
+    ]);
+    unsafe {
+        alias.pre_exec(|| {
+            if libc::dup2(1, 99) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    assert_eq!(alias.output().unwrap().status.code(), Some(64));
 }
