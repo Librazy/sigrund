@@ -201,6 +201,63 @@ impl AuditLog {
         &self.state
     }
 
+    /// Authenticates an event using the current sequencer-owned ratchet key.
+    /// Callers cannot override host, sequence, chain link or authentication.
+    /// The captured policy limit is checked before any append is attempted.
+    pub fn append_event(
+        &mut self,
+        event_type: &str,
+        fields: serde_json::Value,
+        max_record_bytes: usize,
+    ) -> Result<u64> {
+        if max_record_bytes == 0 || max_record_bytes > MAX_RECORD_BYTES {
+            return Err(CoreError::Value(
+                "audit record limit outside protocol bounds".into(),
+            ));
+        }
+        let serde_json::Value::Object(mut body) = fields else {
+            return Err(CoreError::Value(
+                "audit event fields must be an object".into(),
+            ));
+        };
+        if event_type.is_empty()
+            || event_type.len() > 128
+            || !event_type.is_ascii()
+            || [
+                "event_type",
+                "host_id",
+                "seq",
+                "prev_record_sha256",
+                "entry_hmac",
+            ]
+            .iter()
+            .any(|name| body.contains_key(*name))
+        {
+            return Err(CoreError::Value(
+                "invalid event type or reserved audit field".into(),
+            ));
+        }
+        body.insert("event_type".into(), event_type.into());
+        body.insert("host_id".into(), self.host_id.clone().into());
+        body.insert("seq".into(), self.state.seq.into());
+        body.insert(
+            "prev_record_sha256".into(),
+            self.state.last_record_sha256.clone().into(),
+        );
+        let body_bytes = crate::json::canonical_bytes(&body)?;
+        body.insert(
+            "entry_hmac".into(),
+            entry_hmac(&self.key, &body_bytes).into(),
+        );
+        let record = crate::json::canonical_bytes(&body)?;
+        if record.len() > max_record_bytes {
+            return Err(CoreError::Value(
+                "audit event exceeds captured record limit".into(),
+            ));
+        }
+        self.append_raw(&record)
+    }
+
     /// Appends exactly one record line and advances the durable ratchet state.
     /// Any failure while compensating a partial write is reported as fatal so
     /// the daemon can stop accepting requests.
@@ -268,24 +325,8 @@ impl AuditLog {
 
 impl AuditLog {
     fn append_recovery(&mut self, event_type: &str) -> Result<()> {
-        let mut body = std::collections::BTreeMap::new();
-        body.insert("event_type", serde_json::Value::String(event_type.into()));
-        body.insert("host_id", serde_json::Value::String(self.host_id.clone()));
-        body.insert("seq", serde_json::Value::from(self.state.seq));
-        body.insert(
-            "prev_record_sha256",
-            serde_json::Value::String(self.state.last_record_sha256.clone()),
-        );
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| CoreError::Database(format!("serialize audit recovery: {e}")))?;
-        let mut record = body;
-        record.insert(
-            "entry_hmac",
-            serde_json::Value::String(entry_hmac(&self.key, &body_bytes)),
-        );
-        let record_bytes = serde_json::to_vec(&record)
-            .map_err(|e| CoreError::Database(format!("serialize audit recovery record: {e}")))?;
-        self.append_raw(&record_bytes).map(|_| ())
+        self.append_event(event_type, serde_json::json!({}), MAX_RECORD_BYTES)
+            .map(|_| ())
     }
 
     fn persist_state(&self) -> Result<()> {
@@ -649,6 +690,57 @@ mod tests {
             );
             serde_json::to_vec(&record).unwrap()
         }
+    }
+
+    #[test]
+    fn event_builder_authenticates_sequence_host_and_fields_and_checks_bounds_before_writing() {
+        let fixture = Fixture::new();
+        let mut writer = AuditLog::open(&fixture.log, &fixture.state).unwrap();
+        let original_log = std::fs::read(&fixture.log).unwrap();
+        let original_state = writer.state().clone();
+        for name in [
+            "event_type",
+            "host_id",
+            "seq",
+            "prev_record_sha256",
+            "entry_hmac",
+        ] {
+            let fields = serde_json::json!({ name: "spoofed" });
+            assert!(
+                writer
+                    .append_event("AUTH_REJECTED", fields, MAX_RECORD_BYTES)
+                    .is_err()
+            );
+        }
+        assert!(
+            writer
+                .append_event("AUTH_COMMIT", serde_json::json!({"exec_id":"fixture"}), 1)
+                .is_err()
+        );
+        assert_eq!(writer.state(), &original_state);
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), original_log);
+        assert_eq!(writer.append_event("AUTH_COMMIT", serde_json::json!({"exec_id":"fixture","grant_id":"test","payload_sha256":"f".repeat(64)}), MAX_RECORD_BYTES).unwrap(), 1);
+        assert_eq!(
+            writer
+                .append_event(
+                    "AUTH_ABORTED_POST_COMMIT",
+                    serde_json::json!({"exec_id":"fixture","reason":"phase5 unavailable"}),
+                    MAX_RECORD_BYTES
+                )
+                .unwrap(),
+            2
+        );
+        drop(writer);
+        let reopened = AuditLog::open(&fixture.log, &fixture.state).unwrap();
+        assert_eq!(reopened.state().seq, 3);
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&fixture.log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[1]["event_type"], "AUTH_COMMIT");
+        assert_eq!(records[2]["event_type"], "AUTH_ABORTED_POST_COMMIT");
+        assert_eq!(records[1]["host_id"], records[0]["host_id"]);
     }
 
     #[test]

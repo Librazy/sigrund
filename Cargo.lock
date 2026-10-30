@@ -851,6 +851,7 @@ dependencies = [
  "sha2 0.10.9",
  "sigrund-core",
  "ssh-key",
+ "subtle",
  "tempfile",
 ]
 

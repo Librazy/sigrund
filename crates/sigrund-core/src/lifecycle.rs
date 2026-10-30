@@ -65,6 +65,25 @@ impl Lifecycle {
     pub fn state(&self) -> (Phase, Decision) {
         Self::unpack(self.word.load(Ordering::Acquire))
     }
+    /// Release a commit reservation only after a successful rollback has made
+    /// its result known. Pending cancellation stays visible to the coordinator.
+    pub fn rolled_back_commit(&self) -> bool {
+        loop {
+            let current = self.word.load(Ordering::Acquire);
+            if Self::unpack(current) != (Phase::Committing, Decision::Undecided) {
+                return false;
+            }
+            let next = Self::pack(Phase::Authorizing, Decision::Undecided)
+                | (current & CANCELLATION_PENDING);
+            if self
+                .word
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
     pub fn transition(&self, from: Phase, to: Phase) -> bool {
         if !matches!(
             (from, to),

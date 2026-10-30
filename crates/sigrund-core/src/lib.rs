@@ -12,6 +12,7 @@ pub mod lifecycle;
 pub mod paths;
 pub mod protocol;
 pub mod snapshot;
+mod sqlite_pinned;
 pub mod state;
 pub mod warrant;
 
