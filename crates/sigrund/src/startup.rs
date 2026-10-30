@@ -1,8 +1,167 @@
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{MetadataExt, OpenOptionsExt},
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
 };
+
+use crate::{
+    linux::{openat2_root, validate_absolute_path},
+    transport::invalid,
+};
+use sigrund_core::{audit::AuditLog, config::DaemonConfig, crypto::sha256_hex};
+
+/// Pin a no-symlink path below /, allowing configured roots on other mounts.
+pub fn open_pinned(path: &Path) -> io::Result<fs::File> {
+    validate_absolute_path(path)?;
+    if path == Path::new("/") {
+        return fs::File::open("/");
+    }
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| invalid("path must be absolute"))?;
+    let root = fs::File::open("/")?;
+    openat2_root(root.as_raw_fd(), relative).map(Into::into)
+}
+
+pub fn check_root_metadata(file: &fs::File, directory: bool, mode: Option<u32>) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.uid() != 0
+        || metadata.gid() != 0
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+        || metadata.mode() & 0o022 != 0
+        || mode.is_some_and(|mode| metadata.mode() & 0o777 != mode)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path must have trusted root:root ownership, type, and permissions",
+        ));
+    }
+    Ok(())
+}
+
+pub fn read_root_file(path: &Path, mode: Option<u32>, max: u64) -> io::Result<Vec<u8>> {
+    let mut file = open_pinned(path)?;
+    check_root_metadata(&file, false, mode)?;
+    let mut bytes = Vec::new();
+    (&mut file).take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(invalid("startup file exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+/// Retained startup resources. Recovery and all filesystem checks finish before
+/// either listener is published. No filesystem I/O is needed on the event loop.
+pub struct StartupResources {
+    pub host_id: String,
+    pub audit: AuditLog,
+    pub roots: Vec<fs::File>,
+    _collector_files: Vec<fs::File>,
+    _lock: fs::File,
+}
+
+impl StartupResources {
+    pub fn prepare(config: &DaemonConfig, state_dir: &Path, log_path: &Path) -> io::Result<Self> {
+        if unsafe { libc::geteuid() } != 0 || unsafe { libc::getegid() } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "foreground daemon requires UID/GID 0",
+            ));
+        }
+        if config.mvp.is_none() || config.require_remote_audit_ack {
+            return Err(invalid("Phase 1 requires the local-audit [mvp] profile"));
+        }
+        let state_directory = open_pinned(state_dir)?;
+        check_root_metadata(&state_directory, true, None)?;
+        let log_directory = open_pinned(
+            log_path
+                .parent()
+                .ok_or_else(|| invalid("log has no parent"))?,
+        )?;
+        check_root_metadata(&log_directory, true, None)?;
+        let lock_path = PathBuf::from(format!(
+            "/proc/self/fd/{}/daemon.lock",
+            state_directory.as_raw_fd()
+        ));
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(lock_path)?;
+        check_root_metadata(&lock, false, Some(0o600))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "host state is already in use",
+            ));
+        }
+        let mut identity = read_root_file(&state_dir.join("host_identity.key"), Some(0o400), 64)?;
+        if identity.len() != 64 {
+            return Err(invalid(
+                "host identity must contain a 32-byte secret and public key",
+            ));
+        }
+        let mut secret: [u8; 32] = identity[..32].try_into().unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        secret.fill(0);
+        let public = key.verifying_key().to_bytes();
+        if identity[32..] != public {
+            identity.fill(0);
+            return Err(invalid("host identity keypair mismatch"));
+        }
+        identity.fill(0);
+        let host_id = format!("sigrun-host:sha256:{}", sha256_hex(&public));
+        let state_path = state_dir.join("audit_ratchet.state");
+        check_root_metadata(&open_pinned(&state_path)?, false, Some(0o600))?;
+        check_root_metadata(&open_pinned(log_path)?, false, Some(0o600))?;
+        // Only remove a regular, private, provisioned temporary file. Never
+        // follow an attacker-controlled symlink or recursively remove a path.
+        let temporary = state_dir.join("audit_ratchet.state.tmp");
+        match fs::symlink_metadata(&temporary) {
+            Ok(_) => {
+                check_root_metadata(&open_pinned(&temporary)?, false, Some(0o600))?;
+                fs::remove_file(&temporary)?;
+                state_directory.sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut roots = Vec::new();
+        for path in &config.csr_allowed_executable_dirs {
+            let root = open_pinned(path)?;
+            check_root_metadata(&root, true, None)?;
+            roots.push(root);
+        }
+        let mut collector_files = Vec::new();
+        for path in [
+            &config.collector_ca_file,
+            &config.collector_client_cert_file,
+            &config.collector_client_key_file,
+        ] {
+            let file = open_pinned(path)?;
+            check_root_metadata(&file, false, None)?;
+            collector_files.push(file);
+        }
+        let audit = AuditLog::open_for_host(log_path, state_path, &host_id)
+            .map_err(|e| invalid(format!("audit recovery failed: {e}")))?;
+        Ok(Self {
+            host_id,
+            audit,
+            roots,
+            _collector_files: collector_files,
+            _lock: lock,
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CgroupLayout {

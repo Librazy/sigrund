@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
-pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nThe foreground runtime is scheduled for roadmap Phases 1–5.";
+pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nPhase 1 accepts and validates requests; execution requires roadmap Phases 2–5.";
 pub const CLIENT_HELP: &str = "Usage: sigrun [--socket PATH] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nCommand execution is scheduled for roadmap Phases 2–5.";
 pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH]\nDefaults: /run/sigrund-approve.sock and /dev/tty.\nTTY approval and SSH signing are scheduled for roadmap Phase 3.";
 
@@ -23,6 +23,8 @@ pub struct DaemonArgs {
     pub approval_socket: PathBuf,
     pub config: Option<PathBuf>,
     pub signers: Option<PathBuf>,
+    pub state_dir: PathBuf,
+    pub log_path: PathBuf,
 }
 
 impl DaemonArgs {
@@ -33,6 +35,8 @@ impl DaemonArgs {
             approval_socket: APPROVAL_SOCKET.into(),
             config: None,
             signers: None,
+            state_dir: "/var/lib/sigrund".into(),
+            log_path: "/var/log/sigrund/audit.jsonl".into(),
         };
         let mut mode_set = false;
         let mut seen = BTreeSet::new();
@@ -46,6 +50,8 @@ impl DaemonArgs {
                 "--approval-socket" => result.approval_socket = path_value(&mut args)?,
                 "--config" => result.config = Some(path_value(&mut args)?),
                 "--signers" => result.signers = Some(path_value(&mut args)?),
+                "--state-dir" => result.state_dir = path_value(&mut args)?,
+                "--log-path" => result.log_path = path_value(&mut args)?,
                 "--foreground" | "--check-config" | "--check-cgroup" | "--help" => {
                     if mode_set {
                         return Err(invalid("conflicting daemon modes"));
@@ -153,9 +159,8 @@ fn path_value<'a>(args: &mut impl Iterator<Item = &'a String>) -> Result<PathBuf
     )
 }
 fn absolute_path(value: &str) -> Result<PathBuf> {
-    if !value.starts_with('/') || value.contains('\0') {
-        return Err(invalid("path must be absolute and NUL-free"));
-    }
+    crate::linux::validate_absolute_path(std::path::Path::new(value))
+        .map_err(|_| invalid("path must be canonical absolute text and NUL-free"))?;
     Ok(value.into())
 }
 fn invalid(message: &str) -> CoreError {

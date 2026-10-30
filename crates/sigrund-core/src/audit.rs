@@ -72,8 +72,26 @@ pub struct AuditLog {
 
 impl AuditLog {
     pub fn open(log_path: impl AsRef<Path>, state_path: impl AsRef<Path>) -> Result<Self> {
-        let log_path = log_path.as_ref().to_owned();
-        let state_path = state_path.as_ref().to_owned();
+        Self::open_checked(log_path.as_ref(), state_path.as_ref(), None)
+    }
+
+    /// Verify the recovered history belongs to the provisioned host before
+    /// making any recovery writes.
+    pub fn open_for_host(
+        log_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        host_id: &str,
+    ) -> Result<Self> {
+        Self::open_checked(log_path.as_ref(), state_path.as_ref(), Some(host_id))
+    }
+
+    fn open_checked(
+        log_path: &Path,
+        state_path: &Path,
+        expected_host: Option<&str>,
+    ) -> Result<Self> {
+        let log_path = log_path.to_owned();
+        let state_path = state_path.to_owned();
         let state_bytes = std::fs::read(&state_path)
             .map_err(|e| CoreError::Database(format!("read audit state: {e}")))?;
         let state: RatchetState = serde_json::from_slice(&state_bytes)
@@ -98,6 +116,11 @@ impl AuditLog {
             usable: true,
         };
         let recovery = recover_log_state(&mut writer.log, &writer.state, initial_key.as_ref())?;
+        if expected_host.is_some_and(|host| host != recovery.host_id) {
+            return Err(CoreError::Database(
+                "audit history does not match host identity".into(),
+            ));
+        }
         writer.host_id = recovery.host_id;
         match recovery.action {
             RecoveryAction::None => {}

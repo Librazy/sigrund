@@ -16,6 +16,25 @@ const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
+pub fn validate_absolute_path(path: &Path) -> io::Result<()> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
+    if !raw.starts_with('/')
+        || raw.contains('\0')
+        || (raw != "/"
+            && raw[1..]
+                .split('/')
+                .any(|part| matches!(part, "" | "." | "..")))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path must be canonical absolute text",
+        ));
+    }
+    Ok(())
+}
+
 pub fn openat2_root(root_fd: RawFd, relative_path: &Path) -> io::Result<OwnedFd> {
     let text = relative_path
         .to_str()

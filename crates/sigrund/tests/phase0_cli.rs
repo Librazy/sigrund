@@ -67,6 +67,10 @@ fn invalid_or_ambiguous_cli_forms_are_rejected() {
         &["--unknown"],
         &["--foreground", "--check-config"],
         &["--socket", "relative"],
+        &["--socket", "/tmp/./client.sock"],
+        &["--approval-socket", "/tmp/broker.sock/."],
+        &["--state-dir", "/tmp/../state"],
+        &["--log-path", "/tmp//audit.jsonl"],
         &["--socket", "/tmp/x", "--approval-socket", "/tmp/x"],
         &["--socket", "/tmp/a", "--socket", "/tmp/b"],
     ] {
