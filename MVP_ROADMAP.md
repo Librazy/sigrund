@@ -21,11 +21,14 @@ approval profile; the remaining v1.0 features retain their existing requirements
 
 ## Current status
 
-Phases 0–3 provide the contracts, foreground socket service, requester relays,
-sealed snapshots and root TTY approval with OpenSSH signing. The daemon verifies
-the returned signature and exact CSR, then returns an explicit rejection while
-durable authorization and command execution await Phases 4–5. Phase 3 evidence
-and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md).
+Phases 0–4 provide the contracts, foreground socket service, requester relays,
+sealed snapshots, root TTY approval with OpenSSH signing, and local durable
+authorization. Approved and pre-signed requests pass the same captured-policy
+gate and one-time SQLite consumption, then append authenticated commit and
+post-commit abort records. The daemon returns `SPAWN_FAILED` with an explicit
+Phase 5 handoff and consumed-grant message. Child execution remains pending.
+Evidence and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md)
+and [docs/MVP_PHASE4.md](docs/MVP_PHASE4.md).
 
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
@@ -36,8 +39,8 @@ and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md).
   streaming snapshot foundations and updated request-profile gates.
 - [x] Phase 2: client transport and common snapshots.
 - [x] Phase 3: root TTY approval and SSH signing.
-- [x] Phase 4: authorization, commit, and local audit integration (local-only
-  boundary; Phase 5 execution remains pending).
+- [x] Phase 4: local authorization, commit and audit, with concurrent replay,
+  deterministic cancellation, recovery and blocked durable-I/O gates.
 - [ ] Phase 5: child execution and exit relay.
 - [ ] Phase 6: two-UID end-to-end fixture.
 
@@ -267,7 +270,7 @@ Deliverables:
 - Add the missing warrant, CSR, DSSE envelope, and approval-message types to
   `sigrund-core` with strict JCS round-trip validation.
 
-Exit gate (implemented local-audit slice):
+Exit gate:
 
 ```sh
 cargo test --workspace
@@ -402,9 +405,12 @@ Exit gate:
 - Audit reopen and crash-recovery tests pass after approval and denial paths.
 - The namespace fixture covers the approved, refused, expired, disconnected,
   and malformed paths, including authenticated `AUTH_COMMIT` and
-  `AUTH_ABORTED_POST_COMMIT` records. Core state/audit tests cover M-06, M-10,
-  and the guarded cancellation/persistence cases. Concurrent runtime replay
-  and remote ACK remain Phase 4 follow-up work.
+  `AUTH_ABORTED_POST_COMMIT` records. The dedicated Phase 4 fixture covers
+  concurrent matching-peer replay, revocation, pre-signed CLI input,
+  cancellation around commit, durable I/O failure, bounded workers and
+  responsive shutdown. Core state/audit tests and the runtime gate cover
+  M-06, M-10 and applicable M-07/M-14 cancellation/persistence subcases.
+  Remote ACK remains a separate post-MVP milestone.
 
 ### Phase 5: child execution and exit relay
 

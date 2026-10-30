@@ -16,8 +16,9 @@ local-approval profile, including a required execution-time
 `mvp.approval_signer_id`. Phase 1.5 implements received-FD cleanup, retained
 request/snapshot ownership, root pinning, streaming snapshot builders and
 request-profile restrictions. Phases 2–3 add client options and relays, common
-snapshots, explicit signer/key selection, and foreground root approval. Durable
-authorization and execution remain Phases 4–5.
+snapshots, explicit signer/key selection, and foreground root approval. Phase 4
+adds local authorization, SQLite consumption and serialized durable audit.
+Execution remains Phase 5.
 M-01–M-15 and applicable V subcases gate the revised MVP. The Phase 0/1 evidence
 documents remain records of what was actually implemented and tested.
 
@@ -219,6 +220,16 @@ and appends authenticated `AUTH_COMMIT`/`AUTH_ABORTED_POST_COMMIT` records.
 The local profile then returns `SPAWN_FAILED` with an explicit Phase 5 handoff;
 no elevated child or readiness frame is created.
 
+Phase 4's completed checklist and verification evidence are in
+[docs/MVP_PHASE4.md](docs/MVP_PHASE4.md). Runtime tests cover concurrent
+matching-peer redemption, all three revocation selectors, signed null/hashed
+stdin, cancellation around commit, blocked WAL/audit sync, fatal persistence
+errors and startup recovery. Final authorization rehashes retained sealed
+bytes and checks root identity, mode/ownership/seals and ELF. SQLite database
+and sidecars stay under a verified directory FD; metadata verification closes
+its separate database FD before SQLite locks it so it cannot release SQLite's
+process-wide POSIX locks and hide later administrative revocations.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated
@@ -226,11 +237,11 @@ as production functionality:
 
 | Surface | Current behavior | Required integration |
 | --- | --- | --- |
-| `sigrund` | Runs the Phase 3 foreground service under `[mvp]`; unsigned requests snapshot, dispatch root approval when configured/connected and verify the returned warrant. Successful verification still returns a bounded rejection. | Authorization/SQLite commit, cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
-| `sigrun` | `--validate-hello` and `--encode-signal` remain available; the normal command now implements Phase 2 hello transport, stdio relay, status reporting and signal/deadline handling. | PTY/window transport, authorization and child execution. |
+| `sigrund` | Runs the Phase 4 foreground service under `[mvp]`; unsigned and pre-signed requests share retained-snapshot authorization, SQLite consumption and authenticated local audit. Successful authorization returns `SPAWN_FAILED` while preserving consumption. | Cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
+| `sigrun` | Normal command supports unsigned construction or `--warrant PATH`, hello/descriptor transport, stdio relay, separate status reporting and signal/deadline handling. Signed input forbids field overrides and preserves canonical payload bytes. | PTY/window transport and validation against actual child execution. |
 | `sigrund-approve` | Root peer/TTY verification, bounded broker transport, complete escaped prompting, OpenSSH key/agent signing and cancellation are implemented. | Physical FIDO signing evidence; native agent adapter is optional follow-on work. |
 | `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |
-| `sigrundctl` | UUID validation/generation and `init-host` provisioning are available. | Sealing/template commands, revocation administration, anchor-file output, safe ownership checks, and complete operator error handling. |
+| `sigrundctl` | UUID validation/generation and root-only `init-host` provisioning with ownership/permission checks and durable state publication are available. | Sealing/template commands, revocation administration, anchor-file output, and complete operator workflows. |
 | Verification matrix | No V-01 through V-19 end-to-end harness exists. | Linux integration fixtures and deterministic race gates required by every row of Section 8. |
 
 Diagnostic options such as `--check-config`, `--check-cgroup`,
@@ -242,8 +253,8 @@ provide any runtime security guarantee.
 
 Follow [MVP_ROADMAP.md](MVP_ROADMAP.md) as the delivery order: preserve the
 completed transport, snapshot and root-approval gates (Phases 0–3), then add
-authorization/commit/local audit (Phase 4), cgroup
-startup/child setup/reaping (Phase 5), and complete execution fixtures (Phase 6).
+the completed authorization/commit/local-audit gates (Phase 4), followed by
+cgroup startup/child setup/reaping (Phase 5) and execution fixtures (Phase 6).
 Implement the applicable security subcases alongside each phase. PTY, hooks,
 remote replication, reload and additional signature adapters follow the thin
 workflow in separate milestones. Full v1.0 conformance still requires all

@@ -16,13 +16,16 @@ The namespace gate invokes the production `sigrun`, `sigrund` and
 It provisions temporary host state, generates disposable software SSH keys,
 creates a controlling foreground PTY and uses real OpenSSH helpers. Its
 snapshot fixture is deliberately an ELF-shaped file: no elevated command is
-executed during this phase. It asserts that the provisioned audit log remains
-unchanged and no consumption database appears across successful verification,
-refusal, expiry, cancellation and invalid responses.
+executed during this phase. The original Phase 3 gate required no durable
+authorization. Phase 4 has extended this same fixture to assert authenticated
+commit/post-commit abort and one-time consumption after successful approval,
+and rejection records for refusal, expiry and invalid responses. See
+[MVP_PHASE4.md](MVP_PHASE4.md) for that completed integration boundary.
 
-Approval is not durable execution authorization. A successfully verified
-response currently produces `REJECTED` with `Snapshots verified; execution
-authorization requires Phase 4`; no approver produces `TIMEOUT_CSR`, busy
+Approval is not durable execution authorization. At the original Phase 3
+boundary a verified response produced `REJECTED`; the Phase 4 executor now
+performs local durable authorization and returns `SPAWN_FAILED` with an
+explicit Phase 5 handoff. No approver produces `TIMEOUT_CSR`, busy
 admission produces `RESOURCE_EXHAUSTED`, explicit refusal produces `REJECTED`,
 and broker loss/malformed transport produces `TIMEOUT_CSR`. The returned CSR
 keeps its original grant and validity; waiting never renews it. Validated

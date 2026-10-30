@@ -1312,10 +1312,10 @@ The following integrations are required before claiming v1.0 conformance:
    cgroup initialization, child setup, PTY transfer, central reaping, and
    disconnect teardown. Startup recovery, root pinning, common snapshots,
    bounded transport, and local authorization/SQLite commit are integrated.
-2. `sigrun` must implement the `CLIENT_HELLO` descriptor contract, signed and
-   unsigned request construction, snapshot handoff, status-fd reporting,
-   server PTY transfer, frame deadlines, signal/window relaying, and terminal
-   cleanup.
+2. `sigrun` must complete server PTY transfer, window relaying, PTY terminal
+   cleanup and validation against actual child execution. The stdio
+   `CLIENT_HELLO` descriptor contract, signed/unsigned request construction,
+   status-fd reporting, frame deadlines and signal handling are integrated.
 3. `sigrund-collector` must implement authenticated TLS transport, exact
    HTTP/DSSE framing, contiguous batch verification, host binding,
    deduplication, durable cursor advancement, and the denial mappings in
