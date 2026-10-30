@@ -6,6 +6,13 @@ The security specification remains authoritative for the warrant and client
 protocol. The approval broker and `[mvp]` table are implementation contracts
 for the restricted first workflow.
 
+This document records the completed Phase 0 contract. The midpoint revision
+of [the roadmap](../MVP_ROADMAP.md) and specification Section 6.3 require
+additional profile restrictions, signer configuration and CLI options before
+execution is enabled. Phase 1.5 implements the request restrictions; signer
+configuration and CLI extensions belong to Phases 2–4 and are not accepted
+by the current parser.
+
 ## Configuration profile
 
 Add this table at the end of the normal daemon configuration:
@@ -29,9 +36,10 @@ remain valid configuration but cannot enable hooks under this profile.
 The profile allows only `ssh-ed25519` and `sk-ssh-ed25519` signer entries.
 Existing signer ceilings and exact root-list equality still apply. The
 profile's request gate validates the full hello and rejects any PTY request.
-It is retained with a request's captured policy generation. Phase 1 must
-enforce the one-active-approval capacity before sending an approval request;
-Phase 0 establishes the capacity contract without creating a request registry.
+It is retained with a request's captured policy generation. Phase 1 limits
+broker connections; Phase 3 must enforce one active approval request before
+snapshotting/dispatch. Phase 0 establishes the capacity contract without
+creating a request registry.
 
 ## Command forms
 
@@ -181,5 +189,5 @@ tests exact argv/socket parsing. The SSH unit tests also verify successful
 software and simulated security-key SSHSIG signatures with UP/UV enforcement.
 
 Passing these gates completes Phase 0. Phase 1 adds working sockets; a root
-TTY prompt, two-UID execution, and the M-01–M-10 runtime matrix remain gates
+TTY prompt, two-UID execution, and the revised M-01–M-15 runtime matrix remain gates
 of the subsequent roadmap phases.

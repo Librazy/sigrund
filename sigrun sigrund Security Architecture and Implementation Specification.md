@@ -33,6 +33,15 @@ This document is the complete, self-contained v1.0 specification for `sigrun` (u
 5. **Script & Dynamic Dependency Boundary:**
 * Sealing and hashing the target binary (`exec_memfd`) and standard input (`stdin_memfd`) authenticates only those exact byte streams. It does not authenticate dynamically linked libraries resolved from mutable paths, configuration files read after startup, or files sourced by an interpreter.
 
+Approval delegates the effects of the complete command, including argv,
+environment, input and working directory. A signed shell/interpreter or a
+privileged tool accepting caller-selected paths can confer broad authority
+despite an authentic executable digest. The cwd is a signed path, not a sealed
+directory tree. Operators must review those effects; host UID 0 with an empty
+capability set still has ownership-based authority, but does not have every
+Linux capability (Section 5.3). Local audit protection has the protected-state
+and key-compromise limits in Section 7.2.
+
 
 
 ### 1.2 Startup Cgroup v2 Initialization & Supervisor Leaf
@@ -55,7 +64,20 @@ Regular files (`S_ISREG`) do not support `epoll` and ignore `O_NONBLOCK` on loca
 Therefore, `sigrund` enforces the following **Response Deadline and Quota-Pinning Contract**:
 
 1. **Main Control Thread Non-Blocking Invariant:** The main `epoll` event loop handles control sockets, nonblocking hook pipes, child sync pipes, `pidfd`/`signalfd(SIGCHLD)` notifications, `inotify` events, and timers. It never reads filesystem binaries or client-passed `SCM_RIGHTS` descriptors, performs blocking hook-pipe writes, or waits on SQLite/fsync/network operations. Such blocking work is dispatched off-loop; its completion is delivered back to the request coordinator.
+   This includes potentially blocking `openat2`, `fstat`, `close`, and cleanup
+   of caller-controlled descriptors, even on malformed-request, excess-rights,
+   timeout and stale-completion paths. Metadata-only operations and RAII
+   destruction are not exemptions. Before receiving rights, reserve bounded
+   capacity for their eventual off-loop disposal; if unavailable, stop admission
+   before receiving more rights. The owning task retains quota through actual
+   cleanup. Cgroup filesystem operations and durable audit/database work also
+   run off-loop with bounded queues; a blocked operation cannot stall socket
+   deadlines, signal dispatch or other connections.
 2. **Policy-Generation I/O Worker Pool:** Potentially blocking reads (`exec_memfd` binary copying and `stdin_memfd` input collection) are dispatched to a pool sized by the admitted request's captured `max_io_workers_global` and `max_io_workers_per_uid` values (defaults `16` and `2`). The pool is fixed for that policy generation; no replacement threads exceed the captured global value. These values may be lowered by configuration but never exceed immutable ceilings of `16` global and `2` per UID.
+   Metadata, copy and descriptor-cleanup stages share this budget; separate
+   stage pools cannot each claim the full allowance. Uninterruptible tasks
+   may exhaust capacity and cause `RESOURCE_EXHAUSTED`; responsiveness does
+   not guarantee recovery of capacity until those tasks actually finish.
 3. **Response Deadline vs. Resource Reclamation:**
 * Each request is assigned the captured policy-generation `request_deadline_ms` snapshot/initial-response deadline (`5000 ms` default; immutable ceiling `5000 ms`) upon `accept4()`. It covers hello assembly and common executable/stdin snapshotting through the handoff to authorization; it is disarmed when Section 1.3.1 advances to `AUTHORIZING`. Hook, remote RPC, partial-frame, and final-expiry phases use their own deadlines and do not inherit or reset this one.
 * Before and after every immutable `65536`-byte read chunk, the worker checks `clock_gettime(CLOCK_MONOTONIC)` against the deadline and checks an atomic `cancelled` flag.
@@ -149,6 +171,14 @@ max_ttl_secs = 31536000                  # positive uint64, checked timestamp ar
 The following are immutable protocol/security ceilings, not freely adjustable limits: frame payload maxima and JSON structural limits in Section 2.1.1; `max_active_sockets_global/per_uid <= 64/4`; `max_io_workers_global/per_uid <= 16/2`; `request_deadline_ms <= 5000`; `snapshot_ram_global_bytes <= 536870912` and `snapshot_ram_per_uid_bytes <= 134217728`; `max_executable_bytes <= 67108864`; `max_stdin_bytes <= 16777216`; `hook_timeout_ms <= 25000`; `collector_rpc_timeout_ms <= 3000`; control-frame assembly/send deadlines remain the immutable `5000 ms` protocol deadline; `audit_record_max_bytes == 65536`; and finite numeric/identifier bounds in Section 3.5. All other listed numeric values are captured from the policy generation at request admission and used consistently for that request, hook pipeline, RPC, snapshots, and job cgroup. A lower value may reduce availability or resource consumption; no reload or warrant may exceed a ceiling.
 
 A successful `SIGHUP` parses and validates a complete replacement, checks all signer/root relationships and filesystem identities, then atomically installs it with a new monotonically increasing `policy_generation`. Existing requests retain the generation, signer ceilings, root FDs, hook identity, quotas, collector settings, and job limits captured at admission; a reload never mutates an active job or hook. New requests use only the new generation. Failed reloads leave the prior generation active and emit an audit diagnostic without changing authorization policy. A restart repeats full validation before opening the socket. Security-sensitive keys cannot be changed by partial file edits or per-request fields.
+
+Resource accounting spans all live policy generations. Admission checks the
+aggregate global/per-UID sockets, workers and snapshot bytes against the new
+request's captured limits and the immutable ceilings. Lowering a limit does
+not evict existing owners, but blocks new reservations until aggregate usage
+permits them. Reload cannot create replacement capacity for pinned old workers.
+The optional restricted local approval profile is defined in Section 6.3;
+it disables reload and does not relax the startup, descriptor or execution gates.
 
 ## 2. Wire Protocol, Request Shapes, and Job Lifecycle
 
@@ -299,6 +329,18 @@ Both request modes must complete the common phase below. Unsigned requests do no
 | **`"stdio"`** | **`"unrestricted_interactive"`** | Exactly 3 FDs (`stdin`, `stdout`, `stderr`) | `S_ISFIFO`, `S_ISREG`, or `S_ISCHR`. (`S_ISSOCK`, `S_ISDIR`, `O_PATH` rejected). | Must be `null`. |
 | **`"pty"`** | **`"unrestricted_interactive"`** | **0 FDs** (any `SCM_RIGHTS` rejected) | `sigrund` allocates a fresh PTY pair via `posix_openpt(O_RDWR | O_NOCTTY)` and passes exactly one master PTY FD to `sigrun` on the type byte of `SERVER_AUTH_DECISION` (`"READY_TO_EXEC"`) under Section 2.3.2. | Must be `null`. |
 | **`"pty"`** | **`"null"`** or **`"sha256"`** | **FORBIDDEN** | Rejected with `INVALID_TTY_STDIN_COMBINATION`. | N/A |
+
+For a requester invoked from a terminal in `stdio/null` or `stdio/sha256`
+mode, `sigrun` must provide pipe write ends for stdout/stderr and relay their
+read ends to the local sinks. It must not pass TTY descriptors or silently
+switch to unrestricted input to make the request succeed. Keep the two output
+streams separate and queues bounded; service control frames and cancellation
+under sink backpressure, including sinks whose writes may block. After receiving
+the child-exit frame, drain pending output through pipe EOF before returning
+the child status. Broken sinks abort the request and close its control socket.
+Before readiness, user cancellation closes the socket; afterward only the
+specified signals are forwarded. No PTY or raw-terminal setup is implied by
+this relay. Child output remains untrusted and never feeds an approval prompt.
 
 ### 2.3.1 Normative `recvmsg()` and Descriptor Ownership Rules
 
@@ -459,7 +501,7 @@ DSSEv1 38 application/vnd.sigrun.warrant.v1+json 67 {"grant_id":"0192d8f4-7c1b-7
 1. `sigrund` Base64-decodes `dsse_envelope.payload` (strict RFC 4648 standard alphabet, no whitespace) and rejects payloads over `65536` bytes.
 2. `sigrund` parses the JSON into `Warrant`, rejecting duplicate keys at any depth, unknown fields, non-integer numbers, strings exceeding `4096` UTF-8 bytes, and any string containing C0 controls (`U+0000`..`U+001F`), DEL/C1 controls (`U+007F`..`U+009F`), or Unicode BiDi control characters (`U+061C`, `U+200E`, `U+200F`, `U+202A`..`U+202E`, `U+2066`..`U+2069`).
 3. `sigrund` re-serializes `Warrant` using RFC 8785 (JCS) and asserts **byte-for-byte equality** with the raw decoded `payload` bytes. Exact-name `caller_env_allowlist` is the only v1.0 caller-environment forwarding field; obsolete `env_wildcard_allowlist` is rejected, never interpreted as a regex policy.
-4. Canonical wire/status/CSR document outputs retain their specified JSON bytes; for `TIMEOUT_CSR`, the client prints the canonical CSR document followed by one newline, without PEM armor or escaping its structural JSON syntax. Whenever `sigrun`, `sigrund`, or a hook interpolates an individual warrant/CSR field into other display text, logs, or chat webhooks, all bytes outside printable ASCII (`0x20..0x7E`) as well as `\` and `"` are escaped as `\xXX` or `\u{XXXX}`.
+4. Canonical wire/status/CSR document outputs retain their specified JSON bytes; for `TIMEOUT_CSR`, the client prints the canonical CSR document followed by one newline, without PEM armor or escaping its structural JSON syntax. Whenever `sigrun`, `sigrund`, `sigrund-approve`, or a hook interpolates an individual warrant/CSR field into other display text, logs, or chat webhooks, all bytes outside printable ASCII (`0x20..0x7E`) as well as `\` and `"` are escaped as `\xXX` or `\u{XXXX}`.
 
 ### 3.4 Signature Verification Adapters & Single-Signer Rule
 
@@ -793,6 +835,17 @@ The daemon config may set other finite values; `max`/unlimited values are reject
 
 ### 5.3 10-Step Child Transition Sequence
 
+The daemon is multithreaded. Before `clone3()`, prepare immutable argv/envp
+storage, descriptor actions and bounded buffers for the setup checks. From
+the child return of `clone3()` until `execveat()` or `_exit()`, use only an
+audited syscall-only/async-signal-safe path: no heap allocation, Rust formatting,
+logging, mutexes, unwinding, general library parsers or destructor-driven exit.
+Mountinfo verification uses a bounded allocation-free parser and fails closed
+on overflow. Preserve syscall errno when emitting a setup-error frame.
+The parent registers the returned PID/pidfd with the Central Reaper before
+processing queued child-exit notifications; a fast exit must not be discarded
+as an untracked orphan. These requirements also apply to hook child setup.
+
 On any error in Steps 1–10 prior to `execveat()`, the child writes `{ u32 step, i32 errno }` (`step` in `1..=10`) to `FD 4` and calls `_exit(127)`:
 
 1. **Descriptors, Recursive Read-Only Cgroup Mount, & Session:**
@@ -906,6 +959,102 @@ if ((stv.f_flag & req) != req)
 
 ---
 
+### 6.3 Optional Local Root-TTY Approval Profile
+
+This optional profile implements the first local human-approval workflow.
+It replaces Section 6.2 hook dispatch for unsigned requests with a separate
+root foreground approver. It never bypasses the common snapshot phase,
+Sections 3–4 authorization, audit durability, or Section 5 child setup.
+Signed requests use the same gates without consulting the broker.
+
+**Profile configuration and scope:** A `[mvp]` table selects this profile.
+Its exact fields are `tty_mode = "stdio"`, `hooks_enabled = false`,
+`pty_enabled = false`, `max_active_approval_requests = 1`, and
+`approval_signer_id = "<configured SSH signer ID>"`. The first four fields
+default to the shown values and reject alternatives; the signer ID is required
+before enabling execution, references exactly one signer and uses Section 3.5
+bounds. Only `ssh-ed25519` and `sk-ssh-ed25519` policy entries are supported.
+Require `require_remote_audit_ack = false` and retain mandatory collector
+configuration validation. SIGHUP does not reload this profile.
+
+Both signed and unsigned requests must use `one_time`, `stdio`, `null` or
+`sha256` stdin, `allow_interpreted_script = false`, an empty
+`caller_env_allowlist` and empty `caller_env`. Same-UID execution is rejected
+even if the general configuration opts into it. Other unsupported profile
+values fail with `POLICY_VIOLATION`; malformed shapes retain their existing
+protocol errors. No setting or signed warrant can enable a deferred feature.
+The Phase 0/1 transport-only implementation lacks the new signer setting;
+it must continue rejecting execution until these additions are implemented.
+
+**Broker trust and bytes:** Use a distinct root:root `0600` `SOCK_STREAM`
+socket in a trusted root-owned directory. Authenticate `SO_PEERCRED.uid == 0`
+before parsing either peer's messages; invalid credentials close only that
+connection. The approver also verifies the socket and parent ownership/modes.
+Only one root approver connection and one outstanding approval are permitted.
+Each broker frame is a four-byte big-endian length followed by one exact JCS
+document of `1..=524288` bytes, with no ancillary descriptors. Enforce the
+five-second cumulative frame/send deadlines independently of human waiting.
+
+An approval request has exactly `exec_id` (UUIDv7), `signer_id` (configured ID),
+and `csr_payload` (the complete canonical CSR string, at most 65536 decoded
+UTF-8 bytes). A response has exactly either `status: "approved"`, `exec_id`,
+`dsse_envelope`, or `status: "rejected"`, `exec_id`, `reason` (1–1024 UTF-8
+bytes obeying Section 3.3). Apply strict duplicate/unknown-field, depth, schema
+and canonical-encoding checks. An approved response contains exactly one
+signature from the selected signer and a payload byte-for-byte equal to the
+retained CSR. Derive DSSE PAE from those payload bytes, then sign PAE using
+Section 3.4 SSHSIG; neither signing bare JSON nor signing a displayed digest
+is equivalent. A root peer's confirmation is not itself authorization.
+
+**Admission and deadlines:** After static profile/policy checks, reserve the
+single approval slot before starting unsigned snapshots. Busy requests receive
+`RESOURCE_EXHAUSTED`, without an unbounded waiting queue. Snapshot completion
+still competes with the accept-based deadline under Section 1.3.1. At successful
+handoff to `AUTHORIZING`, start a separate immutable `120000 ms` monotonic
+deadline covering broker delivery, human confirmation and signing. This is
+not the hook timeout and progress never resets it. Verify that deadline when
+accepting the response, even if its timer callback has not run. A verified
+response handed to local authorization disarms it; final warrant expiry and
+cancellation checks remain mandatory. Approval never refreshes the grant's
+signed validity window.
+
+If no authenticated approver is connected at handoff, send `TIMEOUT_CSR`
+immediately with the completed canonical CSR. Explicit refusal sends
+`REJECTED`; broker disconnect, malformed response or approval timeout sends
+`TIMEOUT_CSR`. Signature/policy failures use the normal authorization denial.
+These pre-commit outcomes cannot consume a grant or spawn. A requester
+disconnect cancels without a wire reply. On cancellation, timeout or broker
+protocol fault, close the broker connection to invalidate the outstanding
+prompt; do not reuse it for another request. Ignore late completions and bind
+all results to execution ID, connection identity and captured policy. Release
+the approval slot on resolution/cancellation, but retain worker, FD and RAM
+reservations until actual cleanup. An idle approver may reconnect for future
+requests; reconnecting never reissues an old prompt automatically.
+
+**Root interaction:** The approver requires effective UID 0 and a verified
+controlling TTY, with prompts and key passphrase/FIDO interactions on that
+TTY rather than broker stdin. Its root-controlled signer configuration and
+explicit key/agent selection must match the requested signer ID, public key,
+algorithm, namespace and UP/UV policy. Never choose an arbitrary agent key
+or take an identity-file path from the request. Display every CSR field,
+execution ID and selected key fingerprint before confirmation; render argv
+as indexed escaped strings, environment as individual exact key/value pairs,
+and include groups, capabilities, umask, script permission, host/requester/
+target identities, input/executable digests, mode, grant and validity. Do not
+truncate away fields and then permit approval. Confirm with `[y/N]`: only
+explicit `y` or `yes` signs; blank input, EOF or TTY loss denies. No shell
+command is assembled from request data. Any signing helper has bounded output
+and is terminated/reaped on broker loss, timeout or local cancellation.
+
+Verification must cover real terminal output through the Section 2.3 relay,
+OpenSSH signing interoperability, complete sanitized display, no approver,
+busy admission, wrong key/PAE/namespace, refusal/EOF, slow signing, expired
+warrants, stale/duplicate replies, reconnect and disconnect at every boundary.
+M-01–M-15 in the MVP roadmap are the profile's release gates; they supplement
+the applicable Section 8 cases and do not establish full v1.0 conformance.
+
+---
+
 ## 7. Hash-Chained Ratcheting Audit Log & Crash Recovery
 
 ### 7.1 Provisioning (`sigrundctl init-host`)
@@ -948,6 +1097,19 @@ hexadecimal encoding of $K_0$, unchanged for the lifetime of the host. It is
 needed to verify the genesis record and replay the ratchet during startup
 recovery. It is never used as a request-time signing key and remains covered
 by the state file's `0600` ownership and permission requirements.
+
+**Security limit:** Retaining `initial_key_hex` permits derivation of every
+past and future ratchet key. This format therefore provides no forward-secure
+audit authenticity after compromise of the host's state or UID 0. Zeroing a
+working key does not remove the retained seed. Local checks detect corruption
+and inconsistent edits while the protected state remains trustworthy; an
+attacker controlling both log and state can rewrite a self-consistent history
+or roll both back. Collector checkpoints protect history already committed
+outside the host according to Sections 1.1 and 4.4; an unreplicated suffix
+has no such protection. Verification anchors contain secret HMAC material
+and must be handled as secrets. A future forward-secure format would require
+removing the locally recoverable seed and redesigning verification/migration;
+that property must not be claimed for this format or the local-only MVP.
 
 If the record and log `fsync()` succeed but any temporary-state creation,
 state write, rename, or directory `fsync()` fails, the in-memory writer is
@@ -1134,12 +1296,19 @@ Each case runs in a fresh isolated daemon state with test signing keys and actua
 
 This specification is the target runtime contract. The current repository
 contains tested protocol, policy, snapshot, lifecycle, state, audit, framing,
-path, memfd, and cgroup helper primitives, but the production control loops
-are not implied by those helpers. Until the integration work is complete, the
-normal `sigrund`, `sigrun`, and `sigrund-collector` entry points may expose only
-their documented validation/provisioning probes and may exit with the service
-unavailable status (`78`). Such probes do not open `/run/sigrund.sock`, accept
-requests, authorize warrants, spawn jobs, or provide a security guarantee.
+path, memfd, and cgroup helper primitives. Completed roadmap Phases 0/1 also
+provide typed MVP/broker contracts and a foreground socket daemon that validates
+hellos and explicitly rejects execution. Phase 1.5 extends that service with
+reserved off-loop frame reception/FD disposal, retained request and snapshot
+ownership, directory/file-open separation, streaming sealed-snapshot builders
+and the restricted request-profile gate. Its helper and transport regressions
+do not establish the remaining common-snapshot coordinator, approval, cgroup,
+authorization or execution guarantees. Normal `sigrun`,
+`sigrund-approve` and `sigrund-collector` paths still report unavailable runtime
+with status `78`. Diagnostic probes and helper tests are not substitutes for
+the end-to-end gates. Section 6.3 signer selection, prompting and signing, and
+the remaining midpoint roadmap corrections are requirements for subsequent
+phases, not completed runtime functionality.
 
 The following integrations are required before claiming v1.0 conformance:
 

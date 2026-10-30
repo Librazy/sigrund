@@ -8,6 +8,14 @@ a message explaining that snapshots and authorization are not implemented.
 No command is executed, and no grant is consumed. The root TTY approver and
 client command transport remain the work of Phases 2–3.
 
+This is the original Phase 1 evidence record. The current implementation's
+receive/cleanup ownership is extended by
+[Phase 1.5](MVP_PHASE1_5.md): worker capacity is reserved before receiving,
+and caller rights are received and destroyed off-loop on every path. The
+expanded profile also rejects unsupported modes and same-UID requests before
+metadata. Phase 1.5's documentation supersedes the original ownership details
+below; execution is still unavailable.
+
 ## Running the service
 
 Use Rust 1.89 or newer and a Linux kernel supporting `openat2`, `accept4`,
@@ -156,5 +164,5 @@ The loop first implements a requirement, probes it through transport or the
 real daemon, fixes failures, and reruns the focused gate before the workspace
 gates. The fixture deliberately uses temporary executable roots and TLS files
 because it exercises local startup/transport without executing commands or
-making collector requests. The M-01–M-10 and V-01–V-19 execution matrices are
+making collector requests. The revised M-01–M-15 and V-01–V-19 execution matrices are
 still subsequent-phase gates.

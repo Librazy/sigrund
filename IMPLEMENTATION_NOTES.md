@@ -9,6 +9,18 @@ The executable delivery plan is in [MVP_ROADMAP.md](MVP_ROADMAP.md). It
 defines the thin `stdio` approval/signing workflow and the gates required
 before expanding to the full v1.0 surface.
 
+The midpoint roadmap revision adds explicit client defaults, terminal output
+relaying, signer/key selection, bounded root approval, off-loop cleanup and
+post-clone safety gates. Specification Section 6.3 now defines the target
+local-approval profile, including a required execution-time
+`mvp.approval_signer_id`. Phase 1.5 implements received-FD cleanup, retained
+request/snapshot ownership, root pinning, streaming snapshot builders and
+request-profile restrictions. The configuration parser still accepts only
+the original four `[mvp]` fields; signer selection, client/approval options
+and runtime integration belong to Phases 2–5.
+M-01–M-15 and applicable V subcases gate the revised MVP. The Phase 0/1 evidence
+documents remain records of what was actually implemented and tested.
+
 ## Current implementation
 
 The repository currently contains tested building blocks for:
@@ -116,6 +128,42 @@ worker isolation, quota pinning, late-result suppression, and responsive
 shutdown. A child PID-namespace fixture verifies that unmappable peers cannot
 stop either listener and that valid peers still work afterward.
 
+## Phase 1.5: ownership and snapshot foundations
+
+[docs/MVP_PHASE1_5.md](docs/MVP_PHASE1_5.md) tracks the five midpoint findings
+and their Implement–Verify–Fix evidence. The shared I/O pool now reserves
+global/per-UID capacity before receiving a frame and receives/parses/validates
+and disposes of caller rights on that worker. Quota refusal closes the local
+socket without receiving its queued rights. Partial-frame timeout, malformed
+ancillary data, JSON/profile failure, disconnect and stale results cannot
+close caller FDs on the control loop. Root broker receives use the same budget;
+idle broker connections consume no slot.
+
+Successful validation returns a lease retaining the hello, descriptors,
+captured policy, requester UID, deadline and cancellation flag. It may carry
+sealed executable/stdin snapshots and continue on the same reserved worker.
+Dropping the lease schedules disposal there; only cleanup completion releases
+the worker slot. Socket readiness is disabled while the worker receives, with
+disconnect/error events and coordinator deadlines still active.
+Every connection retirement explicitly removes its epoll registration before
+closing the coordinator's socket. A worker's duplicate socket may outlive it
+during blocked disposal; leaving the registration active would repeatedly
+deliver hangups for a removed token. The real-daemon fixture verifies removal
+while cleanup remains blocked.
+
+Executable roots now use separate `O_PATH | O_DIRECTORY` pinning, while
+readable-file and executable-relative opens retain their appropriate flags.
+Worker-only snapshot builders stream/hash with fixed 64-KiB scratch storage,
+reserve aggregate RAM before memfd allocation, retain quotas through source
+close and ownership transfer, seal the destination, rewind it, and trim hashed
+stdin to actual length. Empty stdin is valid. The common snapshot coordinator
+and source-selection/signature gate remain Phase 2 integration work.
+
+The MVP request gate enforces one-time/stdio/null-or-hashed-stdin, no scripts,
+no forwarded caller environment and no same-UID execution using kernel peer
+UID. These restrictions apply before metadata for signed and unsigned requests;
+they do not replace signature verification or the full authorization predicate.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated
@@ -137,19 +185,14 @@ provide any runtime security guarantee.
 
 ## Implementation order
 
-1. Build the daemon startup path: provisioned identity/audit recovery,
-   cgroup hierarchy and pinned roots, canonical configuration generations, and
-   fail-closed socket readiness.
-2. Build bounded control transport and descriptor ownership, then implement
-   the common executable/stdin snapshot phase and per-request quota ownership.
-3. Add signed and unsigned authorization, SQLite consumption, lifecycle
-   reservation reconciliation, and local audit sequencing.
-4. Add hook sandboxing and nonblocking hook I/O, then collector TLS/DSSE
-   replication and startup checkpoint reconciliation.
-5. Add child credential/mount setup, PTY transfer, central reaping, reload,
-   and disconnect teardown.
-6. Implement V-01 through V-19 in isolated Linux fixtures. A release is not
-   conformant until these cases pass in addition to unit tests and Clippy.
+Follow [MVP_ROADMAP.md](MVP_ROADMAP.md) as the delivery order: preserve the
+completed transport gates and Phase 1.5 foundations, then add client/relay/snapshots (Phase 2), root
+approval/signing (Phase 3), authorization/commit/local audit (Phase 4), cgroup
+startup/child setup/reaping (Phase 5), and complete execution fixtures (Phase 6).
+Implement the applicable security subcases alongside each phase. PTY, hooks,
+remote replication, reload and additional signature adapters follow the thin
+workflow in separate milestones. Full v1.0 conformance still requires all
+V-01 through V-19, not just the MVP gates or unit tests and Clippy.
 
 ## Contract clarifications made during implementation
 
@@ -158,7 +201,9 @@ The implementation uses the following crash-recovery and durability rules:
 1. `audit_ratchet.state` retains `initial_key_hex` so startup can verify the
    genesis record and replay HMACs across the complete log. It is protected by
    the same `0600` state-file permissions and is never exposed in normal
-   request processing.
+   request processing. Retaining this seed means the format is not
+   forward-secure after host/state compromise; the full limit and external
+   checkpoint boundary are explicit in specification Section 7.2.
 2. Once an audit record has been fsynced, any failure publishing the successor
    state poisons that writer. It may not append another record with the old
    sequence/key; restart or an equivalent verified reconciliation must recover
