@@ -13,7 +13,7 @@ use crate::{
     linux::{openat2_audit_log, openat2_file, openat2_root, validate_absolute_path},
     transport::invalid,
 };
-use sigrund_core::{audit::AuditLog, config::DaemonConfig, crypto::sha256_hex};
+use sigrund_core::{audit::AuditLog, config::DaemonConfig, crypto::sha256_hex, state::StateStore};
 
 /// Pin a no-symlink path below /, allowing configured roots on other mounts.
 pub fn open_pinned(path: &Path) -> io::Result<fs::File> {
@@ -84,6 +84,7 @@ fn read_root_descriptor(mut file: fs::File, mode: Option<u32>, max: u64) -> io::
 pub struct StartupResources {
     pub host_id: String,
     pub audit: AuditLog,
+    pub store: StateStore,
     pub roots: Vec<fs::File>,
     _collector_files: Vec<fs::File>,
     _lock: fs::File,
@@ -197,6 +198,36 @@ impl StartupResources {
             check_root_metadata(&file, false, None)?;
             collector_files.push(file);
         }
+        // SQLite and its sidecars stay below this verified directory even if
+        // an ancestor is renamed. Pre-create privately instead of changing
+        // the multithreaded process umask. SQLite copies this mode to sidecars.
+        let database_path = PathBuf::from(format!(
+            "/proc/self/fd/{}/state.sqlite",
+            state_directory.as_raw_fd()
+        ));
+        let database = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&database_path)?;
+        check_root_metadata(&database, false, Some(0o600))?;
+        for name in [
+            "state.sqlite-wal",
+            "state.sqlite-shm",
+            "state.sqlite-journal",
+        ] {
+            match openat2_file(state_directory.as_raw_fd(), Path::new(name)) {
+                Ok(file) => check_root_metadata(&file.into(), false, Some(0o600))?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error),
+            }
+        }
+        let store = StateStore::open_in_directory(state_directory.try_clone()?)
+            .map_err(|e| invalid(format!("database startup failed: {e}")))?;
+        state_directory.sync_all()?;
         let audit = AuditLog::from_verified_files(
             log_file,
             state_file,
@@ -208,6 +239,7 @@ impl StartupResources {
         Ok(Self {
             host_id,
             audit,
+            store,
             roots,
             _collector_files: collector_files,
             _lock: lock,

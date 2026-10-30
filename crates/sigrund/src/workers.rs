@@ -34,6 +34,7 @@ pub(crate) struct ValidatedRequest {
     pub policy: Arc<DaemonConfig>,
     pub requester_uid: u32,
     pub deadline: Instant,
+    pub deadline_active: bool,
     pub cancelled: Arc<AtomicBool>,
 }
 pub(crate) struct MeasuredSnapshots {
@@ -42,7 +43,11 @@ pub(crate) struct MeasuredSnapshots {
 }
 impl ValidatedRequest {
     pub fn check(&self) -> io::Result<()> {
-        check(&self.cancelled, self.deadline)?;
+        if self.deadline_active {
+            check(&self.cancelled, self.deadline)?;
+        } else if self.cancelled.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         if self.snapshots.as_ref().is_some_and(|snapshots| {
             snapshots.executable.digest.bytes > self.policy.max_executable_bytes
                 || snapshots
@@ -65,6 +70,12 @@ pub(crate) struct RequestLease {
     sender: SyncSender<Work>,
 }
 impl RequestLease {
+    pub fn request(&self) -> &ValidatedRequest {
+        self.request.as_ref().expect("live lease")
+    }
+    pub fn begin_authorization(&mut self) {
+        self.request.as_mut().expect("live lease").deadline_active = false;
+    }
     pub fn matches_admission(&self, uid: u32, policy: &Arc<DaemonConfig>) -> bool {
         let request = self.request.as_ref().expect("live lease");
         request.requester_uid == uid && Arc::ptr_eq(&request.policy, policy)
@@ -241,6 +252,7 @@ fn read_request(
         policy,
         requester_uid: uid,
         deadline,
+        deadline_active: true,
         cancelled,
     };
     validate_stdio_checked(&request.hello, &request.rights, || request.check())?;

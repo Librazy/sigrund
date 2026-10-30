@@ -1,10 +1,12 @@
 pub mod approver;
+mod authorization;
 pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod linux;
 pub mod memfd;
 mod preparation;
+mod sequencer;
 pub mod snapshot;
 pub mod startup;
 pub mod transport;

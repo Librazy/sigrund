@@ -330,7 +330,7 @@ pub(crate) fn prepare(
     request.check()
 }
 
-fn static_policy(
+pub(crate) fn static_policy(
     signer: &SignerConfig,
     warrant: &sigrund_core::warrant::Warrant,
     uid: u32,
@@ -650,6 +650,7 @@ mod tests {
                 policy: self.config.clone(),
                 requester_uid: 1001,
                 deadline: Instant::now() + Duration::from_secs(5),
+                deadline_active: true,
                 cancelled: Arc::new(AtomicBool::new(false)),
             }
         }

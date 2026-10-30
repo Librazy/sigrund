@@ -6,7 +6,7 @@ use crate::{
 };
 use sigrund_core::{
     framing::FrameType,
-    protocol::{ChildExit, Decision, parse_strict},
+    protocol::{ChildExit, ClientHello, Decision, DsseEnvelope, parse_strict},
     warrant::Csr,
 };
 use std::{
@@ -362,12 +362,58 @@ fn status(writer: &mut Option<Writer>, payload: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Signed input supplies every command and execution field. Never reconstruct
+/// or renew its canonical payload from CLI defaults or the client environment.
+fn signed_hello(bytes: &[u8]) -> io::Result<ClientHello> {
+    let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidInput, error);
+    if bytes.len() > 196_608 {
+        return Err(invalid("signed envelope exceeds wire bound".into()));
+    }
+    let envelope: DsseEnvelope = parse_strict(bytes).map_err(|e| invalid(e.to_string()))?;
+    let warrant = envelope.warrant().map_err(|e| invalid(e.to_string()))?;
+    let hello = ClientHello {
+        caller_env: Default::default(),
+        mode: "signed".into(),
+        tty_mode: warrant.warrant().command.tty_mode.clone(),
+        dsse_envelope: Some(envelope),
+        requested_command: None,
+        requested_execution_context: None,
+        requested_policy: None,
+    };
+    sigrund_core::config::MvpProfile::default()
+        .validate_hello(&hello)
+        .map_err(|e| invalid(e.to_string()))?;
+    ClientHello::parse_request(&serde_json::to_vec(&hello)?).map_err(|e| invalid(e.to_string()))
+}
+
 pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Result<u8> {
-    let cwd = std::env::current_dir()?;
-    let hello = options
-        .hello(command, &cwd)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    if options.stdin_policy == "sha256" && unsafe { libc::isatty(0) } == 1 {
+    let hello = if let Some(path) = &options.warrant {
+        let mut bytes = Vec::new();
+        File::open(path)?.take(196_609).read_to_end(&mut bytes)?;
+        signed_hello(&bytes)?
+    } else {
+        let cwd = std::env::current_dir()?;
+        options
+            .hello(command, &cwd)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+    };
+    let hash_stdin = if let Some(envelope) = &hello.dsse_envelope {
+        envelope
+            .warrant()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+            .warrant()
+            .command
+            .stdin_policy
+            == "sha256"
+    } else {
+        hello
+            .requested_command
+            .as_ref()
+            .expect("unsigned request")
+            .stdin_policy
+            == "sha256"
+    };
+    if hash_stdin && unsafe { libc::isatty(0) } == 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "hashed stdin cannot be a TTY",
@@ -396,7 +442,7 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
         .transpose()?;
     let stdout = duplicate(1)?;
     let stderr = duplicate(2)?;
-    let stdin = if options.stdin_policy == "sha256" {
+    let stdin = if hash_stdin {
         Some(duplicate(0)?)
     } else {
         None
@@ -617,5 +663,122 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
             },
         ];
         poll(&mut fds, deadline)?;
+    }
+}
+
+#[cfg(test)]
+mod signed_input_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sigrund_core::{
+        crypto::WARRANT_PAYLOAD_TYPE,
+        protocol::{DsseEnvelope, DsseSignature},
+        warrant::{CanonicalWarrant, CsrIdentity, SnapshotDigests},
+    };
+
+    fn envelope(hashed_stdin: bool) -> DsseEnvelope {
+        let options = RequestOptions {
+            stdin_policy: if hashed_stdin { "sha256" } else { "null" }.into(),
+            cwd: Some("/signed-directory".into()),
+            ..RequestOptions::default()
+        };
+        let hello = options
+            .hello(
+                &["/usr/bin/id".into(), "two words".into(), "".into()],
+                Path::new("/"),
+            )
+            .unwrap();
+        let csr = Csr::from_unsigned(
+            &hello,
+            CsrIdentity {
+                grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into(),
+                host_id: format!("sigrun-host:sha256:{}", "1".repeat(64)),
+                requester_uid: 1001,
+                requester_gid: 1001,
+                now: 1000,
+            },
+            SnapshotDigests {
+                executable_sha256: "2".repeat(64),
+                stdin_sha256: hashed_stdin.then(|| "3".repeat(64)),
+            },
+            3600,
+        )
+        .unwrap();
+        DsseEnvelope::from_warrant(
+            &CanonicalWarrant::parse(csr.as_bytes()).unwrap(),
+            vec![DsseSignature {
+                keyid: "fixture-signer".into(),
+                sig: STANDARD.encode([0; 64]),
+            }],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn signed_input_preserves_every_payload_byte_and_derives_stdin_from_the_warrant() {
+        for hashed in [false, true] {
+            let envelope = envelope(hashed);
+            let hello = signed_hello(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+            assert_eq!(hello.mode, "signed");
+            assert!(hello.requested_command.is_none());
+            assert!(hello.requested_execution_context.is_none());
+            assert!(hello.requested_policy.is_none());
+            assert!(hello.caller_env.is_empty());
+            assert_eq!(hello.dsse_envelope.as_ref(), Some(&envelope));
+            let signed = hello.dsse_envelope.unwrap().warrant().unwrap();
+            assert_eq!(signed.warrant().command.cwd, "/signed-directory");
+            assert_eq!(
+                signed.warrant().command.argv,
+                ["/usr/bin/id", "two words", ""]
+            );
+            assert_eq!(
+                signed.warrant().command.stdin_policy,
+                if hashed { "sha256" } else { "null" }
+            );
+            assert_eq!(signed.warrant().policy.not_before, 1000);
+            assert_eq!(signed.warrant().policy.not_after, Some(1900));
+        }
+    }
+
+    #[test]
+    fn malformed_and_unsupported_signed_input_fails_before_transport() {
+        for bytes in [b"{}".to_vec(), b"not json".to_vec(), vec![b' '; 196_609]] {
+            assert_eq!(
+                signed_hello(&bytes).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let original = envelope(false);
+        for mutation in ["mode", "script", "allowlist"] {
+            let mut warrant = original.warrant().unwrap().warrant().clone();
+            match mutation {
+                "mode" => warrant.policy.mode = "time_range".into(),
+                "script" => warrant.command.allow_interpreted_script = true,
+                "allowlist" => warrant
+                    .execution_context
+                    .caller_env_allowlist
+                    .push("USER".into()),
+                _ => unreachable!(),
+            }
+            let envelope = DsseEnvelope::from_warrant(
+                &CanonicalWarrant::new(warrant).unwrap(),
+                original.signatures.clone(),
+            )
+            .unwrap();
+            assert!(
+                signed_hello(&serde_json::to_vec(&envelope).unwrap()).is_err(),
+                "{mutation}"
+            );
+        }
+        let mut wrong = original.clone();
+        wrong.payload_type = "wrong".into();
+        assert!(signed_hello(&serde_json::to_vec(&wrong).unwrap()).is_err());
+        let mut wrong = original;
+        wrong.payload = STANDARD.encode(b"{} ");
+        assert!(signed_hello(&serde_json::to_vec(&wrong).unwrap()).is_err());
+        assert_eq!(
+            WARRANT_PAYLOAD_TYPE,
+            "application/vnd.sigrun.warrant.v1+json"
+        );
     }
 }

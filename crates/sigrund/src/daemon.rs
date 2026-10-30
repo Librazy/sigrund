@@ -1,8 +1,9 @@
-//! Foreground coordinator for transport, sealed snapshots and root approval.
-//! Durable authorization and spawning remain the later roadmap phases.
+//! Foreground coordinator for snapshots, approval and durable authorization.
+//! Child setup and readiness remain the Phase 5 execution boundary.
 use crate::{
     linux::validate_absolute_path,
     preparation::{self, Context, Document, PinnedRoot},
+    sequencer::{self, Sequencer},
     snapshot::SnapshotBudget,
     startup::{StartupResources, check_root_metadata, open_pinned},
     transport::{
@@ -43,7 +44,8 @@ const CLIENT_LISTENER: u64 = 1;
 const APPROVAL_LISTENER: u64 = 2;
 const SIGNALS: u64 = 3;
 const IO_COMPLETE: u64 = 4;
-const FIRST_CONNECTION: u64 = 5;
+const AUDIT_COMPLETE: u64 = 5;
+const FIRST_CONNECTION: u64 = 6;
 
 struct BoundSocket {
     fd: OwnedFd,
@@ -249,18 +251,23 @@ enum Input {
     Approval,
     Serving { requester: u64 },
     Validating { _task: ValidationHandle },
+    Authorizing { _task: ValidationHandle },
 }
 
 struct Connection {
+    token: u64,
     fd: OwnedFd,
     peer: PeerCredentials,
     broker: bool,
     input: Input,
     output: Option<FrameWriter>,
+    pending_decision: Option<Decision>,
+    audit_submitted: bool,
     request_deadline: Option<Instant>,
     exec_id: String,
     policy: Arc<DaemonConfig>,
-    lifecycle: Lifecycle,
+    lifecycle: Arc<Lifecycle>,
+    durable: SyncSender<sequencer::Work>,
     approval_reserved: bool,
     approval_broker: Option<u64>,
     approval_csr: Option<String>,
@@ -275,6 +282,9 @@ struct ApprovalAvailability {
 
 impl Connection {
     fn deadline(&self) -> Option<Instant> {
+        if self.pending_decision.is_some() {
+            return None;
+        }
         if let Some(output) = &self.output {
             return Some(output.deadline());
         }
@@ -292,6 +302,17 @@ impl Connection {
         csr_payload: Option<String>,
         now: Instant,
     ) -> io::Result<()> {
+        self.respond_inner(status, message, csr_payload, now, false)
+    }
+
+    fn respond_inner(
+        &mut self,
+        status: &str,
+        message: &str,
+        csr_payload: Option<String>,
+        now: Instant,
+        audited: bool,
+    ) -> io::Result<()> {
         let phase = self.lifecycle.state().0;
         let outcome = if status == "REQUEST_TIMEOUT" {
             LifecycleDecision::Timeout
@@ -304,6 +325,7 @@ impl Connection {
         // Cancelling a task never closes its caller rights on this thread.
         self.input = Input::Client;
         self.request_deadline = None;
+        self.approval_reserved = false;
         let decision = Decision {
             csr_payload,
             exec_id: self.exec_id.clone(),
@@ -311,6 +333,51 @@ impl Connection {
             message: message.into(),
         };
         decision.validate().map_err(|e| invalid(e.to_string()))?;
+        self.pending_decision = Some(decision);
+        if audited {
+            self.publish_decision(now)
+        } else {
+            self.queue_decision_audit()
+        }
+    }
+
+    fn reading(&self) -> bool {
+        self.pending_decision.is_none()
+            && !matches!(
+                self.input,
+                Input::Validating { .. } | Input::Authorizing { .. } | Input::Serving { .. }
+            )
+    }
+
+    fn queue_decision_audit(&mut self) -> io::Result<()> {
+        if self.audit_submitted {
+            return Ok(());
+        }
+        let Some(decision) = &self.pending_decision else {
+            return Ok(());
+        };
+        let work = sequencer::Work::Event {
+            token: self.token,
+            event_type: "AUTH_REJECTED",
+            fields: serde_json::json!({"exec_id":self.exec_id,"requester_uid":self.peer.uid,
+                "requester_gid":self.peer.gid,"status":decision.status,"message":decision.message}),
+            limit: self.policy.audit_record_max_bytes as usize,
+        };
+        match self.durable.try_send(work) {
+            Ok(()) => self.audit_submitted = true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => (),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(invalid("audit executor stopped"));
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_decision(&mut self, now: Instant) -> io::Result<()> {
+        let decision = self
+            .pending_decision
+            .take()
+            .ok_or_else(|| invalid("no audited decision"))?;
         self.output = Some(FrameWriter::control(
             FrameType::ServerAuthDecision,
             &serde_json::to_vec(&decision).map_err(|e| invalid(e.to_string()))?,
@@ -408,11 +475,31 @@ impl Connection {
                     Document::Signed { warrant, signer_id } => {
                         self.approval_reusable = self.approval_csr.is_some();
                         let _ = log.try_send(serde_json::json!({"event":"SIGNED_SNAPSHOTS_BOUND", "exec_id":self.exec_id, "grant_id":warrant.warrant().grant_id,"signer_id":signer_id}).to_string());
-                        self.reject(
-                            "REJECTED",
-                            "Snapshots verified; execution authorization requires Phase 4",
-                            now,
-                        )
+                        let mut lease = result.expect("verified signed snapshots");
+                        lease.begin_authorization();
+                        let work = sequencer::Work::Authorize(sequencer::AuthorizationTask {
+                            token: self.token,
+                            exec_id: self.exec_id.clone(),
+                            gid: self.peer.gid,
+                            lifecycle: self.lifecycle.clone(),
+                            lease,
+                            control: self.fd.try_clone()?,
+                        });
+                        if self.durable.try_send(work).is_err() {
+                            return self.reject(
+                                "RESOURCE_EXHAUSTED",
+                                "authorization executor is full",
+                                now,
+                            );
+                        }
+                        let Input::Validating { _task } =
+                            std::mem::replace(&mut self.input, Input::Client)
+                        else {
+                            unreachable!()
+                        };
+                        self.input = Input::Authorizing { _task };
+                        self.approval_reserved = false;
+                        Ok(())
                     }
                 }
             } else {
@@ -484,6 +571,9 @@ impl Connection {
         workers: &mut IoWorkers,
         _log: &SyncSender<String>,
     ) -> io::Result<bool> {
+        if self.pending_decision.is_some() {
+            return Ok(false);
+        }
         if let Some(output) = &mut self.output {
             return output
                 .write(self.fd.as_raw_fd(), now)
@@ -504,7 +594,7 @@ impl Connection {
                     }
                     Ok(true)
                 }
-                Input::Approval | Input::Serving { .. } => Ok(false),
+                Input::Approval | Input::Serving { .. } | Input::Authorizing { .. } => Ok(false),
             };
         }
         match &self.input {
@@ -531,7 +621,9 @@ impl Connection {
             }
             // EPOLLIN is disabled while the worker receives/validates. The
             // remaining socket events are disconnect/error notifications.
-            Input::Validating { .. } | Input::Serving { .. } => return Ok(false),
+            Input::Validating { .. } | Input::Serving { .. } | Input::Authorizing { .. } => {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -594,6 +686,12 @@ impl ForegroundDaemon {
         // Threads inherit the blocked signal mask, leaving shutdown handling
         // on signalfd even when a metadata syscall cannot be interrupted.
         let mut workers = IoWorkers::new(&self.config)?;
+        let sequencer = Sequencer::new(
+            self._resources,
+            context.clone(),
+            (self.config.max_active_sockets_global + self.config.max_io_workers_global + 2)
+                as usize,
+        )?;
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
@@ -604,6 +702,7 @@ impl ForegroundDaemon {
             (self.approval.fd.as_raw_fd(), APPROVAL_LISTENER),
             (signals.fd.as_raw_fd(), SIGNALS),
             (workers.fd(), IO_COMPLETE),
+            (sequencer.fd(), AUDIT_COMPLETE),
         ] {
             register(
                 epoll.as_raw_fd(),
@@ -614,8 +713,7 @@ impl ForegroundDaemon {
                 true,
             )?;
         }
-        // Diagnostic writes are off-loop and bounded. They are not audit
-        // records; authorization/audit sequencing is introduced in Phase 4.
+        // Human-readable diagnostics remain separate from durable audit.
         let (log, receiver) = sync_channel::<String>(128);
         let logger = std::thread::Builder::new()
             .name("diagnostics".into())
@@ -626,8 +724,8 @@ impl ForegroundDaemon {
             })?;
         drop(logger);
         let _ = log.try_send(
-            serde_json::json!({"event":"DAEMON_READY", "host_id":self._resources.host_id,
-            "phase":1})
+            serde_json::json!({"event":"DAEMON_READY", "host_id":context.host_id,
+            "phase":4, "local_audit_forward_secure":false})
             .to_string(),
         );
         let mut connections: HashMap<u64, Connection> = HashMap::new();
@@ -665,6 +763,66 @@ impl ForegroundDaemon {
                             return Ok(());
                         }
                         let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is outside the Phase 1 MVP\"}".into());
+                    }
+                } else if token == AUDIT_COMPLETE {
+                    for completion in sequencer.drain() {
+                        match completion {
+                            sequencer::Completion::Reserve { token, permit } => {
+                                let allowed = connections.get(&token).is_some_and(|c| {
+                                    matches!(c.input, Input::Authorizing { .. })
+                                        && sequencer::connection_live(c.fd.as_raw_fd())
+                                        && !c
+                                            .lifecycle
+                                            .cancelled
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                        && c.lifecycle
+                                            .transition(Phase::Authorizing, Phase::Committing)
+                                });
+                                let _ = permit.send(allowed);
+                            }
+                            sequencer::Completion::Finished {
+                                token,
+                                lease,
+                                denial,
+                            } => {
+                                if let Some(c) = connections.get_mut(&token) {
+                                    c.respond_inner(
+                                        denial.status,
+                                        denial.message,
+                                        None,
+                                        Instant::now(),
+                                        true,
+                                    )?;
+                                    register(
+                                        epoll.as_raw_fd(),
+                                        libc::EPOLL_CTL_MOD,
+                                        c.fd.as_raw_fd(),
+                                        token,
+                                        true,
+                                        false,
+                                    )?;
+                                }
+                                drop(lease);
+                            }
+                            sequencer::Completion::Audited { token } => {
+                                if let Some(c) = connections.get_mut(&token) {
+                                    c.publish_decision(Instant::now())?;
+                                    register(
+                                        epoll.as_raw_fd(),
+                                        libc::EPOLL_CTL_MOD,
+                                        c.fd.as_raw_fd(),
+                                        token,
+                                        true,
+                                        false,
+                                    )?;
+                                }
+                            }
+                            sequencer::Completion::Fatal(error) => {
+                                return Err(invalid(format!(
+                                    "durable executor failed closed: {error}"
+                                )));
+                            }
+                        }
                     }
                 } else if token == IO_COMPLETE {
                     for completion in workers.drain() {
@@ -711,8 +869,7 @@ impl ForegroundDaemon {
                                 )
                                 .is_ok()
                             {
-                                if connection.output.is_some()
-                                    && connection.approval_reusable
+                                if connection.approval_reusable
                                     && let Some(id) = connection.approval_broker.take()
                                     && let Some(broker) = connections.get_mut(&id)
                                 {
@@ -793,6 +950,7 @@ impl ForegroundDaemon {
                             continue;
                         }
                         let connection = Connection {
+                            token: next_token,
                             fd,
                             peer,
                             broker,
@@ -802,13 +960,16 @@ impl ForegroundDaemon {
                                 Input::Client
                             },
                             output: None,
+                            pending_decision: None,
+                            audit_submitted: false,
                             request_deadline: (!broker).then_some(
                                 accepted
                                     + Duration::from_millis(self.config.request_deadline_ms.into()),
                             ),
                             exec_id: new_uuidv7().to_string(),
                             policy: self.config.clone(),
-                            lifecycle: Lifecycle::new(),
+                            lifecycle: Arc::new(Lifecycle::new()),
+                            durable: sequencer.sender(),
                             approval_reserved: false,
                             approval_broker: None,
                             approval_csr: None,
@@ -844,13 +1005,18 @@ impl ForegroundDaemon {
                             connection.fd.as_raw_fd(),
                             token,
                             connection.output.is_some(),
-                            !matches!(connection.input, Input::Validating { .. }),
+                            connection.reading(),
                         )?;
                         connections.insert(token, connection);
                     } else {
                         unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
                     }
                 }
+            }
+            // A full durable queue applies bounded backpressure: keep each
+            // pending decision in its admitted connection until it can enqueue.
+            for connection in connections.values_mut() {
+                connection.queue_decision_audit()?;
             }
             // Expiry is independent of socket readiness and read progress.
             let now = Instant::now();
@@ -874,7 +1040,7 @@ impl ForegroundDaemon {
                             connection.fd.as_raw_fd(),
                             id,
                             connection.output.is_some(),
-                            !matches!(connection.input, Input::Validating { .. }),
+                            connection.reading(),
                         )?;
                         connections.insert(id, connection);
                     } else {
@@ -1022,10 +1188,12 @@ mod approval_tests {
             let task = workers
                 .submit(42, 1001, &fd, config.clone(), false, deadline)
                 .unwrap();
-            let lifecycle = Lifecycle::new();
+            let lifecycle = Arc::new(Lifecycle::new());
             assert!(lifecycle.transition(Phase::Snapshotting, Phase::Authorizing));
             let payload = String::from_utf8(csr.as_bytes().to_vec()).unwrap();
+            let (durable, _audit) = sync_channel(1);
             let mut connection = Connection {
+                token: 42,
                 fd,
                 peer: PeerCredentials {
                     pid: std::process::id() as i32,
@@ -1035,10 +1203,13 @@ mod approval_tests {
                 broker: false,
                 input: Input::Validating { _task: task },
                 output: None,
+                pending_decision: None,
+                audit_submitted: false,
                 request_deadline: Some(deadline),
                 exec_id: new_uuidv7().to_string(),
                 policy: config.clone(),
                 lifecycle,
+                durable,
                 approval_reserved: true,
                 approval_broker: None,
                 approval_csr: Some(payload.clone()),
@@ -1059,6 +1230,7 @@ mod approval_tests {
             } else {
                 assert!(connection.dispatch(42, now, &mut workers, &log).unwrap());
             }
+            connection.publish_decision(now).unwrap();
             assert!(!connection.dispatch(42, now, &mut workers, &log).unwrap());
             let mut header = [0; 5];
             peer.read_exact(&mut header).unwrap();

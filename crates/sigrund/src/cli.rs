@@ -11,7 +11,7 @@ use std::{
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
 pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nPhase 3 verifies snapshots and root approval; execution requires roadmap Phases 4–5.";
-pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nPhase 3 supports root approval; execution requires Phases 4–5.";
+pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nPhase 3 supports root approval; execution requires Phases 4–5.";
 pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty and /etc/sigrund/signers.toml.\nOnly UID 0 with a controlling TTY may approve and sign.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +133,7 @@ impl ClientArgs {
                 .ok_or_else(|| invalid("missing option value"))?;
             match flag.as_str() {
                 "--socket" => socket = absolute_path(value)?,
+                "--warrant" => options.warrant = Some(absolute_path(value)?),
                 "--target-uid" => options.target_uid = identity(value)?,
                 "--target-gid" => options.target_gid = identity(value)?,
                 "--supplementary-gid" => options.supplementary_gids.push(identity(value)?),
@@ -178,6 +179,28 @@ impl ClientArgs {
                 _ => return Err(invalid("unknown or unsupported client option")),
             }
         }
+        if options.warrant.is_some() {
+            if !command.is_empty()
+                || seen.iter().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "--socket" | "--warrant" | "--status-fd" | "--auth-fail-exit-code"
+                    )
+                })
+                || !env_seen.is_empty()
+                || !options.supplementary_gids.is_empty()
+                || !options.capabilities.is_empty()
+            {
+                return Err(invalid(
+                    "--warrant is mutually exclusive with command construction options",
+                ));
+            }
+            return Ok(Self::Run {
+                socket,
+                command,
+                options,
+            });
+        }
         if command.is_empty() {
             return Err(invalid("missing -- and absolute command"));
         }
@@ -203,6 +226,7 @@ impl ClientArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestOptions {
+    pub warrant: Option<PathBuf>,
     pub target_uid: u32,
     pub target_gid: u32,
     pub supplementary_gids: Vec<u32>,
@@ -218,6 +242,7 @@ pub struct RequestOptions {
 impl Default for RequestOptions {
     fn default() -> Self {
         Self {
+            warrant: None,
             target_uid: 0,
             target_gid: 0,
             supplementary_gids: vec![],
@@ -237,6 +262,11 @@ impl Default for RequestOptions {
 }
 impl RequestOptions {
     pub fn hello(&self, command: &[String], current: &std::path::Path) -> Result<ClientHello> {
+        if self.warrant.is_some() {
+            return Err(invalid(
+                "signed requests cannot construct an unsigned command",
+            ));
+        }
         let cwd = self
             .cwd
             .as_deref()
