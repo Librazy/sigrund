@@ -571,6 +571,10 @@ fn sign_with_helper(
             "-f",
         ])
         .arg(format!("/proc/self/fd/{fd}"))
+        // Passphrases belong on the verified controlling terminal, even when
+        // the operator's launch environment would force an askpass program.
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("SSH_ASKPASS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(tty.try_clone()?));

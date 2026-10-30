@@ -44,6 +44,12 @@ success and failure. The real PTY gate checks full attribute restoration after
 broker cancellation and local termination; the bounded-helper gate also covers
 timeout and I/O-error cleanup with echo disabled.
 
+The signing helper also overrides inherited `SSH_ASKPASS_REQUIRE` with `never`
+and removes `SSH_ASKPASS`. The encrypted-key PTY test launches the approver
+with forced askpass and an executable that can supply the correct fixture
+passphrase; it requires terminal entry and verifies that executable is never
+invoked.
+
 Reproducible checks:
 
 ```sh

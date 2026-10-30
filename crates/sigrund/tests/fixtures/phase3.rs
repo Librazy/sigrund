@@ -613,6 +613,17 @@ fn slow_signing_cancellation(fixture: &Fixture, identity: &Path) {
 }
 
 fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
+    let askpass = fixture.directory.path().join("askpass");
+    let askpass_marker = fixture.directory.path().join("askpass-invoked");
+    fs::write(
+        &askpass,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nprintf 'phase3-test\\n'\n",
+            askpass_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&askpass, fs::Permissions::from_mode(0o700)).unwrap();
     let agent_path = fixture.directory.path().join("agent.sock");
     let mut command = Command::new("/usr/bin/ssh-agent");
     command
@@ -653,7 +664,11 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
         };
         let (mut terminal, mut approver) = launch_approver_with(fixture, &selected, |command| {
             if encrypted {
-                command.env_remove("SSH_AUTH_SOCK");
+                command
+                    .env_remove("SSH_AUTH_SOCK")
+                    .env("SSH_ASKPASS", &askpass)
+                    .env("SSH_ASKPASS_REQUIRE", "force")
+                    .env("DISPLAY", ":phase3-fixture");
             } else {
                 command.env("SSH_AUTH_SOCK", &agent_path);
             }
@@ -671,11 +686,20 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
         prompt(&mut terminal);
         terminal.write_all(b"yes\n").unwrap();
         if encrypted {
-            let text = tty_until(&mut terminal, b": ");
+            let text = tty_until_checked(&mut terminal, b": ", || {
+                assert!(
+                    !askpass_marker.exists(),
+                    "OpenSSH invoked inherited askpass instead of the verified TTY"
+                );
+            });
             assert!(text.contains("Enter passphrase"));
             terminal.write_all(b"phase3-test\n").unwrap();
         }
         assert!(decision(&mut client).message.contains("requires Phase 4"));
+        assert!(
+            !askpass_marker.exists(),
+            "askpass must never receive a signing passphrase request"
+        );
         drop(client);
         fixture.wait_for_cleanup(before);
         let before = fixture.diagnostic_count();
@@ -690,8 +714,12 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
     agent.0.wait().unwrap();
 }
 fn tty_until(terminal: &mut File, target: &[u8]) -> String {
+    tty_until_checked(terminal, target, || {})
+}
+fn tty_until_checked(terminal: &mut File, target: &[u8], check: impl Fn()) -> String {
     let mut bytes = Vec::new();
     wait_for(|| {
+        check();
         let mut chunk = [0u8; 4096];
         match terminal.read(&mut chunk) {
             Ok(n) => bytes.extend_from_slice(&chunk[..n]),
