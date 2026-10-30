@@ -29,6 +29,7 @@ pub(crate) struct ValidatedRequest {
     pub hello: ClientHello,
     pub rights: Vec<OwnedFd>,
     pub snapshots: Option<MeasuredSnapshots>,
+    pub prepared: Option<crate::preparation::Prepared>,
     pub policy: Arc<DaemonConfig>,
     pub requester_uid: u32,
     pub deadline: Instant,
@@ -70,7 +71,9 @@ impl RequestLease {
     pub fn hello(&self) -> &ClientHello {
         &self.request.as_ref().expect("live lease").hello
     }
-    #[allow(dead_code)] // Used by the Phase 2 coordinator; exercised below.
+    pub fn prepared(&self) -> Option<&crate::preparation::Prepared> {
+        self.request.as_ref().expect("live lease").prepared.as_ref()
+    }
     pub fn continue_on_worker(
         mut self,
         operation: impl FnOnce(&mut ValidatedRequest) -> io::Result<()> + Send + 'static,
@@ -222,6 +225,7 @@ fn read_request(
         hello,
         rights: frame.rights,
         snapshots: None,
+        prepared: None,
         policy,
         requester_uid: uid,
         deadline,

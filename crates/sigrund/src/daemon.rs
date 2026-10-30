@@ -2,6 +2,8 @@
 //! no request can be authorized or spawned before the later roadmap phases.
 use crate::{
     linux::validate_absolute_path,
+    preparation::{self, Context, Document, PinnedRoot},
+    snapshot::SnapshotBudget,
     startup::{StartupResources, check_root_metadata, open_pinned},
     transport::{
         FrameWriter, PeerCredentials, disable_ancillary_credentials, invalid, peer_credentials,
@@ -12,6 +14,7 @@ use sigrund_core::{
     config::{DaemonConfig, SignerPolicyFile},
     crypto::new_uuidv7,
     framing::FrameType,
+    lifecycle::{Decision as LifecycleDecision, Lifecycle, Phase},
     protocol::Decision,
 };
 use std::{
@@ -255,6 +258,7 @@ struct Connection {
     request_deadline: Option<Instant>,
     exec_id: String,
     policy: Arc<DaemonConfig>,
+    lifecycle: Lifecycle,
 }
 
 impl Connection {
@@ -266,11 +270,30 @@ impl Connection {
     }
 
     fn reject(&mut self, status: &str, message: &str, now: Instant) -> io::Result<()> {
+        self.respond(status, message, None, now)
+    }
+
+    fn respond(
+        &mut self,
+        status: &str,
+        message: &str,
+        csr_payload: Option<String>,
+        now: Instant,
+    ) -> io::Result<()> {
+        let phase = self.lifecycle.state().0;
+        let outcome = if status == "REQUEST_TIMEOUT" {
+            LifecycleDecision::Timeout
+        } else {
+            LifecycleDecision::Rejected
+        };
+        if !self.lifecycle.claim_terminal(phase, outcome) {
+            return Err(invalid("decision already claimed"));
+        }
         // Cancelling a task never closes its caller rights on this thread.
         self.input = Input::Client;
         self.request_deadline = None;
         let decision = Decision {
-            csr_payload: None,
+            csr_payload,
             exec_id: self.exec_id.clone(),
             status: status.into(),
             message: message.into(),
@@ -289,6 +312,8 @@ impl Connection {
         result: io::Result<RequestLease>,
         now: Instant,
         log: &SyncSender<String>,
+        context: &Arc<Context>,
+        budget: &SnapshotBudget,
     ) -> io::Result<()> {
         // A timeout, disconnect, or protocol error may already have won. A
         // stale task can release resources but must not publish a decision.
@@ -309,13 +334,53 @@ impl Connection {
             if !lease.matches_admission(self.peer.uid, &self.policy) {
                 return Err(invalid("request admission mismatch"));
             }
-            let _ = log.try_send(serde_json::json!({"event":"CLIENT_HELLO_VALIDATED", "exec_id":self.exec_id,
+            if let Some(prepared) = lease.prepared() {
+                if !self
+                    .lifecycle
+                    .transition(Phase::Snapshotting, Phase::Authorizing)
+                {
+                    return Err(invalid("stale snapshot handoff"));
+                }
+                self.request_deadline = None;
+                let _ = log.try_send(serde_json::json!({"event":"SNAPSHOTS_PREPARED", "exec_id":self.exec_id,
+                    "root_path":prepared.root_path,"root_device":prepared.root_identity.device,"root_inode":prepared.root_identity.inode,
+                    "source_device":prepared.source_identity.device,"source_inode":prepared.source_identity.inode,
+                    "null_stdin":prepared.null_stdin.is_some()}).to_string());
+                match &prepared.document {
+                    Document::Unsigned(csr) => self.respond(
+                        "TIMEOUT_CSR",
+                        "No local approver is available; approval runtime requires Phase 3",
+                        Some(String::from_utf8(csr.as_bytes().to_vec()).expect("canonical UTF-8")),
+                        now,
+                    ),
+                    Document::Signed { warrant, signer_id } => {
+                        let _ = log.try_send(serde_json::json!({"event":"SIGNED_SNAPSHOTS_BOUND", "exec_id":self.exec_id, "grant_id":warrant.warrant().grant_id,"signer_id":signer_id}).to_string());
+                        self.reject(
+                            "REJECTED",
+                            "Snapshots verified; execution authorization requires Phase 4",
+                            now,
+                        )
+                    }
+                }
+            } else {
+                let _ = log.try_send(serde_json::json!({"event":"CLIENT_HELLO_VALIDATED", "exec_id":self.exec_id,
                 "requester_pid":self.peer.pid,"requester_uid":self.peer.uid,"requester_gid":self.peer.gid,"request_mode":lease.hello().mode}).to_string());
-            self.reject(
-                "REJECTED",
-                "Phase 1 transport validated; snapshotting and authorization are not implemented",
-                now,
-            )
+                let lease = result.expect("successful lease");
+                let context = context.clone();
+                let budget = budget.clone();
+                let gid = self.peer.gid;
+                lease.continue_on_worker(move |request| {
+                    preparation::prepare(request, &context, &budget, gid)
+                });
+                Ok(())
+            }
+        } else if let Some(failure) = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.get_ref())
+            .and_then(|error| error.downcast_ref::<preparation::Failure>())
+        {
+            self.reject(failure.status, &failure.to_string(), now)
         } else if result
             .as_ref()
             .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
@@ -381,6 +446,12 @@ impl Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.lifecycle.cancel();
+    }
+}
+
 pub struct ForegroundDaemon {
     client: BoundSocket,
     approval: BoundSocket,
@@ -414,7 +485,20 @@ impl ForegroundDaemon {
         })
     }
 
-    pub fn run(self) -> io::Result<()> {
+    pub fn run(mut self) -> io::Result<()> {
+        let context = Arc::new(Context {
+            roots: self
+                .config
+                .csr_allowed_executable_dirs
+                .iter()
+                .cloned()
+                .zip(std::mem::take(&mut self._resources.roots))
+                .map(|(path, directory)| PinnedRoot { path, directory })
+                .collect(),
+            host_id: self._resources.host_id.clone(),
+            signers: self._signers.clone(),
+        });
+        let budget = SnapshotBudget::default();
         let signals = SignalSource::new()?;
         // Threads inherit the blocked signal mask, leaving shutdown handling
         // on signalfd even when a metadata syscall cannot be interrupted.
@@ -507,7 +591,7 @@ impl ForegroundDaemon {
                         };
                         if let Some(mut connection) = connections.remove(&token) {
                             if connection
-                                .finish_validation(result, Instant::now(), &log)
+                                .finish_validation(result, Instant::now(), &log, &context, &budget)
                                 .is_ok()
                             {
                                 register(
@@ -578,6 +662,7 @@ impl ForegroundDaemon {
                             ),
                             exec_id: new_uuidv7().to_string(),
                             policy: self.config.clone(),
+                            lifecycle: Lifecycle::new(),
                         };
                         let id = next_token;
                         next_token = next_token

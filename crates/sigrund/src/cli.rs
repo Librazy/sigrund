@@ -1,11 +1,17 @@
 //! Frozen command forms for the thin MVP. Parsing has no privileged effects.
+use sigrund_core::protocol::{
+    ClientHello, RequestedCommand, RequestedExecutionContext, RequestedPolicy,
+};
 use sigrund_core::{CoreError, Result};
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
 pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nPhase 1 accepts and validates requests; execution requires roadmap Phases 2–5.";
-pub const CLIENT_HELP: &str = "Usage: sigrun [--socket PATH] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nCommand execution is scheduled for roadmap Phases 2–5.";
+pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nPhase 2 returns a canonical CSR; approval and execution require Phases 3–5.";
 pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH]\nDefaults: /run/sigrund-approve.sock and /dev/tty.\nTTY approval and SSH signing are scheduled for roadmap Phase 3.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +88,7 @@ pub enum ClientArgs {
     Run {
         socket: PathBuf,
         command: Vec<String>,
+        options: RequestOptions,
     },
 }
 
@@ -103,25 +110,184 @@ impl ClientArgs {
             }
             _ => (),
         }
-        let (socket, command) = match args {
-            [separator, command @ ..] if separator == "--" => (CLIENT_SOCKET.into(), command),
-            [flag, socket, separator, command @ ..] if flag == "--socket" && separator == "--" => {
-                (absolute_path(socket)?, command)
+        let mut socket = PathBuf::from(CLIENT_SOCKET);
+        let mut options = RequestOptions::default();
+        let mut seen = BTreeSet::new();
+        let mut env_seen = BTreeSet::new();
+        let mut arguments = args.iter();
+        let mut command = Vec::new();
+        while let Some(flag) = arguments.next() {
+            if flag == "--" {
+                command = arguments.cloned().collect();
+                break;
             }
-            _ => return Err(invalid("expected [--socket PATH] -- COMMAND ARG...")),
-        };
-        let Some(executable) = command.first() else {
-            return Err(invalid("missing command"));
-        };
-        absolute_path(executable)?;
-        if command.len() > 256 {
-            return Err(invalid("too many command arguments"));
+            if !matches!(
+                flag.as_str(),
+                "--env" | "--supplementary-gid" | "--capability"
+            ) && !seen.insert(flag)
+            {
+                return Err(invalid("duplicate client option"));
+            }
+            let value = arguments
+                .next()
+                .ok_or_else(|| invalid("missing option value"))?;
+            match flag.as_str() {
+                "--socket" => socket = absolute_path(value)?,
+                "--target-uid" => options.target_uid = identity(value)?,
+                "--target-gid" => options.target_gid = identity(value)?,
+                "--supplementary-gid" => options.supplementary_gids.push(identity(value)?),
+                "--capability" => options.capabilities.push(value.clone()),
+                "--cwd" => options.cwd = Some(absolute_path(value)?),
+                "--env" => {
+                    let (name, value) = value
+                        .split_once('=')
+                        .ok_or_else(|| invalid("environment entry must be NAME=VALUE"))?;
+                    if !env_seen.insert(name.to_owned()) {
+                        return Err(invalid("duplicate explicit environment name"));
+                    }
+                    options.env_exact.insert(name.to_owned(), value.to_owned());
+                }
+                "--umask" => {
+                    if value.is_empty() || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+                        return Err(invalid("umask must be octal"));
+                    }
+                    options.umask =
+                        u32::from_str_radix(value, 8).map_err(|_| invalid("invalid umask"))?;
+                }
+                "--stdin" if matches!(value.as_str(), "null" | "sha256") => {
+                    options.stdin_policy = value.clone()
+                }
+                "--ttl-secs" => {
+                    options.ttl_secs = decimal(value)?;
+                    if options.ttl_secs == 0 {
+                        return Err(invalid("TTL must be positive"));
+                    }
+                }
+                "--status-fd" => {
+                    let fd = i32::try_from(decimal(value)?)
+                        .map_err(|_| invalid("status FD outside bounds"))?;
+                    if matches!(fd, 1 | 2) {
+                        return Err(invalid("status FD must be separate from stdout/stderr"));
+                    }
+                    options.status_fd = Some(fd);
+                }
+                "--auth-fail-exit-code" => {
+                    options.auth_fail_exit_code = u8::try_from(decimal(value)?)
+                        .map_err(|_| invalid("exit code outside 0..255"))?
+                }
+                _ => return Err(invalid("unknown or unsupported client option")),
+            }
         }
+        if command.is_empty() {
+            return Err(invalid("missing -- and absolute command"));
+        }
+        absolute_path(&command[0])?;
+        options.capabilities.sort();
+        if options.capabilities.windows(2).any(|p| p[0] == p[1]) {
+            return Err(invalid("duplicate capability"));
+        }
+        options.supplementary_gids.sort_unstable();
+        if options.supplementary_gids.windows(2).any(|p| p[0] == p[1]) {
+            return Err(invalid("duplicate supplementary GID"));
+        }
+        // Validate all schema bounds before connecting, without depending on
+        // cwd capture (which belongs to request construction).
+        options.hello(&command, std::path::Path::new("/"))?;
         Ok(Self::Run {
             socket,
-            command: command.to_vec(),
+            command,
+            options,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestOptions {
+    pub target_uid: u32,
+    pub target_gid: u32,
+    pub supplementary_gids: Vec<u32>,
+    pub capabilities: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env_exact: BTreeMap<String, String>,
+    pub umask: u32,
+    pub stdin_policy: String,
+    pub ttl_secs: u64,
+    pub status_fd: Option<i32>,
+    pub auth_fail_exit_code: u8,
+}
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self {
+            target_uid: 0,
+            target_gid: 0,
+            supplementary_gids: vec![],
+            capabilities: vec![],
+            cwd: None,
+            env_exact: BTreeMap::from([
+                ("LANG".into(), "C.UTF-8".into()),
+                ("PATH".into(), "/usr/sbin:/usr/bin".into()),
+            ]),
+            umask: 0o77,
+            stdin_policy: "null".into(),
+            ttl_secs: 900,
+            status_fd: None,
+            auth_fail_exit_code: 255,
+        }
+    }
+}
+impl RequestOptions {
+    pub fn hello(&self, command: &[String], current: &std::path::Path) -> Result<ClientHello> {
+        let cwd = self
+            .cwd
+            .as_deref()
+            .unwrap_or(current)
+            .to_str()
+            .ok_or_else(|| invalid("cwd is not UTF-8"))?;
+        let hello = ClientHello {
+            caller_env: BTreeMap::new(),
+            mode: "unsigned_csr_request".into(),
+            tty_mode: "stdio".into(),
+            dsse_envelope: None,
+            requested_command: Some(RequestedCommand {
+                allow_interpreted_script: false,
+                argv: command.to_vec(),
+                cwd: cwd.into(),
+                executable_path: command
+                    .first()
+                    .ok_or_else(|| invalid("missing command"))?
+                    .clone(),
+                stdin_policy: self.stdin_policy.clone(),
+                tty_mode: "stdio".into(),
+            }),
+            requested_execution_context: Some(RequestedExecutionContext {
+                capabilities: self.capabilities.clone(),
+                env_exact: self.env_exact.clone(),
+                caller_env_allowlist: vec![],
+                supplementary_gids: self.supplementary_gids.clone(),
+                target_gid: self.target_gid,
+                target_uid: self.target_uid,
+                umask: self.umask,
+            }),
+            requested_policy: Some(RequestedPolicy {
+                mode: "one_time".into(),
+                ttl_secs: self.ttl_secs,
+            }),
+        };
+        hello.validate_request()?;
+        Ok(hello)
+    }
+}
+fn decimal(value: &str) -> Result<u64> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid("expected unsigned decimal integer"));
+    }
+    value.parse().map_err(|_| invalid("integer overflow"))
+}
+fn identity(value: &str) -> Result<u32> {
+    u32::try_from(decimal(value)?)
+        .ok()
+        .filter(|v| *v != u32::MAX)
+        .ok_or_else(|| invalid("UID/GID outside bounds"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

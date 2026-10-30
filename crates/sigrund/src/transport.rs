@@ -191,6 +191,8 @@ pub struct ControlReader {
     received: usize,
     expected: usize,
     first_frame: bool,
+    expected_kind: Option<FrameType>,
+    reject_frames: bool,
     rights: Vec<OwnedFd>,
     deadline: Option<Instant>,
 }
@@ -203,8 +205,30 @@ impl ControlReader {
             received: 0,
             expected: 5,
             first_frame,
+            expected_kind: None,
+            reject_frames: false,
             rights: Vec::new(),
             deadline: None,
+        }
+    }
+
+    /// Stdio clients accept only the exact next server frame, rejecting a
+    /// wrong direction/state on its type byte before collecting its length.
+    pub fn server(kind: FrameType) -> Self {
+        assert!(matches!(
+            kind,
+            FrameType::ServerAuthDecision | FrameType::ServerChildExit
+        ));
+        Self {
+            expected_kind: Some(kind),
+            ..Self::new(false)
+        }
+    }
+
+    pub fn server_finished() -> Self {
+        Self {
+            reject_frames: true,
+            ..Self::new(false)
         }
     }
 
@@ -238,6 +262,13 @@ impl ControlReader {
                 return Ok(None);
             };
             if self.received == 0 {
+                if self.reject_frames
+                    || self
+                        .expected_kind
+                        .is_some_and(|kind| buffer[0] != kind as u8)
+                {
+                    return Err(invalid("unexpected server frame type or state"));
+                }
                 self.deadline = Some(now + FRAME_TIMEOUT);
                 if self.first_frame && buffer[0] != FrameType::ClientHello as u8 {
                     return Err(invalid("first client frame must be CLIENT_HELLO"));
@@ -328,6 +359,7 @@ impl ApprovalReader {
 
 pub struct FrameWriter {
     bytes: Vec<u8>,
+    rights: Vec<OwnedFd>,
     offset: usize,
     deadline: Instant,
 }
@@ -336,9 +368,19 @@ impl FrameWriter {
     pub fn control(kind: FrameType, payload: &[u8], now: Instant) -> io::Result<Self> {
         Ok(Self {
             bytes: encode_frame(kind, payload).map_err(|e| invalid(e.to_string()))?,
+            rights: Vec::new(),
             offset: 0,
             deadline: now + FRAME_TIMEOUT,
         })
+    }
+
+    pub fn hello(payload: &[u8], rights: Vec<OwnedFd>, now: Instant) -> io::Result<Self> {
+        if !matches!(rights.len(), 2 | 3) {
+            return Err(invalid("invalid hello rights count"));
+        }
+        let mut writer = Self::control(FrameType::ClientHello, payload, now)?;
+        writer.rights = rights;
+        Ok(writer)
     }
 
     pub fn approval(payload: &[u8], now: Instant) -> io::Result<Self> {
@@ -349,6 +391,7 @@ impl FrameWriter {
         bytes.extend_from_slice(payload);
         Ok(Self {
             bytes,
+            rights: Vec::new(),
             offset: 0,
             deadline: now + FRAME_TIMEOUT,
         })
@@ -365,13 +408,41 @@ impl FrameWriter {
                 "frame send expired",
             ));
         }
-        let count = unsafe {
-            libc::send(
-                fd,
-                self.bytes[self.offset..].as_ptr().cast(),
-                (self.bytes.len() - self.offset).min(65_536),
-                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
-            )
+        let count = if self.offset == 0 && !self.rights.is_empty() {
+            let mut control = [0usize; 8];
+            let mut iov = libc::iovec {
+                iov_base: self.bytes.as_ptr().cast_mut().cast(),
+                iov_len: 1,
+            };
+            let mut message: libc::msghdr = unsafe { zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen =
+                unsafe { libc::CMSG_SPACE((self.rights.len() * size_of::<i32>()) as _) } as _;
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len =
+                    libc::CMSG_LEN((self.rights.len() * size_of::<i32>()) as _) as _;
+                for (index, right) in self.rights.iter().enumerate() {
+                    std::ptr::write(
+                        libc::CMSG_DATA(header).cast::<i32>().add(index),
+                        right.as_raw_fd(),
+                    );
+                }
+                libc::sendmsg(fd, &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+            }
+        } else {
+            unsafe {
+                libc::send(
+                    fd,
+                    self.bytes[self.offset..].as_ptr().cast(),
+                    (self.bytes.len() - self.offset).min(65_536),
+                    libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                )
+            }
         };
         if count < 0 {
             let error = io::Error::last_os_error();
@@ -390,6 +461,7 @@ impl FrameWriter {
                 "socket send returned zero",
             ));
         }
+        self.rights.clear();
         self.offset += count as usize;
         Ok(self.offset == self.bytes.len())
     }

@@ -7,7 +7,17 @@ use sigrund_core::{
 };
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = match env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string())
+        .collect::<Result<_, _>>()
+    {
+        Ok(args) => args,
+        Err(_) => {
+            eprintln!("sigrun: arguments must be valid UTF-8");
+            return ExitCode::from(64);
+        }
+    };
     let command = match ClientArgs::parse(&args) {
         Ok(command) => command,
         Err(error) => {
@@ -52,6 +62,23 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    eprintln!("sigrun: client transport is not enabled in this build");
-    ExitCode::from(78)
+    let ClientArgs::Run {
+        socket,
+        command,
+        options,
+    } = command
+    else {
+        unreachable!()
+    };
+    match sigrund::client::run(&socket, &command, &options) {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("sigrun: {error}");
+            ExitCode::from(if error.kind() == std::io::ErrorKind::InvalidInput {
+                64
+            } else {
+                254
+            })
+        }
+    }
 }

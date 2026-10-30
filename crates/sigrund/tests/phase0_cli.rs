@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use sigrund::cli::{ApprovalArgs, ClientArgs, DaemonArgs, DaemonMode};
+use sigrund::cli::{ApprovalArgs, ClientArgs, DaemonArgs, DaemonMode, RequestOptions};
 use std::process::Command;
 
 fn args(values: &[&str]) -> Vec<String> {
@@ -47,7 +47,8 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
         client,
         ClientArgs::Run {
             socket: "/tmp/client.sock".into(),
-            command: args(&["/usr/bin/printf", "--socket", "two words", ""])
+            command: args(&["/usr/bin/printf", "--socket", "two words", ""]),
+            options: RequestOptions::default()
         }
     );
     assert!(matches!(
@@ -137,7 +138,7 @@ fn shipped_binaries_expose_help_and_do_not_claim_runtime_is_available() {
             .unwrap()
             .status
             .code(),
-        Some(78)
+        Some(254)
     );
     assert_eq!(
         Command::new(env!("CARGO_BIN_EXE_sigrund-approve"))

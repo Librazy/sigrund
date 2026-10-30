@@ -72,11 +72,11 @@ fn send_fds(socket: &UnixStream, bytes: &[u8], rights: &[RawFd]) {
     );
 }
 
-fn hello() -> Vec<u8> {
+fn hello(executable: &Path) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "mode":"unsigned_csr_request", "tty_mode":"stdio", "caller_env":{},
         "requested_command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
-            "executable_path":"/usr/bin/id","stdin_policy":"null","tty_mode":"stdio"},
+            "executable_path":executable,"stdin_policy":"null","tty_mode":"stdio"},
         "requested_execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
             "supplementary_gids":[],"target_gid":0,"target_uid":33,"umask":18},
         "requested_policy":{"mode":"one_time","ttl_secs":60}
@@ -124,6 +124,7 @@ struct Fixture {
     signers: PathBuf,
     state: PathBuf,
     log: PathBuf,
+    executable: PathBuf,
     socket: PathBuf,
     broker: PathBuf,
     diagnostics: PathBuf,
@@ -134,6 +135,9 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let base = directory.path();
+        let client_binary = base.join("sigrun");
+        fs::copy(env!("CARGO_BIN_EXE_sigrun"), &client_binary).unwrap();
+        fs::set_permissions(&client_binary, fs::Permissions::from_mode(0o755)).unwrap();
         let peer_binary = base.join("peer-probe");
         fs::copy(std::env::current_exe().unwrap(), &peer_binary).unwrap();
         fs::set_permissions(&peer_binary, fs::Permissions::from_mode(0o755)).unwrap();
@@ -146,6 +150,8 @@ impl Fixture {
         for path in [&state, &log_dir, &root] {
             fs::create_dir(path).unwrap();
         }
+        let executable = root.join("id");
+        fs::write(&executable, b"\x7fELFphase2-fixture").unwrap();
         let mut configuration = include_str!("../../../config/sigrund.toml.example")
             .replace(
                 "<strict-padded-base64-32-byte-ed25519-key>",
@@ -219,6 +225,7 @@ impl Fixture {
             signers,
             state,
             log,
+            executable,
             directory,
         }
     }
@@ -296,7 +303,8 @@ impl Fixture {
             ])
             .env("SIGRUND_PHASE1_ROLE", role)
             .env("SIGRUND_PHASE1_CLIENT", &self.socket)
-            .env("SIGRUND_PHASE1_BROKER", &self.broker);
+            .env("SIGRUND_PHASE1_BROKER", &self.broker)
+            .env("SIGRUND_PHASE1_EXECUTABLE", &self.executable);
         command.env("SIGRUND_PHASE1_DIAGNOSTICS", &self.diagnostics);
         unsafe {
             command.pre_exec(move || {
@@ -456,7 +464,7 @@ fn phase1_namespace_fixture() {
         let body = if iteration % 2 == 0 {
             b"{}".to_vec()
         } else {
-            hello()
+            hello(&fixture.executable)
         };
         let encoded = encode_frame(FrameType::ClientHello, &body).unwrap();
         send_rights(
@@ -469,7 +477,7 @@ fn phase1_namespace_fixture() {
         let _ = socket.write_all(&encoded[1..]);
         let status = decision(&mut socket).status;
         assert!(
-            matches!(status.as_str(), "INVALID_REQUEST" | "REJECTED"),
+            matches!(status.as_str(), "INVALID_REQUEST" | "TIMEOUT_CSR"),
             "iteration {iteration}: unexpected status {status}"
         );
         expect_closed(&mut socket);
@@ -519,9 +527,9 @@ fn phase1_namespace_fixture() {
     wait_for(|| fd_count() == baseline + 2);
     let mut replacement = connect(&fixture.socket);
     send_rights(&replacement, &[1], 2);
-    let encoded = encode_frame(FrameType::ClientHello, &hello()).unwrap();
+    let encoded = encode_frame(FrameType::ClientHello, &hello(&fixture.executable)).unwrap();
     replacement.write_all(&encoded[1..]).unwrap();
-    assert_eq!(decision(&mut replacement).status, "REJECTED");
+    assert_eq!(decision(&mut replacement).status, "TIMEOUT_CSR");
     holder.stdin.take().unwrap().write_all(b"x").unwrap();
     assert!(holder.wait().unwrap().success());
     // The accept-based deadline also applies when no frame has started.
@@ -641,6 +649,7 @@ fn phase1_namespace_fixture() {
     fixture.launch().stop();
     let final_log = fs::read(&fixture.log).unwrap();
     assert_eq!(sha256_hex(&final_log), sha256_hex(&synchronized_log));
+    verify_phase2_requests();
     verify_provisioning_permissions();
     verify_audit_directory_replacement();
     verify_blocked_metadata();
@@ -648,12 +657,149 @@ fn phase1_namespace_fixture() {
     verify_ancestor_pid_peer();
 }
 
-fn send_hello(socket: &mut UnixStream) {
-    let encoded = encode_frame(FrameType::ClientHello, &hello()).unwrap();
+fn send_hello(socket: &mut UnixStream, executable: &Path) {
+    let encoded = encode_frame(FrameType::ClientHello, &hello(executable)).unwrap();
     // Quota denial can close the socket immediately after the first byte.
     // Send ordinary probes in one call; fragmented-frame behavior has its own
     // tests that explicitly allow early rejection of the remaining writes.
     send_rights(socket, &encoded, 2);
+}
+
+fn verify_phase2_requests() {
+    let fixture = Fixture::new();
+    let daemon = fixture.launch();
+    let baseline = fs::read_dir(format!("/proc/{}/fd", daemon.0.id()))
+        .unwrap()
+        .count();
+    for input in [
+        None,
+        Some(b"".as_slice()),
+        Some(b"finite input\0\xff".as_slice()),
+    ] {
+        let events_before = fixture.diagnostic_count();
+        let mut command = Command::new(fixture.directory.path().join("sigrun"));
+        command.arg("--socket").arg(&fixture.socket).args([
+            "--target-uid",
+            "33",
+            "--target-gid",
+            "0",
+            "--cwd",
+            "/",
+            "--env",
+            "LANG=en_US.UTF-8",
+            "--env",
+            "EMPTY=",
+            "--ttl-secs",
+            "60",
+        ]);
+        if let Some(input) = input {
+            let path = fixture.directory.path().join("input");
+            fs::write(&path, input).unwrap();
+            command
+                .args(["--stdin", "sha256"])
+                .stdin(File::open(path).unwrap());
+        } else {
+            command.stdin(Stdio::null());
+        }
+        command
+            .arg("--")
+            .arg(&fixture.executable)
+            .args(["two words", ""])
+            .env("UNRELATED_CLIENT_SECRET", "must not be forwarded");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(65534) != 0
+                    || libc::setuid(65534) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(255),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let text = String::from_utf8(output.stderr).unwrap();
+        let csr =
+            sigrund_core::warrant::Csr::parse(text.lines().last().unwrap().as_bytes()).unwrap();
+        let w = csr.warrant();
+        assert_eq!((w.requester_uid, w.requester_gid), (65534, 65534));
+        assert_eq!(
+            (
+                w.execution_context.target_uid,
+                w.execution_context.target_gid
+            ),
+            (33, 0)
+        );
+        assert_eq!(
+            w.command.argv,
+            [fixture.executable.to_str().unwrap(), "two words", ""]
+        );
+        assert_eq!(
+            w.command.executable_sha256,
+            sha256_hex(&fs::read(&fixture.executable).unwrap())
+        );
+        assert_eq!(w.command.stdin_sha256, input.map(sha256_hex));
+        assert_eq!(w.policy.not_after.unwrap() - w.policy.not_before, 60);
+        assert_eq!(w.execution_context.env_exact.len(), 3);
+        assert_eq!(w.execution_context.env_exact["LANG"], "en_US.UTF-8");
+        assert_eq!(w.execution_context.env_exact["EMPTY"], "");
+        assert!(w.execution_context.caller_env_allowlist.is_empty());
+        assert_eq!(w.execution_context.umask, 0o77);
+        fixture.wait_for_cleanup(events_before);
+        wait_for(|| {
+            fs::read_dir(format!("/proc/{}/fd", daemon.0.id()))
+                .unwrap()
+                .count()
+                == baseline
+        });
+    }
+    for (name, kind) in [
+        ("empty", "empty"),
+        ("script", "script"),
+        ("directory", "directory"),
+        ("fifo", "fifo"),
+        ("socket", "socket"),
+        ("link", "link"),
+    ] {
+        let path = fixture.executable.parent().unwrap().join(name);
+        let mut listener = None;
+        match kind {
+            "empty" => fs::write(&path, []).unwrap(),
+            "script" => fs::write(&path, b"#!/bin/sh\n").unwrap(),
+            "directory" => fs::create_dir(&path).unwrap(),
+            "fifo" => {
+                let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            "socket" => listener = Some(std::os::unix::net::UnixListener::bind(&path).unwrap()),
+            "link" => std::os::unix::fs::symlink(&fixture.executable, &path).unwrap(),
+            _ => unreachable!(),
+        }
+        let events_before = fixture.diagnostic_count();
+        let mut body: serde_json::Value = serde_json::from_slice(&hello(&path)).unwrap();
+        body["requested_command"]["executable_path"] = path.to_str().unwrap().into();
+        let mut socket = connect(&fixture.socket);
+        let encoded =
+            encode_frame(FrameType::ClientHello, &serde_json::to_vec(&body).unwrap()).unwrap();
+        send_rights(&socket, &encoded[..1], 2);
+        socket.write_all(&encoded[1..]).unwrap();
+        assert_eq!(
+            decision(&mut socket).status,
+            "EXECUTABLE_MUTATED_OR_TOO_LARGE",
+            "{kind}"
+        );
+        drop(socket);
+        drop(listener);
+        fixture.wait_for_cleanup(events_before);
+    }
+    daemon.stop();
 }
 
 // Use child-only umasks so the parallel test harness is unaffected. Every
@@ -975,7 +1121,8 @@ fn verify_blocked_metadata() {
         .unwrap();
     // Profile denials must happen before the interposed metadata syscall.
     for field in ["same_uid", "script", "stdin", "mode", "allowlist"] {
-        let mut body: serde_json::Value = serde_json::from_slice(&hello()).unwrap();
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&hello(&fixture.executable)).unwrap();
         match field {
             "same_uid" => body["requested_execution_context"]["target_uid"] = serde_json::json!(0),
             "script" => {
@@ -1016,7 +1163,7 @@ fn verify_blocked_metadata() {
         );
     }
     let mut stalled = connect(&fixture.socket);
-    let encoded = encode_frame(FrameType::ClientHello, &hello()).unwrap();
+    let encoded = encode_frame(FrameType::ClientHello, &hello(&fixture.executable)).unwrap();
     send_fds(
         &stalled,
         &encoded[..1],
@@ -1033,7 +1180,7 @@ fn verify_blocked_metadata() {
     // No second task from this UID may replace a blocked worker. Another UID
     // can still use the second worker and the event loop remains responsive.
     let mut same_uid = connect(&fixture.socket);
-    send_hello(&mut same_uid);
+    send_hello(&mut same_uid, &fixture.executable);
     assert_eq!(decision(&mut same_uid).status, "RESOURCE_EXHAUSTED");
     drop(same_uid);
     fixture.peer(65534, "client");
@@ -1055,7 +1202,7 @@ fn verify_blocked_metadata() {
     // Worker FDs and quotas must stay pinned until actual cleanup.
     wait_for(|| fd_count() == baseline + 4);
     let mut timed_out_uid = connect(&fixture.socket);
-    send_hello(&mut timed_out_uid);
+    send_hello(&mut timed_out_uid, &fixture.executable);
     assert_eq!(decision(&mut timed_out_uid).status, "RESOURCE_EXHAUSTED");
     drop(timed_out_uid);
     holder.stdin.take().unwrap().write_all(b"x").unwrap();
@@ -1080,8 +1227,8 @@ fn verify_blocked_metadata() {
         1
     );
     let mut recovered = connect(&fixture.socket);
-    send_hello(&mut recovered);
-    assert_eq!(decision(&mut recovered).status, "REJECTED");
+    send_hello(&mut recovered, &fixture.executable);
+    assert_eq!(decision(&mut recovered).status, "TIMEOUT_CSR");
     drop(recovered);
     wait_for(|| fd_count() == baseline);
     // Disconnect also cancels without prematurely releasing the worker slot.
@@ -1096,7 +1243,7 @@ fn verify_blocked_metadata() {
     drop(disconnected);
     wait_for(|| fd_count() == baseline + 2);
     let mut pinned_uid = connect(&fixture.socket);
-    send_hello(&mut pinned_uid);
+    send_hello(&mut pinned_uid, &fixture.executable);
     assert_eq!(decision(&mut pinned_uid).status, "RESOURCE_EXHAUSTED");
     drop(pinned_uid);
     let completed_before = completed_count();
@@ -1199,7 +1346,7 @@ fn verify_blocked_cleanup() {
         .write(true)
         .open("/dev/null")
         .unwrap();
-    let encoded = encode_frame(FrameType::ClientHello, &hello()).unwrap();
+    let encoded = encode_frame(FrameType::ClientHello, &hello(&fixture.executable)).unwrap();
     for case in [
         "valid",
         "json",
@@ -1246,7 +1393,8 @@ fn verify_blocked_cleanup() {
                 socket.write_all(&bad[1..]).unwrap();
             }
             "profile" => {
-                let mut body: serde_json::Value = serde_json::from_slice(&hello()).unwrap();
+                let mut body: serde_json::Value =
+                    serde_json::from_slice(&hello(&fixture.executable)).unwrap();
                 body["requested_execution_context"]["target_uid"] = serde_json::json!(0);
                 let bad = encode_frame(FrameType::ClientHello, &serde_json::to_vec(&body).unwrap())
                     .unwrap();
@@ -1299,7 +1447,7 @@ fn verify_blocked_cleanup() {
         // The cleanup reservation is still charged to UID 0. No additional
         // caller FDs may be received just to reject this quota-denied request.
         let mut same_uid = connect(&fixture.socket);
-        send_hello(&mut same_uid);
+        send_hello(&mut same_uid, &fixture.executable);
         assert_eq!(
             decision(&mut same_uid).status,
             "RESOURCE_EXHAUSTED",
@@ -1311,7 +1459,7 @@ fn verify_blocked_cleanup() {
             assert_eq!(
                 decision(&mut socket).status,
                 if case == "valid" {
-                    "REJECTED"
+                    "TIMEOUT_CSR"
                 } else {
                     "REQUEST_TIMEOUT"
                 },
@@ -1353,8 +1501,8 @@ fn verify_blocked_cleanup() {
             .lines()
             .count();
         let mut recovered = connect(&fixture.socket);
-        send_hello(&mut recovered);
-        assert_eq!(decision(&mut recovered).status, "REJECTED", "{case}");
+        send_hello(&mut recovered, &fixture.executable);
+        assert_eq!(decision(&mut recovered).status, "TIMEOUT_CSR", "{case}");
         drop(recovered);
         wait_for(|| {
             let events: Vec<serde_json::Value> = fs::read_to_string(&fixture.diagnostics)
@@ -1385,7 +1533,7 @@ fn verify_blocked_cleanup() {
     stalled.write_all(&encoded[1..]).unwrap();
     let mut tid = [0u8; 8];
     entered.read_exact(&mut tid).unwrap();
-    assert_eq!(decision(&mut stalled).status, "REJECTED");
+    assert_eq!(decision(&mut stalled).status, "TIMEOUT_CSR");
     daemon.stop();
     expect_closed(&mut stalled);
     assert!(!fixture.socket.exists() && !fixture.broker.exists());
@@ -1448,8 +1596,8 @@ fn phase1_pid_namespace_fixture() {
     );
     // A mappable peer still works after both sockets rejected pid=0 peers.
     let mut socket = connect(&fixture.socket);
-    send_hello(&mut socket);
-    assert_eq!(decision(&mut socket).status, "REJECTED");
+    send_hello(&mut socket, &fixture.executable);
+    assert_eq!(decision(&mut socket).status, "TIMEOUT_CSR");
     drop(socket);
     let mut broker = connect(&fixture.broker);
     broker.write_all(&[0, 0, 0, 2, b'{', b'}']).unwrap();
@@ -1462,19 +1610,25 @@ fn phase1_pid_namespace_fixture() {
 fn phase1_peer_probe() {
     assert_ne!(unsafe { libc::geteuid() }, 0);
     let client = PathBuf::from(std::env::var_os("SIGRUND_PHASE1_CLIENT").unwrap());
+    let executable = PathBuf::from(std::env::var_os("SIGRUND_PHASE1_EXECUTABLE").unwrap());
     let broker = PathBuf::from(std::env::var_os("SIGRUND_PHASE1_BROKER").unwrap());
     match std::env::var("SIGRUND_PHASE1_ROLE").unwrap().as_str() {
         "client" => {
             let mut socket = connect(&client);
-            let encoded = encode_frame(FrameType::ClientHello, &hello()).unwrap();
+            let encoded = encode_frame(FrameType::ClientHello, &hello(&executable)).unwrap();
             send_rights(&socket, &encoded[..1], 2);
             socket.write_all(&encoded[1..]).unwrap();
-            assert_eq!(decision(&mut socket).status, "REJECTED");
+            let decision = decision(&mut socket);
+            assert_eq!(decision.status, "TIMEOUT_CSR");
+            let csr = sigrund_core::warrant::Csr::parse(decision.csr_payload.unwrap().as_bytes())
+                .unwrap();
+            assert_eq!(csr.warrant().requester_uid, unsafe { libc::getuid() });
+            assert_eq!(csr.warrant().requester_gid, unsafe { libc::getgid() });
             expect_closed(&mut socket);
         }
         "worker_quota" => {
             let mut socket = connect(&client);
-            send_hello(&mut socket);
+            send_hello(&mut socket, &executable);
             assert_eq!(decision(&mut socket).status, "RESOURCE_EXHAUSTED");
             expect_closed(&mut socket);
         }
@@ -1490,7 +1644,7 @@ fn phase1_peer_probe() {
                 .open("/dev/null")
                 .unwrap();
             let mut socket = connect(&client);
-            let encoded = encode_frame(FrameType::ClientHello, &hello()).unwrap();
+            let encoded = encode_frame(FrameType::ClientHello, &hello(&executable)).unwrap();
             send_fds(
                 &socket,
                 &encoded[..1],
