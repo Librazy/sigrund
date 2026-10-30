@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::crypto::{WARRANT_PAYLOAD_TYPE, strict_base64, validate_uuidv7};
+use crate::crypto::validate_uuidv7;
 use crate::{CoreError, Result};
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -195,41 +195,77 @@ pub struct ClientHello {
     pub caller_env: BTreeMap<String, String>,
     pub mode: String,
     pub tty_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dsse_envelope: Option<DsseEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_command: Option<RequestedCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_execution_context: Option<RequestedExecutionContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_policy: Option<RequestedPolicy>,
 }
 
 impl ClientHello {
+    /// Entry point for an untrusted hello body. Wire bounds apply to the
+    /// original JSON bytes, including whitespace and alternative escapes.
+    pub fn parse_request(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 196_608 {
+            return Err(CoreError::Protocol(
+                "CLIENT_HELLO exceeds frame ceiling".into(),
+            ));
+        }
+        let hello: Self = parse_strict(bytes)?;
+        if hello.mode == "unsigned_csr_request" && bytes.len() > 65_536 {
+            return Err(CoreError::Protocol(
+                "unsigned request exceeds 65536 bytes".into(),
+            ));
+        }
+        hello.validate_request()?;
+        Ok(hello)
+    }
+
+    /// Full privilege-independent validation. Signature verification, peer and
+    /// policy ceilings, and retained snapshot checks follow in authorization.
+    pub fn validate_request(&self) -> Result<()> {
+        let bytes = serde_json::to_vec(self).map_err(|error| CoreError::Json(error.to_string()))?;
+        if bytes.len() > 196_608 || self.mode == "unsigned_csr_request" && bytes.len() > 65_536 {
+            return Err(CoreError::Protocol(
+                "CLIENT_HELLO exceeds request size limit".into(),
+            ));
+        }
+        crate::json::preflight_with_string_limits(&bytes, 8, &Self::string_limit)?;
+        self.validate_shape()?;
+        if let Some(envelope) = &self.dsse_envelope {
+            let warrant = envelope.warrant()?;
+            if warrant.warrant().command.tty_mode != self.tty_mode {
+                return Err(CoreError::Protocol("signed tty_mode fields differ".into()));
+            }
+            validate_unsigned_request(
+                &warrant.warrant().command.requested(),
+                &warrant.warrant().execution_context,
+                &RequestedPolicy {
+                    mode: warrant.warrant().policy.mode.clone(),
+                    ttl_secs: 0,
+                },
+                &self.caller_env,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn validate_shape(&self) -> Result<()> {
         if !matches!(self.tty_mode.as_str(), "stdio" | "pty") {
             return Err(CoreError::Protocol("invalid tty_mode".into()));
         }
         match self.mode.as_str() {
-            "signed" if self.dsse_envelope.is_some() && self.requested_command.is_none() => {
+            "signed"
+                if self.dsse_envelope.is_some()
+                    && self.requested_command.is_none()
+                    && self.requested_execution_context.is_none()
+                    && self.requested_policy.is_none() =>
+            {
                 let envelope = self.dsse_envelope.as_ref().unwrap();
-                if envelope.payload_type != WARRANT_PAYLOAD_TYPE
-                    || envelope.signatures.is_empty()
-                    || envelope.signatures.len() > 4
-                {
-                    return Err(CoreError::Protocol("invalid DSSE envelope shape".into()));
-                }
-                strict_base64(&envelope.payload, 65_536)?;
-                for signature in &envelope.signatures {
-                    if signature.keyid.is_empty()
-                        || signature.keyid.len() > 128
-                        || !signature.keyid.is_ascii()
-                    {
-                        return Err(CoreError::Protocol("invalid signer keyid".into()));
-                    }
-                    if signature.sig.len() > 32_768 {
-                        return Err(CoreError::Protocol(
-                            "signature exceeds Base64 string limit".into(),
-                        ));
-                    }
-                    strict_base64(&signature.sig, 24_576)?;
-                }
+                envelope.validate()?;
             }
             "unsigned_csr_request"
                 if self.dsse_envelope.is_none()
@@ -260,7 +296,7 @@ impl ClientHello {
     }
 }
 
-fn validate_unsigned_request(
+pub(crate) fn validate_unsigned_request(
     command: &RequestedCommand,
     context: &RequestedExecutionContext,
     policy: &RequestedPolicy,
@@ -288,7 +324,6 @@ fn validate_unsigned_request(
             policy.mode.as_str(),
             "one_time" | "time_range" | "permanent"
         )
-        || policy.ttl_secs > 31_536_000
     {
         return Err(CoreError::Protocol(
             "unsigned stdin or policy mode is invalid".into(),
@@ -298,6 +333,7 @@ fn validate_unsigned_request(
         || context.target_uid == u32::MAX
         || context.target_gid == u32::MAX
         || context.supplementary_gids.len() > 64
+        || context.supplementary_gids.contains(&u32::MAX)
         || !sorted_unique(&context.supplementary_gids)
         || context.capabilities.len() > 64
         || !sorted_unique(&context.capabilities)
@@ -753,6 +789,7 @@ pub fn parse_strict<T: for<'de> Deserialize<'de> + ProtocolSchema>(bytes: &[u8])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::WARRANT_PAYLOAD_TYPE;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     #[test]

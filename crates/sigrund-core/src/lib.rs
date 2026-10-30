@@ -2,6 +2,7 @@
 //! remote collector.  Linux operations live outside this crate so these types
 //! can be exercised by unprivileged unit tests and the collector.
 
+pub mod approval;
 pub mod audit;
 pub mod config;
 pub mod crypto;
@@ -12,6 +13,7 @@ pub mod paths;
 pub mod protocol;
 pub mod snapshot;
 pub mod state;
+pub mod warrant;
 
 use thiserror::Error;
 

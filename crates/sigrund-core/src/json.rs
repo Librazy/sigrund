@@ -2,6 +2,62 @@ use std::collections::HashSet;
 
 use crate::{CoreError, Result};
 
+/// RFC 8785 serialization for the integer-only protocol subset. Object keys
+/// are ordered by UTF-16 code units, including inside maps and arrays.
+pub fn canonical_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    fn write(value: &serde_json::Value, out: &mut Vec<u8>) -> Result<()> {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+                out.push(b'{');
+                for (index, (key, value)) in entries.into_iter().enumerate() {
+                    if index != 0 {
+                        out.push(b',');
+                    }
+                    serde_json::to_writer(&mut *out, key).map_err(json_error)?;
+                    out.push(b':');
+                    write(value, out)?;
+                }
+                out.push(b'}');
+            }
+            serde_json::Value::Array(values) => {
+                out.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        out.push(b',');
+                    }
+                    write(value, out)?;
+                }
+                out.push(b']');
+            }
+            serde_json::Value::Number(number) => {
+                // This subset never needs IEEE-754 rounding: timestamps and
+                // IDs fit the exact integer range of JCS's number model.
+                const MAX_EXACT: u64 = (1u64 << 53) - 1;
+                if !number.as_u64().is_some_and(|n| n <= MAX_EXACT)
+                    && !number
+                        .as_i64()
+                        .is_some_and(|n| n.unsigned_abs() <= MAX_EXACT)
+                {
+                    return Err(CoreError::Json("JCS requires an exact integer".into()));
+                }
+                serde_json::to_writer(&mut *out, number).map_err(json_error)?;
+            }
+            _ => serde_json::to_writer(&mut *out, value).map_err(json_error)?,
+        }
+        Ok(())
+    }
+    let value = serde_json::to_value(value).map_err(json_error)?;
+    let mut bytes = Vec::new();
+    write(&value, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn json_error(error: serde_json::Error) -> CoreError {
+    CoreError::Json(error.to_string())
+}
+
 /// Performs the structural checks that serde_json's ordinary map deserializer
 /// cannot provide: duplicate object members and maximum nesting/string sizes.
 /// Typed deserialization still runs after this preflight.

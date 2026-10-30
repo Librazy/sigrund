@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use ssh_key::{Algorithm, PublicKey};
 use std::{
     collections::BTreeSet,
@@ -20,6 +20,9 @@ const MAX_COLLECTOR_TIMEOUT_MS: u32 = 3_000;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
+    /// Presence opts into the roadmap's restricted first executable slice.
+    #[serde(default)]
+    pub mvp: Option<MvpProfile>,
     #[serde(default)]
     pub allow_same_uid_elevation: bool,
     #[serde(default)]
@@ -79,6 +82,46 @@ pub struct DaemonConfig {
     pub max_ttl_secs: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MvpProfile {
+    pub tty_mode: String,
+    pub hooks_enabled: bool,
+    pub pty_enabled: bool,
+    pub max_active_approval_requests: u32,
+}
+
+impl Default for MvpProfile {
+    fn default() -> Self {
+        Self {
+            tty_mode: "stdio".into(),
+            hooks_enabled: false,
+            pty_enabled: false,
+            max_active_approval_requests: 1,
+        }
+    }
+}
+
+impl MvpProfile {
+    pub fn validate(&self) -> Result<()> {
+        if self != &Self::default() {
+            return Err(CoreError::Config(
+                "MVP requires stdio, disabled hooks/PTY, and one active approval".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_hello(&self, hello: &crate::protocol::ClientHello) -> Result<()> {
+        self.validate()?;
+        hello.validate_request()?;
+        if hello.tty_mode != "stdio" {
+            return Err(CoreError::Protocol("MVP supports stdio only".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PolicyGeneration {
     pub number: u64,
@@ -128,6 +171,7 @@ impl PolicyStore {
 #[derive(Clone, Debug)]
 pub struct CapturedPolicy {
     pub generation: u64,
+    pub mvp: Option<MvpProfile>,
     pub max_active_hooks_per_uid: u32,
     pub max_active_hooks_global: u32,
     pub hook_invocations_per_uid: u32,
@@ -153,6 +197,7 @@ impl PolicyGeneration {
         let c = &self.config;
         CapturedPolicy {
             generation: self.number,
+            mvp: c.mvp.clone(),
             max_active_hooks_per_uid: c.max_active_hooks_per_uid,
             max_active_hooks_global: c.max_active_hooks_global,
             hook_invocations_per_uid: c.hook_invocations_per_uid,
@@ -223,6 +268,16 @@ impl SignerPolicyFile {
     pub fn validate_against(&self, daemon: &DaemonConfig) -> Result<()> {
         let mut signer_ids = BTreeSet::new();
         for signer in &self.signers {
+            if daemon.mvp.is_some()
+                && !matches!(
+                    signer.signature_type.as_str(),
+                    "ssh-ed25519" | "sk-ssh-ed25519"
+                )
+            {
+                return Err(CoreError::Config(
+                    "MVP supports SSH Ed25519 signers only".into(),
+                ));
+            }
             if !signer_ids.insert(&signer.signer_id) {
                 return Err(CoreError::Config("duplicate signer_id".into()));
             }
@@ -381,6 +436,14 @@ impl DaemonConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(profile) = &self.mvp {
+            profile.validate()?;
+            if self.require_remote_audit_ack {
+                return Err(CoreError::Config(
+                    "MVP requires local audit without remote ACK".into(),
+                ));
+            }
+        }
         if self.csr_allowed_executable_dirs.is_empty()
             || self
                 .csr_allowed_executable_dirs
@@ -657,6 +720,7 @@ mod tests {
 
     fn valid() -> DaemonConfig {
         DaemonConfig {
+            mvp: None,
             allow_same_uid_elevation: false,
             require_remote_audit_ack: false,
             csr_allowed_executable_dirs: vec![

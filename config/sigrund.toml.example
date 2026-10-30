@@ -36,3 +36,11 @@ collector_rpc_timeout_ms = 3000
 audit_record_max_bytes = 65536
 max_onetime_window_secs = 3600
 max_ttl_secs = 31536000
+
+# Opt into the thin MVP contract. Omit the table for the full-spec profile.
+# Collector settings above remain required; replace the public-key placeholder.
+# [mvp]
+# tty_mode = "stdio"
+# hooks_enabled = false
+# pty_enabled = false
+# max_active_approval_requests = 1
