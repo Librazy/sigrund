@@ -26,6 +26,9 @@ impl Drop for ValidationHandle {
 /// Available only while executing on a reserved worker. Caller rights precede
 /// snapshots so their possibly blocking close cannot release snapshot RAM early.
 pub(crate) struct ValidatedRequest {
+    // Dispose before snapshots so a queued SCM_RIGHTS release from the last
+    // control-socket close cannot release this request's quota early.
+    pub deferred_cleanup: Vec<OwnedFd>,
     pub hello: ClientHello,
     pub rights: Vec<OwnedFd>,
     pub snapshots: Option<MeasuredSnapshots>,
@@ -70,6 +73,15 @@ pub(crate) struct RequestLease {
     sender: SyncSender<Work>,
 }
 impl RequestLease {
+    /// Return a stable borrowed descriptor number; the request's worker owns
+    /// the actual close on every disposal and abandoned-completion path.
+    pub fn retain_control(&mut self, control: OwnedFd) -> i32 {
+        let request = self.request.as_mut().expect("live lease");
+        assert!(request.deferred_cleanup.is_empty());
+        let fd = control.as_raw_fd();
+        request.deferred_cleanup.push(control);
+        fd
+    }
     pub fn request(&self) -> &ValidatedRequest {
         self.request.as_ref().expect("live lease")
     }
@@ -244,6 +256,7 @@ fn read_request(
         .validate_for_peer(&hello, uid)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
     let request = ValidatedRequest {
+        deferred_cleanup: vec![],
         hello,
         rights: frame.rights,
         snapshots: None,
@@ -644,6 +657,179 @@ mod tests {
         }
         assert!(rejected);
         assert!(seen.try_recv().is_err());
+        assert_eq!(budget.usage(1001), (0, 0));
+    }
+    #[test]
+    fn committed_handoff_retains_snapshot_signer_policy_and_quota_on_blocked_stage() {
+        use crate::{
+            admission::Admission,
+            authorization::Authorized,
+            jobs::{JobSupervisor, SpawnOutcome},
+            sequencer::CommittedJob,
+        };
+        use sigrund_core::{
+            crypto::new_uuidv7,
+            lifecycle::{Lifecycle, Phase},
+            warrant::{CanonicalWarrant, Csr, CsrIdentity, SnapshotDigests},
+        };
+        use std::{
+            ffi::CString,
+            io::{Seek, SeekFrom},
+        };
+        let policy = config();
+        let mut workers = IoWorkers::new(&policy).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let server: OwnedFd = server.into();
+        let null = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let handle = workers
+            .submit(
+                10,
+                1001,
+                &server,
+                policy.clone(),
+                false,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        send(&mut client, null.as_raw_fd());
+        let request = lease(next(&mut workers));
+        let budget = crate::snapshot::SnapshotBudget::default();
+        let measured = budget.clone();
+        request.continue_on_worker(move |request| {
+            let mut source = tempfile::tempfile()?;
+            source.write_all(b"\x7fELFtest")?;
+            source.seek(SeekFrom::Start(0))?;
+            request.snapshots = Some(MeasuredSnapshots {
+                executable: crate::snapshot::executable(
+                    source,
+                    &measured,
+                    1001,
+                    &request.policy,
+                    || request.check(),
+                )?,
+                stdin: None,
+            });
+            Ok(())
+        });
+        let mut request = lease(next(&mut workers));
+        request.begin_authorization();
+        let csr = Csr::from_unsigned(
+            request.hello(),
+            CsrIdentity {
+                grant_id: new_uuidv7().to_string(),
+                host_id: format!("sigrun-host:sha256:{}", "0".repeat(64)),
+                requester_uid: 1001,
+                requester_gid: 1001,
+                now: 1,
+            },
+            SnapshotDigests {
+                executable_sha256: request
+                    .request()
+                    .snapshots
+                    .as_ref()
+                    .unwrap()
+                    .executable
+                    .digest
+                    .sha256
+                    .clone(),
+                stdin_sha256: None,
+            },
+            3600,
+        )
+        .unwrap();
+        let warrant = CanonicalWarrant::new(csr.warrant().clone()).unwrap();
+        let canonical = warrant.as_bytes().to_vec();
+        let lifecycle = Arc::new(Lifecycle::new());
+        for (from, to) in [
+            (Phase::Snapshotting, Phase::Authorizing),
+            (Phase::Authorizing, Phase::Committing),
+            (Phase::Committing, Phase::Committed),
+        ] {
+            assert!(lifecycle.transition(from, to));
+        }
+        let mut admission = Admission::new(&policy, Instant::now());
+        let audit = admission.admit(1001, &policy, Instant::now()).unwrap();
+        let control = request.retain_control(server.try_clone().unwrap());
+        let job = CommittedJob {
+            token: 10,
+            exec_id: new_uuidv7().to_string(),
+            gid: 1001,
+            lifecycle: lifecycle.clone(),
+            lease: request,
+            authorized: Authorized {
+                warrant,
+                signer_ids: vec!["selected".into()],
+                envp: vec![CString::new("X=exact").unwrap()],
+            },
+            signer_id: "selected".into(),
+            control,
+            audit,
+            commit_fields: serde_json::json!({"signer_id":"selected"}),
+        };
+        let (entered, seen) = std::sync::mpsc::sync_channel(1);
+        let (release, gate) = std::sync::mpsc::sync_channel(1);
+        // A Mutex only transports the test gate into this Send callback; no
+        // production path waits for it or consults a test environment switch.
+        let gate = std::sync::Mutex::new(gate);
+        let coordinator = std::thread::current().id();
+        let stage = JobSupervisor::with_operation(
+            Some(crate::startup::CgroupLayout::from_root("/unused-test-root")),
+            1,
+            move |layout, job| {
+                assert_ne!(std::thread::current().id(), coordinator);
+                assert_eq!(job.authorized.warrant.as_bytes(), canonical);
+                assert_eq!(job.signer_id, "selected");
+                assert_eq!(job.authorized.envp[0].as_bytes(), b"X=exact");
+                entered.send(()).unwrap();
+                gate.lock().unwrap().recv().unwrap();
+                crate::jobs::prepare_job(layout, job)
+            },
+        )
+        .unwrap();
+        assert!(stage.submit(job).is_ok());
+        seen.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(budget.usage(1001), (8, 8));
+        assert_eq!(workers.reservations.len(), 1);
+        assert!(
+            workers
+                .submit(
+                    11,
+                    1001,
+                    &server,
+                    policy.clone(),
+                    false,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        lifecycle.cancel();
+        drop(handle);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let returned = loop {
+            if let Some(outcome) = stage.drain().pop() {
+                break outcome;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let SpawnOutcome::Failed { job, message } = returned else {
+            panic!("unexpected fatal stage")
+        };
+        assert!(message.contains("cancelled"));
+        assert!(Arc::ptr_eq(&job.lease.request().policy, &policy));
+        assert_eq!(budget.usage(1001), (8, 8));
+        drop(job);
+        while !workers.reservations.is_empty() {
+            workers.drain();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(budget.usage(1001), (0, 0));
     }
 }

@@ -51,6 +51,9 @@ pub(crate) struct CommittedJob {
     pub lifecycle: Arc<Lifecycle>,
     pub lease: RequestLease,
     pub authorized: Authorized,
+    pub signer_id: String,
+    // Borrowed from the retained lease; only its I/O worker closes the socket.
+    pub control: i32,
     pub audit: AuditLease,
     pub commit_fields: serde_json::Value,
 }
@@ -343,6 +346,7 @@ fn authorize(
             },
         )
         .map_err(|e| format!("authorization database failed; reconciliation required: {e}"))?;
+    let signer_id = signer_id.map(str::to_owned);
     let limit = request.policy.audit_record_max_bytes as usize;
     let fields = serde_json::json!({"exec_id":task.exec_id, "grant_id":w.grant_id,
         "payload_sha256":sha256_hex(verified.warrant.as_bytes()), "signer_id":signer_id,
@@ -373,12 +377,16 @@ fn authorize(
         let now = realtime().map_err(|e| e.to_string())?;
         let expired = now < w.policy.not_before || w.policy.not_after.is_none_or(|end| now > end);
         if !cancelled && !expired && resources.execution_layout().is_some() {
+            let mut lease = task.lease;
+            let control = lease.retain_control(task.control);
             return Ok(AuthorizationOutcome::Committed(Box::new(CommittedJob {
                 token: task.token,
                 exec_id: task.exec_id,
                 gid: task.gid,
                 lifecycle: task.lifecycle,
-                lease: task.lease,
+                lease,
+                signer_id: signer_id.ok_or("committed authorization has no signer")?,
+                control,
                 authorized: verified,
                 audit: task.audit,
                 commit_fields: fields,

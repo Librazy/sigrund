@@ -27,7 +27,13 @@ sealed snapshots, root TTY approval with OpenSSH signing, and local durable
 authorization. Approved and pre-signed requests pass the same captured-policy
 gate and one-time SQLite consumption, then append authenticated commit and
 post-commit abort records. The daemon returns `SPAWN_FAILED` with an explicit
-Phase 5 handoff and consumed-grant message. Child execution remains pending.
+Phase 5C handoff and consumed-grant message. Phase 5A/5B now supply pinned
+execution startup, bounded committed-job preparation, the reaper registration
+barrier primitive, and the syscall-only clone/credential/readiness path.
+Normal foreground startup requires its platform probe; `--authorization-only`
+selects the non-executing diagnostic profile. Requester child execution remains
+pending Phase 5C integration. The operator will run privileged acceptance after
+landing; no successful delegated-host result is claimed.
 Evidence and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md)
 and [docs/MVP_PHASE4.md](docs/MVP_PHASE4.md).
 
@@ -50,8 +56,10 @@ passed yet.
   replay and recovery; response-deadline conformance requires Phase 4.5.
 - [x] Phase 4.5: independent denial delivery, bounded audit admission and
   storage-pressure handling; freeze the execution ownership contracts.
-- [ ] Phase 5A: execution startup and committed-job ownership.
-- [ ] Phase 5B: child setup and sync-pipe classification.
+- [x] Phase 5A implementation: execution startup and committed-job ownership;
+  privileged acceptance remains pending the operator's post-landing run.
+- [x] Phase 5B implementation: child setup and sync-pipe classification;
+  privileged clone/mount acceptance remains pending that run.
 - [ ] Phase 5C: central reaping, teardown and daemon shutdown.
 - [ ] Phase 5D: execution failure and race verification.
 - [ ] Phase 6: two-UID end-to-end fixture.
@@ -518,6 +526,13 @@ thresholds, and sticky fail-closed pressure.
 
 ### Phase 5A: execution startup and committed-job ownership
 
+Implementation landed. Unprivileged ownership and registration-barrier gates
+pass. [MVP_PHASE5A.md](docs/MVP_PHASE5A.md) records the code boundary, exact
+commands and delegated-host prerequisites. The operator explicitly owns the
+post-landing privileged acceptance run; keep that gate outstanding until its
+actual result is recorded. Live clone dispatch remains gated on Phase 5C's
+reaper and active-job shutdown integration.
+
 Deliverables:
 
 - Complete Section 1.2 startup hierarchy and required kernel-interface probes
@@ -544,6 +559,12 @@ Exit gate:
   cannot spawn; failed cgroup setup leaves consumption and audit consistent.
 
 ### Phase 5B: child setup and sync-pipe classification
+
+Implementation landed. The production C child path and its unprivileged
+fault/credential tests are documented in
+[MVP_PHASE5B.md](docs/MVP_PHASE5B.md). The real delegated-host clone/mount and
+post-exec acceptance fixture is built but explicitly deferred to the operator.
+Passing the ordinary workspace suite does not satisfy that privileged gate.
 
 Deliverables:
 

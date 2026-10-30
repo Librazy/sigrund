@@ -87,7 +87,6 @@ pub struct StartupResources {
     pub roots: Vec<fs::File>,
     pub(crate) storage: crate::storage::StoragePressure,
     pub(crate) execution: Option<CgroupLayout>,
-    pub(crate) execution_error: Option<String>,
     _collector_files: Vec<fs::File>,
     _lock: fs::File,
 }
@@ -95,10 +94,6 @@ pub struct StartupResources {
 impl StartupResources {
     pub fn execution_layout(&self) -> Option<&CgroupLayout> {
         self.execution.as_ref()
-    }
-
-    pub fn execution_startup_error(&self) -> Option<&str> {
-        self.execution_error.as_deref()
     }
 
     pub fn prepare(config: &DaemonConfig, state_dir: &Path, log_path: &Path) -> io::Result<Self> {
@@ -262,7 +257,6 @@ impl StartupResources {
         Ok(Self {
             storage,
             execution: None,
-            execution_error: Some("execution startup requires the explicit platform gate".into()),
             host_id,
             audit,
             store,

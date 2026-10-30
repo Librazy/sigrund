@@ -1487,23 +1487,34 @@ broker contracts, bounded foreground transport, retained sealed snapshots,
 root-TTY approval, and SSH signing. Phase 4 now integrates the local thin
 profile authorization predicate, one bounded off-loop SQLite/audit sequencer,
 one-time consumption, authenticated `AUTH_COMMIT`/rejection records, and
-post-commit abort reconciliation. The local profile intentionally stops at the
-Phase 5 handoff: it returns `SPAWN_FAILED` after durable authorization when
-child setup is unavailable, and never reports readiness or creates a child.
-The collector, hooks, reload, remote ACK, and child execution remain pending.
-The pre-execution recap also identifies outstanding Phase 4.5 work: current
-pre-commit replies await rejection auditing, and admission-window, retained
-audit-capacity and storage-pressure gates are not implemented. Sections 1.3.2,
-1.4 and 7.2.1 specify their target behavior; passing existing stall tests does
-not establish that a denial arrives while durable I/O remains blocked.
-Execution ownership, registration barriers and shutdown in Sections 2.4–5.3
-are Phase 5 requirements, not claims about the current daemon.
+post-commit abort reconciliation. Phase 4.5 adds independent pre-commit denial
+responses, retained bounded audit ownership, admission windows and sticky
+storage-pressure gates, including post-append refresh.
+
+Phases 5A/5B add descriptor-pinned cgroup startup, bounded committed-job
+preparation/cleanup, the standalone pending-spawn registration barrier and
+syscall-only clone/descriptor/mount/credential/exec transition. Normal foreground
+startup requires its isolated platform probe; `--authorization-only` explicitly
+selects the non-executing diagnostic profile. Startup probes create trusted test
+children, but requester commands still stop at an audited post-commit abort:
+`SPAWN_FAILED`, with consumption preserved. Live requester clone dispatch,
+readiness publication, central reaper integration and active-job shutdown remain
+Phase 5C requirements. The collector, hooks, reload, remote ACK and PTY also
+remain pending.
+
+Unprivileged ownership, real-child registration-barrier and syscall-fault tests
+are implemented. The operator explicitly defers privileged delegated-host
+acceptance until after Phase 5A/5B land. Its ignored fixture and runner are
+provided in the phase evidence documents; the ordinary workspace suite does
+not prove those privileged gates. Sections 2.4–5.3 retain their full runtime
+requirements, including shutdown and actual post-exec observations.
 
 The following integrations are required before claiming v1.0 conformance:
 
 1. `sigrund` still must complete policy reload, hooks, collector replication,
-   cgroup initialization, child setup, PTY transfer, central reaping, and
-   disconnect teardown. Startup recovery, root pinning, common snapshots,
+   live child dispatch/readiness, PTY transfer, central reaping, active-job
+   shutdown and disconnect teardown. Privileged cgroup/child acceptance remains
+   pending. Startup recovery, root pinning, common snapshots,
    bounded transport, and local authorization/SQLite commit are integrated.
 2. `sigrun` must complete server PTY transfer, window relaying, PTY terminal
    cleanup and validation against actual child execution. The stdio

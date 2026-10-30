@@ -660,6 +660,7 @@ mod tests {
                 rights.push(File::open("/dev/null").unwrap().into());
             }
             ValidatedRequest {
+                deferred_cleanup: vec![],
                 hello,
                 rights,
                 snapshots: None,

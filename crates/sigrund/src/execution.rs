@@ -12,65 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::sequencer::CommittedJob;
-
-pub(crate) struct JobSupervisor {
-    layout: Option<CgroupLayout>,
-    startup_error: Option<String>,
-}
-
-pub(crate) enum SpawnOutcome {
-    Failed { job: CommittedJob, message: String },
-}
-
-impl JobSupervisor {
-    pub(crate) fn new(layout: Option<CgroupLayout>, startup_error: Option<String>) -> Self {
-        Self {
-            layout,
-            startup_error,
-        }
-    }
-
-    pub(crate) fn spawn(&self, job: CommittedJob) -> SpawnOutcome {
-        let Some(layout) = &self.layout else {
-            return SpawnOutcome::Failed {
-                job,
-                message: self
-                    .startup_error
-                    .clone()
-                    .unwrap_or_else(|| "delegated cgroup hierarchy unavailable".into()),
-            };
-        };
-        let _ = (
-            job.gid,
-            job.authorized.signer_ids.len(),
-            job.authorized.envp.len(),
-        );
-        let request = job.lease.request();
-        match layout.create_job(
-            &job.exec_id,
-            request.policy.job_memory_max_bytes,
-            request.policy.job_memory_swap_max_bytes,
-            request.policy.job_pids_max,
-        ) {
-            Ok(cgroup) => {
-                // The clone3 handoff is supplied by Phase 5B's syscall
-                // primitives. Keep the cgroup owner attached to this result
-                // until the coordinator has a real child outcome.
-                drop(cgroup);
-                SpawnOutcome::Failed {
-                    job,
-                    message: "child setup failed before clone3 handoff".into(),
-                }
-            }
-            Err(error) => SpawnOutcome::Failed {
-                job,
-                message: format!("job cgroup setup failed: {error}"),
-            },
-        }
-    }
-}
-
 /// Exact parent-owned storage used by the C-only clone/exec transition.
 /// Pointer tables are built immediately before dispatch and remain live until
 /// clone returns; the child receives independent copies (no CLONE_VM/FILES).

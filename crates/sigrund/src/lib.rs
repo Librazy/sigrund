@@ -6,6 +6,7 @@ pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod execution;
+mod jobs;
 pub mod linux;
 pub mod memfd;
 mod preparation;

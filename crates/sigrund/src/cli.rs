@@ -10,8 +10,8 @@ use std::{
 
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
-pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nPhase 3 verifies snapshots and root approval; execution requires roadmap Phases 4–5.";
-pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nPhase 3 supports root approval; execution requires Phases 4–5.";
+pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nExecution startup requires a dedicated delegated cgroup service.\n       --authorization-only provides the non-executing authorization diagnostic profile.";
+pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nRoot approval and local authorization are available; child execution awaits Phase 5C integration.";
 pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty and /etc/sigrund/signers.toml.\nOnly UID 0 with a controlling TTY may approve and sign.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +25,7 @@ pub enum DaemonMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonArgs {
     pub mode: DaemonMode,
+    pub authorization_only: bool,
     pub socket: PathBuf,
     pub approval_socket: PathBuf,
     pub config: Option<PathBuf>,
@@ -37,6 +38,7 @@ impl DaemonArgs {
     pub fn parse(args: &[String]) -> Result<Self> {
         let mut result = Self {
             mode: DaemonMode::Foreground,
+            authorization_only: false,
             socket: CLIENT_SOCKET.into(),
             approval_socket: APPROVAL_SOCKET.into(),
             config: None,
@@ -52,6 +54,7 @@ impl DaemonArgs {
                 return Err(invalid("duplicate option"));
             }
             match arg.as_str() {
+                "--authorization-only" => result.authorization_only = true,
                 "--socket" => result.socket = path_value(&mut args)?,
                 "--approval-socket" => result.approval_socket = path_value(&mut args)?,
                 "--config" => result.config = Some(path_value(&mut args)?),
@@ -72,6 +75,9 @@ impl DaemonArgs {
                 }
                 _ => return Err(invalid("unknown daemon option")),
             }
+        }
+        if result.authorization_only && result.mode != DaemonMode::Foreground {
+            return Err(invalid("--authorization-only requires foreground mode"));
         }
         if result.socket == result.approval_socket {
             return Err(invalid("client and approval sockets must differ"));

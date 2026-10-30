@@ -77,13 +77,14 @@ fn main() -> ExitCode {
     if args.mode == DaemonMode::CheckConfig {
         return ExitCode::SUCCESS;
     }
-    match ForegroundDaemon::prepare(
+    match ForegroundDaemon::prepare_with_mode(
         config,
         signers,
         &args.state_dir,
         &args.log_path,
         &args.socket,
         &args.approval_socket,
+        args.authorization_only,
     )
     .and_then(ForegroundDaemon::run)
     {

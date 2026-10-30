@@ -244,6 +244,7 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sigrund"));
         command
             .arg("--foreground")
+            .arg("--authorization-only")
             .arg("--config")
             .arg(&self.config)
             .arg("--signers")
@@ -415,6 +416,20 @@ fn phase1_namespace_fixture() {
     );
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let fixture = Fixture::new();
+    // This unprivileged user namespace has no dedicated delegated execution
+    // service. Normal startup must fail before either listener is published;
+    // only the explicit authorization diagnostic may continue below.
+    let diagnostic = fixture.command();
+    let output = Command::new(diagnostic.get_program())
+        .args(
+            diagnostic
+                .get_args()
+                .filter(|arg| *arg != "--authorization-only"),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(78));
+    assert!(!fixture.socket.exists() && !fixture.broker.exists());
     let daemon = fixture.launch();
     let fd_count = || {
         fs::read_dir(format!("/proc/{}/fd", daemon.0.id()))

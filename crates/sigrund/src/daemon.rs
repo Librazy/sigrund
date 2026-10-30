@@ -2,7 +2,7 @@
 //! Child setup and readiness remain the Phase 5 execution boundary.
 use crate::{
     admission::{Admission, AuditLease},
-    execution::{JobSupervisor, SpawnOutcome},
+    jobs::{JobSupervisor, SpawnOutcome},
     linux::validate_absolute_path,
     preparation::{self, Context, Document, PinnedRoot},
     sequencer::{self, Sequencer},
@@ -47,7 +47,8 @@ const APPROVAL_LISTENER: u64 = 2;
 const SIGNALS: u64 = 3;
 const IO_COMPLETE: u64 = 4;
 const AUDIT_COMPLETE: u64 = 5;
-const FIRST_CONNECTION: u64 = 6;
+const JOB_COMPLETE: u64 = 6;
+const FIRST_CONNECTION: u64 = 7;
 
 struct BoundSocket {
     fd: OwnedFd,
@@ -184,6 +185,7 @@ impl Drop for BoundSocket {
 struct SignalSource {
     fd: OwnedFd,
     previous: libc::sigset_t,
+    previous_child: libc::sigaction,
 }
 
 impl SignalSource {
@@ -192,24 +194,36 @@ impl SignalSource {
         let mut previous = unsafe { zeroed() };
         unsafe {
             libc::sigemptyset(&mut mask);
-            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGCHLD] {
                 libc::sigaddset(&mut mask, signal);
             }
         }
+        let mut action: libc::sigaction = unsafe { zeroed() };
+        let mut previous_child = unsafe { zeroed() };
+        action.sa_sigaction = libc::SIG_DFL;
+        if unsafe { libc::sigaction(libc::SIGCHLD, &action, &mut previous_child) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous) };
         if result != 0 {
+            unsafe {
+                libc::sigaction(libc::SIGCHLD, &previous_child, std::ptr::null_mut());
+            }
             return Err(io::Error::from_raw_os_error(result));
         }
         let fd = unsafe { libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
         if fd < 0 {
+            let error = io::Error::last_os_error();
             unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                libc::sigaction(libc::SIGCHLD, &previous_child, std::ptr::null_mut());
             }
-            return Err(io::Error::last_os_error());
+            return Err(error);
         }
         Ok(Self {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             previous,
+            previous_child,
         })
     }
 
@@ -244,6 +258,7 @@ impl Drop for SignalSource {
     fn drop(&mut self) {
         unsafe {
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+            libc::sigaction(libc::SIGCHLD, &self.previous_child, std::ptr::null_mut());
         }
     }
 }
@@ -658,8 +673,8 @@ fn queue_post_commit_abort(
     durable: &SyncSender<sequencer::Work>,
     job: sequencer::CommittedJob,
     reason: &str,
-    policy: &DaemonConfig,
 ) -> io::Result<()> {
+    let limit = job.lease.request().policy.audit_record_max_bytes as usize;
     let mut fields = job.commit_fields;
     fields["status"] = "SPAWN_FAILED".into();
     fields["reason"] = reason.into();
@@ -668,7 +683,7 @@ fn queue_post_commit_abort(
             token: job.token,
             event_type: "AUTH_ABORTED_POST_COMMIT",
             fields,
-            limit: policy.audit_record_max_bytes as usize,
+            limit,
             _audit: job.audit,
         })
         .map_err(|_| invalid("post-commit audit executor capacity unavailable"))?;
@@ -682,6 +697,7 @@ pub struct ForegroundDaemon {
     _resources: StartupResources,
     config: Arc<DaemonConfig>,
     _signers: SignerPolicyFile,
+    signals: SignalSource,
 }
 
 impl ForegroundDaemon {
@@ -693,11 +709,56 @@ impl ForegroundDaemon {
         socket: &Path,
         approval_socket: &Path,
     ) -> io::Result<Self> {
+        Self::prepare_with_mode(
+            config,
+            signers,
+            state_dir,
+            log_path,
+            socket,
+            approval_socket,
+            false,
+        )
+    }
+
+    pub fn prepare_with_mode(
+        config: DaemonConfig,
+        signers: SignerPolicyFile,
+        state_dir: &Path,
+        log_path: &Path,
+        socket: &Path,
+        approval_socket: &Path,
+        authorization_only: bool,
+    ) -> io::Result<Self> {
         config.validate().map_err(|e| invalid(e.to_string()))?;
         signers
             .validate_against(&config)
             .map_err(|e| invalid(e.to_string()))?;
-        let resources = StartupResources::prepare(&config, state_dir, log_path)?;
+        let signals = SignalSource::new()?;
+        let mut resources = StartupResources::prepare(&config, state_dir, log_path)?;
+        if !authorization_only {
+            let layout = crate::startup::CgroupLayout::discover()?;
+            layout.initialize()?;
+            let removed = layout.cleanup_orphans()?;
+            if removed > 0 {
+                resources
+                    .audit
+                    .append_event(
+                        "ORPHAN_CLEANUP",
+                        serde_json::json!({"cgroups":removed}),
+                        config.audit_record_max_bytes as usize,
+                    )
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
+            crate::execution::startup_probe(&layout)?;
+            resources.execution = Some(layout);
+        }
+        // Startup recovery/orphan records may themselves cross high water.
+        // Recheck before publishing either listener, retaining those records.
+        if !resources.storage.check(&config)? {
+            return Err(invalid(
+                "audit storage pressure after execution startup; remediation and restart required",
+            ));
+        }
         let client = BoundSocket::bind(socket, 0o666)?;
         let approval = BoundSocket::bind(approval_socket, 0o600)?;
         Ok(Self {
@@ -706,6 +767,7 @@ impl ForegroundDaemon {
             _resources: resources,
             config: Arc::new(config),
             _signers: signers,
+            signals,
         })
     }
 
@@ -723,7 +785,8 @@ impl ForegroundDaemon {
             signers: self._signers.clone(),
         });
         let budget = SnapshotBudget::default();
-        let signals = SignalSource::new()?;
+        let signals = self.signals;
+        crate::startup::CgroupLayout::register_subreaper()?;
         // Threads inherit the blocked signal mask, leaving shutdown handling
         // on signalfd even when a metadata syscall cannot be interrupted.
         let mut workers = IoWorkers::new(&self.config)?;
@@ -733,14 +796,15 @@ impl ForegroundDaemon {
             .checked_mul(2)
             .ok_or_else(|| invalid("sequencer capacity overflow"))?;
         let execution_layout = self._resources.execution_layout().cloned();
-        let execution_error = self._resources.execution_startup_error().map(str::to_owned);
+
         let sequencer = Sequencer::new(
             self._resources,
             context.clone(),
             self.config.clone(),
             sequencer_capacity,
         )?;
-        let supervisor = JobSupervisor::new(execution_layout, execution_error);
+        let supervisor =
+            JobSupervisor::new(execution_layout, self.config.max_io_workers_global as usize)?;
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
@@ -752,6 +816,7 @@ impl ForegroundDaemon {
             (signals.fd.as_raw_fd(), SIGNALS),
             (workers.fd(), IO_COMPLETE),
             (sequencer.fd(), AUDIT_COMPLETE),
+            (supervisor.fd(), JOB_COMPLETE),
         ] {
             register(
                 epoll.as_raw_fd(),
@@ -812,6 +877,9 @@ impl ForegroundDaemon {
                         if signal == libc::SIGINT as u32 || signal == libc::SIGTERM as u32 {
                             return Ok(());
                         }
+                        if signal == libc::SIGCHLD as u32 {
+                            continue;
+                        }
                         let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is outside the Phase 1 MVP\"}".into());
                         reload_diagnostic_pending = true;
                     }
@@ -860,44 +928,26 @@ impl ForegroundDaemon {
                             sequencer::Completion::Committed(job) => {
                                 let job = *job;
                                 let token = job.token;
-                                if !job.lifecycle.transition(Phase::Committed, Phase::Spawning) {
+                                if let Err(job) = supervisor.submit(job) {
                                     queue_post_commit_abort(
                                         &sequencer.sender(),
-                                        job,
-                                        "committed job lost its spawn reservation",
-                                        &self.config,
+                                        *job,
+                                        "bounded job preparation executor unavailable",
                                     )?;
-                                    continue;
-                                }
-                                match supervisor.spawn(job) {
-                                    SpawnOutcome::Failed { job, message } => {
-                                        let _ =
-                                            job.lifecycle.finish_spawn(LifecycleDecision::Rejected);
-                                        if let Some(connection) = connections.get_mut(&token)
-                                            && connection.lifecycle.state().1
-                                                == LifecycleDecision::Undecided
-                                        {
-                                            connection.respond_inner(
-                                                "SPAWN_FAILED",
-                                                "Authorization committed; execution requires Phase 5; one-time grant remains consumed",
-                                                None,
-                                                Instant::now(),
-                                                true,
-                                            )?;
-                                            register(
-                                                epoll.as_raw_fd(),
-                                                libc::EPOLL_CTL_MOD,
-                                                connection.fd.as_raw_fd(),
-                                                token,
-                                                true,
-                                                false,
-                                            )?;
-                                        }
-                                        queue_post_commit_abort(
-                                            &sequencer.sender(),
-                                            job,
-                                            &message,
-                                            &self.config,
+                                    if let Some(connection) = connections.get_mut(&token) {
+                                        connection.respond_inner(
+                                            "SPAWN_FAILED",
+                                            concat!("Authorization committed; job preparation unavailable; ",
+                                                "one-time grant remains consumed"),
+                                            None, Instant::now(), true,
+                                        )?;
+                                        register(
+                                            epoll.as_raw_fd(),
+                                            libc::EPOLL_CTL_MOD,
+                                            connection.fd.as_raw_fd(),
+                                            token,
+                                            true,
+                                            false,
                                         )?;
                                     }
                                 }
@@ -928,6 +978,31 @@ impl ForegroundDaemon {
                                     "durable executor failed closed: {error}"
                                 )));
                             }
+                        }
+                    }
+                } else if token == JOB_COMPLETE {
+                    for outcome in supervisor.drain() {
+                        match outcome {
+                            SpawnOutcome::Failed { job, message } => {
+                                if let Some(connection) = connections.get_mut(&job.token) {
+                                    connection.respond_inner(
+                                        "SPAWN_FAILED",
+                                        concat!("Authorization committed; child launch awaits Phase 5C; ",
+                                            "one-time grant remains consumed"),
+                                        None, Instant::now(), true,
+                                    )?;
+                                    register(
+                                        epoll.as_raw_fd(),
+                                        libc::EPOLL_CTL_MOD,
+                                        connection.fd.as_raw_fd(),
+                                        job.token,
+                                        true,
+                                        false,
+                                    )?;
+                                }
+                                queue_post_commit_abort(&sequencer.sender(), *job, &message)?;
+                            }
+                            SpawnOutcome::Fatal(message) => return Err(invalid(message)),
                         }
                     }
                 } else if token == IO_COMPLETE {

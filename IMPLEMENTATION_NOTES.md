@@ -18,7 +18,8 @@ request/snapshot ownership, root pinning, streaming snapshot builders and
 request-profile restrictions. Phases 2–3 add client options and relays, common
 snapshots, explicit signer/key selection, and foreground root approval. Phase 4
 adds local authorization, SQLite consumption and serialized durable audit.
-Execution remains Phase 5.
+Phases 5A/5B add startup, ownership and child-transition foundations; live
+request execution and shutdown remain Phase 5C.
 M-01–M-15 and applicable V subcases gate the revised MVP. The Phase 0/1 evidence
 documents remain records of what was actually implemented and tested.
 
@@ -249,8 +250,9 @@ service without retrying uncertain authorization. The Phase 4 namespace gate
 reads `REQUEST_TIMEOUT` and `RESOURCE_EXHAUSTED` while a WAL/audit sync remains
 blocked, then verifies replay and shutdown behavior after releasing the gate.
 The pre-FD-4 child setup, pending-spawn reaper barrier and active-job shutdown
-contracts are frozen in the specification for Phase 5 and remain unimplemented
-runtime surfaces.
+contracts are frozen in the specification. Phase 5B implements the tracked
+child error descriptor; the tested registration-barrier primitive is ready for
+Phase 5C's runtime integration. Active-job shutdown remains Phase 5C work.
 
 The durable sequencer also refreshes the pressure gate after every successful
 append. The owned record that reaches the high-water mark persists, while new
@@ -260,6 +262,34 @@ byte below the threshold, crosses it with a real rejection, checks that the
 next connection is refused before admission, and reopens the resulting audit
 history. Removing the post-append check makes this regression test fail.
 
+## Landed Phase 5A/5B foundations
+
+Normal foreground startup now performs pinned cgroup initialization and an
+isolated kernel/credential/exec probe before publishing listeners. The explicit
+`--authorization-only` profile keeps non-executing diagnostics available.
+A committed job retains its original request, snapshots, selected signer,
+canonical warrant, environment, policy and audit owners through bounded
+off-loop cgroup preparation/cleanup. Failed partial setup retains a cleanup
+owner. A cancellation test holds this handoff blocked and checks that quotas
+remain pinned until actual owner disposal.
+
+The standalone reaper reserves one unpublished clone, keeps registered pidfds
+serviceable, registers returned children before clearing the barrier, and
+requires a bounded deferred sweep before another reservation. A real-child
+fixture verifies concurrent early exits without status theft. The C child
+path covers the full descriptor/mount/credential transition with parent-owned
+buffers and syscall-only error/exec handling. Its fault matrix and sealed-ELF
+post-exec probes run unprivileged in a user namespace.
+
+See [MVP_PHASE5A.md](docs/MVP_PHASE5A.md) and
+[MVP_PHASE5B.md](docs/MVP_PHASE5B.md) for exact evidence and commands. The
+operator explicitly deferred privileged testing until after landing. The
+ignored `phase5_platform` fixture and bounded supervisor runner are supplied;
+no successful local privileged acceptance result is claimed. Requester clone
+dispatch, readiness/audit publication, active-job reaping and shutdown remain
+Phase 5C. The current job worker prepares/disposes an empty cgroup and records
+a post-commit abort instead of launching a command without those protections.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated
@@ -267,7 +297,7 @@ as production functionality:
 
 | Surface | Current behavior | Required integration |
 | --- | --- | --- |
-| `sigrund` | Runs the Phase 4 foreground service under `[mvp]`; unsigned and pre-signed requests share retained-snapshot authorization, SQLite consumption and authenticated local audit. Successful authorization returns `SPAWN_FAILED` while preserving consumption. | Cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
+| `sigrund` | Runs under `[mvp]` after the execution startup gate, or with explicit `--authorization-only`; signed/unsigned requests share retained snapshots, SQLite consumption and authenticated local audit. Successful authorization still returns `SPAWN_FAILED` while preserving consumption. | Live clone/reaper/readiness/shutdown integration, hooks, audit replication, PTY and reload. |
 | `sigrun` | Normal command supports unsigned construction or `--warrant PATH`, hello/descriptor transport, stdio relay, separate status reporting and signal/deadline handling. Signed input forbids field overrides and preserves canonical payload bytes. | PTY/window transport and validation against actual child execution. |
 | `sigrund-approve` | Root peer/TTY verification, bounded broker transport, complete escaped prompting, OpenSSH key/agent signing and cancellation are implemented. | Physical FIDO signing evidence; native agent adapter is optional follow-on work. |
 | `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |
