@@ -16,10 +16,11 @@ Implemented:
 - execution startup failures are retained as an explicit fail-closed reason;
   authorization and audit remain available for rejection and recovery tests.
 
-The current daemon still stops at the Phase 4 response boundary. The typed
-committed-job transfer and coordinator admission wiring are the next runtime
-integration step; no request can reach a child merely because these startup
-helpers are present.
+The coordinator now transfers a successful durable authorization as one typed
+committed-job object when the delegated hierarchy is available. The object
+retains the request lease, selected signer, exact authorization material and
+audit lease; a missing hierarchy remains an audited fail-closed
+`SPAWN_FAILED`. Child launch and central reaping are Phase 5B/5C work.
 
 Verification:
 

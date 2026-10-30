@@ -22,9 +22,11 @@ Implemented:
 - focused unit tests cover descriptor placement, frame encoding and all
   readiness/error framing boundaries.
 
-The coordinator has not yet connected these primitives to the committed-job
-completion queue or central reaper. Until that wiring is added, the existing
-daemon cannot report readiness or execute a child.
+The committed-job completion queue now owns the handoff into an execution
+supervisor and creates the per-job cgroup before any child launch attempt.
+The supervisor still fails closed before reporting readiness until the full
+descriptor transition, central reaper, and shutdown lifecycle are connected;
+the current daemon therefore cannot yet execute a child end to end.
 
 Verification:
 
