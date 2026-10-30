@@ -69,8 +69,9 @@ PTY, requires local audit without remote ACK, and sets the active approval
 capacity to one. The profile is retained in captured policy generations. Only
 SSH Ed25519 signer adapters are accepted under that profile. The shared CLI
 parser defines daemon/client/approver commands and separate socket overrides;
-all three commands expose `--help`. The new `sigrund-approve` entry point
-reports its unavailable runtime with status 78 until Phase 3 is implemented.
+all three commands expose `--help`. The `sigrun` runtime now implements the
+Phase 2 requester path; `sigrund-approve` still reports its unavailable runtime
+with status 78 until Phase 3.
 
 The implement/verify/fix loop exercised golden canonical bytes, UTF-16 key
 ordering, maximum-size round trips, invalid schema and encoding cases,
@@ -157,12 +158,40 @@ Worker-only snapshot builders stream/hash with fixed 64-KiB scratch storage,
 reserve aggregate RAM before memfd allocation, retain quotas through source
 close and ownership transfer, seal the destination, rewind it, and trim hashed
 stdin to actual length. Empty stdin is valid. The common snapshot coordinator
-and source-selection/signature gate remain Phase 2 integration work.
+and source-selection/signature gate are integrated in Phase 2 on the retained
+worker lease.
 
 The MVP request gate enforces one-time/stdio/null-or-hashed-stdin, no scripts,
 no forwarded caller environment and no same-UID execution using kernel peer
 UID. These restrictions apply before metadata for signed and unsigned requests;
 they do not replace signature verification or the full authorization predicate.
+
+## Phase 2: client transport and common snapshots
+
+The Phase 2 client captures and validates requester options before connecting,
+constructs the exact canonical hello with documented defaults, duplicates
+caller descriptors before allocating internal FDs, and sends stdout/stderr
+(plus hashed stdin when selected) with the first hello byte using bounded
+nonblocking `SCM_RIGHTS`. Separate relay threads keep control and cancellation
+responsive while local sinks block; status output remains newline-delimited and
+separate from child output. Malformed, wrong-state, fragmented, disconnected,
+and deadline-expired server responses are handled with the specified status
+codes, and output is drained through EOF after child exit.
+
+The daemon continues each validated request on its existing reserved worker.
+Preparation selects a pinned root, opens the executable beneath it with
+`openat2()`, snapshots and hashes sealed executable/stdin memfds, retains
+source/root identities and captured policy, and builds a canonical CSR from
+kernel peer credentials and the provisioned host identity. Signed DSSE
+requests verify an SSHSIG candidate and static policy before source opening,
+then compare signed executable/stdin digests against the sealed results.
+Snapshot memory and descriptor ownership remain charged until worker cleanup.
+No approval, durable authorization, or child spawn is attempted in this phase:
+unsigned requests receive `TIMEOUT_CSR`, and signed requests receive a bounded
+rejection after preparation.
+
+Focused implementation–verification–fix evidence is recorded in
+[docs/MVP_PHASE2.md](docs/MVP_PHASE2.md).
 
 ## Deliberately incomplete runtime
 
@@ -171,8 +200,8 @@ as production functionality:
 
 | Surface | Current behavior | Required integration |
 | --- | --- | --- |
-| `sigrund` | Runs the Phase 1 foreground socket service under `[mvp]`; validated hellos receive an explicit rejection. Validation/cgroup probes remain available. | Common snapshots, approval request dispatch, authorization/SQLite commit, cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
-| `sigrun` | `--validate-hello` and `--encode-signal` are available; the normal command exits with status 78. | SCM_RIGHTS/PTY transport, hello construction, snapshots, status-fd output, signal/window relaying, deadline handling, and terminal cleanup. |
+| `sigrund` | Runs the Phase 2 foreground socket service under `[mvp]`; unsigned requests snapshot and return a canonical `TIMEOUT_CSR`, while signed requests verify, snapshot, and return a bounded rejection. | Approval request dispatch, authorization/SQLite commit, cgroup runtime integration, hooks, audit replication, `clone3`, child reaping, and reload handling. |
+| `sigrun` | `--validate-hello` and `--encode-signal` remain available; the normal command now implements Phase 2 hello transport, stdio relay, status reporting and signal/deadline handling. | Root approval/signing, PTY/window transport, authorization and child execution. |
 | `sigrund-approve` | Parses the frozen command form and provides `--help`; normal invocation exits with status 78. | Root peer/TTY verification, broker transport, sanitized prompting, SSH-agent/key signing, and bounded approval delivery. |
 | `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |
 | `sigrundctl` | UUID validation/generation and `init-host` provisioning are available. | Sealing/template commands, revocation administration, anchor-file output, safe ownership checks, and complete operator error handling. |

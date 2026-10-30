@@ -32,7 +32,7 @@ Phases 2–5. The client and approver execution paths remain unavailable.
 - [x] Phase 1: daemon and approval-broker sockets.
 - [x] Phase 1.5: cleanup isolation, retained request ownership, root pinning,
   streaming snapshot foundations and updated request-profile gates.
-- [ ] Phase 2: client transport and common snapshots.
+- [x] Phase 2: client transport and common snapshots.
 - [ ] Phase 3: root TTY approval and SSH signing.
 - [ ] Phase 4: authorization, commit, and local audit integration.
 - [ ] Phase 5: child execution and exit relay.
