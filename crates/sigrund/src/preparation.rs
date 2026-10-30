@@ -22,6 +22,7 @@ use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 
 pub(crate) struct PinnedRoot {
     pub path: PathBuf,
@@ -281,13 +282,25 @@ pub(crate) fn prepare(
     let snapshots = request.snapshots.as_ref().expect("snapshot owner");
     let stdin_digest = snapshots.stdin.as_ref().map(|s| s.digest.sha256.clone());
     let document = if let Some((warrant, signer_id)) = signed {
-        if warrant.warrant().command.executable_sha256 != snapshots.executable.digest.sha256 {
+        if !bool::from(
+            warrant
+                .warrant()
+                .command
+                .executable_sha256
+                .as_bytes()
+                .ct_eq(snapshots.executable.digest.sha256.as_bytes()),
+        ) {
             return Err(fail(
                 "EXECUTABLE_MUTATED_OR_TOO_LARGE",
                 "signed executable digest differs",
             ));
         }
-        if warrant.warrant().command.stdin_sha256 != stdin_digest {
+        let stdin_matches = match (&warrant.warrant().command.stdin_sha256, &stdin_digest) {
+            (None, None) => true,
+            (Some(a), Some(b)) => bool::from(a.as_bytes().ct_eq(b.as_bytes())),
+            _ => false,
+        };
+        if !stdin_matches {
             return Err(fail("STDIN_HASH_MISMATCH", "signed stdin digest differs"));
         }
         Document::Signed { warrant, signer_id }
@@ -724,6 +737,105 @@ mod tests {
             std::fs::write(&source, &original).unwrap();
             drop(request);
             assert_eq!(fixture.budget.usage(1001), (0, 0));
+        }
+    }
+
+    #[test]
+    fn final_authorization_rechecks_retained_policy_and_identity() {
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-auto", "--map-root-user"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "preparation::tests::final_authorization_namespace_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SIGRUND_FINAL_GATE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    #[ignore = "invoked by the namespace gate"]
+    fn final_authorization_namespace_fixture() {
+        assert_eq!(std::env::var("SIGRUND_FINAL_GATE").unwrap(), "1");
+        let mut fixture = Fixture::new();
+        Arc::make_mut(&mut fixture.config).mvp = Some(Default::default());
+        let canonical = fixture.warrant();
+        for case in [
+            "valid",
+            "root_path",
+            "root_inode",
+            "root_device",
+            "signer",
+            "cached_digest",
+            "caller_env",
+            "stdin",
+            "peer_gid",
+            "same_uid",
+        ] {
+            let mut request =
+                fixture.request(signed_hello(&canonical, "sigrun.warrant.v1", 7), None);
+            prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap();
+            let prepared = request.prepared.as_mut().unwrap();
+            match case {
+                "valid" => (),
+                "root_path" => prepared.root_path = "/different-root".into(),
+                "root_inode" => prepared.root_identity.inode ^= 1,
+                "root_device" => prepared.root_identity.device ^= 1,
+                "signer" => {
+                    let Document::Signed { signer_id, .. } = &mut prepared.document else {
+                        panic!()
+                    };
+                    *signer_id = "unconfigured".into();
+                }
+                "cached_digest" => {
+                    let Document::Signed { warrant, .. } = &mut prepared.document else {
+                        panic!()
+                    };
+                    let mut changed = warrant.warrant().clone();
+                    changed.command.executable_sha256 = "0".repeat(64);
+                    *warrant = CanonicalWarrant::new(changed).unwrap();
+                    request.snapshots.as_mut().unwrap().executable.digest.sha256 = "0".repeat(64);
+                }
+                "caller_env" => {
+                    request
+                        .hello
+                        .caller_env
+                        .insert("PATH".into(), "/attacker".into());
+                }
+                "stdin" => {
+                    prepared.null_stdin = None;
+                }
+                "peer_gid" => (),
+                "same_uid" => {
+                    let Document::Signed { warrant, .. } = &mut prepared.document else {
+                        panic!()
+                    };
+                    let mut changed = warrant.warrant().clone();
+                    changed.execution_context.target_uid = 1001;
+                    *warrant = CanonicalWarrant::new(changed).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = crate::authorization::verify(
+                &request,
+                &fixture.context,
+                if case == "peer_gid" { 1002 } else { 1001 },
+            );
+            if case == "valid" {
+                let result = result.unwrap();
+                let environment: Vec<_> = result.envp.iter().map(|s| s.to_str().unwrap()).collect();
+                assert_eq!(environment, ["LANG=C.UTF-8", "PATH=/usr/sbin:/usr/bin"]);
+            } else {
+                assert!(result.is_err(), "{case}");
+            }
         }
     }
 

@@ -11,7 +11,7 @@ use std::{
     fs::File,
     io,
     os::{
-        fd::{AsFd, AsRawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd},
         unix::fs::{FileExt, MetadataExt},
     },
 };
@@ -106,6 +106,7 @@ pub(crate) fn verify(
         &w.command.executable_sha256,
         request.policy.max_executable_bytes,
         true,
+        || request.check(),
     )
     .map_err(|_| {
         Denial::new(
@@ -120,9 +121,16 @@ pub(crate) fn verify(
         &prepared.null_stdin,
     ) {
         ("sha256", Some(digest), Some(snapshot), None) => {
-            verify_snapshot(snapshot, digest, request.policy.max_stdin_bytes, false).map_err(
-                |_| Denial::new("STDIN_HASH_MISMATCH", "stdin snapshot verification failed"),
-            )?;
+            verify_snapshot(
+                snapshot,
+                digest,
+                request.policy.max_stdin_bytes,
+                false,
+                || request.check(),
+            )
+            .map_err(|_| {
+                Denial::new("STDIN_HASH_MISMATCH", "stdin snapshot verification failed")
+            })?;
         }
         ("null", None, None, Some(fd)) => {
             let file = File::from(fd.try_clone().map_err(|_| policy())?);
@@ -175,8 +183,28 @@ fn verify_snapshot(
     expected: &str,
     maximum: u64,
     executable: bool,
+    check: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
-    let file = File::from(snapshot.as_fd().try_clone_to_owned()?);
+    verify_fd(
+        snapshot.as_fd(),
+        snapshot.digest.bytes,
+        expected,
+        maximum,
+        executable,
+        check,
+    )
+}
+
+fn verify_fd(
+    fd: BorrowedFd<'_>,
+    bytes: u64,
+    expected: &str,
+    maximum: u64,
+    executable: bool,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    check()?;
+    let file = File::from(fd.try_clone_to_owned()?);
     let m = file.metadata()?;
     let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
     if !m.is_file()
@@ -185,16 +213,24 @@ fn verify_snapshot(
         || m.mode() & 0o7777 != if executable { 0o111 } else { 0o400 }
         || seals < 0
         || seals & 0x1f != 0x1f
-        || m.len() != snapshot.digest.bytes
+        || m.len() != bytes
         || m.len() > maximum
         || executable && m.len() < 4
     {
         return Err(io::ErrorKind::InvalidData.into());
     }
+    if executable {
+        let mut magic = [0; 4];
+        file.read_exact_at(&mut magic, 0)?;
+        if &magic != b"\x7fELF" {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+    }
     let mut hasher = Sha256::new();
     let mut offset = 0;
     let mut chunk = [0u8; 32768];
     while offset < m.len() {
+        check()?;
         let length = chunk.len().min((m.len() - offset) as usize);
         let n = match file.read_at(&mut chunk[..length], offset) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -203,12 +239,11 @@ fn verify_snapshot(
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        if executable && offset == 0 && (n < 4 || &chunk[..4] != b"\x7fELF") {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
+        check()?;
         hasher.update(&chunk[..n]);
         offset += n as u64;
     }
+    check()?;
     let digest = hasher.finalize();
     let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     if !bool::from(actual.as_bytes().ct_eq(expected.as_bytes())) {
@@ -262,4 +297,140 @@ fn capability_number(name: &str) -> Option<u32> {
         "CAP_CHECKPOINT_RESTORE",
     ];
     NAMES.iter().position(|n| *n == name).map(|n| n as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Seek, SeekFrom, Write},
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn final_snapshot_gate() {
+        let output = Command::new("unshare")
+            .args(["--user", "--map-auto", "--map-root-user"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "authorization::tests::snapshot_namespace_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SIGRUND_SNAPSHOT_GATE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    #[ignore = "invoked by the namespace gate"]
+    fn snapshot_namespace_fixture() {
+        assert_eq!(std::env::var("SIGRUND_SNAPSHOT_GATE").unwrap(), "1");
+        let bytes = b"\x7fELFsealed test command";
+        let digest = sigrund_core::crypto::sha256_hex(bytes);
+        let fd = crate::memfd::create_sealed("gate", bytes, true, 0o111).unwrap();
+        let verify = |expected: &str, maximum, executable| {
+            verify_fd(
+                fd.as_fd(),
+                bytes.len() as u64,
+                expected,
+                maximum,
+                executable,
+                || Ok(()),
+            )
+        };
+        assert!(verify(&digest, bytes.len() as u64, true).is_ok());
+        assert!(verify(&"0".repeat(64), bytes.len() as u64, true).is_err());
+        assert!(verify(&digest, bytes.len() as u64 - 1, true).is_err());
+        assert!(
+            verify_fd(
+                fd.as_fd(),
+                bytes.len() as u64 + 1,
+                &digest,
+                100,
+                true,
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) }, 0);
+        // Seal bits alone are insufficient: enforce execute-only root ownership.
+        assert_eq!(unsafe { libc::fchmod(fd.as_raw_fd(), 0o555) }, 0);
+        assert!(verify(&digest, 100, true).is_err());
+        assert_eq!(unsafe { libc::fchmod(fd.as_raw_fd(), 0o111) }, 0);
+        assert_eq!(unsafe { libc::fchown(fd.as_raw_fd(), 1, 1) }, 0);
+        assert!(verify(&digest, 100, true).is_err());
+        let mut unsealed = crate::memfd::create("unsealed", true).unwrap();
+        unsealed.write_all(bytes).unwrap();
+        assert_eq!(unsafe { libc::fchmod(unsealed.as_raw_fd(), 0o111) }, 0);
+        assert!(
+            verify_fd(
+                unsealed.as_fd(),
+                bytes.len() as u64,
+                &digest,
+                100,
+                true,
+                || Ok(())
+            )
+            .is_err()
+        );
+        let bad = crate::memfd::create_sealed("not-elf", b"#!script", true, 0o111).unwrap();
+        assert!(
+            verify_fd(
+                bad.as_fd(),
+                8,
+                &sigrund_core::crypto::sha256_hex(b"#!script"),
+                100,
+                true,
+                || Ok(())
+            )
+            .is_err()
+        );
+        let empty = crate::memfd::create_sealed("stdin", b"", false, 0o400).unwrap();
+        verify_fd(
+            empty.as_fd(),
+            0,
+            &sigrund_core::crypto::sha256_hex(b""),
+            100,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        let calls = AtomicUsize::new(0);
+        let fd = crate::memfd::create_sealed("cancel", &vec![0; 65536], false, 0o400).unwrap();
+        assert_eq!(
+            verify_fd(fd.as_fd(), 65536, &"0".repeat(64), 65536, false, || {
+                if calls.fetch_add(1, Ordering::Relaxed) >= 2 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        // Ordinary files cannot stand in for sealed memfds.
+        let mut ordinary = tempfile::tempfile().unwrap();
+        ordinary.write_all(bytes).unwrap();
+        ordinary.seek(SeekFrom::Start(0)).unwrap();
+        assert!(
+            verify_fd(
+                ordinary.as_fd(),
+                bytes.len() as u64,
+                &digest,
+                100,
+                true,
+                || Ok(())
+            )
+            .is_err()
+        );
+    }
 }
