@@ -27,7 +27,7 @@ until Phases 1–5 are complete.
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
 - [x] Raw `ssh-ed25519` and `sk-ssh-ed25519` SSHSIG verification helpers.
-- [ ] Phase 0: thin-MVP types and profile.
+- [x] Phase 0: thin-MVP types and profile.
 - [ ] Phase 1: daemon and approval-broker sockets.
 - [ ] Phase 2: client transport and common snapshots.
 - [ ] Phase 3: root TTY approval and SSH signing.
@@ -113,6 +113,11 @@ PTY, hooks, remote collectors, and the complete V-01–V-19 matrix are a
 follow-on effort.
 
 ### Phase 0: freeze the thin-MVP boundary
+
+Completed. The frozen configuration, command forms, broker documents, binding
+rules, and verification commands are in [docs/MVP_PHASE0.md](docs/MVP_PHASE0.md).
+This phase defines and tests the contracts; socket transport, approval prompts,
+and execution are delivered by the subsequent phases.
 
 Deliverables:
 
