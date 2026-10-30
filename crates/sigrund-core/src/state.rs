@@ -362,6 +362,45 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_one_time_redemption_commits_exactly_once() {
+        use std::{
+            sync::{Arc, Barrier, mpsc},
+            thread,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        drop(StateStore::open(&path).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let (results, received) = mpsc::channel();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let results = results.clone();
+            thread::spawn(move || {
+                let mut store = StateStore::open(&path).unwrap();
+                barrier.wait();
+                let result = store.authorize(request("concurrent"));
+                results.send(result.unwrap()).unwrap();
+            });
+        }
+        let outcomes = [received.recv().unwrap(), received.recv().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| **r == AuthorizationResult::Allowed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| **r == AuthorizationResult::ReplayDetected)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn consumption_stores_raw_sha256_and_deduplicates_across_grant_ids() {
         let mut store = StateStore::open(":memory:").unwrap();
         assert_eq!(
