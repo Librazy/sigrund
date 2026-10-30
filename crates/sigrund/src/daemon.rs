@@ -569,7 +569,7 @@ impl Connection {
         token: u64,
         now: Instant,
         workers: &mut IoWorkers,
-        _log: &SyncSender<String>,
+        log: &SyncSender<String>,
     ) -> io::Result<bool> {
         if self.pending_decision.is_some() {
             return Ok(false);
@@ -610,7 +610,13 @@ impl Connection {
                     self.broker,
                     deadline,
                 ) {
-                    Ok(task) => self.input = Input::Validating { _task: task },
+                    Ok(task) => {
+                        self.input = Input::Validating { _task: task };
+                        let _ = log.try_send(
+                            serde_json::json!({"event":"IO_WORKER_RESERVED","worker_task":token})
+                                .to_string(),
+                        );
+                    }
                     Err(_) if self.broker => return Ok(false),
                     Err(_) => self.reject(
                         "RESOURCE_EXHAUSTED",
@@ -730,6 +736,7 @@ impl ForegroundDaemon {
         );
         let mut connections: HashMap<u64, Connection> = HashMap::new();
         let mut next_token = FIRST_CONNECTION;
+        let mut reload_diagnostic_pending = false;
         let mut events: [libc::epoll_event; 64] = unsafe { zeroed() };
         loop {
             let now = Instant::now();
@@ -763,6 +770,7 @@ impl ForegroundDaemon {
                             return Ok(());
                         }
                         let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is outside the Phase 1 MVP\"}".into());
+                        reload_diagnostic_pending = true;
                     }
                 } else if token == AUDIT_COMPLETE {
                     for completion in sequencer.drain() {
@@ -1017,6 +1025,23 @@ impl ForegroundDaemon {
             // pending decision in its admitted connection until it can enqueue.
             for connection in connections.values_mut() {
                 connection.queue_decision_audit()?;
+            }
+            if reload_diagnostic_pending {
+                // Coalesce repeated unsupported reload signals while the
+                // sequencer is busy; retain one bounded durable diagnostic.
+                let work = sequencer::Work::Event {
+                    token: 0,
+                    event_type: "RELOAD_UNAVAILABLE",
+                    fields: serde_json::json!({"reason":"reload is disabled in the MVP profile"}),
+                    limit: self.config.audit_record_max_bytes as usize,
+                };
+                match sequencer.sender().try_send(work) {
+                    Ok(()) => reload_diagnostic_pending = false,
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => (),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        return Err(invalid("audit executor stopped"));
+                    }
+                }
             }
             // Expiry is independent of socket readiness and read progress.
             let now = Instant::now();

@@ -236,6 +236,7 @@ fn namespace_fixture() {
     broker_failures_and_reconnect(&fixture, &identity);
     operator_failures_and_expiry(&fixture, &identity);
     wrong_operator_identity(&fixture);
+    revocation_after_approval_request(&fixture, &identity);
     slow_signing_cancellation(&fixture, &identity);
     successful_agent_and_encrypted_identity(&fixture, &identity);
     encrypted_signing_cancellation_restores_terminal(&fixture, &identity);
@@ -372,6 +373,29 @@ fn broker_send(socket: &mut UnixStream, value: &serde_json::Value) {
         .write_all(&(body.len() as u32).to_be_bytes())
         .unwrap();
     socket.write_all(&body).unwrap();
+}
+fn revocation_after_approval_request(fixture: &Fixture, identity: &Path) {
+    let mut broker = admitted_broker(fixture);
+    let before = fixture.diagnostic_count();
+    let mut client = connect(&fixture.socket);
+    send_hello(&mut client, &fixture.executable);
+    let approval = broker_request(&mut broker);
+    let csr = sigrund_core::warrant::Csr::parse(approval.csr_payload.as_bytes()).unwrap();
+    let store = sigrund_core::state::StateStore::open(fixture.state.join("state.sqlite")).unwrap();
+    store
+        .revoke(
+            "grant_id",
+            &csr.warrant().grant_id,
+            csr.warrant().policy.not_before,
+            "revoked while awaiting confirmation",
+        )
+        .unwrap();
+    let response = signed_response(&approval, identity, |_| {});
+    broker_send(&mut broker, &response);
+    assert_eq!(decision(&mut client).status, "REVOKED");
+    drop(client);
+    fixture.wait_for_cleanup(before);
+    drop(broker);
 }
 fn signed_response(
     request: &sigrund_core::approval::ApprovalRequest,

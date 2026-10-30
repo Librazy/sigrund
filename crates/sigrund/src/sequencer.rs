@@ -14,6 +14,7 @@ use sigrund_core::{
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::Ordering,
@@ -76,54 +77,73 @@ impl Sequencer {
         std::thread::Builder::new()
             .name("authorization-audit".into())
             .spawn(move || {
-                for task in receiver {
-                    let result = match task {
-                        Work::Authorize(task) => {
-                            let outcome = authorize(
-                                &mut resources,
-                                &context,
-                                &task,
-                                &completed,
-                                &thread_wake,
-                            );
-                            match outcome {
-                                Ok(denial) => notify(
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    for task in receiver {
+                        let result = match task {
+                            Work::Authorize(task) => {
+                                let outcome = authorize(
+                                    &mut resources,
+                                    &context,
+                                    &task,
                                     &completed,
                                     &thread_wake,
-                                    Completion::Finished {
-                                        token: task.token,
-                                        lease: task.lease,
-                                        denial,
-                                    },
-                                ),
-                                Err(error) => {
-                                    notify(&completed, &thread_wake, Completion::Fatal(error));
-                                    false
+                                );
+                                // A disconnected coordinator may have marked
+                                // cancellation during COMMIT's reservation.
+                                // Once its result and audit are reconciled,
+                                // finish that transition even without a live
+                                // connection to consume the completion.
+                                if task.lifecycle.cancelled.load(Ordering::Acquire) {
+                                    task.lifecycle.cancel();
+                                }
+                                match outcome {
+                                    Ok(denial) => notify(
+                                        &completed,
+                                        &thread_wake,
+                                        Completion::Finished {
+                                            token: task.token,
+                                            lease: task.lease,
+                                            denial,
+                                        },
+                                    ),
+                                    Err(error) => {
+                                        notify(&completed, &thread_wake, Completion::Fatal(error));
+                                        false
+                                    }
                                 }
                             }
+                            Work::Event {
+                                token,
+                                event_type,
+                                fields,
+                                limit,
+                            } => match resources.audit.append_event(event_type, fields, limit) {
+                                Ok(_) => {
+                                    notify(&completed, &thread_wake, Completion::Audited { token })
+                                }
+                                Err(error) => {
+                                    notify(
+                                        &completed,
+                                        &thread_wake,
+                                        Completion::Fatal(error.to_string()),
+                                    );
+                                    false
+                                }
+                            },
+                        };
+                        if !result {
+                            break;
                         }
-                        Work::Event {
-                            token,
-                            event_type,
-                            fields,
-                            limit,
-                        } => match resources.audit.append_event(event_type, fields, limit) {
-                            Ok(_) => {
-                                notify(&completed, &thread_wake, Completion::Audited { token })
-                            }
-                            Err(error) => {
-                                notify(
-                                    &completed,
-                                    &thread_wake,
-                                    Completion::Fatal(error.to_string()),
-                                );
-                                false
-                            }
-                        },
-                    };
-                    if !result {
-                        break;
                     }
+                }));
+                if result.is_err() {
+                    notify(
+                        &completed,
+                        &thread_wake,
+                        Completion::Fatal(
+                            "durable executor panicked; reconciliation required".into(),
+                        ),
+                    );
                 }
             })?;
         Ok(Self {
