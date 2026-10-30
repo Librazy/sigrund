@@ -119,7 +119,8 @@ pub fn verify_ssh_signature(
     }
     if signature_type == "sk-ssh-ed25519" {
         let data = signature.signature().as_bytes();
-        if data.len() != 68 {
+        // Ed25519 signature (64), authenticator flags (1), and counter (4).
+        if data.len() != 69 {
             return Err(CoreError::Value(
                 "invalid security-key signature data".into(),
             ));
@@ -144,6 +145,135 @@ pub fn verify_ssh_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use ssh_key::{
+        encoding::Encode,
+        public::{Ed25519PublicKey, SkEd25519},
+    };
+
+    const TEST_PAYLOAD: &[u8] = b"warrant payload";
+    const TEST_NAMESPACE: &str = "sigrun.warrant.v1";
+
+    /// Build signatures with an independent Ed25519 implementation, including
+    /// the authenticator's signed application, flags, and counter for SK keys.
+    fn ssh_signature_fixture(namespace: &str, sk_flags: Option<u8>) -> (String, String) {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let public_key = Ed25519PublicKey(key.verifying_key().to_bytes());
+        let message = SshSig::signed_data(
+            namespace,
+            HashAlg::Sha512,
+            &pae(WARRANT_PAYLOAD_TYPE, TEST_PAYLOAD),
+        )
+        .unwrap();
+        let (public_key, signature) = match sk_flags {
+            None => (
+                PublicKey::from(public_key),
+                ssh_key::Signature::new(Algorithm::Ed25519, key.sign(&message).to_bytes().to_vec())
+                    .unwrap(),
+            ),
+            Some(flags) => {
+                let counter = 9u32.to_be_bytes();
+                let mut authenticator_data = Sha256::digest(b"ssh:").to_vec();
+                authenticator_data.push(flags);
+                authenticator_data.extend_from_slice(&counter);
+                authenticator_data.extend_from_slice(&Sha256::digest(&message));
+                let mut signature_data = key.sign(&authenticator_data).to_bytes().to_vec();
+                signature_data.push(flags);
+                signature_data.extend_from_slice(&counter);
+                assert_eq!(signature_data.len(), 69);
+                (
+                    PublicKey::from(SkEd25519::new(public_key, "ssh:")),
+                    ssh_key::Signature::new(Algorithm::SkEd25519, signature_data).unwrap(),
+                )
+            }
+        };
+        let signature = SshSig::new(
+            public_key.key_data().clone(),
+            namespace,
+            HashAlg::Sha512,
+            signature,
+        )
+        .unwrap();
+        (
+            public_key.to_openssh().unwrap(),
+            STANDARD.encode(signature.encode_vec().unwrap()),
+        )
+    }
+
+    #[test]
+    fn verifies_ed25519_sshsig_and_rejects_changed_payload_or_namespace() {
+        let (key, signature) = ssh_signature_fixture(TEST_NAMESPACE, None);
+        verify_ssh_signature(
+            "ssh-ed25519",
+            &key,
+            &signature,
+            WARRANT_PAYLOAD_TYPE,
+            TEST_PAYLOAD,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            verify_ssh_signature(
+                "ssh-ed25519",
+                &key,
+                &signature,
+                WARRANT_PAYLOAD_TYPE,
+                b"changed payload",
+                false,
+                false,
+            )
+            .is_err()
+        );
+        let (key, signature) = ssh_signature_fixture("other.namespace", None);
+        assert!(
+            verify_ssh_signature(
+                "ssh-ed25519",
+                &key,
+                &signature,
+                WARRANT_PAYLOAD_TYPE,
+                TEST_PAYLOAD,
+                false,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verifies_sk_ed25519_sshsig_and_enforces_authenticated_flags() {
+        for flags in [0x00, 0x01, 0x04, 0x05] {
+            let (key, signature) = ssh_signature_fixture(TEST_NAMESPACE, Some(flags));
+            for (require_presence, require_verification) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let result = verify_ssh_signature(
+                    "sk-ssh-ed25519",
+                    &key,
+                    &signature,
+                    WARRANT_PAYLOAD_TYPE,
+                    TEST_PAYLOAD,
+                    require_presence,
+                    require_verification,
+                );
+                let expected = (!require_presence || flags & 0x01 != 0)
+                    && (!require_verification || flags & 0x04 != 0);
+                assert_eq!(result.is_ok(), expected, "flags={flags:#04x}: {result:?}");
+            }
+            assert!(
+                verify_ssh_signature(
+                    "sk-ssh-ed25519",
+                    &key,
+                    &signature,
+                    WARRANT_PAYLOAD_TYPE,
+                    b"changed payload",
+                    false,
+                    false,
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn pae_matches_spec_vector_prefix() {
