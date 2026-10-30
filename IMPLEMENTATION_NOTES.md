@@ -252,6 +252,14 @@ The pre-FD-4 child setup, pending-spawn reaper barrier and active-job shutdown
 contracts are frozen in the specification for Phase 5 and remain unimplemented
 runtime surfaces.
 
+The durable sequencer also refreshes the pressure gate after every successful
+append. The owned record that reaches the high-water mark persists, while new
+requests are refused without waiting for a later durable operation. The
+`storage_pressure::exit_gate` namespace fixture starts with a verified log one
+byte below the threshold, crosses it with a real rejection, checks that the
+next connection is refused before admission, and reopens the resulting audit
+history. Removing the post-append check makes this regression test fail.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated

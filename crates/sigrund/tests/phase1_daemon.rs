@@ -1710,3 +1710,5 @@ fn phase1_peer_probe() {
 mod phase3;
 #[path = "fixtures/phase4.rs"]
 mod phase4;
+#[path = "fixtures/storage_pressure.rs"]
+mod storage_pressure;
