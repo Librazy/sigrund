@@ -214,6 +214,10 @@ impl StartupResources {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&database_path)?;
         check_root_metadata(&database, false, Some(0o600))?;
+        // POSIX record locks are process-wide: closing any independently
+        // opened FD for the database after SQLite locks it drops those locks.
+        // Finish verification and close this descriptor before opening SQLite.
+        drop(database);
         for name in [
             "state.sqlite-wal",
             "state.sqlite-shm",

@@ -372,18 +372,29 @@ mod tests {
         drop(StateStore::open(&path).unwrap());
         let barrier = Arc::new(Barrier::new(2));
         let (results, received) = mpsc::channel();
+        let mut executors = Vec::new();
         for _ in 0..2 {
-            let path = path.clone();
+            let mut store = StateStore::open(&path).unwrap();
             let barrier = barrier.clone();
             let results = results.clone();
-            thread::spawn(move || {
-                let mut store = StateStore::open(&path).unwrap();
+            executors.push(thread::spawn(move || {
                 barrier.wait();
                 let result = store.authorize(request("concurrent"));
                 results.send(result.unwrap()).unwrap();
-            });
+            }));
         }
-        let outcomes = [received.recv().unwrap(), received.recv().unwrap()];
+        drop(results);
+        let outcomes = [
+            received
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            received
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+        ];
+        for executor in executors {
+            executor.join().unwrap();
+        }
         assert_eq!(
             outcomes
                 .iter()
@@ -397,6 +408,54 @@ mod tests {
                 .filter(|r| **r == AuthorizationResult::ReplayDetected)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn pinned_database_and_sidecars_follow_the_directory_after_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("state");
+        let retained = fixture.path().join("retained");
+        std::fs::create_dir(&original).unwrap();
+        let directory = File::open(&original).unwrap();
+        let mut store = StateStore::open_in_directory(directory).unwrap();
+        std::fs::rename(&original, &retained).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let sentinel = original.join("state.sqlite");
+        std::fs::write(&sentinel, b"untrusted replacement").unwrap();
+        assert_eq!(
+            store.authorize(request("pinned")).unwrap(),
+            AuthorizationResult::Allowed
+        );
+        store.revoke("grant_id", "blocked", 2, "fixture").unwrap();
+        assert_eq!(
+            store.authorize(request("blocked")).unwrap(),
+            AuthorizationResult::Revoked
+        );
+        assert!(retained.join("state.sqlite-wal").exists());
+        assert!(!original.join("state.sqlite-wal").exists());
+        assert!(!original.join("state.sqlite-shm").exists());
+        drop(store);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"untrusted replacement");
+        let mut reopened = StateStore::open(retained.join("state.sqlite")).unwrap();
+        assert_eq!(
+            reopened.authorize(request("pinned")).unwrap(),
+            AuthorizationResult::ReplayDetected
+        );
+    }
+
+    #[test]
+    fn pinned_database_observes_revocations_from_an_administrative_connection() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut daemon =
+            StateStore::open_in_directory(File::open(fixture.path()).unwrap()).unwrap();
+        let administrator = StateStore::open(fixture.path().join("state.sqlite")).unwrap();
+        administrator
+            .revoke("grant_id", "external", 2, "fixture")
+            .unwrap();
+        assert_eq!(
+            daemon.authorize(request("external")).unwrap(),
+            AuthorizationResult::Revoked
         );
     }
 
