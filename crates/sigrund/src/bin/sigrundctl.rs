@@ -3,7 +3,10 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -67,10 +70,22 @@ fn init_host(args: &[String]) -> ExitCode {
     let log_parent = log_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    if !root_owned_dir(&state_dir) || !root_owned_dir(log_parent) {
-        eprintln!("sigrundctl: provisioning directories must be owned by root:root");
-        return ExitCode::from(73);
-    }
+    let directories = trusted_directory(&state_dir)
+        .and_then(|state| trusted_directory(log_parent).map(|log| (state, log)));
+    let (state_directory, log_directory) = match directories {
+        Ok(directories) => directories,
+        Err(error) => {
+            eprintln!("sigrundctl: untrusted provisioning directory: {error}");
+            return ExitCode::from(73);
+        }
+    };
+    // Keep checked directories alive and address their entries through those
+    // descriptors, even if an ancestor is renamed during provisioning.
+    let state_dir = PathBuf::from(format!("/proc/self/fd/{}", state_directory.as_raw_fd()));
+    let log_path = PathBuf::from(format!("/proc/self/fd/{}", log_directory.as_raw_fd()))
+        .join(log_path.file_name().expect("log path has a filename"));
+    let key_path = state_dir.join("host_identity.key");
+    let state_path = state_dir.join("audit_ratchet.state");
     let mut host_secret = [0u8; 32];
     let mut ratchet_key = [0u8; 32];
     if let Err(error) =
@@ -206,7 +221,10 @@ fn write_provisioning_files(
 /// from the leaf through the filesystem root also handles existing ancestors
 /// whose entries may have just been created by this provisioning invocation.
 fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(path)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
     let absolute = std::path::absolute(path)?;
     sync_directory_chain(&absolute, sync_directory)
 }
@@ -231,10 +249,10 @@ fn root_owned(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-fn root_owned_dir(path: &std::path::Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_dir() && metadata.uid() == 0 && metadata.gid() == 0)
-        .unwrap_or(false)
+fn trusted_directory(path: &Path) -> std::io::Result<File> {
+    let directory = sigrund::startup::open_pinned(path)?;
+    sigrund::startup::check_root_metadata(&directory, true, None)?;
+    Ok(directory)
 }
 
 fn option_path(args: &[String], name: &str) -> Option<PathBuf> {

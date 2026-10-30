@@ -107,3 +107,18 @@ namespace gate pauses after verification, replaces both directory paths, and
 requires partial-tail and forward recovery to modify only the verified files.
 A core audit test also replaces the directory after opening the writer and
 verifies a subsequent append and state publication remain on the original files.
+
+`init-host` creates every new provisioning directory with mode `0700` and
+applies the daemon's root ownership, directory type, no-symlink and no-group/
+other-write checks before generating or writing secrets. Existing trusted
+directory modes are preserved; writable directories are rejected. Provisioning
+also retains the checked directories while creating, syncing and publishing
+their entries. Namespace tests run the shipped command with umasks `0000` and
+`0002`, verify all new directory and file modes, and require daemon startup to
+accept each result. They also accept existing `0755` directories and require
+`0775`/`0777` state or log directories to fail without publishing secrets.
+
+Post-fixup verification passes all 77 top-level workspace tests on the development
+toolchain and Rust `1.89.0`, including the namespace subprocess gates. Clippy
+with warnings denied, formatting and whitespace checks pass. Verification used
+the unchanged lockfile with `--locked --offline`.

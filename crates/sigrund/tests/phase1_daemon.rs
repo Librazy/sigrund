@@ -641,6 +641,7 @@ fn phase1_namespace_fixture() {
     fixture.launch().stop();
     let final_log = fs::read(&fixture.log).unwrap();
     assert_eq!(sha256_hex(&final_log), sha256_hex(&synchronized_log));
+    verify_provisioning_permissions();
     verify_audit_directory_replacement();
     verify_blocked_metadata();
     verify_blocked_cleanup();
@@ -653,6 +654,119 @@ fn send_hello(socket: &mut UnixStream) {
     // Send ordinary probes in one call; fragmented-frame behavior has its own
     // tests that explicitly allow early rejection of the remaining writes.
     send_rights(socket, &encoded, 2);
+}
+
+// Use child-only umasks so the parallel test harness is unaffected. Every
+// successful provisioning must produce files/directories accepted by startup.
+fn verify_provisioning_permissions() {
+    let fixture = Fixture::new();
+    let config =
+        sigrund_core::config::DaemonConfig::from_toml(&fs::read(&fixture.config).unwrap()).unwrap();
+    for mask in [0o000, 0o002] {
+        let base = fixture.directory.path().join(format!("umask-{mask:o}"));
+        let state = base.join("state/host");
+        let log = base.join("log/host/audit.jsonl");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sigrundctl"));
+        command
+            .arg("init-host")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--log-path")
+            .arg(&log);
+        unsafe {
+            command.pre_exec(move || {
+                libc::umask(mask);
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for path in [
+            &state,
+            state.parent().unwrap(),
+            log.parent().unwrap(),
+            log.parent().unwrap().parent().unwrap(),
+            &base,
+        ] {
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
+        for (path, mode) in [
+            (state.join("host_identity.key"), 0o400),
+            (state.join("audit_ratchet.state"), 0o600),
+            (log.clone(), 0o600),
+        ] {
+            let metadata = fs::metadata(path).unwrap();
+            assert_eq!(
+                (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+                (0, 0, mode)
+            );
+        }
+        sigrund::startup::StartupResources::prepare(&config, &state, &log).unwrap();
+    }
+    // Trusted existing modes are preserved, rather than chmodded by init-host.
+    let state = fixture.directory.path().join("trusted-state");
+    let log_dir = fixture.directory.path().join("trusted-log");
+    for directory in [&state, &log_dir] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = log_dir.join("audit.jsonl");
+    let output = Command::new(env!("CARGO_BIN_EXE_sigrundctl"))
+        .arg("init-host")
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("--log-path")
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for directory in [&state, &log_dir] {
+        assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o755);
+    }
+    sigrund::startup::StartupResources::prepare(&config, &state, &log).unwrap();
+    for role in ["state", "log"] {
+        for mode in [0o775, 0o777] {
+            let base = fixture
+                .directory
+                .path()
+                .join(format!("unsafe-{role}-{mode:o}"));
+            let state = base.join("state");
+            let log_dir = base.join("log");
+            for directory in [&state, &log_dir] {
+                fs::create_dir_all(directory).unwrap();
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let unsafe_dir = if role == "state" { &state } else { &log_dir };
+            fs::set_permissions(unsafe_dir, fs::Permissions::from_mode(mode)).unwrap();
+            let log = log_dir.join("audit.jsonl");
+            let output = Command::new(env!("CARGO_BIN_EXE_sigrundctl"))
+                .arg("init-host")
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--log-path")
+                .arg(&log)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(73));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("untrusted provisioning directory")
+            );
+            assert!(!state.join("host_identity.key").exists());
+            assert!(!state.join("audit_ratchet.state").exists());
+            assert!(!state.join("audit_ratchet.state.tmp").exists());
+            assert!(!log.exists());
+            assert_eq!(fs::metadata(unsafe_dir).unwrap().mode() & 0o777, mode);
+        }
+    }
 }
 
 // Pause startup after audit-file verification, then replace both directory
