@@ -4,6 +4,7 @@ mod authorization;
 pub mod cli;
 pub mod client;
 pub mod daemon;
+pub mod execution;
 pub mod linux;
 pub mod memfd;
 mod preparation;

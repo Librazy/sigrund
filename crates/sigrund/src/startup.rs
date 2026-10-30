@@ -87,11 +87,24 @@ pub struct StartupResources {
     pub store: StateStore,
     pub roots: Vec<fs::File>,
     pub(crate) storage: crate::storage::StoragePressure,
+    /// The delegated execution hierarchy is optional only for hosts that do
+    /// not expose one.  Authorization may still run for audit/rejection
+    /// testing, but execution remains fail-closed without this resource.
+    pub(crate) execution: Option<CgroupLayout>,
+    pub(crate) execution_error: Option<String>,
     _collector_files: Vec<fs::File>,
     _lock: fs::File,
 }
 
 impl StartupResources {
+    pub fn execution_layout(&self) -> Option<&CgroupLayout> {
+        self.execution.as_ref()
+    }
+
+    pub fn execution_startup_error(&self) -> Option<&str> {
+        self.execution_error.as_deref()
+    }
+
     pub fn prepare(config: &DaemonConfig, state_dir: &Path, log_path: &Path) -> io::Result<Self> {
         if unsafe { libc::geteuid() } != 0 || unsafe { libc::getegid() } != 0 {
             return Err(io::Error::new(
@@ -250,8 +263,17 @@ impl StartupResources {
                 "audit storage pressure; remediation and restart required",
             ));
         }
+        let (execution, execution_error) = match CgroupLayout::discover().and_then(|layout| {
+            layout.initialize()?;
+            Ok(layout)
+        }) {
+            Ok(layout) => (Some(layout), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Ok(Self {
             storage,
+            execution,
+            execution_error,
             host_id,
             audit,
             store,
@@ -271,6 +293,43 @@ pub struct CgroupLayout {
 }
 
 impl CgroupLayout {
+    /// Discover the cgroup v2 directory containing the daemon from the
+    /// kernel's membership record.  Unit/service names are deliberately not
+    /// assumed: systemd may place the service below any delegated slice.
+    pub fn discover() -> io::Result<Self> {
+        let membership = fs::read_to_string("/proc/self/cgroup")?;
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "cgroup v2 is unavailable")
+            })?;
+        let relative = relative.trim_start_matches('/');
+        let root = if relative.is_empty() {
+            PathBuf::from("/sys/fs/cgroup")
+        } else {
+            PathBuf::from("/sys/fs/cgroup").join(relative)
+        };
+        let metadata = fs::metadata(root.join("cgroup.controllers"))?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "delegated cgroup is not a cgroup v2 hierarchy",
+            ));
+        }
+        Ok(Self::from_root(root))
+    }
+
+    /// Register the daemon as a subreaper before any worker is started.
+    pub fn register_subreaper() -> io::Result<()> {
+        let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
@@ -333,6 +392,113 @@ impl CgroupLayout {
         })();
         let remove = fs::remove_dir(&probe);
         result.and(remove)
+    }
+
+    /// Remove stale job/hook leaves after killing their cgroups.  Processes
+    /// reparented to a previous init/subreaper are intentionally not waited
+    /// for here; `populated=0` is the authoritative cleanup condition.
+    pub fn cleanup_orphans(&self) -> io::Result<usize> {
+        let mut removed = 0;
+        for parent in [&self.jobs, &self.hooks] {
+            let entries = match fs::read_dir(parent) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let kill = path.join("cgroup.kill");
+                if kill.exists() {
+                    write_exact(&kill, b"1\n")?;
+                }
+                let events = path.join("cgroup.events");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    let populated = fs::read_to_string(&events).ok().and_then(|text| {
+                        text.lines().find_map(|line| {
+                            line.strip_prefix("populated ")
+                                .and_then(|v| v.parse::<u8>().ok())
+                        })
+                    });
+                    if populated == Some(0) || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let populated = fs::read_to_string(&events)
+                    .ok()
+                    .is_some_and(|text| text.lines().any(|line| line.trim() == "populated 0"));
+                if !populated {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("cgroup cleanup stalled: {}", path.display()),
+                    ));
+                }
+                fs::remove_dir(&path)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn create_job(
+        &self,
+        exec_id: &str,
+        memory: u64,
+        swap: u64,
+        pids: u64,
+    ) -> io::Result<JobCgroup> {
+        if exec_id.is_empty()
+            || exec_id
+                .bytes()
+                .any(|b| !(b.is_ascii_alphanumeric() || b == b'-'))
+            || memory == 0
+            || pids == 0
+        {
+            return Err(invalid("invalid job cgroup identity or limits"));
+        }
+        let path = self.jobs.join(format!("job-{exec_id}"));
+        fs::create_dir(&path)?;
+        if let Err(error) = (|| {
+            write_and_verify(&path.join("memory.max"), format!("{memory}\n").as_bytes())?;
+            write_and_verify(
+                &path.join("memory.swap.max"),
+                format!("{swap}\n").as_bytes(),
+            )?;
+            write_and_verify(&path.join("memory.oom.group"), b"1\n")?;
+            write_and_verify(&path.join("pids.max"), format!("{pids}\n").as_bytes())?;
+            Ok::<_, io::Error>(())
+        })() {
+            let _ = fs::remove_dir(&path);
+            return Err(error);
+        }
+        let fd = fs::File::open(&path)?;
+        Ok(JobCgroup { path, fd })
+    }
+}
+
+pub struct JobCgroup {
+    path: PathBuf,
+    fd: fs::File,
+}
+
+impl JobCgroup {
+    pub fn fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for JobCgroup {
+    fn drop(&mut self) {
+        let _ = write_exact(self.path.join("cgroup.kill"), b"1\n");
+        let _ = fs::remove_dir(&self.path);
     }
 }
 
