@@ -268,17 +268,8 @@ fn validate_unsigned_request(
 ) -> Result<()> {
     if command.argv.is_empty()
         || command.argv.len() > 256
-        || !command.executable_path.starts_with('/')
-        || command.executable_path.ends_with('/')
-        || command
-            .executable_path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || !command.cwd.starts_with('/')
-        || command
-            .cwd
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !valid_absolute_path(&command.executable_path, false)
+        || !valid_absolute_path(&command.cwd, true)
     {
         return Err(CoreError::Protocol(
             "unsigned command path or argv bounds are invalid".into(),
@@ -345,6 +336,21 @@ fn validate_unsigned_request(
         ));
     }
     Ok(())
+}
+
+fn valid_absolute_path(path: &str, allow_root: bool) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    if path == "/" {
+        return allow_root;
+    }
+    if path.ends_with('/') {
+        return false;
+    }
+    path[1..]
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn sorted_unique<T: Ord>(values: &[T]) -> bool {
@@ -596,18 +602,15 @@ impl RemoteAuditBatchRequest {
                     ));
                 }
             }
-            for (field, target_value) in [
-                (
-                    "auth_commit_seq",
-                    serde_json::Value::from(target.auth_commit_seq),
-                ),
-                ("not_before", serde_json::Value::from(target.not_before)),
-            ] {
-                if final_record.get(field) != Some(&target_value) {
-                    return Err(CoreError::Protocol(
-                        "target_auth numeric field does not match AUTH_COMMIT".into(),
-                    ));
-                }
+            if final_record.get("seq") != Some(&serde_json::Value::from(target.auth_commit_seq)) {
+                return Err(CoreError::Protocol(
+                    "target_auth sequence does not match AUTH_COMMIT".into(),
+                ));
+            }
+            if final_record.get("not_before") != Some(&serde_json::Value::from(target.not_before)) {
+                return Err(CoreError::Protocol(
+                    "target_auth numeric field does not match AUTH_COMMIT".into(),
+                ));
             }
             let final_not_after = final_record
                 .get("not_after")
@@ -817,6 +820,79 @@ mod tests {
         hello = valid;
         hello["caller_env"]["TERM"] = "x".repeat(4097).into();
         assert!(parse_strict::<ClientHello>(&serde_json::to_vec(&hello).unwrap()).is_err());
+    }
+
+    #[test]
+    fn unsigned_hello_accepts_absolute_executable_and_root_cwd() {
+        let hello = serde_json::json!({
+            "caller_env": {},
+            "mode": "unsigned_csr_request",
+            "requested_command": {
+                "allow_interpreted_script": false,
+                "argv": ["/usr/bin/probe"],
+                "cwd": "/",
+                "executable_path": "/usr/bin/probe",
+                "stdin_policy": "null",
+                "tty_mode": "stdio"
+            },
+            "requested_execution_context": {
+                "capabilities": [],
+                "env_exact": {},
+                "caller_env_allowlist": [],
+                "supplementary_gids": [],
+                "target_gid": 0,
+                "target_uid": 0,
+                "umask": 63
+            },
+            "requested_policy": {"mode": "one_time", "ttl_secs": 900},
+            "tty_mode": "stdio"
+        });
+        parse_strict::<ClientHello>(&serde_json::to_vec(&hello).unwrap())
+            .unwrap()
+            .validate_shape()
+            .unwrap();
+        assert!(!valid_absolute_path("/usr/bin/", false));
+        assert!(!valid_absolute_path("/usr//bin/probe", false));
+        assert!(!valid_absolute_path("/usr/../bin/probe", false));
+        assert!(valid_absolute_path("/", true));
+    }
+
+    #[test]
+    fn target_auth_binds_to_final_record_sequence_field() {
+        let exec_id = "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f";
+        let grant_id = "0192d8f4-9a00-7000-8000-112233445566";
+        let digest = "00".repeat(32);
+        let record = serde_json::json!({
+            "event_type": "AUTH_COMMIT",
+            "exec_id": exec_id,
+            "grant_id": grant_id,
+            "host_id": "host",
+            "not_after": 1900,
+            "not_before": 1000,
+            "payload_sha256": digest,
+            "policy_mode": "one_time",
+            "seq": 1,
+            "signer_id": "signer"
+        });
+        let target = TargetAuth {
+            auth_commit_seq: 1,
+            exec_id: exec_id.into(),
+            grant_id: grant_id.into(),
+            host_id: "host".into(),
+            not_after: Some(1900),
+            not_before: 1000,
+            payload_sha256: "00".repeat(32),
+            policy_mode: "one_time".into(),
+            signer_id: "signer".into(),
+        };
+        let batch = RemoteAuditBatchRequest {
+            first_seq: 1,
+            last_seq: 1,
+            host_id: "host".into(),
+            records_jcs: vec![serde_json::to_string(&record).unwrap()],
+            target_auth: Some(target),
+        };
+        batch.validate().unwrap();
     }
 
     #[test]

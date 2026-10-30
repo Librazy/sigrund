@@ -65,6 +65,7 @@ pub struct AuditLog {
     log: File,
     state: RatchetState,
     key: [u8; 32],
+    host_id: String,
     usable: bool,
 }
 
@@ -92,9 +93,12 @@ impl AuditLog {
             log,
             state,
             key,
+            host_id: String::new(),
             usable: true,
         };
-        match recover_log_state(&mut writer.log, &writer.state, initial_key.as_ref())? {
+        let recovery = recover_log_state(&mut writer.log, &writer.state, initial_key.as_ref())?;
+        writer.host_id = recovery.host_id;
+        match recovery.action {
             RecoveryAction::None => {}
             RecoveryAction::Truncate { offset } => {
                 writer
@@ -127,6 +131,7 @@ impl AuditLog {
                     .ok_or_else(|| CoreError::Database("audit sequence overflow".into()))?;
                 writer.state.last_record_sha256 = last_hash;
                 writer.key = next_key;
+                writer.state.key_hex = encode_hex(&next_key);
                 writer.persist_state()?;
                 writer.append_recovery("RATCHET_FORWARD_RECOVERY")?;
             }
@@ -152,6 +157,11 @@ impl AuditLog {
         if record_seq != self.state.seq || previous != self.state.last_record_sha256 {
             return Err(CoreError::Database(
                 "audit record does not extend current state".into(),
+            ));
+        }
+        if record_host_id(record)? != self.host_id {
+            return Err(CoreError::Database(
+                "audit record host_id does not match local host".into(),
             ));
         }
         verify_record_hmac(record, &self.key)?;
@@ -225,6 +235,7 @@ impl AuditLog {
     fn append_recovery(&mut self, event_type: &str) -> Result<()> {
         let mut body = std::collections::BTreeMap::new();
         body.insert("event_type", serde_json::Value::String(event_type.into()));
+        body.insert("host_id", serde_json::Value::String(self.host_id.clone()));
         body.insert("seq", serde_json::Value::from(self.state.seq));
         body.insert(
             "prev_record_sha256",
@@ -284,11 +295,16 @@ enum RecoveryAction {
     },
 }
 
+struct RecoveryResult {
+    action: RecoveryAction,
+    host_id: String,
+}
+
 fn recover_log_state(
     log: &mut File,
     state: &RatchetState,
     initial_key: Option<&[u8; 32]>,
-) -> Result<RecoveryAction> {
+) -> Result<RecoveryResult> {
     if state.seq == 0 || state.remote_acked_seq >= state.seq {
         return Err(CoreError::Database(
             "AUDIT_TAMPER_OR_CORRUPTION: invalid state sequence".into(),
@@ -321,6 +337,7 @@ fn recover_log_state(
     let mut key = *initial;
     let mut key_at_state = None;
     let mut previous_hash = "0".repeat(64);
+    let mut host_id: Option<String> = None;
     for (index, record) in records.iter().enumerate() {
         if index as u64 == state.seq {
             key_at_state = Some(key);
@@ -330,6 +347,16 @@ fn recover_log_state(
             return Err(CoreError::Database(
                 "AUDIT_TAMPER_OR_CORRUPTION: audit chain mismatch".into(),
             ));
+        }
+        let record_host = record_host_id(record)?;
+        if let Some(expected_host) = host_id.as_deref() {
+            if record_host != expected_host {
+                return Err(CoreError::Database(
+                    "AUDIT_TAMPER_OR_CORRUPTION: audit host_id mismatch".into(),
+                ));
+            }
+        } else {
+            host_id = Some(record_host);
         }
         verify_record_hmac(record, &key)?;
         previous_hash = record_hash(record);
@@ -343,11 +370,17 @@ fn recover_log_state(
             ));
         }
         if partial {
-            return Ok(RecoveryAction::Truncate {
-                offset: last_newline as u64,
+            return Ok(RecoveryResult {
+                action: RecoveryAction::Truncate {
+                    offset: last_newline as u64,
+                },
+                host_id: host_id.expect("audit log has at least one record"),
             });
         }
-        return Ok(RecoveryAction::None);
+        return Ok(RecoveryResult {
+            action: RecoveryAction::None,
+            host_id: host_id.expect("audit log has at least one record"),
+        });
     }
     if complete_count == state.seq + 1 {
         if records
@@ -365,9 +398,12 @@ fn recover_log_state(
                 "AUDIT_TAMPER_OR_CORRUPTION: state key mismatch before forward recovery".into(),
             ));
         }
-        return Ok(RecoveryAction::Forward {
-            last_hash: record_hash(records.last().unwrap()),
-            truncate_offset: partial.then_some(last_newline as u64),
+        return Ok(RecoveryResult {
+            action: RecoveryAction::Forward {
+                last_hash: record_hash(records.last().unwrap()),
+                truncate_offset: partial.then_some(last_newline as u64),
+            },
+            host_id: host_id.expect("audit log has at least one record"),
         });
     }
     Err(CoreError::Database(
@@ -437,6 +473,17 @@ fn record_metadata(record: &[u8]) -> Result<(u64, String)> {
     Ok((seq, previous.to_owned()))
 }
 
+fn record_host_id(record: &[u8]) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(record)
+        .map_err(|e| CoreError::Database(format!("parse audit record host_id: {e}")))?;
+    value
+        .get("host_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| CoreError::Database("audit record missing host_id".into()))
+}
+
 fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
     if value.len() != 64
         || !value
@@ -476,7 +523,7 @@ mod tests {
             let log = dir.path().join("audit.jsonl");
             let state = dir.path().join("audit_ratchet.state");
             let genesis_body = serde_json::to_vec(&serde_json::json!({
-                "event_type": "AUDIT_INIT", "seq": 0,
+                "event_type": "AUDIT_INIT", "host_id": "host", "seq": 0,
                 "prev_record_sha256": "0".repeat(64),
             }))
             .unwrap();
@@ -507,7 +554,7 @@ mod tests {
 
         fn record(&self) -> Vec<u8> {
             let body = serde_json::to_vec(&serde_json::json!({
-                "event_type": "TEST", "seq": 1,
+                "event_type": "TEST", "host_id": "host", "seq": 1,
                 "prev_record_sha256": record_hash(&self.genesis),
             }))
             .unwrap();
@@ -567,6 +614,13 @@ mod tests {
         .concat();
         std::fs::write(&fixture.log, &partial).unwrap();
         assert!(AuditLog::open(&fixture.log, &fixture.state).is_ok());
+        let recovered = std::fs::read_to_string(&fixture.log).unwrap();
+        let recovery_record: serde_json::Value = recovered
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .unwrap();
+        assert_eq!(recovery_record["host_id"], "host");
         let mut wrong_hash = fixture.genesis.clone();
         wrong_hash.extend_from_slice(b" \n");
         std::fs::write(&fixture.log, wrong_hash).unwrap();
@@ -581,7 +635,7 @@ mod tests {
         writer.append_raw(&record).unwrap();
         drop(writer);
         let corrupt_genesis = serde_json::to_vec(&serde_json::json!({
-            "event_type": "AUDIT_INIT", "seq": 0,
+            "event_type": "AUDIT_INIT", "host_id": "host", "seq": 0,
             "prev_record_sha256": "0".repeat(64), "extra": "tampered",
         }))
         .unwrap();
