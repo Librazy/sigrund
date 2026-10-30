@@ -2,6 +2,7 @@
 //! Child setup and readiness remain the Phase 5 execution boundary.
 use crate::{
     admission::{Admission, AuditLease},
+    execution::{JobSupervisor, SpawnOutcome},
     linux::validate_absolute_path,
     preparation::{self, Context, Document, PinnedRoot},
     sequencer::{self, Sequencer},
@@ -316,7 +317,17 @@ impl Connection {
         } else {
             LifecycleDecision::Rejected
         };
-        if !self.lifecycle.claim_terminal(phase, outcome) {
+        let already_published = matches!(
+            (self.lifecycle.state(), outcome),
+            (
+                (Phase::Failed, LifecycleDecision::Rejected),
+                LifecycleDecision::Rejected
+            ) | (
+                (Phase::Cancelled, LifecycleDecision::Timeout),
+                LifecycleDecision::Timeout
+            )
+        );
+        if !already_published && !self.lifecycle.claim_terminal(phase, outcome) {
             return Err(invalid("decision already claimed"));
         }
         // Cancelling a task never closes its caller rights on this thread.
@@ -643,6 +654,28 @@ impl Drop for Connection {
     }
 }
 
+fn queue_post_commit_abort(
+    durable: &SyncSender<sequencer::Work>,
+    job: sequencer::CommittedJob,
+    reason: &str,
+    policy: &DaemonConfig,
+) -> io::Result<()> {
+    let mut fields = job.commit_fields;
+    fields["status"] = "SPAWN_FAILED".into();
+    fields["reason"] = reason.into();
+    durable
+        .try_send(sequencer::Work::Event {
+            token: job.token,
+            event_type: "AUTH_ABORTED_POST_COMMIT",
+            fields,
+            limit: policy.audit_record_max_bytes as usize,
+            _audit: job.audit,
+        })
+        .map_err(|_| invalid("post-commit audit executor capacity unavailable"))?;
+    drop(job.lease);
+    Ok(())
+}
+
 pub struct ForegroundDaemon {
     client: BoundSocket,
     approval: BoundSocket,
@@ -699,12 +732,15 @@ impl ForegroundDaemon {
         let sequencer_capacity = (self.config.max_pending_audits_global as usize)
             .checked_mul(2)
             .ok_or_else(|| invalid("sequencer capacity overflow"))?;
+        let execution_layout = self._resources.execution_layout().cloned();
+        let execution_error = self._resources.execution_startup_error().map(str::to_owned);
         let sequencer = Sequencer::new(
             self._resources,
             context.clone(),
             self.config.clone(),
             sequencer_capacity,
         )?;
+        let supervisor = JobSupervisor::new(execution_layout, execution_error);
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
@@ -820,6 +856,51 @@ impl ForegroundDaemon {
                                     )?;
                                 }
                                 drop(lease);
+                            }
+                            sequencer::Completion::Committed(job) => {
+                                let job = *job;
+                                let token = job.token;
+                                if !job.lifecycle.transition(Phase::Committed, Phase::Spawning) {
+                                    queue_post_commit_abort(
+                                        &sequencer.sender(),
+                                        job,
+                                        "committed job lost its spawn reservation",
+                                        &self.config,
+                                    )?;
+                                    continue;
+                                }
+                                match supervisor.spawn(job) {
+                                    SpawnOutcome::Failed { job, message } => {
+                                        let _ =
+                                            job.lifecycle.finish_spawn(LifecycleDecision::Rejected);
+                                        if let Some(connection) = connections.get_mut(&token)
+                                            && connection.lifecycle.state().1
+                                                == LifecycleDecision::Undecided
+                                        {
+                                            connection.respond_inner(
+                                                "SPAWN_FAILED",
+                                                "Authorization committed; execution requires Phase 5; one-time grant remains consumed",
+                                                None,
+                                                Instant::now(),
+                                                true,
+                                            )?;
+                                            register(
+                                                epoll.as_raw_fd(),
+                                                libc::EPOLL_CTL_MOD,
+                                                connection.fd.as_raw_fd(),
+                                                token,
+                                                true,
+                                                false,
+                                            )?;
+                                        }
+                                        queue_post_commit_abort(
+                                            &sequencer.sender(),
+                                            job,
+                                            &message,
+                                            &self.config,
+                                        )?;
+                                    }
+                                }
                             }
                             sequencer::Completion::Denied { token, denial } => {
                                 if let Some(c) = connections.get_mut(&token)

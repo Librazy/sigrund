@@ -2,7 +2,7 @@
 //! worker/FD/RAM reservation until the original worker actually disposes them.
 use crate::{
     admission::AuditLease,
-    authorization::{self, Denial},
+    authorization::{self, Authorized, Denial},
     preparation::Context,
     startup::StartupResources,
     workers::RequestLease,
@@ -43,6 +43,17 @@ pub(crate) enum Work {
         _audit: AuditLease,
     },
 }
+
+pub(crate) struct CommittedJob {
+    pub token: u64,
+    pub exec_id: String,
+    pub gid: u32,
+    pub lifecycle: Arc<Lifecycle>,
+    pub lease: RequestLease,
+    pub authorized: Authorized,
+    pub audit: AuditLease,
+    pub commit_fields: serde_json::Value,
+}
 pub(crate) enum Completion {
     Reserve {
         token: u64,
@@ -53,6 +64,7 @@ pub(crate) enum Completion {
         lease: RequestLease,
         denial: Denial,
     },
+    Committed(Box<CommittedJob>),
     Denied {
         token: u64,
         denial: Denial,
@@ -86,10 +98,12 @@ impl Sequencer {
                     for task in receiver {
                         let result = match task {
                             Work::Authorize(task) => {
+                                let token = task.token;
+                                let lifecycle = task.lifecycle.clone();
                                 let outcome = authorize(
                                     &mut resources,
                                     &context,
-                                    &task,
+                                    task,
                                     &completed,
                                     &thread_wake,
                                 );
@@ -98,19 +112,22 @@ impl Sequencer {
                                 // Once its result and audit are reconciled,
                                 // finish that transition even without a live
                                 // connection to consume the completion.
-                                if task.lifecycle.cancelled.load(Ordering::Acquire) {
-                                    task.lifecycle.cancel();
+                                if lifecycle.cancelled.load(Ordering::Acquire) {
+                                    lifecycle.cancel();
                                 }
                                 match outcome {
-                                    Ok(denial) => notify(
+                                    Ok(AuthorizationOutcome::Denied { lease, denial }) => notify(
                                         &completed,
                                         &thread_wake,
                                         Completion::Finished {
-                                            token: task.token,
-                                            lease: task.lease,
+                                            token,
+                                            lease,
                                             denial,
                                         },
                                     ),
+                                    Ok(AuthorizationOutcome::Committed(job)) => {
+                                        notify(&completed, &thread_wake, Completion::Committed(job))
+                                    }
                                     Err(error) => {
                                         notify(&completed, &thread_wake, Completion::Fatal(error));
                                         false
@@ -228,13 +245,18 @@ fn realtime() -> sigrund_core::Result<i64> {
         .and_then(|d| d.as_secs().try_into().ok())
         .ok_or_else(|| sigrund_core::CoreError::Value("invalid realtime clock".into()))
 }
+enum AuthorizationOutcome {
+    Denied { lease: RequestLease, denial: Denial },
+    Committed(Box<CommittedJob>),
+}
+
 fn authorize(
     resources: &mut StartupResources,
     context: &Context,
-    task: &AuthorizationTask,
+    task: AuthorizationTask,
     completed: &SyncSender<Completion>,
     wake: &OwnedFd,
-) -> std::result::Result<Denial, String> {
+) -> std::result::Result<AuthorizationOutcome, String> {
     let request = task.lease.request();
     let verified = match authorization::verify(request, context, task.gid) {
         Ok(verified) => verified,
@@ -249,7 +271,10 @@ fn authorize(
                 request.policy.audit_record_max_bytes as usize,
             )
             .map_err(|e| e.to_string())?;
-            return Ok(denial);
+            return Ok(AuthorizationOutcome::Denied {
+                lease: task.lease,
+                denial,
+            });
         }
     };
     if !resources
@@ -270,7 +295,10 @@ fn authorize(
             request.policy.audit_record_max_bytes as usize,
         )
         .map_err(|e| e.to_string())?;
-        return Ok(denial);
+        return Ok(AuthorizationOutcome::Denied {
+            lease: task.lease,
+            denial,
+        });
     }
     let w = verified.warrant.warrant();
     let candidates: Vec<_> = verified.signer_ids.iter().map(String::as_str).collect();
@@ -344,6 +372,18 @@ fn authorize(
             || !connection_live(task.control.as_raw_fd());
         let now = realtime().map_err(|e| e.to_string())?;
         let expired = now < w.policy.not_before || w.policy.not_after.is_none_or(|end| now > end);
+        if !cancelled && !expired && resources.execution_layout().is_some() {
+            return Ok(AuthorizationOutcome::Committed(Box::new(CommittedJob {
+                token: task.token,
+                exec_id: task.exec_id,
+                gid: task.gid,
+                lifecycle: task.lifecycle,
+                lease: task.lease,
+                authorized: verified,
+                audit: task.audit,
+                commit_fields: fields,
+            })));
+        }
         let denial = if cancelled {
             Denial::new(
                 "REQUEST_TIMEOUT",
@@ -371,7 +411,10 @@ fn authorize(
             limit,
         )
         .map_err(|e| e.to_string())?;
-        Ok(denial)
+        Ok(AuthorizationOutcome::Denied {
+            lease: task.lease,
+            denial,
+        })
     } else {
         if task.lifecycle.state().0 == Phase::Committing && !task.lifecycle.rolled_back_commit() {
             return Err("lost rollback reservation".into());
@@ -396,7 +439,10 @@ fn authorize(
         fields["status"] = denial.status.into();
         append_event(resources, &request.policy, "AUTH_REJECTED", fields, limit)
             .map_err(|e| e.to_string())?;
-        Ok(denial)
+        Ok(AuthorizationOutcome::Denied {
+            lease: task.lease,
+            denial,
+        })
     }
 }
 

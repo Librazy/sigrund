@@ -181,6 +181,36 @@ impl Lifecycle {
         won
     }
 
+    /// Completes a reserved spawn after the syscall result is known.
+    pub fn finish_spawn(&self, decision: Decision) -> bool {
+        if matches!(decision, Decision::Undecided | Decision::Ready) {
+            return false;
+        }
+        loop {
+            let current = self.word.load(Ordering::Acquire);
+            let (phase, current_decision) = Self::unpack(current);
+            if phase != Phase::Spawning || current_decision != Decision::Undecided {
+                return false;
+            }
+            let terminal = if decision == Decision::Rejected {
+                Phase::Failed
+            } else {
+                Phase::Cancelled
+            };
+            let next = Self::pack(terminal, decision) | (current & CANCELLATION_PENDING);
+            if self
+                .word
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if terminal == Phase::Cancelled {
+                    self.cancelled.store(true, Ordering::Release);
+                }
+                return true;
+            }
+        }
+    }
+
     /// Requests cancellation. Returns true only when a terminal phase was
     /// claimed. During reservations, the owner must reconcile the syscall's
     /// result before calling this again to finish cancellation.
