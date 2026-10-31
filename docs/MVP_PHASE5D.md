@@ -1,9 +1,11 @@
 # Phase 5D: real execution failure and race verification
 
-The executable gate is prepared in `scripts/verify-phase5-failures.py`.
-It has not yet run on the delegated host. Phase 5D remains incomplete until
-that gate and the Phase 5A–5C gates pass together. Syntax/compilation checks
-and the unprivileged child/reaper tests do not establish privileged acceptance.
+The executable gate in `scripts/verify-phase5-failures.py` passed all 26 cases
+on the delegated host on 2026-10-31. The same launch repeated the real
+Phase 5A/5B platform fixture successfully. The expanded Phase 5C service gate
+and complete workspace suite also pass against the same daemon/client build.
+Syscall traces and post-exec kernel observations are retained in the
+[acceptance artifacts](evidence/phase5-2026-10-31/README.md).
 
 The harness uses production daemon/client/approver binaries, disposable software
 SSH keys, root-owned temporary configuration/state and isolated job cgroups.
@@ -49,8 +51,8 @@ Use a fresh artifact directory for each attempt, including failed attempts.
 The controlled root TTY is a new foreground PTY owned by the fixture's root
 approver, never an operator's existing terminal. The harness submits `no` and
 `yes` only to prompts for its own disposable requests and key. It executes a
-private native copy of `id`, since distributions can make `/usr/bin/id` a
-symlink rejected by executable resolution. The root approval test runs the
+private native copy of a memfd-compatible standalone `id`, since some
+distributions use symlinks or hardened multicall dispatchers. The root approval test runs the
 unsigned client as UID 65534 and verifies that approved `id -u` runs as UID 0,
 prints `0`, and returns status zero. This supplies execution evidence for the
 user story; Phase 6 still owns the packaged operator walkthrough, full fixture
@@ -58,7 +60,7 @@ interface and additional user-story cases. No physical FIDO evidence is claimed.
 
 ## Required observations
 
-Every row below is prepared and pending delegated-host verification.
+Every row below passed on the real delegated host in the recorded run.
 
 | Gate | Required evidence |
 | --- | --- |
@@ -94,5 +96,26 @@ syscall/FD fault matrix and the delegated Phase 5A/5B platform fixture.
 
 This remains thin-MVP coverage of the corresponding V-06/V-08/V-10/V-11/V-15/
 V-17 subcases. PTY, hooks, reusable grants, remote collector ACKs, reload and
-the complete V-01–V-19 stress matrix remain later work. All acceptance statuses
-stay pending until the recorded real gates prove the requirements above.
+the complete V-01–V-19 stress matrix remain later work. The recorded real gates prove these thin-path requirements; they do not
+complete the full specification or Phase 6 operator packaging.
+
+## Recorded acceptance
+
+The approved command was
+`~/.local/bin/pkexec-run -- /usr/bin/python3 /tmp/sigrund-phase5-failures/run.py`.
+It ran service `sigrund-phase5-failures-5f2969a847384549ac44b2293391c7bf.service`
+under the 180-second supervising limit on kernel `7.2.11-300.fc45.x86_64`.
+The platform fixture reported `1 passed; 0 failed` in 0.38 seconds. The
+failure/race manifest has `result: passed`, 26 completed gates, and binary
+SHA-256 digests matching the Phase 5C build. The runner reported `success`,
+status `0` and cgroup `removed=true`.
+
+The controlled root-TTY case returned stdout `0\n` and exit 0 after approval;
+refusal exited 255 without consumption. Stopped readiness cases failed at
+2.059/2.057 seconds and remained replay-denied. Four post-exec combinations
+reported exact UID/GID triples 0/33, P/E/I/bounding/ambient masks 0/1024,
+securebits 47, no_new_privs 1, umask 027, a private protected cgroup mount,
+and clean FD/signal state. A 1 MiB binary stdin round-trip matched exactly.
+The client/control stress returned to FD baseline 30, and 43 trace files
+recorded actual clone3/credential/exec/reaper syscalls. The artifact archive
+preserves audit records, prompts, status records and the complete trace set.

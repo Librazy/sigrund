@@ -36,11 +36,15 @@ real delegated-host gate passed on 2026-10-31 with whole-service cleanup.
 Phase 5C now wires authorized jobs into bounded off-loop clone/cgroup work,
 central reaping, readiness/exit auditing, signal forwarding and shutdown.
 Normal foreground startup requires its platform probe; `--authorization-only`
-selects the non-executing diagnostic profile. The workspace regressions pass;
-Phase 5C's real runtime/service acceptance is still pending. Phase 5D's full
-execution failure/race gate and Phase 6's root-TTY user-story fixture remain
-outstanding. See [MVP_PHASE5C.md](docs/MVP_PHASE5C.md) for the implementation
-boundary and prepared verification commands.
+selects the non-executing diagnostic profile. Phases 5C/5D passed their real
+delegated runtime/service and failure/race gates on 2026-10-31, together with
+the repeated Phase 5A/5B platform fixture and all ordinary workspace regressions.
+The controlled root-TTY test confirmed an unsigned UID 65534 request, SSH
+signing by root, UID 0 execution and exact output/status. Phase 6's packaged
+operator walkthrough and broader end-to-end fixture remain outstanding.
+See [MVP_PHASE5C.md](docs/MVP_PHASE5C.md),
+[MVP_PHASE5D.md](docs/MVP_PHASE5D.md), and the retained
+[acceptance evidence](docs/evidence/phase5-2026-10-31/README.md).
 
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
@@ -59,8 +63,10 @@ boundary and prepared verification commands.
   delegated-host privileged acceptance passed on 2026-10-31.
 - [x] Phase 5B: child setup and sync-pipe classification;
   privileged clone/mount acceptance passed in the same run.
-- [ ] Phase 5C: central reaping, teardown and daemon shutdown.
-- [ ] Phase 5D: execution failure and race verification.
+- [x] Phase 5C: central reaping, teardown and daemon shutdown; delegated
+  runtime/service acceptance passed on 2026-10-31.
+- [x] Phase 5D: execution failure and race verification; real syscall traces
+  and post-exec observations retained for the 2026-10-31 run.
 - [ ] Phase 6: two-UID end-to-end fixture.
 
 ### Midpoint review and follow-through
@@ -338,7 +344,8 @@ oversized strings/arrays, and mismatched CSR/warrant fields before any spawn.
 
 Completed. Startup, transport behavior, isolated two-UID verification, and
 operator commands are documented in [docs/MVP_PHASE1.md](docs/MVP_PHASE1.md).
-The service cannot yet authorize or execute a command.
+At the Phase 1 boundary the service could not authorize or execute a command;
+Phases 4–5 subsequently provide those paths.
 
 Deliverables:
 
@@ -529,8 +536,8 @@ Implementation landed. Unprivileged ownership and registration-barrier gates
 pass. [MVP_PHASE5A.md](docs/MVP_PHASE5A.md) records the code boundary, exact
 commands and delegated-host prerequisites. The post-landing privileged
 acceptance gate passed on 2026-10-31, including whole-service cleanup.
-Live clone dispatch remains gated on Phase 5C's
-reaper and active-job shutdown integration.
+Live clone dispatch is now integrated by Phase 5C's verified reaper and
+active-job shutdown path.
 
 Deliverables:
 
@@ -590,9 +597,10 @@ Exit gate:
 
 ### Phase 5C: central reaping, teardown and daemon shutdown
 
-Implementation is in progress. [MVP_PHASE5C.md](docs/MVP_PHASE5C.md) records
-ownership, shutdown behavior and the prepared runtime/service verification
-gates. Unprivileged regressions pass; privileged acceptance remains pending.
+Implementation and delegated-host acceptance completed on 2026-10-31.
+[MVP_PHASE5C.md](docs/MVP_PHASE5C.md) records ownership, shutdown, retained
+supervisor restart, and the successful runtime/service gates. The ordinary
+workspace regressions and the expanded shutdown/trust cases also pass.
 
 Deliverables:
 
@@ -625,9 +633,11 @@ Exit gate:
 
 ### Phase 5D: execution failure and race verification
 
-The executable gate and evidence contract are prepared in
-[MVP_PHASE5D.md](docs/MVP_PHASE5D.md). Its real delegated execution and syscall
-trace results are pending; this phase is not marked complete.
+Completed on 2026-10-31. The executable gate and evidence contract in
+[MVP_PHASE5D.md](docs/MVP_PHASE5D.md) have passing delegated execution,
+root-TTY signing, post-exec credential observations and retained syscall traces.
+The Phase 5A/5B platform gate, expanded Phase 5C service gate and ordinary
+Phase 4.5 response/storage regressions passed against the same build.
 
 Exit gate:
 
@@ -686,7 +696,9 @@ for two root terminals and a separate requester login. It must:
 
 Missing kernel/delegation requirements fail the execution gate;
 namespace-only transport tests cannot substitute for it. The following are
-target commands after Phases 2–5, not commands that execute successfully today.
+supported command forms after Phases 2–5. Use a canonical, memfd-compatible
+standalone executable; a distribution symlink or hardened multicall dispatcher
+may require a different native target. Phase 6 still must package this recipe.
 Run the root terminals in a provisioned disposable host with a delegated
 cgroup (for example a systemd service with `Delegate=yes`):
 

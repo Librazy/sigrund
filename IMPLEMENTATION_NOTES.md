@@ -20,7 +20,8 @@ snapshots, explicit signer/key selection, and foreground root approval. Phase 4
 adds local authorization, SQLite consumption and serialized durable audit.
 Phases 5A/5B add startup, ownership and child-transition foundations. Phase 5C
 wires live request execution, central reaping and shutdown; its ordinary
-regressions pass and real delegated runtime/service acceptance remains pending.
+regressions and real delegated runtime/service acceptance pass. Phase 5D adds
+verified execution failures, races, syscall traces and post-exec observations.
 M-01–M-15 and applicable V subcases gate the revised MVP. The Phase 0/1 evidence
 documents remain records of what was actually implemented and tested.
 
@@ -252,8 +253,8 @@ reads `REQUEST_TIMEOUT` and `RESOURCE_EXHAUSTED` while a WAL/audit sync remains
 blocked, then verifies replay and shutdown behavior after releasing the gate.
 The pre-FD-4 child setup, pending-spawn reaper barrier and active-job shutdown
 contracts are frozen in the specification. Phase 5B implements the tracked
-child error descriptor; the tested registration-barrier primitive is ready for
-Phase 5C's runtime integration. Active-job shutdown remains Phase 5C work.
+child error descriptor; Phase 5C integrates the tested registration barrier
+and active-job shutdown. Phase 5D verifies the resulting real execution path.
 
 The durable sequencer also refreshes the pressure gate after every successful
 append. The owned record that reaches the high-water mark persists, while new
@@ -314,14 +315,28 @@ that discards unfinished owners.
 
 The complete workspace suite, Clippy, formatting and diff checks pass. Real
 runtime and transient-service verification in
-[MVP_PHASE5C.md](docs/MVP_PHASE5C.md) remains pending approved execution;
-these ordinary checks do not establish delegated-host acceptance.
+[MVP_PHASE5C.md](docs/MVP_PHASE5C.md) passed on 2026-10-31, including shutdown
+before commit/spawn/readiness, poisoned audit, blocked cleanup, unsafe restart
+layout rejection, prior-instance orphan recovery and automatic escalation.
+Retained hierarchies restart in a verified `G/supervisor` leaf, preserving
+controllers and prior jobs until reconciliation.
 
-Phase 5D's real failure/race harness is prepared in
+Phase 5D's passing real failure/race harness is documented in
 [MVP_PHASE5D.md](docs/MVP_PHASE5D.md). It adds startup feature failures,
 per-step child failures, readiness races, real root-TTY approval/execution,
-post-exec kernel observations and retained syscall traces. Its privileged
-acceptance remains pending; the complete phase and MVP are not yet verified.
+post-exec kernel observations and retained syscall traces. Its 26 gates passed
+on 2026-10-31 alongside a repeated Phase 5A/5B platform gate. The controlled
+root-TTY workflow returned `0` with exit status zero to UID 65534 after root
+confirmation/signing and UID 0 execution. This completes Phases 5C/5D; Phase 6
+still owns the packaged walkthrough and broader fixture. Evidence is retained
+in [docs/evidence/phase5-2026-10-31](docs/evidence/phase5-2026-10-31/README.md).
+
+The acceptance loop corrected fixture root ordering, sealed execution of
+hardened multicall tools, restart entry into a retained cgroup hierarchy, and
+client progress-diagnostic assertions. Standalone GNU alternatives are tested
+through a sealed memfd before copying. Executable byte authentication cannot
+make an executable support memfd execution; incompatible tools return their
+actual status without weakening executable resolution or readiness semantics.
 
 ## Deliberately incomplete runtime
 
@@ -330,8 +345,8 @@ as production functionality:
 
 | Surface | Current behavior | Required integration |
 | --- | --- | --- |
-| `sigrund` | Runs under `[mvp]` after the execution startup gate, or with explicit `--authorization-only`; signed/unsigned requests share retained snapshots, SQLite consumption and authenticated local audit. Authorized jobs enter clone/reaper/readiness/shutdown integration; the runtime/service acceptance gate is pending. | Delegated runtime acceptance, hooks, audit replication, PTY and reload. |
-| `sigrun` | Normal command supports unsigned construction or `--warrant PATH`, hello/descriptor transport, stdio relay, separate status reporting and signal/deadline handling. Signed input forbids field overrides and preserves canonical payload bytes. | PTY/window transport; Phase 5C/5D actual-execution acceptance is pending. |
+| `sigrund` | Runs under `[mvp]` after the execution startup gate, or with explicit `--authorization-only`; signed/unsigned requests share retained snapshots, SQLite consumption and authenticated local audit. Authorized jobs execute through the verified clone/reaper/readiness/shutdown path. | Phase 6 operator fixture, hooks, audit replication, PTY and reload. |
+| `sigrun` | Normal command supports unsigned construction or `--warrant PATH`, hello/descriptor transport, stdio relay, separate status reporting and signal/deadline handling. Signed input forbids field overrides and preserves canonical payload bytes. | PTY/window transport and Phase 6 operator fixture; actual stdio execution is verified. |
 | `sigrund-approve` | Root peer/TTY verification, bounded broker transport, complete escaped prompting, OpenSSH key/agent signing and cancellation are implemented. | Physical FIDO signing evidence; native agent adapter is optional follow-on work. |
 | `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |
 | `sigrundctl` | UUID validation/generation and root-only `init-host` provisioning with ownership/permission checks and durable state publication are available. | Sealing/template commands, revocation administration, anchor-file output, and complete operator workflows. |

@@ -32,13 +32,12 @@ clearing it, and requires a deferred P_ALL sweep before admitting another
 clone. Sweeps are bounded to 256 orphan statuses per dispatch and retain
 already-observed statuses even on a later error.
 
-Phase 5C still must connect this reaper and registration barrier to live
-requests and implement active-job shutdown. Until then the job preparation
-worker never calls clone3: after disposing its empty cgroup it explicitly
-aborts the committed grant with `SPAWN_FAILED` and
-`AUTH_ABORTED_POST_COMMIT`. Consumption is preserved. Phase 5A/5B therefore
-provide startup, ownership and child-transition foundations, not a working
-end-to-end command execution service.
+At the Phase 5A boundary the worker disposed its empty cgroup and explicitly
+aborted the consumed grant, pending runtime/reaper/shutdown integration.
+[Phase 5C](MVP_PHASE5C.md) now supplies that integration and passed real
+runtime/service acceptance; [Phase 5D](MVP_PHASE5D.md) verifies failures,
+races and actual root/service-UID execution. The Phase 5A/5B platform gate
+was repeated successfully with that build on 2026-10-31.
 
 Verification already run without host-root privilege:
 
@@ -104,4 +103,4 @@ systemd reported `result=success`, `status=0`, and cleanup reported
 using real clone3, job controls, pidfds, sealed exec and mount isolation.
 The two targeted child/reaper tests, two handshake unit tests, Clippy for all
 sigrund targets, and formatting checks also passed. Live request dispatch
-and active-job daemon shutdown are still Phase 5C work.
+and active-job daemon shutdown are now verified by Phase 5C.

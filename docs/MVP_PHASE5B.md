@@ -21,7 +21,8 @@ original two-second deadline. Only a complete readiness frame followed by EOF
 means `READY_TO_EXEC`, whose exec outcome remains unknown. Missing, partial,
 excess, malformed or late evidence fails closed; an additional step-11 frame
 identifies an exec error. The runtime readiness/audit/reaping integration is
-Phase 5C, and the daemon does not launch requester commands yet.
+now implemented and verified by [Phase 5C](MVP_PHASE5C.md); the real failure
+and race matrix is verified by [Phase 5D](MVP_PHASE5D.md).
 
 Unprivileged verification (included in `cargo test --workspace --locked`):
 

@@ -133,11 +133,13 @@ own design and tests before such an adapter can be enabled.
 
 ## MVP boundary and follow-on gates
 
-Complete Phase 5C/5D and the two-UID end-to-end fixture using execution in the
+Phases 5C/5D execute commands in the configured domain. Complete the Phase 6
+two-UID end-to-end fixture using execution in the
 daemon's configured domain, with the existing documented child-isolation
 changes. This boundary does not automatically follow the requester's
-namespaces or add cross-domain routing. Phase 5C now wires live requester execution, with real runtime/service
-acceptance still pending; these notes do not establish that acceptance.
+namespaces or add cross-domain routing. The real Phase 5C/5D acceptance
+evidence is recorded in their phase documents; these design notes introduce
+no additional implementation claims.
 
 Before extending that boundary, decide whether independently deployed daemons
 or a host runtime adapter serve each supported destination, and version any

@@ -1,10 +1,9 @@
 # Phase 5C: execution ownership, reaping and shutdown
 
-The runtime and verification fixtures are committed in `3d16f0c`, with
-documentation in `147c730` and the authorization-only diagnostic correction in
-`7f476ba`. The workspace suite, Clippy, formatting and the existing child/reaper
-tests pass. The prepared real execution/service fixtures have not yet run;
-Phase 5C acceptance remains pending that evidence.
+Implemented and accepted on the real delegated host on 2026-10-31. The runtime
+landed in `3d16f0c`; acceptance fixups add verified retained-supervisor restart,
+portable sealed fixture tools and explicit shutdown/trust gates. The workspace
+suite, Clippy, formatting and real runtime/service gates pass.
 
 ## Runtime ownership
 
@@ -59,7 +58,11 @@ A production service should use `Type=notify`, `NotifyAccess=main`,
 `WatchdogSec`, and `TimeoutStopSec` greater than `shutdown_grace_ms`. A finite
 runtime limit additionally bounds disposable test services. Prior-instance
 children are never assigned invented wait statuses; startup reconciles their
-cgroups before publishing listeners. Root/out-of-profile containment retains
+cgroups before publishing listeners. For an existing delegated hierarchy with
+controllers enabled, restart enters its retained `supervisor` leaf; startup
+verifies the complete root-owned layout and selects its immediate parent as G.
+The harness preserves controllers and orphan jobs across this restart rather
+than disabling limits to migrate into G's internal node. Root/out-of-profile containment retains
 the specification's qualified best-effort guarantee.
 
 ## Verification and reproduction
@@ -92,8 +95,9 @@ The parent must already enable `memory pids`, and its runner must occupy a
 separate leaf. The script creates and removes only its fresh subgroups. Its
 fixtures use real binaries and SSH signatures, an unprivileged UID 65534
 requester, target UID/GID 33, native copies of `id`/`true`/`false`/`sleep`, and
-production clone/exec. Private native copies accommodate distributions whose
-`/usr/bin/id` is a symlink, which the executable-resolution contract rejects.
+production clone/exec. Private native copies use standalone GNU alternatives where needed; the
+fixture verifies their actual sealed-memfd execution before use. This avoids
+symlink and hardened multicall executable-name assumptions.
 The client is copied to a traversable fixture directory so a private developer
 home does not invalidate the unprivileged probe.
 
@@ -115,4 +119,26 @@ its own runtime limit also covers abrupt runner death.
 The delegated hierarchy must expose a coherent cgroup2 mount view. The
 Distrobox launcher prepares that view only in a private mount namespace; no
 host-wide mount changes or mutation of unrelated cgroups are permitted.
-These runtime/service gates remain pending operator-approved execution.
+The expanded suite passed in
+`sigrund-phase5-runtime-11a52d4ae64f4e929cea18ce2e24e643.service` on kernel
+`7.2.11-300.fc45.x86_64`. All 13 case/point results passed, including
+predicate-before and both WAL commit windows, cgroup preparation before clone,
+a stopped pre-readiness child, unpublished clone reconciliation, unsafe retained
+layout rejection, orphan recovery and four real transient-service starts.
+The runner reported service result `success`, status `0`, and final cgroup
+`removed=true`. Request FD/pidfd ownership returned to baseline 30.
+
+The exact approved launcher was
+`~/.local/bin/pkexec-run -- /usr/bin/python3 /tmp/sigrund-phase5-runtime/run.py`.
+It applied a 180-second outer runtime limit and used the private mount view
+and cleanup contract above. The earlier complete suite also passed in service
+`55934f8fe7df48929fbdf77dcc85fb7d`; the expanded run is the final evidence.
+[Retained results](evidence/phase5-2026-10-31/README.md) distinguish the
+transcribed launcher output from Phase 5D's original machine-written manifest.
+
+The acceptance loop first corrected generated root ordering and standalone-tool
+selection. It then found that entering G on restart violates cgroup v2's
+no-internal-process rule when its controllers remain enabled. Startup now
+verifies a retained `G/supervisor` entry, as specified in Section 1.2. The trust
+gate rejects a writable retained layout before listening, restores it, then
+verifies a clean restart. No controllers are disabled to make the test pass.
