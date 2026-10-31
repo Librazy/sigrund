@@ -23,12 +23,14 @@ def isolate(group_fd):
     finally:
         os.close(procs)
     lib = ctypes.CDLL(None, use_errno=True)
-    if lib.unshare(0x00020000 | 0x02000000) != 0:  # NEWNS | NEWCGROUP
-        raise OSError(ctypes.get_errno(), "unshare")
+    if lib.unshare(0x00020000) != 0:  # NEWNS
+        raise OSError(ctypes.get_errno(), "mount namespace")
     if lib.mount(None, b"/", None, 0x4000 | 0x40000, None) != 0:  # REC | PRIVATE
         raise OSError(ctypes.get_errno(), "private mount propagation")
-    if lib.mount(b"cgroup2", b"/sys/fs/cgroup", b"cgroup2", 0, None) != 0:
-        raise OSError(ctypes.get_errno(), "cgroup2 namespace mount")
+    # Preserve the existing cgroup2 view and actual service membership for
+    # CgroupLayout::discover(). The production clone3 child creates its own
+    # mount/cgroup namespaces and locks the inherited mount with mount_setattr.
+    # Remounting cgroup2 here adds unrelated superblock-option constraints.
 
 
 def wait_child(pid, deadline):

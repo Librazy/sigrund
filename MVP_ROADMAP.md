@@ -32,16 +32,16 @@ execution startup, bounded committed-job preparation, the reaper registration
 barrier primitive, and the syscall-only clone/credential/readiness path.
 Normal foreground startup requires its platform probe; `--authorization-only`
 selects the non-executing diagnostic profile. Requester child execution remains
-pending Phase 5C integration. The operator will run privileged acceptance after
-landing; no successful delegated-host result is claimed.
+pending Phase 5C integration. The delegated-host Phase 5A/5B privileged gate
+passed on 2026-10-31; its service and cgroup cleanup also succeeded.
 Evidence and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md)
 and [docs/MVP_PHASE4.md](docs/MVP_PHASE4.md).
 
 The pre-execution recap identified a Phase 4 conformance gap: pre-commit
 responses had waited for rejection auditing. Phase 4.5 now publishes those
 responses independently and retains bounded audit ownership. Its gate reads
-those frames while durable I/O is still blocked. No child-execution gate has
-passed yet.
+those frames while durable I/O is still blocked. The isolated child-execution
+platform gate passes; live requester execution remains Phase 5C work.
 
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
@@ -56,10 +56,10 @@ passed yet.
   replay and recovery; response-deadline conformance requires Phase 4.5.
 - [x] Phase 4.5: independent denial delivery, bounded audit admission and
   storage-pressure handling; freeze the execution ownership contracts.
-- [x] Phase 5A implementation: execution startup and committed-job ownership;
-  privileged acceptance remains pending the operator's post-landing run.
-- [x] Phase 5B implementation: child setup and sync-pipe classification;
-  privileged clone/mount acceptance remains pending that run.
+- [x] Phase 5A: execution startup and committed-job ownership;
+  delegated-host privileged acceptance passed on 2026-10-31.
+- [x] Phase 5B: child setup and sync-pipe classification;
+  privileged clone/mount acceptance passed in the same run.
 - [ ] Phase 5C: central reaping, teardown and daemon shutdown.
 - [ ] Phase 5D: execution failure and race verification.
 - [ ] Phase 6: two-UID end-to-end fixture.
@@ -528,9 +528,9 @@ thresholds, and sticky fail-closed pressure.
 
 Implementation landed. Unprivileged ownership and registration-barrier gates
 pass. [MVP_PHASE5A.md](docs/MVP_PHASE5A.md) records the code boundary, exact
-commands and delegated-host prerequisites. The operator explicitly owns the
-post-landing privileged acceptance run; keep that gate outstanding until its
-actual result is recorded. Live clone dispatch remains gated on Phase 5C's
+commands and delegated-host prerequisites. The post-landing privileged
+acceptance gate passed on 2026-10-31, including whole-service cleanup.
+Live clone dispatch remains gated on Phase 5C's
 reaper and active-job shutdown integration.
 
 Deliverables:
@@ -563,8 +563,8 @@ Exit gate:
 Implementation landed. The production C child path and its unprivileged
 fault/credential tests are documented in
 [MVP_PHASE5B.md](docs/MVP_PHASE5B.md). The real delegated-host clone/mount and
-post-exec acceptance fixture is built but explicitly deferred to the operator.
-Passing the ordinary workspace suite does not satisfy that privileged gate.
+post-exec acceptance fixture passed on 2026-10-31. This is separate evidence
+from the ordinary workspace suite and does not complete Phase 5C/5D.
 
 Deliverables:
 

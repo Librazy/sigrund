@@ -183,7 +183,7 @@ fn delegated_platform_gate() {
     drop(
         fs::OpenOptions::new()
             .write(true)
-            .open("/sys/fs/cgroup/supervisor/cgroup.procs")
+            .open(layout.supervisor.join("cgroup.procs"))
             .unwrap(),
     );
 }

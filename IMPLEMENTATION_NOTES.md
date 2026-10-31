@@ -282,10 +282,16 @@ buffers and syscall-only error/exec handling. Its fault matrix and sealed-ELF
 post-exec probes run unprivileged in a user namespace.
 
 See [MVP_PHASE5A.md](docs/MVP_PHASE5A.md) and
-[MVP_PHASE5B.md](docs/MVP_PHASE5B.md) for exact evidence and commands. The
-operator explicitly deferred privileged testing until after landing. The
-ignored `phase5_platform` fixture and bounded supervisor runner are supplied;
-no successful local privileged acceptance result is claimed. Requester clone
+[MVP_PHASE5B.md](docs/MVP_PHASE5B.md) for exact evidence and commands. After
+landing, the privileged `phase5_platform` fixture passed on 2026-10-31 under
+a delegated, time-limited service; the service cgroup was removed after exit.
+The run required a coherent private cgroup mount view in the development
+container. It also exposed and fixed the startup probe's rejection of the
+distribution's `/usr/bin/true` symlink and a short-read assumption in the
+post-exec test's mountinfo reader. The startup probe resolves its fixed alias,
+then pins and validates the target before sealed execution. The test runner
+preserves service membership, and the fixture uses the discovered supervisor
+path rather than assuming it is at the cgroup mount root. Requester clone
 dispatch, readiness/audit publication, active-job reaping and shutdown remain
 Phase 5C. The current job worker prepares/disposes an empty cgroup and records
 a post-commit abort instead of launching a command without those protections.

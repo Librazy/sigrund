@@ -57,8 +57,8 @@ warrant/signer/environment/policy and pinned snapshot quota, cancels, then
 verifies release only after returned-owner disposal. See
 [MVP_PHASE5B.md](MVP_PHASE5B.md) for the syscall/credential fault matrix.
 
-The privileged acceptance result is explicitly deferred to the operator after
-landing, as requested. Build the fixture as the workspace user:
+The post-landing privileged acceptance gate passed on 2026-10-31. Build the
+fixture as the workspace user to repeat it:
 
 ```sh
 cargo test -p sigrund --test phase5_platform --locked --no-run
@@ -76,11 +76,13 @@ python3 /absolute/repository/scripts/verify-phase5.py \
 The supplied parent must already have `memory pids` enabled in
 `cgroup.subtree_control`; it must reside inside that dedicated supervising
 service. The runner creates a fresh child G, moves only the test process into
-it through a retained descriptor, creates private mount/cgroup namespaces,
-and mounts cgroup2 with G as the visible root. Its 60-second deadline includes
-namespace setup. The runner kills/removes only its fresh subtree, waits for
-emptiness, and reaps the fixture. It fails early if the delegated interfaces
-are missing. It never enables controllers on an arbitrary existing parent.
+it through a retained descriptor, and creates a private mount namespace while
+preserving the service's cgroup2 view and membership for discovery. The actual
+clone3 child creates the private mount/cgroup namespaces under test. The
+runner's 60-second deadline includes namespace setup. It kills/removes only
+its fresh subtree, waits for emptiness, and reaps the fixture. It fails early
+if the delegated interfaces are missing. It never enables controllers on an
+arbitrary existing parent.
 
 Configure the enclosing service with `Delegate=yes`,
 `KillMode=control-group`, `SendSIGKILL=yes`, `RuntimeMaxSec=75s`, and
@@ -88,5 +90,18 @@ Configure the enclosing service with `Delegate=yes`,
 in a separate supervisor leaf inside that service so enabling controllers
 obeys the no-internal-process rule. This final service limit covers a blocked
 cleanup syscall or abrupt runner death. Do not run this in an ordinary root
-shell or move an existing interactive shell into the test hierarchy. No
-successful privileged result or full V-01–V-19 conformance is claimed here.
+shell or move an existing interactive shell into the test hierarchy. Full
+V-01–V-19 conformance remains outstanding.
+
+Acceptance evidence (2026-10-31): the approved distrobox-pkexec launcher
+started `sigrund-phase5-kernel-ce910a4a86e440cb869ac305e34a685a.service`
+with `Delegate=yes`, a 90-second runtime limit, a private container mount
+view and whole-service cleanup. The development container's stacked cgroup
+mounts were replaced only inside that private namespace with one consistent
+host cgroup2 view. The fixture reported `1 passed; 0 failed` in 0.35 seconds;
+systemd reported `result=success`, `status=0`, and cleanup reported
+`removed=true`. This exercises startup plus four UID/capability combinations
+using real clone3, job controls, pidfds, sealed exec and mount isolation.
+The two targeted child/reaper tests, two handshake unit tests, Clippy for all
+sigrund targets, and formatting checks also passed. Live request dispatch
+and active-job daemon shutdown are still Phase 5C work.

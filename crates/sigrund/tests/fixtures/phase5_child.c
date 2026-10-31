@@ -95,7 +95,16 @@ static void probe(void) {
         REQUIRE((st.f_flag&required)==required);
         char *mounts=malloc(1048576);REQUIRE(mounts);
         int fd=open("/proc/self/mountinfo",O_RDONLY|O_CLOEXEC);REQUIRE(fd>=0);
-        ssize_t count=read(fd,mounts,1048576);REQUIRE(count>0&&count<1048576);
+        size_t count=0;
+        for (;;) {
+            REQUIRE(count<1048576);
+            ssize_t n=read(fd,mounts+count,1048576-count);
+            if(n<0&&errno==EINTR)continue;
+            REQUIRE(n>=0);
+            if(!n)break;
+            count+=(size_t)n;
+        }
+        REQUIRE(count>0);
         REQUIRE(check_mountinfo(mounts,count));close(fd);free(mounts);
     }
     REQUIRE(write(1,"probe-ok\n",9)==9);

@@ -257,7 +257,12 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
     // creation. Pin a trusted, bounded ELF and execute only its sealed bytes.
     let result = (|| {
         use std::io::Read;
-        let file = crate::startup::open_pinned(std::path::Path::new("/usr/bin/true"))?;
+        // Distributions may install true as a symlink (for example to
+        // gnutrue or a multicall binary). Resolve this fixed probe alias,
+        // then pin its target without following any further links. Keep
+        // argv[0] as true for multicall implementations.
+        let probe_path = std::fs::canonicalize("/usr/bin/true")?;
+        let file = crate::startup::open_pinned(&probe_path)?;
         crate::startup::check_root_metadata(&file, false, None)?;
         let mut bytes = Vec::new();
         file.take(67_108_865).read_to_end(&mut bytes)?;

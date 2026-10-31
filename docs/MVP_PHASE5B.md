@@ -47,5 +47,8 @@ mandatory limits, pidfds, private read-only cgroup mounts and post-exec
 credentials on a delegated root test host. It also reaps a fast-exiting child
 before classifying its buffered handshake and checks that parent mount flags,
 mountinfo and cgroup write access remain unchanged. See
-[MVP_PHASE5A.md](MVP_PHASE5A.md) for the build/run recipe. The operator will run
-this privileged gate after landing; no successful privileged result is claimed.
+[MVP_PHASE5A.md](MVP_PHASE5A.md) for the build/run recipe and the successful
+2026-10-31 privileged acceptance evidence. All four combinations of UID 0/33
+and empty/nonempty capabilities passed, as did the startup probe, fast-exit
+handshake, job cleanup and unchanged parent-mount checks. The post-exec test
+reads mountinfo through bounded reads to EOF, including short reads and EINTR.
