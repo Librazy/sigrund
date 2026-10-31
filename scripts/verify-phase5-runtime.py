@@ -125,7 +125,7 @@ class Fixture:
         (self.base / 'signers').write_text(signer)
         subprocess.run([str(binaries / 'sigrundctl'), 'init-host', '--state-dir', str(self.state), '--log-path', str(self.log)], check=True, capture_output=True)
 
-    def launch(self, env=None, pass_fds=()):
+    def launch(self, env=None, pass_fds=(), expect_ready=True):
         # Stale socket entries are an operator/supervisor responsibility after
         # forced death; normal shutdown must remove them itself.
         def enter():
@@ -135,6 +135,8 @@ class Fixture:
             '--signers', str(self.base / 'signers'), '--state-dir', str(self.state),
             '--log-path', str(self.log), '--socket', str(self.client), '--approval-socket', str(self.approval),
         ], preexec_fn=enter, env=env, pass_fds=pass_fds, stdout=self.stdout, stderr=self.stderr)
+        if not expect_ready:
+            return self
         def ready():
             if self.process.poll() is not None:
                 raise AssertionError(self.diagnostics.read_text())
@@ -142,16 +144,22 @@ class Fixture:
         wait_for(ready, 'daemon startup')
         return self
 
-    def signed(self, command, args=(), uid=65534):
+    def signed(self, command, args=(), uid=65534, target_uid=33,
+               capabilities=(), env_exact=None, input_bytes=None,
+               supplementary_gids=(33,)):
         genesis = json.loads(self.log.read_text().splitlines()[0])
         payload = canonical({
             'version': '1.0', 'grant_id': uuid7(), 'host_id': genesis['host_id'],
             'requester_uid': uid, 'requester_gid': uid,
             'command': {'allow_interpreted_script': False, 'argv': [str(command), *args], 'cwd': '/',
                         'executable_path': str(command), 'executable_sha256': hashlib.sha256(Path(command).read_bytes()).hexdigest(),
-                        'stdin_policy': 'null', 'stdin_sha256': None, 'tty_mode': 'stdio'},
-            'execution_context': {'target_uid': 33, 'target_gid': 33, 'supplementary_gids': [33],
-                                  'capabilities': [], 'env_exact': {}, 'caller_env_allowlist': [], 'umask': 0o027},
+                        'stdin_policy': 'null' if input_bytes is None else 'sha256',
+                        'stdin_sha256': None if input_bytes is None else hashlib.sha256(input_bytes).hexdigest(),
+                        'tty_mode': 'stdio'},
+            'execution_context': {'target_uid': target_uid, 'target_gid': target_uid,
+                                  'supplementary_gids': list(supplementary_gids),
+                                  'capabilities': list(capabilities), 'env_exact': env_exact or {},
+                                  'caller_env_allowlist': [], 'umask': 0o027},
             'policy': {'mode': 'one_time', 'not_before': int(time.time()) - 1, 'not_after': int(time.time()) + 120},
         })
         kind = b'application/vnd.sigrun.warrant.v1+json'
@@ -162,6 +170,7 @@ class Fixture:
                     'signatures': [{'keyid': SIGNER, 'sig': base64.b64encode(signature).decode()}]}
         path = self.base / ('warrant-' + uuid.uuid4().hex + '.json')
         path.write_bytes(canonical(envelope))
+        path.chmod(0o644)
         return path, envelope
 
     def cli(self, command, args=()):

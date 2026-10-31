@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -47,6 +48,12 @@ long syscall(long number,...) {
         errno=saved;return result;
     }
     if(active) {
+        if(number==SYS_unshare&&!strcmp(mode,"fd-exhaust")) {
+            const struct rlimit limit={128,128};
+            if(real_call(SYS_setrlimit,RLIMIT_NOFILE,&limit)<0)real_call(SYS_exit_group,98);
+            while(real_call(SYS_openat,AT_FDCWD,"/dev/null",O_RDONLY|O_CLOEXEC,0)>=0){}
+        }
+        if(number==SYS_mount_setattr&&!strcmp(mode,"mount-unavailable")){errno=ENOSYS;return -1;}
         unsigned step=0;
         if(number==SYS_unshare)step=1;
         if(number==SYS_chdir)step=2;
@@ -65,11 +72,31 @@ long syscall(long number,...) {
             if(frame[0]==0&&frame[1]==0) {
                 if(!strcmp(mode,"kill-before-ready"))real_call(SYS_kill,real_call(SYS_getpid),SIGKILL);
                 if(!strcmp(mode,"stop-before-ready"))real_call(SYS_kill,real_call(SYS_getpid),SIGSTOP);
+                if(!strcmp(mode,"partial-ready")) {
+                    real_call(SYS_write,4,frame,3);
+                    real_call(SYS_exit_group,127);
+                }
+                if(!strcmp(mode,"excess-ready")) {
+                    const char excess[17]={0};
+                    real_call(SYS_write,4,excess,sizeof(excess));
+                    real_call(SYS_exit_group,127);
+                }
+                if(!strcmp(mode,"stop-after-ready")) {
+                    long n=real_call(number,args[0],args[1],args[2],args[3],args[4],args[5]);
+                    real_call(SYS_kill,real_call(SYS_getpid),SIGSTOP);
+                    return n;
+                }
             }
         }
         if(number==SYS_execveat&&!strcmp(mode,"kill-after-ready"))real_call(SYS_kill,real_call(SYS_getpid),SIGKILL);
     }
     return real_call(number,args[0],args[1],args[2],args[3],args[4],args[5]);
+}
+int openat(int dir,const char *path,int flags,...) {
+    mode_t permissions=0;
+    if(flags&O_CREAT){va_list ap;va_start(ap,flags);permissions=va_arg(ap,int);va_end(ap);}
+    if(!strcmp(mode,"swap-unavailable")&&!strcmp(path,"memory.swap.max")){errno=ENOENT;return -1;}
+    return real_call(SYS_openat,dir,path,flags,permissions);
 }
 ssize_t write(int fd,const void *data,size_t len) {
     if(!strcmp(mode,"cleanup-before")||!strcmp(mode,"cleanup-fail")) {

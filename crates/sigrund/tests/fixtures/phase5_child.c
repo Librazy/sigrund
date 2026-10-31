@@ -70,29 +70,33 @@ static void test_fd_failure(int fail_at, int closed_mask, int exhaust) {
     close(r);close(null);close(sentinel);
 }
 static unsigned last_cap(void) {FILE *f=fopen("/proc/sys/kernel/cap_last_cap","r");unsigned n;REQUIRE(f&&fscanf(f,"%u",&n)==1&&n<64);fclose(f);return n;}
-static void probe(void) {
+static void probe(int observe) {
     const char *uid=getenv("P5_UID"),*caps=getenv("P5_CAPS");REQUIRE(uid&&caps);
     uint32_t wanted=strtoul(uid,NULL,10);uint64_t cap=strtoull(caps,NULL,10);
     uid_t ur,ue,us;gid_t gr,ge,gs;REQUIRE(getresuid(&ur,&ue,&us)==0&&ur==wanted&&ue==wanted&&us==wanted);
     REQUIRE(getresgid(&gr,&ge,&gs)==0&&gr==wanted&&ge==wanted&&gs==wanted);
     gid_t group[2];REQUIRE(getgroups(2,group)==1&&group[0]==wanted);
-    REQUIRE(prctl(PR_GET_SECUREBITS)==0x2f&&prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
+    int securebits=prctl(PR_GET_SECUREBITS),nnp=prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0);
+    REQUIRE(securebits==0x2f&&nnp==1);
     struct __user_cap_header_struct head={_LINUX_CAPABILITY_VERSION_3,0};struct __user_cap_data_struct data[2];
     REQUIRE(syscall(SYS_capget,&head,data)==0);
     for(unsigned i=0;i<2;++i){uint32_t c=cap>>(i*32);REQUIRE(data[i].effective==c&&data[i].permitted==c&&data[i].inheritable==c);}
-    for(unsigned i=0;i<=last_cap();++i){int c=!!(cap&(1ULL<<i));REQUIRE(prctl(PR_CAPBSET_READ,i,0,0,0)==c&&prctl(PR_CAP_AMBIENT,PR_CAP_AMBIENT_IS_SET,i,0,0)==c);}
-    REQUIRE(umask(0)==027);char cwd[2];REQUIRE(getcwd(cwd,sizeof(cwd))&&!strcmp(cwd,"/"));
-    REQUIRE(getsid(0)==getpid());
+    uint64_t bounding=0,ambient=0;
+    for(unsigned i=0;i<=last_cap();++i){int c=!!(cap&(1ULL<<i)),b=prctl(PR_CAPBSET_READ,i,0,0,0),a=prctl(PR_CAP_AMBIENT,PR_CAP_AMBIENT_IS_SET,i,0,0);REQUIRE(b==c&&a==c);bounding|=(uint64_t)b<<i;ambient|=(uint64_t)a<<i;}
+    mode_t observed_mask=umask(0);REQUIRE(observed_mask==027);char cwd[2];REQUIRE(getcwd(cwd,sizeof(cwd))&&!strcmp(cwd,"/"));
+    pid_t session=getsid(0);REQUIRE(session==getpid());
     sigset_t mask;REQUIRE(sigprocmask(SIG_SETMASK,NULL,&mask)==0);
     for(int i=1;i<NSIG;++i)REQUIRE(sigismember(&mask,i)!=1);
     struct sigaction action;REQUIRE(sigaction(SIGPIPE,NULL,&action)==0&&action.sa_handler==SIG_DFL);
     REQUIRE(sigaction(SIGCHLD,NULL,&action)==0&&action.sa_handler==SIG_DFL);
     for(int i=0;i<3;++i) REQUIRE(fcntl(i,F_GETFD)>=0);
     for(int i=3;i<128;++i) REQUIRE(fcntl(i,F_GETFD)<0&&errno==EBADF);
+    unsigned long mount_flags=0;
     if (getenv("P5_ISOLATED")) {
         struct statvfs st;REQUIRE(statvfs("/sys/fs/cgroup",&st)==0);
         unsigned long required=ST_RDONLY|ST_NOSUID|ST_NODEV|ST_NOEXEC;
         REQUIRE((st.f_flag&required)==required);
+        mount_flags=st.f_flag;
         char *mounts=malloc(1048576);REQUIRE(mounts);
         int fd=open("/proc/self/mountinfo",O_RDONLY|O_CLOEXEC);REQUIRE(fd>=0);
         size_t count=0;
@@ -107,7 +111,19 @@ static void probe(void) {
         REQUIRE(count>0);
         REQUIRE(check_mountinfo(mounts,count));close(fd);free(mounts);
     }
-    REQUIRE(write(1,"probe-ok\n",9)==9);
+    if(observe) {
+        printf("{\"uid\":[%u,%u,%u],\"gid\":[%u,%u,%u],\"groups\":[%u],"
+               "\"cap_effective\":%llu,\"cap_permitted\":%llu,\"cap_inheritable\":%llu,"
+               "\"cap_bounding\":%llu,\"cap_ambient\":%llu,\"securebits\":%d,"
+               "\"no_new_privs\":%d,\"umask\":%u,\"cwd\":\"%s\",\"pid\":%u,"
+               "\"session\":%u,\"mount_flags\":%lu,\"fd_signal_checks\":true}\n",
+               ur,ue,us,gr,ge,gs,group[0],
+               (unsigned long long)(data[0].effective|((uint64_t)data[1].effective<<32)),
+               (unsigned long long)(data[0].permitted|((uint64_t)data[1].permitted<<32)),
+               (unsigned long long)(data[0].inheritable|((uint64_t)data[1].inheritable<<32)),
+               (unsigned long long)bounding,(unsigned long long)ambient,securebits,nnp,
+               observed_mask,cwd,(unsigned)getpid(),(unsigned)session,mount_flags);
+    } else REQUIRE(write(1,"probe-ok\n",9)==9);
 }
 static void setup_test(uint32_t uid, uint64_t caps, int exec_error, long fault, unsigned step, int kill_window) {
     int p[2],o[2];REQUIRE(pipe2(p,O_CLOEXEC)==0);REQUIRE(pipe2(o,O_CLOEXEC)==0);
@@ -141,7 +157,7 @@ static void setup_test(uint32_t uid, uint64_t caps, int exec_error, long fault, 
     close(p[0]);close(o[0]);close(exec);close(null);free(mountinfo);
 }
 int main(int argc,char **argv) {
-    if(argc==2&&!strcmp(argv[1],"--probe")){probe();return 0;}
+    if(argc==2&&(!strcmp(argv[1],"--probe")||!strcmp(argv[1],"--observe"))){probe(!strcmp(argv[1],"--observe"));return 0;}
     REQUIRE(geteuid()==0);
     for(int failure=1;failure<=12;++failure)for(int mask=0;mask<32;++mask)test_fd_failure(failure,mask,0);
     for(int mask=0;mask<32;++mask)test_fd_failure(0,mask,1);
