@@ -200,7 +200,8 @@ fn namespace_fixture() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("execution requires Phase 5"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("execution is disabled by --authorization-only"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -243,7 +244,7 @@ fn namespace_fixture() {
     encrypted_signing_cancellation_restores_terminal(&fixture, &identity);
     // The preserved approval gate now reaches Phase 4's durable boundary.
     // Each successful approval consumes a fresh grant, records its abort, and
-    // still cannot claim child readiness before Phase 5.
+    // cannot claim child readiness in the authorization-only profile.
     let log = fs::read(&fixture.log).unwrap();
     assert!(log.starts_with(&initial_log));
     let events: Vec<serde_json::Value> = String::from_utf8(log)
@@ -533,7 +534,11 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
     let request = broker_request(&mut broker);
     let response = signed_response(&request, identity, |_| {});
     broker_send(&mut broker, &response);
-    assert!(decision(&mut client).message.contains("requires Phase 5"));
+    assert!(
+        decision(&mut client)
+            .message
+            .contains("disabled by --authorization-only")
+    );
     drop(client);
     fixture.wait_for_cleanup(before);
     broker_send(&mut broker, &response);
@@ -743,7 +748,11 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
             assert!(text.contains("Enter passphrase"));
             terminal.write_all(b"phase3-test\n").unwrap();
         }
-        assert!(decision(&mut client).message.contains("requires Phase 5"));
+        assert!(
+            decision(&mut client)
+                .message
+                .contains("disabled by --authorization-only")
+        );
         assert!(
             !askpass_marker.exists(),
             "askpass must never receive a signing passphrase request"

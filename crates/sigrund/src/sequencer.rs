@@ -455,7 +455,7 @@ fn authorize(
         } else {
             Denial::new(
                 "SPAWN_FAILED",
-                "Authorization committed; execution requires Phase 5; one-time grant remains consumed",
+                "Authorization committed; execution is disabled by --authorization-only; one-time grant remains consumed",
             )
         };
         let mut fields = fields;
