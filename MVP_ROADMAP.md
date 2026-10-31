@@ -20,6 +20,10 @@ stress matrix until the slice is working. Excluding those features is an MVP
 scope decision. Section 6.3 of the specification defines the optional local
 approval profile; the remaining v1.0 features retain their existing requirements.
 
+Follow-on discussion of privileged interpreters and container destinations is
+recorded in [Interpreters and execution domains](docs/INTERPRETERS_AND_EXECUTION_DOMAINS.md).
+Those design notes do not expand the current MVP or define new protocol fields.
+
 ## Current status
 
 Phases 0–4 provide the contracts, foreground socket service, requester relays,
