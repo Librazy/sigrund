@@ -954,8 +954,9 @@ impl ForegroundDaemon {
             let timeout = connections
                 .values()
                 .filter_map(Connection::deadline)
-                .min()
                 .map(|deadline| deadline.saturating_duration_since(now))
+                .chain(service.watchdog_wait(now).filter(|_| stopping.is_none()))
+                .min()
                 .unwrap_or(Duration::from_secs(1));
             let milliseconds = timeout.as_millis().saturating_add(1).min(
                 if execution.active() || stopping.is_some() {
