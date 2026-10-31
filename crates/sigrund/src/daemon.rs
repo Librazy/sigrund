@@ -8,6 +8,7 @@ use crate::{
     runtime::{Execution, Notice, PID_TAG, SYNC_TAG},
     sequencer::{self, Sequencer},
     snapshot::SnapshotBudget,
+    socket_disposal::{Permit, Socket, SocketDisposal},
     startup::{StartupResources, check_root_metadata, open_pinned},
     transport::{
         FrameWriter, PeerCredentials, disable_ancillary_credentials, invalid, peer_credentials,
@@ -49,10 +50,12 @@ const SIGNALS: u64 = 3;
 const IO_COMPLETE: u64 = 4;
 const AUDIT_COMPLETE: u64 = 5;
 const JOB_COMPLETE: u64 = 6;
-const FIRST_CONNECTION: u64 = 7;
+const SOCKET_DISPOSAL: u64 = 7;
+const FIRST_CONNECTION: u64 = 8;
 
 struct BoundSocket {
-    fd: OwnedFd,
+    fd: Option<OwnedFd>,
+    disposal: Option<Permit>,
     parent: File,
     name: CString,
     inode: u64,
@@ -126,7 +129,8 @@ impl BoundSocket {
         }
         let metadata = fs::symlink_metadata(&pinned)?;
         let bound = Self {
-            fd,
+            fd: Some(fd),
+            disposal: None,
             parent,
             name,
             inode: metadata.ino(),
@@ -136,16 +140,34 @@ impl BoundSocket {
             return Err(invalid("socket must be owned by root:root"));
         }
         fs::set_permissions(&pinned, fs::Permissions::from_mode(mode))?;
-        if unsafe { libc::listen(bound.fd.as_raw_fd(), 64) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
         Ok(bound)
     }
 
-    fn accept(&self) -> io::Result<Option<OwnedFd>> {
+    fn listen(&self) -> io::Result<()> {
+        if unsafe { libc::listen(self.fd(), 64) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn fd(&self) -> RawFd {
+        self.fd.as_ref().expect("live listener").as_raw_fd()
+    }
+
+    fn close(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            if let Some(permit) = self.disposal.take() {
+                drop(permit.socket(fd));
+            } else {
+                drop(fd);
+            }
+        }
+    }
+
+    fn accept(&self, permit: Permit) -> io::Result<Option<Socket>> {
         let fd = unsafe {
             libc::accept4(
-                self.fd.as_raw_fd(),
+                self.fd(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
@@ -162,12 +184,13 @@ impl BoundSocket {
                 Err(error)
             };
         }
-        Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok(Some(permit.socket(unsafe { OwnedFd::from_raw_fd(fd) })))
     }
 }
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
+        self.close();
         let pinned = PathBuf::from(format!(
             "/proc/self/fd/{}/{}",
             self.parent.as_raw_fd(),
@@ -286,7 +309,7 @@ enum Input {
 
 struct Connection {
     token: u64,
-    fd: OwnedFd,
+    fd: Socket,
     peer: PeerCredentials,
     broker: bool,
     input: Input,
@@ -306,7 +329,7 @@ struct Connection {
 #[derive(Default)]
 struct ApprovalAvailability {
     busy: bool,
-    broker: Option<(u64, OwnedFd)>,
+    broker: Option<(u64, Socket)>,
 }
 
 impl Connection {
@@ -508,7 +531,7 @@ impl Connection {
                             gid: self.peer.gid,
                             lifecycle: self.lifecycle.clone(),
                             lease,
-                            control: self.fd.try_clone()?,
+                            control: self.fd.clone(),
                             audit: self
                                 .audit
                                 .take()
@@ -794,6 +817,7 @@ pub struct ForegroundDaemon {
     config: Arc<DaemonConfig>,
     _signers: SignerPolicyFile,
     signals: SignalSource,
+    disposal: SocketDisposal,
 }
 
 impl ForegroundDaemon {
@@ -855,8 +879,14 @@ impl ForegroundDaemon {
                 "audit storage pressure after execution startup; remediation and restart required",
             ));
         }
-        let client = BoundSocket::bind(socket, 0o666)?;
-        let approval = BoundSocket::bind(approval_socket, 0o600)?;
+        let mut client = BoundSocket::bind(socket, 0o666)?;
+        let mut approval = BoundSocket::bind(approval_socket, 0o600)?;
+        let disposal = SocketDisposal::new()?;
+        client.disposal = Some(disposal.reserve().expect("new pool listener capacity"));
+        approval.disposal = Some(disposal.reserve().expect("new pool listener capacity"));
+        // Protect listener final closes before any peer can queue connections.
+        client.listen()?;
+        approval.listen()?;
         Ok(Self {
             client,
             approval,
@@ -864,6 +894,7 @@ impl ForegroundDaemon {
             config: Arc::new(config),
             _signers: signers,
             signals,
+            disposal,
         })
     }
 
@@ -908,10 +939,11 @@ impl ForegroundDaemon {
         }
         let epoll = unsafe { OwnedFd::from_raw_fd(raw) };
         for (fd, token) in [
-            (self.client.fd.as_raw_fd(), CLIENT_LISTENER),
-            (self.approval.fd.as_raw_fd(), APPROVAL_LISTENER),
+            (self.client.fd(), CLIENT_LISTENER),
+            (self.approval.fd(), APPROVAL_LISTENER),
             (signals.fd.as_raw_fd(), SIGNALS),
             (workers.fd(), IO_COMPLETE),
+            (self.disposal.fd(), SOCKET_DISPOSAL),
             (sequencer.fd(), AUDIT_COMPLETE),
             (execution.supervisor.fd(), JOB_COMPLETE),
         ] {
@@ -948,6 +980,7 @@ impl ForegroundDaemon {
         let mut grace_reported = false;
         let mut service = crate::service::Service::new()?;
         let mut stop_notified = false;
+        let mut listeners_registered = true;
         service.ready();
         loop {
             let now = Instant::now();
@@ -1001,6 +1034,8 @@ impl ForegroundDaemon {
                         && (token == CLIENT_LISTENER || token == APPROVAL_LISTENER)
                     {
                         continue;
+                    } else if token == SOCKET_DISPOSAL {
+                        self.disposal.drain();
                     } else if token == AUDIT_COMPLETE {
                         for completion in sequencer.drain() {
                             match completion {
@@ -1121,8 +1156,7 @@ impl ForegroundDaemon {
                                         .find(|(_, c)| {
                                             c.broker && matches!(c.input, Input::Approval)
                                         })
-                                        .map(|(id, c)| c.fd.try_clone().map(|fd| (*id, fd)))
-                                        .transpose()?
+                                        .map(|(id, c)| (*id, c.fd.clone()))
                                 } else {
                                     None
                                 };
@@ -1190,7 +1224,10 @@ impl ForegroundDaemon {
                         };
                         // An accept flood cannot starve active frames or timers.
                         for _ in 0..64 {
-                            let Some(fd) = listener.accept()? else {
+                            let Some(permit) = self.disposal.reserve() else {
+                                break;
+                            };
+                            let Some(fd) = listener.accept(permit)? else {
                                 break;
                             };
                             let accepted = Instant::now();
@@ -1405,17 +1442,21 @@ impl ForegroundDaemon {
                 }
                 execution.shutdown(false);
                 // Close both listening endpoints and all control connections
-                // once. Worker-held duplicates observe shutdown immediately.
-                for listener in [&self.client, &self.approval] {
+                // once. Worker-held shared sockets observe shutdown immediately.
+                for listener in [&mut self.client, &mut self.approval] {
+                    if listener.fd.is_none() {
+                        continue;
+                    }
                     unsafe {
                         libc::epoll_ctl(
                             epoll.as_raw_fd(),
                             libc::EPOLL_CTL_DEL,
-                            listener.fd.as_raw_fd(),
+                            listener.fd(),
                             std::ptr::null_mut(),
                         );
-                        libc::shutdown(listener.fd.as_raw_fd(), libc::SHUT_RDWR);
+                        libc::shutdown(listener.fd(), libc::SHUT_RDWR);
                     }
+                    listener.close();
                 }
                 for (_, connection) in connections.drain() {
                     let _ = unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd());
@@ -1456,10 +1497,42 @@ impl ForegroundDaemon {
                 }
             }
             if stopping.is_none() {
+                // Do not accept an FD without reserved final-close capacity.
+                // Remove level-triggered listeners while full to avoid a spin;
+                // disposal completion wakes epoll so admission can resume.
+                let available = self.disposal.available();
+                if available != listeners_registered {
+                    for (listener, token) in [
+                        (&self.client, CLIENT_LISTENER),
+                        (&self.approval, APPROVAL_LISTENER),
+                    ] {
+                        let result = if available {
+                            register(
+                                epoll.as_raw_fd(),
+                                libc::EPOLL_CTL_ADD,
+                                listener.fd(),
+                                token,
+                                false,
+                                true,
+                            )
+                        } else {
+                            unregister(epoll.as_raw_fd(), listener.fd())
+                        };
+                        if let Err(error) = result {
+                            fatal_error.get_or_insert(error);
+                            stopping.get_or_insert(Instant::now());
+                        }
+                    }
+                    listeners_registered = available;
+                }
                 service.tick();
             }
             if let Some(start) = stopping {
-                if execution.is_idle() && workers.is_idle() && admission.is_idle() {
+                if execution.is_idle()
+                    && workers.is_idle()
+                    && admission.is_idle()
+                    && self.disposal.used() == 0
+                {
                     return fatal_error.map_or(Ok(()), Err);
                 }
                 if !grace_reported
@@ -1475,9 +1548,8 @@ impl ForegroundDaemon {
 }
 
 fn unregister(epoll: RawFd, fd: RawFd) -> io::Result<()> {
-    // A worker can retain a duplicate during blocked caller-FD disposal.
-    // Closing only the coordinator's copy does not remove the registration
-    // until every duplicate closes, so explicitly stop HUP/error delivery.
+    // Workers and the disposal queue can retain the socket after retirement.
+    // Explicitly stop HUP/error delivery before releasing coordinator ownership.
     if unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1563,10 +1635,11 @@ mod approval_tests {
         });
         let (log, _logs) = sync_channel(16);
         let mut workers = IoWorkers::new(&config).unwrap();
+        let disposal = SocketDisposal::new().unwrap();
         for completion_first in [true, false] {
             let (socket, mut peer) = UnixStream::pair().unwrap();
             socket.set_nonblocking(true).unwrap();
-            let fd: OwnedFd = socket.into();
+            let fd = disposal.reserve().unwrap().socket(socket.into());
             let deadline = Instant::now() + crate::approver::APPROVAL_TIMEOUT;
             assert_eq!(
                 crate::approver::APPROVAL_TIMEOUT,

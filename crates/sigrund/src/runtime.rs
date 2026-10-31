@@ -287,7 +287,7 @@ impl Execution {
         let Some(owner) = job.owner.as_ref() else {
             return Ok(());
         };
-        let socket = owner.job.lease.request().deferred_cleanup[0].try_clone()?;
+        let socket = owner.job.lease.request().deferred_cleanup[0].clone();
         let stop = job.stop_control.clone();
         let lifecycle = job.lifecycle.clone();
         let notifier = self.supervisor.notifier();

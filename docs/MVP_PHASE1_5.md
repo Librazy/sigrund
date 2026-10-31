@@ -91,10 +91,11 @@ The normal client, approval prompt, common snapshot coordinator and execution
 remain later-phase work. The transport parser itself can still be used
 synchronously by unprivileged diagnostics/tests; the daemon invokes its receive
 and destructor paths only on reserved workers. A quota-refused connection is
-closed without receiving its queued rights. Idle sockets reserve no worker;
+retired without receiving its queued rights; the final socket close runs on
+the bounded disposal pool described below. Idle sockets reserve no worker;
 once frame reception begins, partial input consumes a slot through timeout and
-actual disposal. This stricter admission behavior prevents cleanup capacity from
-being multiplied independently of metadata and snapshot workers.
+actual disposal. Received-rights cleanup retains the original metadata/snapshot worker slot;
+unread queued rights retain the separate fixed socket-disposal reservation.
 
 ## Post-1.5 fixups
 
@@ -122,3 +123,38 @@ Post-fixup verification passes all 77 top-level workspace tests on the developme
 toolchain and Rust `1.89.0`, including the namespace subprocess gates. Clippy
 with warnings denied, formatting and whitespace checks pass. Verification used
 the unchanged lockfile with `--locked --offline`.
+
+## Post-MVP control-socket disposal fix
+
+An unread Unix socket can hold queued `SCM_RIGHTS` whose final release blocks,
+so rejecting a connection before parsing still requires off-loop cleanup.
+Control-socket owners now share one descriptor and one disposal reservation,
+including approval, authorization and post-readiness monitoring. The last owner
+shuts down the endpoint to notify peers, then schedules its final close on two
+fixed disposal workers. Both listeners also retain disposal reservations before
+listening, and their shutdown closes use the same pool.
+
+The process permits at most 128 owned sockets in total, including listeners,
+admitted sockets, retired worker-owned sockets and pending rejected closes.
+Capacity is reserved before accept and released only after close returns. Both
+listeners leave epoll while full; disposal completion wakes the coordinator to
+resume admission. There are no replacement threads or growing cleanup queues.
+Connection retirement still unregisters epoll first. Graceful shutdown retains
+ownership and the instance lock through disposal; blocked cleanup requires the
+existing service-manager escalation contract.
+
+`verify_blocked_socket_disposal` queues rights before acceptance, stalls both
+quota-rejected and duplicate-broker closes, and requires worker TIDs distinct
+from the coordinator. With both disposal workers blocked, it verifies another
+UID receives its decision and EOF, floods rejection to the fixed ownership
+limit, inspects listener removal from epoll, checks a stable thread count and
+300 ms watchdog delivery, and retires an admitted connection. Releasing cleanup
+must restore listener registration and allow a fresh request, followed by clean
+shutdown, including instance-lock retention through a fresh stalled close.
+Unit tests cover reservation exhaustion and shared-owner retention.
+
+Post-MVP fix verification: `cargo test --workspace --locked --offline`, Clippy
+for all workspace targets with warnings denied, formatting and whitespace
+checks pass. `cargo +1.89.0 check --workspace --all-targets --locked --offline`
+also passes. The daemon gate runs in an unprivileged user namespace; privileged
+delegated-cgroup/VM acceptance was not rerun for this fix.

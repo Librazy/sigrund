@@ -1,6 +1,7 @@
-//! Shared, reserved I/O workers. Caller rights are received and destroyed only
+//! Shared, reserved I/O workers. Received caller rights are destroyed only
 //! here. A validated request can return to the same worker without releasing
 //! its reservation or transferring raw descriptor ownership to the coordinator.
+use crate::socket_disposal::Socket;
 use crate::transport::{ApprovalReader, ControlReader, invalid, validate_stdio_checked};
 use sigrund_core::{config::DaemonConfig, protocol::ClientHello};
 use std::{
@@ -26,9 +27,9 @@ impl Drop for ValidationHandle {
 /// Available only while executing on a reserved worker. Caller rights precede
 /// snapshots so their possibly blocking close cannot release snapshot RAM early.
 pub(crate) struct ValidatedRequest {
-    // Dispose before snapshots so a queued SCM_RIGHTS release from the last
-    // control-socket close cannot release this request's quota early.
-    pub deferred_cleanup: Vec<OwnedFd>,
+    // Shared control ownership retains its separate bounded disposal permit
+    // through the actual final close, including unread queued SCM_RIGHTS.
+    pub deferred_cleanup: Vec<Socket>,
     pub hello: ClientHello,
     pub rights: Vec<OwnedFd>,
     pub snapshots: Option<MeasuredSnapshots>,
@@ -73,9 +74,9 @@ pub(crate) struct RequestLease {
     sender: SyncSender<Work>,
 }
 impl RequestLease {
-    /// Return a stable borrowed descriptor number; the request's worker owns
-    /// the actual close on every disposal and abandoned-completion path.
-    pub fn retain_control(&mut self, control: OwnedFd) -> i32 {
+    /// Return a stable borrowed descriptor number; shared ownership retains
+    /// its disposal reservation through abandoned completions and final close.
+    pub fn retain_control(&mut self, control: Socket) -> i32 {
         let request = self.request.as_mut().expect("live lease");
         assert!(request.deferred_cleanup.is_empty());
         let fd = control.as_raw_fd();
@@ -160,7 +161,7 @@ enum Work {
     Monitor(Box<dyn FnOnce() + Send>),
     Read {
         token: u64,
-        socket: OwnedFd,
+        socket: Socket,
         uid: u32,
         policy: Arc<DaemonConfig>,
         broker: bool,
@@ -236,7 +237,7 @@ fn wait_readable(fd: i32, cancelled: &AtomicBool, deadline: Instant) -> io::Resu
     check(cancelled, deadline)
 }
 fn read_request(
-    socket: OwnedFd,
+    socket: Socket,
     uid: u32,
     policy: Arc<DaemonConfig>,
     deadline: Instant,
@@ -280,7 +281,7 @@ fn read_request(
     Ok(request)
 }
 fn read_broker(
-    socket: OwnedFd,
+    socket: Socket,
     cancelled: &AtomicBool,
     deadline: Instant,
 ) -> io::Result<ValidatedRequest> {
@@ -410,7 +411,7 @@ impl IoWorkers {
         &mut self,
         token: u64,
         uid: u32,
-        socket: &OwnedFd,
+        socket: &Socket,
         policy: Arc<DaemonConfig>,
         broker: bool,
         deadline: Instant,
@@ -436,7 +437,7 @@ impl IoWorkers {
                 )
             })?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let socket = socket.try_clone()?;
+        let socket = socket.clone();
         enqueue(
             &self.senders[slot],
             Work::Read {
@@ -580,7 +581,8 @@ mod tests {
         let mut workers = IoWorkers::new(&policy).unwrap();
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         receiver.set_nonblocking(true).unwrap();
-        let receiver: OwnedFd = receiver.into();
+        let disposal = crate::socket_disposal::SocketDisposal::new().unwrap();
+        let receiver = disposal.reserve().unwrap().socket(receiver.into());
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -692,7 +694,8 @@ mod tests {
         let mut workers = IoWorkers::new(&policy).unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
-        let server: OwnedFd = server.into();
+        let disposal = crate::socket_disposal::SocketDisposal::new().unwrap();
+        let server = disposal.reserve().unwrap().socket(server.into());
         let null = OpenOptions::new()
             .read(true)
             .write(true)
@@ -766,7 +769,7 @@ mod tests {
         }
         let mut admission = Admission::new(&policy, Instant::now());
         let audit = admission.admit(1001, &policy, Instant::now()).unwrap();
-        let control = request.retain_control(server.try_clone().unwrap());
+        let control = request.retain_control(server.clone());
         let job = CommittedJob {
             token: 10,
             exec_id: new_uuidv7().to_string(),

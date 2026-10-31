@@ -706,7 +706,7 @@ fn blocked_io_remains_bounded_and_responsive() {
         let (mut gate, mut daemon) = Gate::launch(&f, point);
         let pid = daemon.0.id();
         let threads = || fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
-        assert_eq!(threads(), 5);
+        assert_eq!(threads(), 7);
         let signed = envelope(warrant(&f, 0), 7);
         gate.arm();
         let client = connect(&f.socket);
@@ -727,7 +727,7 @@ fn blocked_io_remains_bounded_and_responsive() {
         let mut excess = connect(&f.socket);
         send_hello(&mut excess, &f.executable);
         f.wait_for_cleanup(before); // partial-frame deadline runs while blocked
-        assert_eq!(threads(), 5);
+        assert_eq!(threads(), 7);
         drop(client);
         let retained = fs::read_dir(format!("/proc/{pid}/fd"))
             .unwrap()

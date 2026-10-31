@@ -400,7 +400,7 @@ pub(crate) fn approve(
     context: &Context,
     gid: u32,
     approval: ApprovalRequest,
-    socket: OwnedFd,
+    socket: crate::socket_disposal::Socket,
 ) -> io::Result<()> {
     use crate::transport::{ApprovalReader, FrameWriter};
     let exchange = (|| -> io::Result<ApprovalResponse> {

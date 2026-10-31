@@ -4,6 +4,7 @@ use crate::{
     admission::AuditLease,
     authorization::{self, Authorized, Denial},
     preparation::Context,
+    socket_disposal::Socket,
     startup::StartupResources,
     workers::RequestLease,
 };
@@ -30,7 +31,7 @@ pub(crate) struct AuthorizationTask {
     pub gid: u32,
     pub lifecycle: Arc<Lifecycle>,
     pub lease: RequestLease,
-    pub control: OwnedFd,
+    pub control: Socket,
     pub audit: AuditLease,
 }
 pub(crate) enum Work {
@@ -58,7 +59,7 @@ pub(crate) struct CommittedJob {
     pub lease: RequestLease,
     pub authorized: Authorized,
     pub signer_id: String,
-    // Borrowed from the retained lease; only its I/O worker closes the socket.
+    // Borrowed from the retained lease; final close uses the disposal pool.
     pub control: i32,
     pub audit: AuditLease,
     pub commit_fields: serde_json::Value,

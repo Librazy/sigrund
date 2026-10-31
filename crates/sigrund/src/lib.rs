@@ -15,6 +15,7 @@ mod runtime;
 mod sequencer;
 mod service;
 pub mod snapshot;
+mod socket_disposal;
 pub mod startup;
 mod storage;
 pub mod transport;

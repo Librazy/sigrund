@@ -440,6 +440,7 @@ fn phase1_namespace_fixture() {
     );
     assert_eq!(unsafe { libc::geteuid() }, 0);
     verify_short_watchdog();
+    verify_blocked_socket_disposal();
     let fixture = Fixture::new();
     // This unprivileged user namespace has no dedicated delegated execution
     // service. Normal startup must fail before either listener is published;
@@ -1163,8 +1164,8 @@ fn verify_blocked_metadata() {
     let baseline = fd_count();
     let baseline_threads = thread_count();
     assert_eq!(
-        baseline_threads, 5,
-        "expected coordinator, diagnostics, two fixed workers, and authorization executor"
+        baseline_threads, 7,
+        "expected coordinator, diagnostics, two I/O workers, two disposal workers, and authorization executor"
     );
     let null = OpenOptions::new()
         .read(true)
@@ -1598,6 +1599,236 @@ fn verify_blocked_cleanup() {
     let replacement = fixture.command().output().unwrap();
     assert!(String::from_utf8_lossy(&replacement.stderr).contains("already in use"));
     release.write_all(b"x").unwrap();
+    daemon.finish_stop();
+    assert!(!fixture.socket.exists() && !fixture.broker.exists());
+}
+
+fn verify_blocked_socket_disposal() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.config,
+        fs::read_to_string(&fixture.config)
+            .unwrap()
+            .replace(
+                "max_active_sockets_per_uid = 2",
+                "max_active_sockets_per_uid = 1",
+            )
+            .replace("request_deadline_ms = 1500", "request_deadline_ms = 5000"),
+    )
+    .unwrap();
+    let interposer = fixture.directory.path().join("socket_close_gate.so");
+    let output = Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Werror", "-o"])
+        .arg(&interposer)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/socket_close_gate.c"
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (mut entered, worker_entered) = UnixStream::pair().unwrap();
+    entered
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let (mut release, worker_release) = UnixStream::pair().unwrap();
+    let entered_fd = worker_entered.as_raw_fd();
+    let release_fd = worker_release.as_raw_fd();
+    let notify = UnixDatagram::bind(fixture.directory.path().join("notify.sock")).unwrap();
+    notify
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut command = fixture.command();
+    command
+        .env("LD_PRELOAD", &interposer)
+        .env(
+            "SIGRUND_SOCKET_GATE_PEER_PID",
+            std::process::id().to_string(),
+        )
+        .env("SIGRUND_GATE_ENTERED_FD", entered_fd.to_string())
+        .env("SIGRUND_GATE_RELEASE_FD", release_fd.to_string())
+        .env(
+            "NOTIFY_SOCKET",
+            fixture.directory.path().join("notify.sock"),
+        )
+        .env("WATCHDOG_USEC", "300000")
+        .env_remove("WATCHDOG_PID");
+    unsafe {
+        command.pre_exec(move || {
+            for fd in [entered_fd, release_fd] {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut daemon = fixture.launch_command(command);
+    drop(worker_entered);
+    let pid = daemon.0.id();
+    let mut message = [0; 128];
+    let count = notify.recv(&mut message).unwrap();
+    assert!(message[..count].starts_with(b"READY=1\n"));
+    let baseline_fds = fs::read_dir(format!("/proc/{pid}/fd")).unwrap().count();
+    let threads = fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
+    let mut held_client = connect(&fixture.socket);
+    let mut held_broker = connect(&fixture.broker);
+    wait_for(|| {
+        fs::read_to_string(&fixture.diagnostics)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "SOCKET_ADMITTED")
+            .count()
+            == 2
+    });
+    let held_token = fs::read_to_string(&fixture.diagnostics)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["event"] == "SOCKET_ADMITTED" && event["broker"] == false)
+        .and_then(|event| event["worker_task"].as_u64())
+        .unwrap();
+    let null = File::open("/dev/null").unwrap();
+    let mut rejected = Vec::new();
+    // Neither rejection may parse the queued rights. Both final closes stall
+    // until released, representing arbitrary destructor work in queued rights.
+    let pause = || {
+        assert_eq!(unsafe { libc::kill(pid as _, libc::SIGSTOP) }, 0);
+        wait_for(|| {
+            fs::read_to_string(format!("/proc/{pid}/status"))
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("State:") && line.contains("T (stopped)"))
+        });
+    };
+    let resume = || assert_eq!(unsafe { libc::kill(pid as _, libc::SIGCONT) }, 0);
+    for path in [&fixture.socket, &fixture.broker] {
+        // Queue rights before accept/rejection, as an attacker can do on a
+        // busy daemon. This removes a sender-vs-shutdown race from the probe.
+        pause();
+        let socket = connect(path);
+        send_fds(&socket, &[0xfe], &[null.as_raw_fd()]);
+        rejected.push(socket);
+        resume();
+        let mut tid = [0; 8];
+        entered
+            .read_exact(&mut tid)
+            .expect("rejected socket close not reached");
+        assert_ne!(
+            u64::from_ne_bytes(tid),
+            pid as u64,
+            "coordinator closed rejected socket"
+        );
+    }
+    // An unrelated UID still receives a decision while both close workers are
+    // stalled. Its final socket close must also retain bounded ownership.
+    fixture.peer(65534, "client");
+    let epoll_info = fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .flatten()
+        .find(|entry| fs::read_link(entry.path()).unwrap() == Path::new("anon_inode:[eventpoll]"))
+        .map(|entry| format!("/proc/{pid}/fdinfo/{}", entry.file_name().to_string_lossy()))
+        .unwrap();
+    let registered = |token: u64| {
+        fs::read_to_string(&epoll_info)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("tfd:"))
+            .any(|line| {
+                let mut fields = line.split_ascii_whitespace();
+                assert!(fields.any(|field| field == "data:"));
+                u64::from_str_radix(fields.next().unwrap(), 16).unwrap() == token
+            })
+    };
+    // Fill disposal ownership, including a few sockets left in the kernel
+    // backlog. A full queue must pause accept, not grow threads or spin epoll.
+    for count in [32, 32, 32, 32, 2] {
+        pause();
+        for _ in 0..count {
+            let socket = connect(&fixture.socket);
+            send_fds(&socket, &[0xfe], &[null.as_raw_fd()]);
+            rejected.push(socket);
+        }
+        resume();
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for(|| !registered(1) && !registered(2));
+    assert_eq!(
+        fs::read_dir(format!("/proc/{pid}/task")).unwrap().count(),
+        threads
+    );
+    for _ in 0..3 {
+        let count = notify
+            .recv(&mut message)
+            .expect("socket disposal delayed watchdog");
+        assert_eq!(&message[..count], b"WATCHDOG=1");
+    }
+    // Retiring an admitted connection remains responsive with disposal full.
+    held_client.shutdown(std::net::Shutdown::Both).unwrap();
+    expect_closed(&mut held_client);
+    wait_for(|| !registered(held_token));
+    release.write_all(&[b'x'; 200]).unwrap();
+    wait_for(|| registered(1) && registered(2));
+    drop(rejected);
+    drop(held_client);
+    held_broker.shutdown(std::net::Shutdown::Both).unwrap();
+    expect_closed(&mut held_broker);
+    // All reserved capacity eventually returns; root can make a fresh request.
+    let mut recovered = connect(&fixture.socket);
+    send_hello(&mut recovered, &fixture.executable);
+    assert_eq!(decision(&mut recovered).status, "TIMEOUT_CSR");
+    drop(recovered);
+    wait_for(|| fs::read_dir(format!("/proc/{pid}/fd")).unwrap().count() == baseline_fds);
+    // Every queued close is done. Remove unused release bytes so a fresh close
+    // can prove shutdown retains the instance lock through stalled disposal.
+    let mut unused = [0u8; 200];
+    let count = unsafe {
+        libc::recv(
+            worker_release.as_raw_fd(),
+            unused.as_mut_ptr().cast(),
+            unused.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    assert!(count > 0);
+    let mut tid = [0u8; 8];
+    let mut available = 0i32;
+    assert_eq!(
+        unsafe { libc::ioctl(entered.as_raw_fd(), libc::FIONREAD, &mut available) },
+        0
+    );
+    for _ in 0..(available as usize / tid.len()) {
+        entered.read_exact(&mut tid).unwrap();
+    }
+    let admitted_before = fixture.diagnostic_count();
+    let mut blocker = connect(&fixture.broker);
+    wait_for(|| {
+        fs::read_to_string(&fixture.diagnostics)
+            .unwrap()
+            .lines()
+            .skip(admitted_before)
+            .any(|line| line.contains("SOCKET_ADMITTED"))
+    });
+    pause();
+    let queued = connect(&fixture.broker);
+    send_fds(&queued, &[0xfe], &[null.as_raw_fd()]);
+    resume();
+    entered
+        .read_exact(&mut tid)
+        .expect("shutdown close gate not reached");
+    assert_ne!(u64::from_ne_bytes(tid), pid as u64);
+    daemon.begin_stop();
+    expect_closed(&mut blocker);
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    let replacement = fixture.command().output().unwrap();
+    assert!(String::from_utf8_lossy(&replacement.stderr).contains("already in use"));
+    release.write_all(b"x").unwrap();
+    drop((blocker, queued));
     daemon.finish_stop();
     assert!(!fixture.socket.exists() && !fixture.broker.exists());
 }
