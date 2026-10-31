@@ -99,10 +99,10 @@ int openat(int dir,const char *path,int flags,...) {
     return real_call(SYS_openat,dir,path,flags,permissions);
 }
 ssize_t write(int fd,const void *data,size_t len) {
-    if(!strcmp(mode,"cleanup-before")||!strcmp(mode,"cleanup-fail")) {
+    if(!strcmp(mode,"cleanup-before")||!strcmp(mode,"cleanup-fail")||!strcmp(mode,"prepare-before")) {
         char name[64],path[4096];snprintf(name,sizeof(name),"/proc/self/fd/%d",fd);
         long n=real_call(SYS_readlink,name,path,sizeof(path)-1);
-        if(n>0){path[n]=0;size_t size=strlen(path);const char *tail="/cgroup.kill";
+        if(n>0){path[n]=0;size_t size=strlen(path);const char *tail=!strcmp(mode,"prepare-before")?"/pids.max":"/cgroup.kill";
             if(size>=strlen(tail)&&!strcmp(path+size-strlen(tail),tail)&&take_arm()) {
                 if(!strcmp(mode,"cleanup-fail")){errno=EIO;return -1;}
                 gate(0);

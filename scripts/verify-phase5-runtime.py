@@ -25,6 +25,32 @@ import uuid
 
 REPO = Path(__file__).resolve().parent.parent
 SIGNER = 'mandator-alice-yubikey'
+CLIENT_PROGRESS = b'sigrun: waiting for authorization\n'
+
+
+def command_source(name):
+    # Some distributions ship hardened multicall tools that reject a memfd's
+    # executable name. Prefer their standalone GNU alternatives when present.
+    # Check the actual copied bytes through the same sealed-execution boundary.
+    for candidate in (Path('/usr/bin', 'gnu' + name), Path('/usr/bin', name)):
+        if not candidate.exists():
+            continue
+        fd = os.memfd_create('sigrun-fixture-preflight', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING | 0x10)
+        try:
+            with open(candidate.resolve(), 'rb') as source:
+                with os.fdopen(os.dup(fd), 'wb') as target:
+                    shutil.copyfileobj(source, target)
+            os.fchmod(fd, 0o111)
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+                        fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL | 0x20)
+            args = {'id': ['-u'], 'sleep': ['0']}.get(name, [])
+            result = subprocess.run([name, *args], executable='/proc/self/fd/' + str(fd), pass_fds=(fd,),
+                                    input=b'', capture_output=True, timeout=3)
+            if result.returncode == (1 if name == 'false' else 0) and not result.stderr:
+                return candidate.resolve()
+        finally:
+            os.close(fd)
+    raise RuntimeError('no memfd-compatible standalone fixture tool: ' + name)
 
 
 def wait_for(condition, description, timeout=6):
@@ -102,9 +128,9 @@ class Fixture:
         root.mkdir()
         self.commands = root
         for name in ('id', 'true', 'sleep', 'false', 'cat'):
-            shutil.copyfile(Path('/usr/bin', name).resolve(), root / name)
+            shutil.copyfile(command_source(name), root / name)
             (root / name).chmod(0o755)
-        roots = json.dumps(['/usr/bin', str(root)])
+        roots = json.dumps(sorted(['/usr/bin', str(root)]))
         config = (REPO / 'config/sigrund.toml.example').read_text()
         config = config.replace('["/usr/bin", "/usr/sbin"]', roots)
         config = config.replace('<strict-padded-base64-32-byte-ed25519-key>', base64.b64encode(bytes(32)).decode())
@@ -123,24 +149,35 @@ class Fixture:
         signer = signer.replace('allowed_requester_uids = [1001]', 'allowed_requester_uids = [0, 65534]')
         signer = signer.replace('["/usr/bin", "/usr/sbin"]', roots)
         (self.base / 'signers').write_text(signer)
+        subprocess.run([str(binaries / 'sigrund'), '--check-config', '--config', str(self.base / 'config'),
+                        '--signers', str(self.base / 'signers')], check=True)
         subprocess.run([str(binaries / 'sigrundctl'), 'init-host', '--state-dir', str(self.state), '--log-path', str(self.log)], check=True, capture_output=True)
 
     def launch(self, env=None, pass_fds=(), expect_ready=True):
         # Stale socket entries are an operator/supervisor responsibility after
         # forced death; normal shutdown must remove them itself.
+        entry_fd = self.group_fd
+        supervisor = self.group / 'supervisor' / 'cgroup.procs'
+        if supervisor.exists():
+            entry_fd = os.open(supervisor, os.O_WRONLY | os.O_CLOEXEC)
         def enter():
-            os.write(self.group_fd, str(os.getpid()).encode())
-        self.process = subprocess.Popen([
-            str(self.binaries / 'sigrund'), '--foreground', '--config', str(self.base / 'config'),
-            '--signers', str(self.base / 'signers'), '--state-dir', str(self.state),
-            '--log-path', str(self.log), '--socket', str(self.client), '--approval-socket', str(self.approval),
-        ], preexec_fn=enter, env=env, pass_fds=pass_fds, stdout=self.stdout, stderr=self.stderr)
+            os.write(entry_fd, str(os.getpid()).encode())
+        log_offset = self.diagnostics.stat().st_size if self.diagnostics.exists() else 0
+        try:
+            self.process = subprocess.Popen([
+                str(self.binaries / 'sigrund'), '--foreground', '--config', str(self.base / 'config'),
+                '--signers', str(self.base / 'signers'), '--state-dir', str(self.state),
+                '--log-path', str(self.log), '--socket', str(self.client), '--approval-socket', str(self.approval),
+            ], preexec_fn=enter, env=env, pass_fds=pass_fds, stdout=self.stdout, stderr=self.stderr)
+        finally:
+            if entry_fd != self.group_fd:
+                os.close(entry_fd)
         if not expect_ready:
             return self
         def ready():
             if self.process.poll() is not None:
                 raise AssertionError(self.diagnostics.read_text())
-            return self.client.exists() and 'DAEMON_READY' in self.diagnostics.read_text()
+            return self.client.exists() and 'DAEMON_READY' in self.diagnostics.read_text()[log_offset:]
         wait_for(ready, 'daemon startup')
         return self
 
@@ -311,7 +348,7 @@ def phase_c_barrier(parent, binaries):
 
 
 def phase_c_commit_shutdown(parent, binaries):
-    for point in ('wal-before', 'wal-after'):
+    for point in ('predicate-before', 'wal-before', 'wal-after'):
         f = Fixture(parent, binaries)
         gate = None
         try:
@@ -328,7 +365,10 @@ def phase_c_commit_shutdown(parent, binaries):
             assert f.process.returncode == 0, f.diagnostics.read_text()
             assert f.empty()
             records = f.records()
-            assert any(r.get('event_type') == 'AUTH_ABORTED_POST_COMMIT' for r in records)
+            if point == 'predicate-before':
+                assert not any(r.get('event_type') == 'AUTH_COMMIT' for r in records)
+            else:
+                assert any(r.get('event_type') == 'AUTH_ABORTED_POST_COMMIT' for r in records)
             assert not any(r.get('event_type') == 'EXEC_READY_TO_EXEC' for r in records)
             client.close()
             print(json.dumps({'gate': 'phase5c-commit-shutdown', 'point': point, 'result': 'passed'}), flush=True)
@@ -452,6 +492,67 @@ def phase_c_orphans(parent, binaries):
         f.stop()
         running.close()
         print(json.dumps({'gate': 'phase5c-prior-instance-orphan-recovery', 'result': 'passed'}), flush=True)
+    finally:
+        f.cleanup()
+
+
+def phase_c_pre_spawn_shutdown(parent, binaries):
+    for mode in ('prepare-before', 'stop-before-ready'):
+        f = Fixture(parent, binaries)
+        gate = None
+        try:
+            gate = Gate(f, mode)
+            gate.arm()
+            client = f.socket(f.commands / 'sleep', ('30',))
+            if mode == 'prepare-before':
+                gate.arrive()
+                assert not list((f.group / 'jobs').glob('job-*/cgroup.procs')) or all(
+                    not path.read_text().strip() for path in (f.group / 'jobs').glob('job-*/cgroup.procs'))
+            else:
+                def stopped():
+                    for path in (f.group / 'jobs').glob('job-*/cgroup.procs'):
+                        for pid in path.read_text().split():
+                            status = Path('/proc', pid, 'stat')
+                            if status.exists() and status.read_text().split(') ')[1].startswith('T'):
+                                return True
+                    return False
+                wait_for(stopped, 'child stopped before writing readiness')
+            f.process.send_signal(signal.SIGTERM)
+            assert client.recv(1) == b'', 'readiness published after shutdown began'
+            if mode == 'prepare-before':
+                assert_lock_held(f)
+                gate.unblock()
+            f.process.wait(timeout=6)
+            assert f.process.returncode == 0, f.diagnostics.read_text()
+            assert f.empty()
+            assert not any(r.get('event_type') == 'EXEC_READY_TO_EXEC' for r in f.records())
+            assert any(r.get('event_type') == ('AUTH_ABORTED_POST_COMMIT' if mode == 'prepare-before'
+                                             else 'EXEC_SPAWN_FAILED') for r in f.records())
+            client.close()
+            print(json.dumps({'gate': 'phase5c-pre-spawn-readiness-shutdown', 'point': mode, 'result': 'passed'}), flush=True)
+        finally:
+            if gate:
+                gate.close()
+            f.cleanup()
+
+
+def phase_c_restart_trust(parent, binaries):
+    f = Fixture(parent, binaries)
+    try:
+        f.launch()
+        f.stop()
+        hooks = f.group / 'hooks'
+        hooks.chmod(0o777)
+        try:
+            f.launch(expect_ready=False)
+            f.process.wait(timeout=6)
+            assert f.process.returncode == 78
+            assert not f.client.exists() and not f.approval.exists()
+        finally:
+            hooks.chmod(0o755)
+        f.launch()
+        f.stop()
+        print(json.dumps({'gate': 'phase5c-retained-layout-trust', 'result': 'passed'}), flush=True)
     finally:
         f.cleanup()
 
@@ -605,9 +706,11 @@ def main():
     phase_c(args.cgroup_parent, args.binaries)
     phase_c_barrier(args.cgroup_parent, args.binaries)
     phase_c_commit_shutdown(args.cgroup_parent, args.binaries)
+    phase_c_pre_spawn_shutdown(args.cgroup_parent, args.binaries)
     phase_c_cleanup_shutdown(args.cgroup_parent, args.binaries)
     phase_c_poisoned_shutdown(args.cgroup_parent, args.binaries)
     phase_c_orphans(args.cgroup_parent, args.binaries)
+    phase_c_restart_trust(args.cgroup_parent, args.binaries)
     if args.systemd:
         phase_c_services(args.cgroup_parent, args.binaries)
 
