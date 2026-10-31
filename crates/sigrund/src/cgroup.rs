@@ -111,10 +111,40 @@ impl CgroupLayout {
         }
     }
     pub fn discover() -> io::Result<Self> {
-        Self::discover_from(
+        let layout = Self::discover_from(
             &fs::read_to_string("/proc/self/cgroup")?,
             &fs::read_to_string("/proc/self/mountinfo")?,
-        )
+        )?;
+        // A supervisor may restart us directly in the retained supervisor
+        // leaf: enabled domain controllers forbid entering G itself. Never
+        // infer G from an arbitrary ancestor or accept a caller-selected PID.
+        if layout
+            .root
+            .file_name()
+            .is_some_and(|name| name == "supervisor")
+        {
+            let parent = layout
+                .root
+                .parent()
+                .ok_or_else(|| invalid("supervisor leaf has no parent"))?;
+            let root = open_pinned(parent)?;
+            check_root_metadata(&root, true, None)?;
+            let supervisor = open_dir(&root, c"supervisor")?;
+            let _jobs = open_dir(&root, c"jobs")?;
+            let _hooks = open_dir(&root, c"hooks")?;
+            if !read(&root, "cgroup.procs")?.trim().is_empty()
+                || !read(&supervisor, "cgroup.subtree_control")?
+                    .trim()
+                    .is_empty()
+                || read(&supervisor, "cgroup.procs")?
+                    .split_whitespace()
+                    .any(|pid| pid != std::process::id().to_string())
+            {
+                return Err(invalid("untrusted retained supervisor membership"));
+            }
+            return Ok(Self::from_root(parent));
+        }
+        Ok(layout)
     }
     fn discover_from(membership: &str, mounts: &str) -> io::Result<Self> {
         let member = membership

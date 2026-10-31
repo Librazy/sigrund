@@ -52,6 +52,15 @@ Before opening `/run/sigrund.sock`, `sigrund` executes the following mandatory s
 
 1. **Subreaper Registration:** Calls `prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)` so orphaned descendants of this daemon are reparented to it while it remains alive. This does not adopt processes already reparented to PID 1 or another subreaper after an earlier daemon instance died.
 2. **Directory Creation:** Resolves and pins its own delegated service cgroup path $G$ before migration (e.g., `/sys/fs/cgroup/system.slice/sigrund.service`), using its cgroup membership and the verified cgroup v2 mount rather than a hardcoded unit name, and creates three subdirectories (`0755 root:root`): $G\text{/supervisor}$, $G\text{/jobs}$, and $G\text{/hooks}$.
+   On restart with a retained hierarchy whose domain controllers remain enabled,
+   the external supervisor may start the daemon directly in `G/supervisor`.
+   Only that exact leaf name permits selecting its immediate parent as `G`:
+   startup pins and verifies root-owned, non-writable, no-symlink `G`,
+   `supervisor`, `jobs` and `hooks`, requires `G/cgroup.procs` empty,
+   the supervisor leaf's `cgroup.subtree_control` empty, and no other process
+   in the supervisor leaf. Normal initialization and orphan reconciliation
+   still run before listeners. Do not disable controllers to enter `G`, infer
+   arbitrary ancestors, or use requester-supplied cgroup/namespace identities.
 3. **Daemon Migration to Supervisor Leaf:** Writes its own PID (`getpid()`) to $G\text{/supervisor/cgroup.procs}$, vacating the root of $G$.
 4. **Controller Enablement:** Reads $G\text{/cgroup.controllers}$, verifies both `memory` and `pids` are present, and writes `"+memory +pids\n"` sequentially to $G\text{/cgroup.subtree\_control}$, $G\text{/jobs/cgroup.subtree\_control}$, and $G\text{/hooks/cgroup.subtree\_control}$.
 5. **Orphan Cleanup from Prior Crashes:** Iterates over any existing `job-*` directories under $G\text{/jobs}$ and `hook-*` directories under $G\text{/hooks}$, writes `"1\n"` to each `cgroup.kill`, waits for `populated 0` in `cgroup.events`, drains only processes that are actually children of the current daemon via the Central Reaper (`waitid(P_ALL, 0, ..., WEXITED | WNOHANG)`), logs an `ORPHAN_CLEANUP` audit entry, and removes the directories via `rmdir()`. Prior-instance processes may already belong to PID 1 or another subreaper; the new daemon can kill their cgroups but cannot generally reap them or recover their exit status. Their current parent is responsible for reaping; cleanup completion requires `populated 0`, not successful `waitid()` for those non-children.
