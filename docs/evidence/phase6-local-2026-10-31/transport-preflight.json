@@ -1,0 +1,14 @@
+[
+  {
+    "mode": "pipes",
+    "code": 1,
+    "stdout": "",
+    "stderr": "Failed to start transient service unit: Connection reset by peer\n"
+  },
+  {
+    "mode": "files",
+    "code": 1,
+    "stdout": "",
+    "stderr": "Failed to start transient service unit: Failed to set unit properties: Bad message\n"
+  }
+]

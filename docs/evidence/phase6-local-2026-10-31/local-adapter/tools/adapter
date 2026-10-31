@@ -1,0 +1,63 @@
+#!/usr/bin/python3
+"""Local test adapter: keep host-systemd jobs in the prepared container view."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+BASE = Path('/tmp/sigrund-phase6-local-1f66ebd')
+config = json.loads((BASE / 'adapter.json').read_text())
+anchor = config['anchor']
+namespace = ['/usr/bin/nsenter', '--mount=/proc/' + str(anchor) + '/ns/mnt',
+             '--root=/proc/' + str(anchor) + '/root', '--']
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+# This rootful container shares host PID 1 but has another filesystem root.
+# Control the deliberately selected host manager instead of silently skipping
+# service starts as a chroot operation.
+os.environ['SYSTEMD_IGNORE_CHROOT'] = '1'
+os.environ['SYSTEMD_OFFLINE'] = '0'
+if name == 'strace':
+    os.execv('/tmp/sigrund-tools/strace-run', ['/tmp/sigrund-tools/strace-run', *args])
+if name == 'systemctl' and args == ['daemon-reload']:
+    # Touch only acceptance-created units bound to our unique supervisor.
+    for path in Path('/run/systemd/system').glob('sigrund-mvp-*.service'):
+        if not re.fullmatch(r'sigrund-mvp-[0-9a-f]{12}\.service', path.name):
+            continue
+        text = path.read_text()
+        if 'BindsTo=' + config['supervisor'] + '\n' not in text:
+            continue
+        if 'ExecStart=/usr/bin/nsenter ' in text:
+            continue
+        text = re.sub(r'^ExecStart=(.+)$', lambda m: 'ExecStart=' + ' '.join(namespace) + ' ' + m[1], text, flags=re.M)
+        text = re.sub(r'^ConditionPathExists=(/.*)$', lambda m: 'ConditionPathExists=/proc/' + str(anchor) + '/root' + m[1], text, flags=re.M)
+        path.write_text(text)
+if name == 'systemd-run':
+    offset = next(i for i, arg in enumerate(args) if not arg.startswith('--'))
+    args[offset:offset] = namespace
+if name == 'journalctl':
+    args = ['--directory=' + config['hostroot'] + '/var/log/journal', *args]
+command = ['/usr/bin/' + name, *args]
+if name == 'systemd-run':
+    # Use the manager's matching native client. The launched daemon still enters
+    # our prepared Distrobox view through the explicit namespace prefix above.
+    command = ['/usr/bin/nsenter', '--mount=/proc/1/ns/mnt', '--root=/proc/1/root',
+               '--', '/usr/bin/systemd-run', *args]
+if name == 'systemd-run':
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+        stdout.seek(0)
+        stderr.seek(0)
+        result.stdout, result.stderr = stdout.read(), stderr.read()
+else:
+    result = subprocess.run(command, capture_output=True)
+with open(BASE / 'systemd-client-5.jsonl', 'a') as log:
+    os.fchmod(log.fileno(), 0o644)
+    log.write(json.dumps({'command': name, 'actual_command': command, 'args': args, 'exit': result.returncode,
+              'stdout': result.stdout.decode(errors='replace'),
+              'stderr': result.stderr.decode(errors='replace')}) + '\n')
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+raise SystemExit(result.returncode)

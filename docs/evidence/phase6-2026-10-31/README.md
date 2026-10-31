@@ -75,3 +75,10 @@ Phase 6 deliverable audit:
 | Recovery, retained consumption, pressure and interruption | `synchronized-partial-tail-recovery`, `failed-job-limit`, repeated runtime poison/restart tests and ordinary Phase 4/storage-pressure tests |
 | Copyable operator walkthrough and safe cleanup/recovery instructions | `docs/MVP_PHASE6.md`; tested `mvp-lab.py` service/foreground recipes |
 | Scope and traceability | `docs/MVP_COVERAGE.md`; full v1.0 features remain explicitly deferred |
+
+A later local rootful Distrobox run against commit `1f66ebd` passed eight
+top-level gates, including the corrected blocked-output assertion and the
+packaged-service approval workflow. It remains incomplete at the foreground
+systemd transport, independently reproduced with `/usr/bin/true`. See the
+[local evidence record](../phase6-local-2026-10-31/README.md); it is not a
+replacement passing result for this native VM run.

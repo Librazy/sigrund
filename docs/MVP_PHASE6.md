@@ -9,8 +9,11 @@ The executable verification entry points are `scripts/check-mvp.py` and
 `scripts/verify-mvp.py`. The latter runs on a disposable systemd Linux host,
 with a real unified cgroup v2 hierarchy and the required kernel operations.
 It does not substitute a user namespace for the privileged execution gate.
-Local privileged testing is deferred; acceptance runs in a disposable pvem
-guest. The final result and non-secret artifacts are retained in
+Native acceptance runs in a disposable pvem guest. A later local rootful
+Distrobox run passed eight top-level gates but remains incomplete because the
+foreground systemd launch also fails for `/usr/bin/true`; see the
+[local test record](evidence/phase6-local-2026-10-31/README.md).
+The earlier native result and non-secret artifacts are retained in
 [`docs/evidence/phase6-2026-10-31`](evidence/phase6-2026-10-31/README.md), and
 coverage is tracked in the [MVP coverage map](MVP_COVERAGE.md).
 
@@ -70,7 +73,9 @@ ceiling. Systemd therefore stops their whole cgroups when the supervisor stops
 or dies, including when Python cannot execute its cleanup. Standalone manual
 labs do not inherit these acceptance-only dependencies. Ordinary harness
 regressions check both generated service recipes; the retained 2026-10-31 VM
-run predates this lifetime correction, so privileged revalidation is pending.
+run predates this lifetime correction. Local privileged revalidation passed
+the packaged-service workflow but remains blocked on the foreground systemd
+transport; the full corrected two-recipe gate still needs passing evidence.
 Only fresh fixture cgroups, units, processes and directories are changed.
 
 The loop is implement, run ordinary checks, run VM acceptance, inspect the

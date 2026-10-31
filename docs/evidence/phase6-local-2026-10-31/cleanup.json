@@ -1,0 +1,33 @@
+{
+  "supervisors": [
+    {
+      "attempt": "acceptance",
+      "unit": "sigrund-mvp-gate-3ab9dab01fa5405cae5d113c879e8f3e.service",
+      "cgroup_removed": true
+    },
+    {
+      "attempt": "acceptance-2",
+      "unit": "sigrund-mvp-gate-91304078fc8248d4a0f96a8ae40bb036.service",
+      "cgroup_removed": true
+    },
+    {
+      "attempt": "acceptance-3",
+      "unit": "sigrund-mvp-gate-93ff35c1667a4b188377198d85721ef2.service",
+      "cgroup_removed": true
+    },
+    {
+      "attempt": "acceptance-4",
+      "unit": "sigrund-mvp-gate-85e2fe7f24954203aae709badae74624.service",
+      "cgroup_removed": true
+    },
+    {
+      "attempt": "acceptance-5",
+      "unit": "sigrund-mvp-gate-d4dc6f310c8542ac81fe6186ef8c4861.service",
+      "cgroup_removed": true
+    }
+  ],
+  "live_sigrund_acceptance_units": [],
+  "host_runtime_fixtures": [],
+  "container_lab_fixtures": [],
+  "observed_via": "read-only host systemd ListUnits, host cgroup paths, runtime and container lab directory checks"
+}

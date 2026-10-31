@@ -1,0 +1,7 @@
+{
+  "unit": "sigrund-mvp-gate-85e2fe7f24954203aae709badae74624.service",
+  "result_code": 1,
+  "cgroup_removed": true,
+  "local_adapter": "/tmp/sigrund-phase6-local-1f66ebd/adapter.json",
+  "log": "/tmp/sigrund-phase6-local-1f66ebd/sigrund-mvp-gate-85e2fe7f24954203aae709badae74624.service.log"
+}
