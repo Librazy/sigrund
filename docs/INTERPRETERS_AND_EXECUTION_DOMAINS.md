@@ -136,9 +136,8 @@ own design and tests before such an adapter can be enabled.
 Complete Phase 5C/5D and the two-UID end-to-end fixture using execution in the
 daemon's configured domain, with the existing documented child-isolation
 changes. This boundary does not automatically follow the requester's
-namespaces or add cross-domain routing. The current implementation still
-lacks live requester execution integration; these notes do not change that
-status.
+namespaces or add cross-domain routing. Phase 5C now wires live requester execution, with real runtime/service
+acceptance still pending; these notes do not establish that acceptance.
 
 Before extending that boundary, decide whether independently deployed daemons
 or a host runtime adapter serve each supported destination, and version any

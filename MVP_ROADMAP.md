@@ -28,24 +28,19 @@ Those design notes do not expand the current MVP or define new protocol fields.
 
 Phases 0–4 provide the contracts, foreground socket service, requester relays,
 sealed snapshots, root TTY approval with OpenSSH signing, and local durable
-authorization. Approved and pre-signed requests pass the same captured-policy
-gate and one-time SQLite consumption, then append authenticated commit and
-post-commit abort records. The daemon returns `SPAWN_FAILED` with an explicit
-Phase 5C handoff and consumed-grant message. Phase 5A/5B now supply pinned
-execution startup, bounded committed-job preparation, the reaper registration
-barrier primitive, and the syscall-only clone/credential/readiness path.
-Normal foreground startup requires its platform probe; `--authorization-only`
-selects the non-executing diagnostic profile. Requester child execution remains
-pending Phase 5C integration. The delegated-host Phase 5A/5B privileged gate
-passed on 2026-10-31; its service and cgroup cleanup also succeeded.
-Evidence and reproducible gates are in [docs/MVP_PHASE3.md](docs/MVP_PHASE3.md)
-and [docs/MVP_PHASE4.md](docs/MVP_PHASE4.md).
+authorization. Phase 4.5 publishes bounded pre-commit denials independently of
+blocked rejection auditing and retains bounded audit ownership. Phases 5A/5B
+supply pinned execution startup and the syscall-only child transition; their
+real delegated-host gate passed on 2026-10-31 with whole-service cleanup.
 
-The pre-execution recap identified a Phase 4 conformance gap: pre-commit
-responses had waited for rejection auditing. Phase 4.5 now publishes those
-responses independently and retains bounded audit ownership. Its gate reads
-those frames while durable I/O is still blocked. The isolated child-execution
-platform gate passes; live requester execution remains Phase 5C work.
+Phase 5C now wires authorized jobs into bounded off-loop clone/cgroup work,
+central reaping, readiness/exit auditing, signal forwarding and shutdown.
+Normal foreground startup requires its platform probe; `--authorization-only`
+selects the non-executing diagnostic profile. The workspace regressions pass;
+Phase 5C's real runtime/service acceptance is still pending. Phase 5D's full
+execution failure/race gate and Phase 6's root-TTY user-story fixture remain
+outstanding. See [MVP_PHASE5C.md](docs/MVP_PHASE5C.md) for the implementation
+boundary and prepared verification commands.
 
 - [x] Protocol, policy, snapshot, lifecycle, state, audit, memfd, and cgroup
   primitives with unit tests.
@@ -594,6 +589,10 @@ Exit gate:
   descriptors and mount isolation after exec. Parent mounts stay unchanged.
 
 ### Phase 5C: central reaping, teardown and daemon shutdown
+
+Implementation is in progress. [MVP_PHASE5C.md](docs/MVP_PHASE5C.md) records
+ownership, shutdown behavior and the prepared runtime/service verification
+gates. Unprivileged regressions pass; privileged acceptance remains pending.
 
 Deliverables:
 
