@@ -29,6 +29,10 @@ __attribute__((constructor)) static void initialize(void) {
     p=getenv("SIGRUND_EXEC_RELEASE");release_fd=p?atoi(p):-1;
 }
 static int take_arm(void) {return arm[0]&&real_call(SYS_unlinkat,AT_FDCWD,arm,0)==0;}
+static int parent_gate_mode(void) {
+    return !strcmp(mode,"cleanup-before") || !strcmp(mode,"cleanup-fail") ||
+           !strcmp(mode,"prepare-before") || !strcmp(mode,"limit-fail");
+}
 static void gate(long pid) {
     uint64_t message[2]={(uint64_t)real_call(SYS_gettid),(uint64_t)pid};
     long n;
@@ -44,10 +48,25 @@ long syscall(long number,...) {
         long result=real_call(number,args[0],args[1],args[2],args[3],args[4],args[5]);
         int saved=errno;
         if(result>0&&!strcmp(mode,"clone-after")&&take_arm())gate(result);
-        if(result==0&&strcmp(mode,"clone-after"))active=take_arm();
+        if(result>0&&parent_gate_mode())active=1;
+        if(result==0&&strcmp(mode,"clone-after")&&!parent_gate_mode())active=take_arm();
         errno=saved;return result;
     }
     if(active) {
+        if(number==SYS_write&&(args[2]==2||args[2]==8)) {
+            char name[64],path[4096];
+            snprintf(name,sizeof(name),"/proc/self/fd/%d",(int)args[0]);
+            long n=real_call(SYS_readlinkat,AT_FDCWD,name,path,sizeof(path)-1);
+            if(n>0) {
+                path[n]=0;
+                size_t size=strlen(path);
+                const char *tail=(!strcmp(mode,"prepare-before")||!strcmp(mode,"limit-fail"))?"/pids.max":"/cgroup.kill";
+                if(size>=strlen(tail)&&!strcmp(path+size-strlen(tail),tail)&&take_arm()) {
+                    if(!strcmp(mode,"cleanup-fail")||!strcmp(mode,"limit-fail")){errno=EIO;return -1;}
+                    gate(0);
+                }
+            }
+        }
         if(number==SYS_unshare&&!strcmp(mode,"fd-exhaust")) {
             const struct rlimit limit={128,128};
             if(real_call(SYS_setrlimit,RLIMIT_NOFILE,&limit)<0)real_call(SYS_exit_group,98);
@@ -99,12 +118,12 @@ int openat(int dir,const char *path,int flags,...) {
     return real_call(SYS_openat,dir,path,flags,permissions);
 }
 ssize_t write(int fd,const void *data,size_t len) {
-    if(!strcmp(mode,"cleanup-before")||!strcmp(mode,"cleanup-fail")||!strcmp(mode,"prepare-before")) {
+    if(!strcmp(mode,"cleanup-before")||!strcmp(mode,"cleanup-fail")||!strcmp(mode,"prepare-before")||!strcmp(mode,"limit-fail")) {
         char name[64],path[4096];snprintf(name,sizeof(name),"/proc/self/fd/%d",fd);
         long n=real_call(SYS_readlink,name,path,sizeof(path)-1);
-        if(n>0){path[n]=0;size_t size=strlen(path);const char *tail=!strcmp(mode,"prepare-before")?"/pids.max":"/cgroup.kill";
+        if(n>0){path[n]=0;size_t size=strlen(path);const char *tail=(!strcmp(mode,"prepare-before")||!strcmp(mode,"limit-fail"))?"/pids.max":"/cgroup.kill";
             if(size>=strlen(tail)&&!strcmp(path+size-strlen(tail),tail)&&take_arm()) {
-                if(!strcmp(mode,"cleanup-fail")){errno=EIO;return -1;}
+                if((!strcmp(mode,"cleanup-fail")||!strcmp(mode,"limit-fail"))){errno=EIO;return -1;}
                 gate(0);
             }}
     }

@@ -1,0 +1,21 @@
+{
+  "daemon_command": [
+    "/home/lab/sigrund-phase6-current/target/debug/sigrund",
+    "--foreground",
+    "--config",
+    "/tmp/sigrund-runtime-vh5q2uyi/config",
+    "--signers",
+    "/tmp/sigrund-runtime-vh5q2uyi/signers",
+    "--state-dir",
+    "/tmp/sigrund-runtime-vh5q2uyi/state",
+    "--log-path",
+    "/tmp/sigrund-runtime-vh5q2uyi/log/audit.jsonl",
+    "--socket",
+    "/tmp/sigrund-runtime-vh5q2uyi/client.sock",
+    "--approval-socket",
+    "/tmp/sigrund-runtime-vh5q2uyi/approval.sock"
+  ],
+  "daemon_status": 0,
+  "cgroup": "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-a26207bd8ac8432881f60e458e9fc00a.service/sigrund-runtime-33399d0edd334f6b9069cb3ad15e1a6a",
+  "jobs": []
+}

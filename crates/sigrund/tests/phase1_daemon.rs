@@ -14,6 +14,7 @@ use std::{
     os::{
         fd::{AsRawFd, RawFd},
         unix::{
+            ffi::OsStrExt,
             fs::{MetadataExt, PermissionsExt},
             net::{UnixDatagram, UnixStream},
             process::CommandExt,
@@ -154,6 +155,13 @@ impl Fixture {
         let root = base.join("executables");
         for path in [&state, &log_dir, &root] {
             fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            // The fixture may start in a user namespace whose temporary
+            // directory inherited the caller's mapped UID. Provisioning is
+            // intentionally root:root-only, so normalize the new directories
+            // while namespace root still owns the mapping.
+            let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(path_c.as_ptr(), 0, 0) }, 0);
         }
         let executable = root.join("id");
         fs::write(&executable, b"\x7fELFphase2-fixture").unwrap();
@@ -192,11 +200,13 @@ impl Fixture {
         ] {
             let path = base.join(name);
             fs::write(&path, "fixture TLS file; no Phase 1 network use\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             configuration =
                 configuration.replace(&format!("/etc/sigrund/{name}"), path.to_str().unwrap());
         }
         configuration.push_str("\n[mvp]\n");
         fs::write(&config, configuration).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
         let public = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
             .verifying_key()
             .to_bytes();
@@ -220,6 +230,7 @@ impl Fixture {
                 &format!("[\"{}\"]", root.display()),
             );
         fs::write(&signers, signer).unwrap();
+        fs::set_permissions(&signers, fs::Permissions::from_mode(0o600)).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_sigrundctl"))
             .args(["init-host", "--state-dir"])
             .arg(&state)
@@ -229,7 +240,8 @@ impl Fixture {
             .unwrap();
         assert!(
             output.status.success(),
-            "{}",
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         Self {
@@ -673,6 +685,8 @@ fn phase1_namespace_fixture() {
     fs::remove_file(&collector).unwrap();
     fixture.must_fail("No such file");
     fs::write(&collector, "fixture").unwrap();
+    // Restore the trusted fixture independently of the caller's umask.
+    fs::set_permissions(&collector, fs::Permissions::from_mode(0o600)).unwrap();
     // Failed second bind removes only the first socket owned by this startup.
     fs::write(&fixture.broker, "operator-owned sentinel").unwrap();
     let output = fixture.command().output().unwrap();

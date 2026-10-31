@@ -327,8 +327,8 @@ per-step child failures, readiness races, real root-TTY approval/execution,
 post-exec kernel observations and retained syscall traces. Its 26 gates passed
 on 2026-10-31 alongside a repeated Phase 5A/5B platform gate. The controlled
 root-TTY workflow returned `0` with exit status zero to UID 65534 after root
-confirmation/signing and UID 0 execution. This completes Phases 5C/5D; Phase 6
-still owns the packaged walkthrough and broader fixture. Evidence is retained
+confirmation/signing and UID 0 execution. This completes Phases 5C/5D; the Phase 6
+section below records the packaged walkthrough and broader fixture. Evidence is retained
 in [docs/evidence/phase5-2026-10-31](docs/evidence/phase5-2026-10-31/README.md).
 
 The acceptance loop corrected fixture root ordering, sealed execution of
@@ -340,17 +340,17 @@ actual status without weakening executable resolution or readiness semantics.
 
 ## Deliberately incomplete runtime
 
-The following specification surfaces are still stubs and must not be treated
-as production functionality:
+The local MVP is implemented. The table distinguishes its working surfaces
+from specification features that remain unimplemented or unverified:
 
 | Surface | Current behavior | Required integration |
 | --- | --- | --- |
-| `sigrund` | Runs under `[mvp]` after the execution startup gate, or with explicit `--authorization-only`; signed/unsigned requests share retained snapshots, SQLite consumption and authenticated local audit. Authorized jobs execute through the verified clone/reaper/readiness/shutdown path. | Phase 6 operator fixture, hooks, audit replication, PTY and reload. |
-| `sigrun` | Normal command supports unsigned construction or `--warrant PATH`, hello/descriptor transport, stdio relay, separate status reporting and signal/deadline handling. Signed input forbids field overrides and preserves canonical payload bytes. | PTY/window transport and Phase 6 operator fixture; actual stdio execution is verified. |
+| `sigrund` | Runs under `[mvp]` after the execution startup gate, or with explicit `--authorization-only`; signed/unsigned requests share retained snapshots, SQLite consumption and authenticated local audit. Authorized jobs execute through the verified clone/reaper/readiness/shutdown path. | Hooks, audit replication, PTY and reload. The Phase 6 operator fixture is implemented and verified. |
+| `sigrun` | Normal command supports unsigned construction or `--warrant PATH`, hello/descriptor transport, stdio relay, separate status reporting and signal/deadline handling. Signed input forbids field overrides and preserves canonical payload bytes. | PTY/window transport; stdio execution and the Phase 6 operator fixture are verified. |
 | `sigrund-approve` | Root peer/TTY verification, bounded broker transport, complete escaped prompting, OpenSSH key/agent signing and cancellation are implemented. | Physical FIDO signing evidence; native agent adapter is optional follow-on work. |
 | `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |
-| `sigrundctl` | UUID validation/generation and root-only `init-host` provisioning with ownership/permission checks and durable state publication are available. | Sealing/template commands, revocation administration, anchor-file output, and complete operator workflows. |
-| Verification matrix | No V-01 through V-19 end-to-end harness exists. | Linux integration fixtures and deterministic race gates required by every row of Section 8. |
+| `sigrundctl` | UUID helpers, root-only durable `init-host`, and exact-byte `csr-pae`/`pack-warrant` offline helpers are implemented. | Sealing/template commands, revocation administration and anchor-file output. |
+| Verification matrix | M-01–M-15 have focused or delegated integration evidence, tracked in `docs/MVP_COVERAGE.md`. | Complete V-01–V-19 rows, including deferred feature subcases; MVP evidence does not establish full v1.0 conformance. |
 
 Diagnostic options such as `--check-config`, `--check-cgroup`,
 `--validate-hello`, and `--validate-batch` validate inputs or a local probe;
@@ -391,3 +391,26 @@ The implementation uses the following crash-recovery and durability rules:
    ratchet state. New directory hierarchies are synced through their ancestors
    before use, and the state directory is synced after atomic state rename.
    Any failed directory barrier prevents successful provisioning.
+
+
+## Phase 6 implementation
+
+The Phase 6 operator lab and acceptance entry points are implemented in
+`scripts/mvp-lab.py`, `scripts/check-mvp.py`, and `scripts/verify-mvp.py`.
+Offline CSR/SSHSIG packaging is exposed by `sigrundctl csr-pae` and
+`sigrundctl pack-warrant`, with byte-preservation tests in
+`crates/sigrund/tests/phase6_tools.rs`. The disposable pvem acceptance run
+passed on 2026-10-31; its non-secret manifest and ordinary-check evidence are
+retained in `docs/evidence/phase6-2026-10-31/`. Local privileged tests remain
+deferred. The acceptance wrapper passes the discovered `strace` path to the
+failure gate, and its execution interposer covers both Rust syscall and libc
+write paths for cgroup fault boundaries. See `docs/MVP_PHASE6.md` and
+`docs/MVP_COVERAGE.md`.
+
+The final repeat includes the watchdog-aware epoll timeout fix. Testing under
+the VM user's `0002` umask exposed a Phase 1 fixture which recreated the
+collector CA placeholder as group-writable after its missing-file test. The
+fixture now restores mode `0600`; production startup correctly continued to
+reject writable files. Both the local and VM ordinary check sets passed with
+the corrected fixture and identical runtime/build-input source digests,
+followed by all nine real delegated VM acceptance gates and supervisor cleanup.

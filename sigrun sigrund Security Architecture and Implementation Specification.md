@@ -1500,35 +1500,35 @@ post-commit abort reconciliation. Phase 4.5 adds independent pre-commit denial
 responses, retained bounded audit ownership, admission windows and sticky
 storage-pressure gates, including post-append refresh.
 
-Phases 5A/5B add descriptor-pinned cgroup startup, bounded committed-job
-preparation/cleanup, the standalone pending-spawn registration barrier and
-syscall-only clone/descriptor/mount/credential/exec transition. Normal foreground
-startup requires its isolated platform probe; `--authorization-only` explicitly
-selects the non-executing diagnostic profile. Startup probes create trusted test
-children, but requester commands still stop at an audited post-commit abort:
-`SPAWN_FAILED`, with consumption preserved. Live requester clone dispatch,
-readiness publication, central reaper integration and active-job shutdown remain
-Phase 5C requirements. The collector, hooks, reload, remote ACK and PTY also
-remain pending.
+Phases 5A–5D integrate descriptor-pinned cgroup startup, bounded committed-job
+preparation/cleanup, the pending-spawn registration barrier, the syscall-only
+child transition, readiness/exit publication, central reaping, disconnect
+teardown and active-job shutdown. Normal foreground startup requires its
+isolated platform probe; `--authorization-only` explicitly selects the
+non-executing diagnostic profile. Delegated-host acceptance passed on
+2026-10-31 with actual post-exec credentials, setup/race failures, service
+restart and whole-service cleanup.
 
-Unprivileged ownership, real-child registration-barrier and syscall-fault tests
-are implemented. The operator explicitly defers privileged delegated-host
-acceptance until after Phase 5A/5B land. Its ignored fixture and runner are
-provided in the phase evidence documents; the ordinary workspace suite does
-not prove those privileged gates. Sections 2.4–5.3 retain their full runtime
-requirements, including shutdown and actual post-exec observations.
+Phase 6 supplies the two-UID operator lab, packaged and supervised foreground
+recipes, offline CSR/PAE/SSHSIG packaging and broader local MVP acceptance.
+Its disposable pvem run and ordinary-check manifests are recorded in
+`docs/evidence/phase6-2026-10-31/`; `docs/MVP_COVERAGE.md` distinguishes verified
+local subcases from unimplemented features. The current profile supports
+one-time SSH warrants with stdio and null/hashed stdin. Local privileged tests
+remain deferred; namespace-only fixtures do not substitute for the recorded
+real delegated VM gates. These results establish the thin local MVP boundary,
+not complete v1.0 conformance.
 
 The following integrations are required before claiming v1.0 conformance:
 
-1. `sigrund` still must complete policy reload, hooks, collector replication,
-   live child dispatch/readiness, PTY transfer, central reaping, active-job
-   shutdown and disconnect teardown. Privileged cgroup/child acceptance remains
-   pending. Startup recovery, root pinning, common snapshots,
-   bounded transport, and local authorization/SQLite commit are integrated.
-2. `sigrun` must complete server PTY transfer, window relaying, PTY terminal
-   cleanup and validation against actual child execution. The stdio
-   `CLIENT_HELLO` descriptor contract, signed/unsigned request construction,
-   status-fd reporting, frame deadlines and signal handling are integrated.
+1. `sigrund` still must complete policy reload with aggregate generation
+   quotas, hooks, collector replication/ACK and PTY transfer, plus scripts,
+   reusable grants and the remaining signature adapters. The local stdio
+   execution, central reaper and shutdown paths are integrated.
+2. `sigrun` must complete server PTY transfer, window relaying, and PTY terminal
+   cleanup/validation. The stdio descriptor contract, signed/unsigned request
+   construction, separate status output, deadlines, signal forwarding and
+   actual child result relaying are integrated.
 3. `sigrund-collector` must implement authenticated TLS transport, exact
    HTTP/DSSE framing, contiguous batch verification, host binding,
    deduplication, durable cursor advancement, and the denial mappings in

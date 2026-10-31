@@ -1,0 +1,182 @@
+[
+  {
+    "target_uid": 0,
+    "capabilities": [],
+    "observed": {
+      "uid": [
+        0,
+        0,
+        0
+      ],
+      "gid": [
+        0,
+        0,
+        0
+      ],
+      "groups": [
+        0
+      ],
+      "cap_effective": 0,
+      "cap_permitted": 0,
+      "cap_inheritable": 0,
+      "cap_bounding": 0,
+      "cap_ambient": 0,
+      "securebits": 47,
+      "no_new_privs": 1,
+      "umask": 23,
+      "cwd": "/",
+      "pid": 109743,
+      "session": 109743,
+      "mount_flags": 4111,
+      "fd_signal_checks": true
+    },
+    "status": [
+      {
+        "csr_payload": null,
+        "exec_id": "01a191c2-b078-7494-89db-9516a8c0748c",
+        "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+        "status": "READY_TO_EXEC"
+      },
+      {
+        "exit_code": 0,
+        "signal": null
+      }
+    ]
+  },
+  {
+    "target_uid": 0,
+    "capabilities": [
+      "CAP_NET_BIND_SERVICE"
+    ],
+    "observed": {
+      "uid": [
+        0,
+        0,
+        0
+      ],
+      "gid": [
+        0,
+        0,
+        0
+      ],
+      "groups": [
+        0
+      ],
+      "cap_effective": 1024,
+      "cap_permitted": 1024,
+      "cap_inheritable": 1024,
+      "cap_bounding": 1024,
+      "cap_ambient": 1024,
+      "securebits": 47,
+      "no_new_privs": 1,
+      "umask": 23,
+      "cwd": "/",
+      "pid": 109750,
+      "session": 109750,
+      "mount_flags": 4111,
+      "fd_signal_checks": true
+    },
+    "status": [
+      {
+        "csr_payload": null,
+        "exec_id": "01a191c2-b0ba-732a-a785-00673d1465d1",
+        "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+        "status": "READY_TO_EXEC"
+      },
+      {
+        "exit_code": 0,
+        "signal": null
+      }
+    ]
+  },
+  {
+    "target_uid": 33,
+    "capabilities": [],
+    "observed": {
+      "uid": [
+        33,
+        33,
+        33
+      ],
+      "gid": [
+        33,
+        33,
+        33
+      ],
+      "groups": [
+        33
+      ],
+      "cap_effective": 0,
+      "cap_permitted": 0,
+      "cap_inheritable": 0,
+      "cap_bounding": 0,
+      "cap_ambient": 0,
+      "securebits": 47,
+      "no_new_privs": 1,
+      "umask": 23,
+      "cwd": "/",
+      "pid": 109757,
+      "session": 109757,
+      "mount_flags": 4111,
+      "fd_signal_checks": true
+    },
+    "status": [
+      {
+        "csr_payload": null,
+        "exec_id": "01a191c2-b0ff-7794-96ba-a243f2267a71",
+        "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+        "status": "READY_TO_EXEC"
+      },
+      {
+        "exit_code": 0,
+        "signal": null
+      }
+    ]
+  },
+  {
+    "target_uid": 33,
+    "capabilities": [
+      "CAP_NET_BIND_SERVICE"
+    ],
+    "observed": {
+      "uid": [
+        33,
+        33,
+        33
+      ],
+      "gid": [
+        33,
+        33,
+        33
+      ],
+      "groups": [
+        33
+      ],
+      "cap_effective": 1024,
+      "cap_permitted": 1024,
+      "cap_inheritable": 1024,
+      "cap_bounding": 1024,
+      "cap_ambient": 1024,
+      "securebits": 47,
+      "no_new_privs": 1,
+      "umask": 23,
+      "cwd": "/",
+      "pid": 109764,
+      "session": 109764,
+      "mount_flags": 4111,
+      "fd_signal_checks": true
+    },
+    "status": [
+      {
+        "csr_payload": null,
+        "exec_id": "01a191c2-b145-71f5-8080-1e4a34e9addb",
+        "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+        "status": "READY_TO_EXEC"
+      },
+      {
+        "exit_code": 0,
+        "signal": null
+      }
+    ]
+  }
+]

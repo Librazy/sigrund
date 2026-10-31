@@ -1,0 +1,14 @@
+11:40:18.069090 fcntl(21, F_DUPFD_CLOEXEC, 3) = 36
+11:40:18.069482 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.069664 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.069819 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.070015 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.070174 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.070373 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.070517 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.070677 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.492888 fcntl(38, F_SETFL, O_RDONLY|O_NONBLOCK) = 0
+11:40:18.492934 clone3({flags=CLONE_PIDFD|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_INTO_CGROUP, pidfd=0x7e7e99be9f6c, exit_signal=SIGCHLD, stack=NULL, stack_size=0, cgroup=37} => {pidfd=[40]}, 88) = 109792
+11:40:18.493426 fcntl(39, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.508466 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
+11:40:18.508773 +++ exited with 0 +++

@@ -40,8 +40,7 @@ selects the non-executing diagnostic profile. Phases 5C/5D passed their real
 delegated runtime/service and failure/race gates on 2026-10-31, together with
 the repeated Phase 5A/5B platform fixture and all ordinary workspace regressions.
 The controlled root-TTY test confirmed an unsigned UID 65534 request, SSH
-signing by root, UID 0 execution and exact output/status. Phase 6's packaged
-operator walkthrough and broader end-to-end fixture remain outstanding.
+signing by root, UID 0 execution and exact output/status. Phase 6's packaged operator walkthrough and broader end-to-end fixture are implemented and passed on the disposable pvem guest on 2026-10-31. The ordinary checks, delegated platform/runtime/failure gates, offline warrant path, binding/replay, limits, recovery, and two-terminal operator workflow are retained in [Phase 6 evidence](docs/evidence/phase6-2026-10-31/README.md).
 See [MVP_PHASE5C.md](docs/MVP_PHASE5C.md),
 [MVP_PHASE5D.md](docs/MVP_PHASE5D.md), and the retained
 [acceptance evidence](docs/evidence/phase5-2026-10-31/README.md).
@@ -67,7 +66,7 @@ See [MVP_PHASE5C.md](docs/MVP_PHASE5C.md),
   runtime/service acceptance passed on 2026-10-31.
 - [x] Phase 5D: execution failure and race verification; real syscall traces
   and post-exec observations retained for the 2026-10-31 run.
-- [ ] Phase 6: two-UID end-to-end fixture.
+- [x] Phase 6: two-UID end-to-end fixture; disposable pvem acceptance passed on 2026-10-31.
 
 ### Midpoint review and follow-through
 
@@ -80,7 +79,7 @@ they do not verify the host-root cgroup/credential execution path.
 
 The following table preserves the earlier midpoint findings and their owning
 phases. Current status and phase evidence above identify the completed portions;
-execution and follow-on features remain planned contracts.
+the deferred features remain separate milestones.
 
 | Finding or ambiguity | Delivery phase | Acceptance evidence |
 | --- | --- | --- |
@@ -100,8 +99,9 @@ Phase 0 interface. Preserve the Phase 1 regression fixtures as required gates.
 
 ### Pre-execution recap and corrective gates
 
-The verified Phase 0–4 building blocks remain in use. The following are
-outstanding requirements, not claims that the runtime already implements them.
+The verified Phase 0–4 building blocks remain in use. These historical findings
+were resolved in the owning phases listed below; the phase evidence records
+the implemented behavior and its acceptance gates.
 
 | Finding | Owner | Acceptance evidence |
 | --- | --- | --- |
@@ -654,6 +654,8 @@ Exit gate:
 
 ### Phase 6: end-to-end MVP fixture
 
+Implementation and VM acceptance landed in `scripts/mvp-lab.py`, `scripts/check-mvp.py`, `scripts/verify-mvp.py`, `crates/sigrund/tests/phase6_tools.rs`, and `docs/MVP_PHASE6.md`. The passing manifest and non-secret artifacts are retained in `docs/evidence/phase6-2026-10-31/`. Local privileged execution remains deferred; the disposable VM is the acceptance environment.
+
 Add an isolated Linux fixture with:
 
 - a root account running `sigrund` and `sigrund-approve` on a controlled TTY;
@@ -698,7 +700,8 @@ Missing kernel/delegation requirements fail the execution gate;
 namespace-only transport tests cannot substitute for it. The following are
 supported command forms after Phases 2–5. Use a canonical, memfd-compatible
 standalone executable; a distribution symlink or hardened multicall dispatcher
-may require a different native target. Phase 6 still must package this recipe.
+may require a different native target. Phase 6 packages the supported recipes
+in [MVP_PHASE6.md](docs/MVP_PHASE6.md).
 Run the root terminals in a provisioned disposable host with a delegated
 cgroup (for example a systemd service with `Delegate=yes`):
 

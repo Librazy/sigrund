@@ -1,0 +1,11 @@
+11:40:17.936738 fcntl(38, F_SETFL, O_RDONLY|O_NONBLOCK) = 0
+11:40:17.936798 clone3({flags=CLONE_PIDFD|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_INTO_CGROUP, pidfd=0x7e7e989e0f6c, exit_signal=SIGCHLD, stack=NULL, stack_size=0, cgroup=37} => {pidfd=[40]}, 88) = 109743
+11:40:17.937362 fcntl(39, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.396407 inotify_add_watch(39, "/proc/self/fd/37/cgroup.events", IN_MODIFY) = 1
+11:40:18.396551 fcntl(40, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.396707 fcntl(40, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.396777 fcntl(39, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.398432 fcntl(37, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.398504 fcntl(36, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.508046 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
+11:40:18.508282 +++ exited with 0 +++

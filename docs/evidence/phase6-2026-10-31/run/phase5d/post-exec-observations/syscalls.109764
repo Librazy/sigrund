@@ -1,0 +1,438 @@
+11:40:18.141824 unshare(CLONE_FILES)    = 0
+11:40:18.141877 fcntl(39, F_DUPFD_CLOEXEC, 5) = 40
+11:40:18.141908 fcntl(31, F_DUPFD_CLOEXEC, 5) = 41
+11:40:18.141935 fcntl(32, F_DUPFD_CLOEXEC, 5) = 42
+11:40:18.141971 fcntl(33, F_DUPFD_CLOEXEC, 5) = 43
+11:40:18.142005 fcntl(34, F_DUPFD_CLOEXEC, 5) = 44
+11:40:18.142036 dup3(41, 0, 0)          = 0
+11:40:18.142065 dup3(42, 1, 0)          = 1
+11:40:18.142098 dup3(43, 2, 0)          = 2
+11:40:18.142135 dup3(44, 3, O_CLOEXEC)  = 3
+11:40:18.142171 dup3(40, 4, O_CLOEXEC)  = 4
+11:40:18.142211 close_range(5, 4294967295, 0) = 0
+11:40:18.142250 mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) = 0
+11:40:18.142313 mount_setattr(AT_FDCWD, "/sys/fs/cgroup", AT_RECURSIVE, {attr_set=MOUNT_ATTR_RDONLY|MOUNT_ATTR_NOSUID|MOUNT_ATTR_NODEV|MOUNT_ATTR_NOEXEC, attr_clr=0, propagation=0 /* MS_??? */, userns_fd=0}, 32) = 0
+11:40:18.142634 rt_sigaction(SIGHUP, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.142677 rt_sigaction(SIGINT, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.142715 rt_sigaction(SIGQUIT, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.142751 rt_sigaction(SIGILL, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.142789 rt_sigaction(SIGTRAP, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.142826 rt_sigprocmask(SIG_BLOCK, ~[], [HUP INT TERM CHLD], 8) = 0
+11:40:18.142873 rt_sigaction(SIGABRT, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.142910 rt_sigprocmask(SIG_SETMASK, [HUP INT TERM CHLD], NULL, 8) = 0
+11:40:18.142946 rt_sigaction(SIGBUS, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.142984 rt_sigaction(SIGFPE, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143018 rt_sigaction(SIGUSR1, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143053 rt_sigaction(SIGSEGV, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143089 rt_sigaction(SIGUSR2, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143125 rt_sigaction(SIGPIPE, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143160 rt_sigaction(SIGALRM, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143194 rt_sigaction(SIGTERM, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143230 rt_sigaction(SIGSTKFLT, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143267 rt_sigaction(SIGCHLD, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143316 rt_sigaction(SIGCONT, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143361 rt_sigaction(SIGTSTP, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143399 rt_sigaction(SIGTTIN, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143437 rt_sigaction(SIGTTOU, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143474 rt_sigaction(SIGURG, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143510 rt_sigaction(SIGXCPU, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143546 rt_sigaction(SIGXFSZ, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143586 rt_sigaction(SIGVTALRM, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143633 rt_sigaction(SIGPROF, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143679 rt_sigaction(SIGWINCH, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143721 rt_sigaction(SIGIO, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143756 rt_sigaction(SIGPWR, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143790 rt_sigaction(SIGSYS, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143825 rt_sigaction(SIGRT_2, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143863 rt_sigaction(SIGRT_3, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143898 rt_sigaction(SIGRT_4, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143932 rt_sigaction(SIGRT_5, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.143970 rt_sigaction(SIGRT_6, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144006 rt_sigaction(SIGRT_7, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144042 rt_sigaction(SIGRT_8, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144078 rt_sigaction(SIGRT_9, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144115 rt_sigaction(SIGRT_10, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144152 rt_sigaction(SIGRT_11, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144187 rt_sigaction(SIGRT_12, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144222 rt_sigaction(SIGRT_13, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144258 rt_sigaction(SIGRT_14, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144299 rt_sigaction(SIGRT_15, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144347 rt_sigaction(SIGRT_16, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144385 rt_sigaction(SIGRT_17, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144425 rt_sigaction(SIGRT_18, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144473 rt_sigaction(SIGRT_19, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144513 rt_sigaction(SIGRT_20, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144550 rt_sigaction(SIGRT_21, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144590 rt_sigaction(SIGRT_22, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144629 rt_sigaction(SIGRT_23, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144672 rt_sigaction(SIGRT_24, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144710 rt_sigaction(SIGRT_25, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144754 rt_sigaction(SIGRT_26, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144799 rt_sigaction(SIGRT_27, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144839 rt_sigaction(SIGRT_28, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144876 rt_sigaction(SIGRT_29, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144919 rt_sigaction(SIGRT_30, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144958 rt_sigaction(SIGRT_31, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.144998 rt_sigaction(SIGRT_32, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x7e7ea8c45cb0}, NULL, 8) = 0
+11:40:18.145036 rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
+11:40:18.145080 setsid()                = 109764
+11:40:18.145128 chdir("/")              = 0
+11:40:18.145171 umask(027)              = 022
+11:40:18.145208 prctl(PR_CAPBSET_DROP, CAP_CHOWN) = 0
+11:40:18.145250 prctl(PR_CAPBSET_DROP, CAP_DAC_OVERRIDE) = 0
+11:40:18.145297 prctl(PR_CAPBSET_DROP, CAP_DAC_READ_SEARCH) = 0
+11:40:18.145345 prctl(PR_CAPBSET_DROP, CAP_FOWNER) = 0
+11:40:18.145382 prctl(PR_CAPBSET_DROP, CAP_FSETID) = 0
+11:40:18.145423 prctl(PR_CAPBSET_DROP, CAP_KILL) = 0
+11:40:18.145464 prctl(PR_CAPBSET_DROP, CAP_SETGID) = 0
+11:40:18.145507 prctl(PR_CAPBSET_DROP, CAP_SETUID) = 0
+11:40:18.145542 prctl(PR_CAPBSET_DROP, CAP_SETPCAP) = 0
+11:40:18.145584 prctl(PR_CAPBSET_DROP, CAP_LINUX_IMMUTABLE) = 0
+11:40:18.145620 prctl(PR_CAPBSET_DROP, CAP_NET_BROADCAST) = 0
+11:40:18.145654 prctl(PR_CAPBSET_DROP, CAP_NET_ADMIN) = 0
+11:40:18.145689 prctl(PR_CAPBSET_DROP, CAP_NET_RAW) = 0
+11:40:18.145723 prctl(PR_CAPBSET_DROP, CAP_IPC_LOCK) = 0
+11:40:18.145757 prctl(PR_CAPBSET_DROP, CAP_IPC_OWNER) = 0
+11:40:18.145790 prctl(PR_CAPBSET_DROP, CAP_SYS_MODULE) = 0
+11:40:18.145824 prctl(PR_CAPBSET_DROP, CAP_SYS_RAWIO) = 0
+11:40:18.145858 prctl(PR_CAPBSET_DROP, CAP_SYS_CHROOT) = 0
+11:40:18.145892 prctl(PR_CAPBSET_DROP, CAP_SYS_PTRACE) = 0
+11:40:18.145926 prctl(PR_CAPBSET_DROP, CAP_SYS_PACCT) = 0
+11:40:18.145959 prctl(PR_CAPBSET_DROP, CAP_SYS_ADMIN) = 0
+11:40:18.145993 prctl(PR_CAPBSET_DROP, CAP_SYS_BOOT) = 0
+11:40:18.146026 prctl(PR_CAPBSET_DROP, CAP_SYS_NICE) = 0
+11:40:18.146060 prctl(PR_CAPBSET_DROP, CAP_SYS_RESOURCE) = 0
+11:40:18.146094 prctl(PR_CAPBSET_DROP, CAP_SYS_TIME) = 0
+11:40:18.146129 prctl(PR_CAPBSET_DROP, CAP_SYS_TTY_CONFIG) = 0
+11:40:18.146162 prctl(PR_CAPBSET_DROP, CAP_MKNOD) = 0
+11:40:18.146195 prctl(PR_CAPBSET_DROP, CAP_LEASE) = 0
+11:40:18.146228 prctl(PR_CAPBSET_DROP, CAP_AUDIT_WRITE) = 0
+11:40:18.146263 prctl(PR_CAPBSET_DROP, CAP_AUDIT_CONTROL) = 0
+11:40:18.146305 prctl(PR_CAPBSET_DROP, CAP_SETFCAP) = 0
+11:40:18.146350 prctl(PR_CAPBSET_DROP, CAP_MAC_OVERRIDE) = 0
+11:40:18.146385 prctl(PR_CAPBSET_DROP, CAP_MAC_ADMIN) = 0
+11:40:18.146417 prctl(PR_CAPBSET_DROP, CAP_SYSLOG) = 0
+11:40:18.146464 prctl(PR_CAPBSET_DROP, CAP_WAKE_ALARM) = 0
+11:40:18.146506 prctl(PR_CAPBSET_DROP, CAP_BLOCK_SUSPEND) = 0
+11:40:18.146547 prctl(PR_CAPBSET_DROP, CAP_AUDIT_READ) = 0
+11:40:18.146586 prctl(PR_CAPBSET_DROP, CAP_PERFMON) = 0
+11:40:18.146625 prctl(PR_CAPBSET_DROP, CAP_BPF) = 0
+11:40:18.146666 prctl(PR_CAPBSET_DROP, CAP_CHECKPOINT_RESTORE) = 0
+11:40:18.146707 prctl(PR_SET_SECUREBITS, SECBIT_NOROOT|SECBIT_NOROOT_LOCKED|SECBIT_NO_SETUID_FIXUP|SECBIT_NO_SETUID_FIXUP_LOCKED|SECBIT_KEEP_CAPS_LOCKED) = 0
+11:40:18.146747 setgroups(1, [33])      = 0
+11:40:18.146791 setresgid(33, 33, 33)   = 0
+11:40:18.146829 setresuid(33, 33, 33)   = 0
+11:40:18.146868 capset({version=_LINUX_CAPABILITY_VERSION_3, pid=0}, {effective=1<<CAP_NET_BIND_SERVICE, permitted=1<<CAP_NET_BIND_SERVICE, inheritable=1<<CAP_NET_BIND_SERVICE}) = 0
+11:40:18.146906 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) = 0
+11:40:18.146940 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_BIND_SERVICE, 0, 0) = 0
+11:40:18.146980 prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) = 0
+11:40:18.147015 getresuid([33], [33], [33]) = 0
+11:40:18.147052 getresgid([33], [33], [33]) = 0
+11:40:18.147088 getgroups(1, [33])      = 1
+11:40:18.147127 prctl(PR_GET_SECUREBITS) = 0x2f (SECBIT_NOROOT|SECBIT_NOROOT_LOCKED|SECBIT_NO_SETUID_FIXUP|SECBIT_NO_SETUID_FIXUP_LOCKED|SECBIT_KEEP_CAPS_LOCKED)
+11:40:18.147162 prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) = 1
+11:40:18.147196 capget({version=_LINUX_CAPABILITY_VERSION_3, pid=0}, {effective=1<<CAP_NET_BIND_SERVICE, permitted=1<<CAP_NET_BIND_SERVICE, inheritable=1<<CAP_NET_BIND_SERVICE}) = 0
+11:40:18.147234 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0) = 0
+11:40:18.147269 prctl(PR_CAPBSET_READ, CAP_CHOWN) = 0
+11:40:18.147321 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_DAC_OVERRIDE, 0, 0) = 0
+11:40:18.147362 prctl(PR_CAPBSET_READ, CAP_DAC_OVERRIDE) = 0
+11:40:18.147395 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_DAC_READ_SEARCH, 0, 0) = 0
+11:40:18.147427 prctl(PR_CAPBSET_READ, CAP_DAC_READ_SEARCH) = 0
+11:40:18.147469 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_FOWNER, 0, 0) = 0
+11:40:18.147502 prctl(PR_CAPBSET_READ, CAP_FOWNER) = 0
+11:40:18.147536 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_FSETID, 0, 0) = 0
+11:40:18.147574 prctl(PR_CAPBSET_READ, CAP_FSETID) = 0
+11:40:18.147608 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_KILL, 0, 0) = 0
+11:40:18.147641 prctl(PR_CAPBSET_READ, CAP_KILL) = 0
+11:40:18.147678 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETGID, 0, 0) = 0
+11:40:18.147712 prctl(PR_CAPBSET_READ, CAP_SETGID) = 0
+11:40:18.147753 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETUID, 0, 0) = 0
+11:40:18.147789 prctl(PR_CAPBSET_READ, CAP_SETUID) = 0
+11:40:18.147830 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETPCAP, 0, 0) = 0
+11:40:18.147864 prctl(PR_CAPBSET_READ, CAP_SETPCAP) = 0
+11:40:18.147903 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_LINUX_IMMUTABLE, 0, 0) = 0
+11:40:18.147940 prctl(PR_CAPBSET_READ, CAP_LINUX_IMMUTABLE) = 0
+11:40:18.147976 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_BIND_SERVICE, 0, 0) = 1
+11:40:18.148011 prctl(PR_CAPBSET_READ, CAP_NET_BIND_SERVICE) = 1
+11:40:18.148046 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_BROADCAST, 0, 0) = 0
+11:40:18.148087 prctl(PR_CAPBSET_READ, CAP_NET_BROADCAST) = 0
+11:40:18.148121 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN, 0, 0) = 0
+11:40:18.148161 prctl(PR_CAPBSET_READ, CAP_NET_ADMIN) = 0
+11:40:18.148197 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_RAW, 0, 0) = 0
+11:40:18.148231 prctl(PR_CAPBSET_READ, CAP_NET_RAW) = 0
+11:40:18.148269 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_IPC_LOCK, 0, 0) = 0
+11:40:18.148318 prctl(PR_CAPBSET_READ, CAP_IPC_LOCK) = 0
+11:40:18.148361 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_IPC_OWNER, 0, 0) = 0
+11:40:18.148402 prctl(PR_CAPBSET_READ, CAP_IPC_OWNER) = 0
+11:40:18.148443 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_MODULE, 0, 0) = 0
+11:40:18.148486 prctl(PR_CAPBSET_READ, CAP_SYS_MODULE) = 0
+11:40:18.148522 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_RAWIO, 0, 0) = 0
+11:40:18.148560 prctl(PR_CAPBSET_READ, CAP_SYS_RAWIO) = 0
+11:40:18.148597 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_CHROOT, 0, 0) = 0
+11:40:18.148634 prctl(PR_CAPBSET_READ, CAP_SYS_CHROOT) = 0
+11:40:18.148668 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_PTRACE, 0, 0) = 0
+11:40:18.148701 prctl(PR_CAPBSET_READ, CAP_SYS_PTRACE) = 0
+11:40:18.148737 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_PACCT, 0, 0) = 0
+11:40:18.148772 prctl(PR_CAPBSET_READ, CAP_SYS_PACCT) = 0
+11:40:18.148804 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_ADMIN, 0, 0) = 0
+11:40:18.148837 prctl(PR_CAPBSET_READ, CAP_SYS_ADMIN) = 0
+11:40:18.148871 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_BOOT, 0, 0) = 0
+11:40:18.148904 prctl(PR_CAPBSET_READ, CAP_SYS_BOOT) = 0
+11:40:18.148935 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_NICE, 0, 0) = 0
+11:40:18.148967 prctl(PR_CAPBSET_READ, CAP_SYS_NICE) = 0
+11:40:18.149000 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_RESOURCE, 0, 0) = 0
+11:40:18.149039 prctl(PR_CAPBSET_READ, CAP_SYS_RESOURCE) = 0
+11:40:18.149071 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_TIME, 0, 0) = 0
+11:40:18.149104 prctl(PR_CAPBSET_READ, CAP_SYS_TIME) = 0
+11:40:18.149138 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_TTY_CONFIG, 0, 0) = 0
+11:40:18.149172 prctl(PR_CAPBSET_READ, CAP_SYS_TTY_CONFIG) = 0
+11:40:18.149203 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_MKNOD, 0, 0) = 0
+11:40:18.149237 prctl(PR_CAPBSET_READ, CAP_MKNOD) = 0
+11:40:18.149272 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_LEASE, 0, 0) = 0
+11:40:18.149320 prctl(PR_CAPBSET_READ, CAP_LEASE) = 0
+11:40:18.149359 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_AUDIT_WRITE, 0, 0) = 0
+11:40:18.149393 prctl(PR_CAPBSET_READ, CAP_AUDIT_WRITE) = 0
+11:40:18.149427 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_AUDIT_CONTROL, 0, 0) = 0
+11:40:18.149467 prctl(PR_CAPBSET_READ, CAP_AUDIT_CONTROL) = 0
+11:40:18.149501 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETFCAP, 0, 0) = 0
+11:40:18.149536 prctl(PR_CAPBSET_READ, CAP_SETFCAP) = 0
+11:40:18.149569 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_MAC_OVERRIDE, 0, 0) = 0
+11:40:18.149601 prctl(PR_CAPBSET_READ, CAP_MAC_OVERRIDE) = 0
+11:40:18.149633 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_MAC_ADMIN, 0, 0) = 0
+11:40:18.149667 prctl(PR_CAPBSET_READ, CAP_MAC_ADMIN) = 0
+11:40:18.149700 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYSLOG, 0, 0) = 0
+11:40:18.149733 prctl(PR_CAPBSET_READ, CAP_SYSLOG) = 0
+11:40:18.149765 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_WAKE_ALARM, 0, 0) = 0
+11:40:18.149801 prctl(PR_CAPBSET_READ, CAP_WAKE_ALARM) = 0
+11:40:18.149833 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_BLOCK_SUSPEND, 0, 0) = 0
+11:40:18.149869 prctl(PR_CAPBSET_READ, CAP_BLOCK_SUSPEND) = 0
+11:40:18.149904 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_AUDIT_READ, 0, 0) = 0
+11:40:18.149942 prctl(PR_CAPBSET_READ, CAP_AUDIT_READ) = 0
+11:40:18.149985 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_PERFMON, 0, 0) = 0
+11:40:18.150027 prctl(PR_CAPBSET_READ, CAP_PERFMON) = 0
+11:40:18.150059 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_BPF, 0, 0) = 0
+11:40:18.150095 prctl(PR_CAPBSET_READ, CAP_BPF) = 0
+11:40:18.150127 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHECKPOINT_RESTORE, 0, 0) = 0
+11:40:18.150161 prctl(PR_CAPBSET_READ, CAP_CHECKPOINT_RESTORE) = 0
+11:40:18.150228 execveat(3, "", ["/tmp/sigrund-runtime-amkucrel/commands/probe", "--observe"], 0x7e7e5c100eb0 /* 3 vars */, AT_EMPTY_PATH) = 0
+11:40:18.151757 getresuid([33], [33], [33]) = 0
+11:40:18.151799 getresgid([33], [33], [33]) = 0
+11:40:18.151836 getgroups(2, [33])      = 1
+11:40:18.151866 prctl(PR_GET_SECUREBITS) = 0x2f (SECBIT_NOROOT|SECBIT_NOROOT_LOCKED|SECBIT_NO_SETUID_FIXUP|SECBIT_NO_SETUID_FIXUP_LOCKED|SECBIT_KEEP_CAPS_LOCKED)
+11:40:18.151903 prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) = 1
+11:40:18.151944 capget({version=_LINUX_CAPABILITY_VERSION_3, pid=0}, {effective=1<<CAP_NET_BIND_SERVICE, permitted=1<<CAP_NET_BIND_SERVICE, inheritable=1<<CAP_NET_BIND_SERVICE}) = 0
+11:40:18.152232 prctl(PR_CAPBSET_READ, CAP_CHOWN) = 0
+11:40:18.152262 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0) = 0
+11:40:18.152499 prctl(PR_CAPBSET_READ, CAP_DAC_OVERRIDE) = 0
+11:40:18.152524 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_DAC_OVERRIDE, 0, 0) = 0
+11:40:18.152709 prctl(PR_CAPBSET_READ, CAP_DAC_READ_SEARCH) = 0
+11:40:18.152739 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_DAC_READ_SEARCH, 0, 0) = 0
+11:40:18.152946 prctl(PR_CAPBSET_READ, CAP_FOWNER) = 0
+11:40:18.152981 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_FOWNER, 0, 0) = 0
+11:40:18.153174 prctl(PR_CAPBSET_READ, CAP_FSETID) = 0
+11:40:18.153218 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_FSETID, 0, 0) = 0
+11:40:18.153447 prctl(PR_CAPBSET_READ, CAP_KILL) = 0
+11:40:18.153485 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_KILL, 0, 0) = 0
+11:40:18.153677 prctl(PR_CAPBSET_READ, CAP_SETGID) = 0
+11:40:18.153711 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETGID, 0, 0) = 0
+11:40:18.153906 prctl(PR_CAPBSET_READ, CAP_SETUID) = 0
+11:40:18.153938 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETUID, 0, 0) = 0
+11:40:18.154125 prctl(PR_CAPBSET_READ, CAP_SETPCAP) = 0
+11:40:18.154158 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETPCAP, 0, 0) = 0
+11:40:18.154373 prctl(PR_CAPBSET_READ, CAP_LINUX_IMMUTABLE) = 0
+11:40:18.154419 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_LINUX_IMMUTABLE, 0, 0) = 0
+11:40:18.154628 prctl(PR_CAPBSET_READ, CAP_NET_BIND_SERVICE) = 1
+11:40:18.154662 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_BIND_SERVICE, 0, 0) = 1
+11:40:18.154848 prctl(PR_CAPBSET_READ, CAP_NET_BROADCAST) = 0
+11:40:18.154881 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_BROADCAST, 0, 0) = 0
+11:40:18.155068 prctl(PR_CAPBSET_READ, CAP_NET_ADMIN) = 0
+11:40:18.155102 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN, 0, 0) = 0
+11:40:18.155313 prctl(PR_CAPBSET_READ, CAP_NET_RAW) = 0
+11:40:18.155359 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_RAW, 0, 0) = 0
+11:40:18.155560 prctl(PR_CAPBSET_READ, CAP_IPC_LOCK) = 0
+11:40:18.155593 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_IPC_LOCK, 0, 0) = 0
+11:40:18.155789 prctl(PR_CAPBSET_READ, CAP_IPC_OWNER) = 0
+11:40:18.155822 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_IPC_OWNER, 0, 0) = 0
+11:40:18.156011 prctl(PR_CAPBSET_READ, CAP_SYS_MODULE) = 0
+11:40:18.156043 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_MODULE, 0, 0) = 0
+11:40:18.156231 prctl(PR_CAPBSET_READ, CAP_SYS_RAWIO) = 0
+11:40:18.156264 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_RAWIO, 0, 0) = 0
+11:40:18.156469 prctl(PR_CAPBSET_READ, CAP_SYS_CHROOT) = 0
+11:40:18.156508 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_CHROOT, 0, 0) = 0
+11:40:18.156699 prctl(PR_CAPBSET_READ, CAP_SYS_PTRACE) = 0
+11:40:18.156731 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_PTRACE, 0, 0) = 0
+11:40:18.156920 prctl(PR_CAPBSET_READ, CAP_SYS_PACCT) = 0
+11:40:18.156952 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_PACCT, 0, 0) = 0
+11:40:18.157140 prctl(PR_CAPBSET_READ, CAP_SYS_ADMIN) = 0
+11:40:18.157171 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_ADMIN, 0, 0) = 0
+11:40:18.157400 prctl(PR_CAPBSET_READ, CAP_SYS_BOOT) = 0
+11:40:18.157445 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_BOOT, 0, 0) = 0
+11:40:18.157646 prctl(PR_CAPBSET_READ, CAP_SYS_NICE) = 0
+11:40:18.157680 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_NICE, 0, 0) = 0
+11:40:18.157870 prctl(PR_CAPBSET_READ, CAP_SYS_RESOURCE) = 0
+11:40:18.157903 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_RESOURCE, 0, 0) = 0
+11:40:18.158109 prctl(PR_CAPBSET_READ, CAP_SYS_TIME) = 0
+11:40:18.158149 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_TIME, 0, 0) = 0
+11:40:18.158459 prctl(PR_CAPBSET_READ, CAP_SYS_TTY_CONFIG) = 0
+11:40:18.158500 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYS_TTY_CONFIG, 0, 0) = 0
+11:40:18.158728 prctl(PR_CAPBSET_READ, CAP_MKNOD) = 0
+11:40:18.158771 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_MKNOD, 0, 0) = 0
+11:40:18.158987 prctl(PR_CAPBSET_READ, CAP_LEASE) = 0
+11:40:18.159038 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_LEASE, 0, 0) = 0
+11:40:18.159269 prctl(PR_CAPBSET_READ, CAP_AUDIT_WRITE) = 0
+11:40:18.159331 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_AUDIT_WRITE, 0, 0) = 0
+11:40:18.159585 prctl(PR_CAPBSET_READ, CAP_AUDIT_CONTROL) = 0
+11:40:18.159633 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_AUDIT_CONTROL, 0, 0) = 0
+11:40:18.159885 prctl(PR_CAPBSET_READ, CAP_SETFCAP) = 0
+11:40:18.159935 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SETFCAP, 0, 0) = 0
+11:40:18.160179 prctl(PR_CAPBSET_READ, CAP_MAC_OVERRIDE) = 0
+11:40:18.160221 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_MAC_OVERRIDE, 0, 0) = 0
+11:40:18.160498 prctl(PR_CAPBSET_READ, CAP_MAC_ADMIN) = 0
+11:40:18.160540 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_MAC_ADMIN, 0, 0) = 0
+11:40:18.160728 prctl(PR_CAPBSET_READ, CAP_SYSLOG) = 0
+11:40:18.160763 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_SYSLOG, 0, 0) = 0
+11:40:18.160953 prctl(PR_CAPBSET_READ, CAP_WAKE_ALARM) = 0
+11:40:18.160996 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_WAKE_ALARM, 0, 0) = 0
+11:40:18.161184 prctl(PR_CAPBSET_READ, CAP_BLOCK_SUSPEND) = 0
+11:40:18.161219 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_BLOCK_SUSPEND, 0, 0) = 0
+11:40:18.161480 prctl(PR_CAPBSET_READ, CAP_AUDIT_READ) = 0
+11:40:18.161526 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_AUDIT_READ, 0, 0) = 0
+11:40:18.161726 prctl(PR_CAPBSET_READ, CAP_PERFMON) = 0
+11:40:18.161759 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_PERFMON, 0, 0) = 0
+11:40:18.161948 prctl(PR_CAPBSET_READ, CAP_BPF) = 0
+11:40:18.161980 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_BPF, 0, 0) = 0
+11:40:18.162165 prctl(PR_CAPBSET_READ, CAP_CHECKPOINT_RESTORE) = 0
+11:40:18.162197 prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHECKPOINT_RESTORE, 0, 0) = 0
+11:40:18.162404 umask(000)              = 027
+11:40:18.162525 rt_sigprocmask(SIG_SETMASK, NULL, [], 8) = 0
+11:40:18.162569 rt_sigaction(SIGPIPE, NULL, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
+11:40:18.162606 rt_sigaction(SIGCHLD, NULL, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
+11:40:18.162643 fcntl(0, F_GETFD)       = 0
+11:40:18.162677 fcntl(1, F_GETFD)       = 0
+11:40:18.162711 fcntl(2, F_GETFD)       = 0
+11:40:18.162744 fcntl(3, F_GETFD)       = -1 EBADF (Bad file descriptor)
+11:40:18.162784 fcntl(4, F_GETFD)       = -1 EBADF (Bad file descriptor)
+11:40:18.162823 fcntl(5, F_GETFD)       = -1 EBADF (Bad file descriptor)
+11:40:18.162857 fcntl(6, F_GETFD)       = -1 EBADF (Bad file descriptor)
+11:40:18.162890 fcntl(7, F_GETFD)       = -1 EBADF (Bad file descriptor)
+11:40:18.162923 fcntl(8, F_GETFD)       = -1 EBADF (Bad file descriptor)
+11:40:18.162957 fcntl(9, F_GETFD)       = -1 EBADF (Bad file descriptor)
+11:40:18.162991 fcntl(10, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163024 fcntl(11, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163058 fcntl(12, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163091 fcntl(13, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163125 fcntl(14, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163158 fcntl(15, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163192 fcntl(16, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163224 fcntl(17, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163257 fcntl(18, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163296 fcntl(19, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163345 fcntl(20, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163380 fcntl(21, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163413 fcntl(22, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163454 fcntl(23, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163488 fcntl(24, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163522 fcntl(25, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163554 fcntl(26, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163588 fcntl(27, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163621 fcntl(28, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163654 fcntl(29, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163688 fcntl(30, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163722 fcntl(31, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163755 fcntl(32, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163788 fcntl(33, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163821 fcntl(34, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163856 fcntl(35, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163889 fcntl(36, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163923 fcntl(37, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163956 fcntl(38, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.163991 fcntl(39, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164025 fcntl(40, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164059 fcntl(41, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164097 fcntl(42, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164132 fcntl(43, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164165 fcntl(44, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164198 fcntl(45, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164231 fcntl(46, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164266 fcntl(47, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164303 fcntl(48, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164340 fcntl(49, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164374 fcntl(50, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164407 fcntl(51, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164446 fcntl(52, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164481 fcntl(53, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164515 fcntl(54, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164548 fcntl(55, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164582 fcntl(56, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164613 fcntl(57, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164647 fcntl(58, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164680 fcntl(59, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164713 fcntl(60, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164746 fcntl(61, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164780 fcntl(62, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164813 fcntl(63, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164847 fcntl(64, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164879 fcntl(65, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164913 fcntl(66, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164946 fcntl(67, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.164980 fcntl(68, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165012 fcntl(69, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165046 fcntl(70, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165079 fcntl(71, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165113 fcntl(72, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165145 fcntl(73, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165179 fcntl(74, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165212 fcntl(75, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165246 fcntl(76, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165278 fcntl(77, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165319 fcntl(78, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165352 fcntl(79, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165383 fcntl(80, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165415 fcntl(81, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165455 fcntl(82, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165490 fcntl(83, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165523 fcntl(84, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165556 fcntl(85, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165591 fcntl(86, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165625 fcntl(87, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165658 fcntl(88, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165691 fcntl(89, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165725 fcntl(90, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165759 fcntl(91, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165792 fcntl(92, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165824 fcntl(93, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165862 fcntl(94, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165901 fcntl(95, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165935 fcntl(96, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.165969 fcntl(97, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.166015 fcntl(98, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.166058 fcntl(99, F_GETFD)      = -1 EBADF (Bad file descriptor)
+11:40:18.166093 fcntl(100, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166129 fcntl(101, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166162 fcntl(102, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166196 fcntl(103, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166229 fcntl(104, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166264 fcntl(105, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166304 fcntl(106, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166345 fcntl(107, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166380 fcntl(108, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166412 fcntl(109, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166452 fcntl(110, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166487 fcntl(111, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166522 fcntl(112, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166556 fcntl(113, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166590 fcntl(114, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166623 fcntl(115, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166658 fcntl(116, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166692 fcntl(117, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166726 fcntl(118, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166759 fcntl(119, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166794 fcntl(120, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166828 fcntl(121, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166862 fcntl(122, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166895 fcntl(123, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166930 fcntl(124, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166963 fcntl(125, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.166996 fcntl(126, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.167028 fcntl(127, F_GETFD)     = -1 EBADF (Bad file descriptor)
+11:40:18.167689 +++ exited with 0 +++

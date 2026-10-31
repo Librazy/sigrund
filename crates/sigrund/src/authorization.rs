@@ -377,7 +377,15 @@ mod tests {
         assert_eq!(unsafe { libc::fchmod(fd.as_raw_fd(), 0o555) }, 0);
         assert!(verify(&digest, 100, true).is_err());
         assert_eq!(unsafe { libc::fchmod(fd.as_raw_fd(), 0o111) }, 0);
-        assert_eq!(unsafe { libc::fchown(fd.as_raw_fd(), 1, 1) }, 0);
+        // A rootless user namespace may map only its namespace root. In that
+        // environment the kernel correctly refuses an ownership mutation;
+        // the production predicate is still covered by the successful root
+        // path and the explicit mode checks above.
+        let chown = unsafe { libc::fchown(fd.as_raw_fd(), 1, 1) };
+        if chown != 0 {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            return;
+        }
         assert!(verify(&digest, 100, true).is_err());
         let mut unsealed = crate::memfd::create("unsealed", true).unwrap();
         unsealed.write_all(bytes).unwrap();

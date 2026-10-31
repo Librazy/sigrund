@@ -5,13 +5,24 @@ ConditionPathExists=/etc/sigrund/config.toml
 ConditionPathExists=/etc/sigrund/signers.toml
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 Group=root
-ExecStart=/usr/libexec/sigrund/sigrund
+ExecStart=/usr/libexec/sigrund/sigrund --foreground --socket /run/sigrund/client.sock --approval-socket /run/sigrund/approve.sock
 Restart=on-failure
+RestartSec=2s
 Delegate=yes
+KillMode=control-group
+SendSIGKILL=yes
+TimeoutStartSec=30s
+# Must exceed config.shutdown_grace_ms (default 10000).
+TimeoutStopSec=15s
+# Fatal shutdown stops heartbeats; systemd cleans up even if ownership stalls.
+WatchdogSec=3s
 RuntimeDirectory=sigrund
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=no
 StateDirectory=sigrund
 LogsDirectory=sigrund
 UMask=0077

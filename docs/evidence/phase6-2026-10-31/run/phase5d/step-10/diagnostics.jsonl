@@ -1,0 +1,13 @@
+{"event":"DAEMON_READY","host_id":"sigrun-host:sha256:411481baf29ee6c6a03808c4e95c5266d5caf04a303ebf828bd6a9347e2f086f","local_audit_forward_secure":false,"phase":"5C"}
+{"broker":false,"event":"SOCKET_ADMITTED","requester_gid":0,"requester_pid":108462,"requester_uid":0,"worker_task":7}
+{"event":"IO_WORKER_RESERVED","worker_task":7}
+{"event":"CLIENT_HELLO_VALIDATED","exec_id":"01a191c2-66e1-71db-b9a3-6ca776c4d2f8","request_mode":"signed","requester_gid":0,"requester_pid":108462,"requester_uid":0}
+{"event":"SNAPSHOTS_PREPARED","exec_id":"01a191c2-66e1-71db-b9a3-6ca776c4d2f8","null_stdin":true,"root_device":35,"root_inode":25797,"root_path":"/tmp/sigrund-runtime-l60iv9m1/commands","source_device":35,"source_inode":25799}
+{"candidate_signer_ids":["mandator-alice-yubikey"],"event":"SIGNED_SNAPSHOTS_BOUND","exec_id":"01a191c2-66e1-71db-b9a3-6ca776c4d2f8","grant_id":"01a191c2-66dd-74d7-9192-60aef568a9cb"}
+{"event":"FD_VALIDATION_COMPLETE","worker_task":7}
+{"broker":false,"event":"SOCKET_ADMITTED","requester_gid":0,"requester_pid":108462,"requester_uid":0,"worker_task":8}
+{"event":"IO_WORKER_RESERVED","worker_task":8}
+{"event":"CLIENT_HELLO_VALIDATED","exec_id":"01a191c2-66f5-73ca-84d4-3c2fd8edd3e3","request_mode":"signed","requester_gid":0,"requester_pid":108462,"requester_uid":0}
+{"event":"SNAPSHOTS_PREPARED","exec_id":"01a191c2-66f5-73ca-84d4-3c2fd8edd3e3","null_stdin":true,"root_device":35,"root_inode":25797,"root_path":"/tmp/sigrund-runtime-l60iv9m1/commands","source_device":35,"source_inode":25799}
+{"candidate_signer_ids":["mandator-alice-yubikey"],"event":"SIGNED_SNAPSHOTS_BOUND","exec_id":"01a191c2-66f5-73ca-84d4-3c2fd8edd3e3","grant_id":"01a191c2-66dd-74d7-9192-60aef568a9cb"}
+{"event":"FD_VALIDATION_COMPLETE","worker_task":8}

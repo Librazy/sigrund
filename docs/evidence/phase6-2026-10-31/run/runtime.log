@@ -1,0 +1,17 @@
+{"gate": "phase5c-runtime", "result": "passed", "observed_uid": 33, "fd_baseline": 30}
+{"gate": "phase5c-registration-shutdown", "result": "passed"}
+{"gate": "phase5c-commit-shutdown", "point": "predicate-before", "result": "passed"}
+{"gate": "phase5c-commit-shutdown", "point": "wal-before", "result": "passed"}
+{"gate": "phase5c-commit-shutdown", "point": "wal-after", "result": "passed"}
+{"gate": "phase5c-pre-spawn-readiness-shutdown", "point": "prepare-before", "result": "passed"}
+{"gate": "phase5c-pre-spawn-readiness-shutdown", "point": "stop-before-ready", "result": "passed"}
+{"gate": "phase5c-blocked-cleanup-shutdown", "result": "passed"}
+{"gate": "phase5c-poisoned-shutdown", "result": "passed"}
+{"gate": "phase5c-prior-instance-orphan-recovery", "result": "passed"}
+{"gate": "phase5c-retained-layout-trust", "result": "passed"}
+{"event": "RUNTIME_SERVICE_READY", "unit": "sigrund-phase5-service-0aed7f53bfd646cbb3d9be730a8765e3.service"}
+{"event": "RUNTIME_SERVICE_READY", "unit": "sigrund-phase5-service-0e4bedc7284649e9957ea98702f3fc9d.service"}
+{"event": "RUNTIME_SERVICE_READY", "unit": "sigrund-phase5-service-6b25c2cf5ac6475bbaa31d408fd469c9.service"}
+{"gate": "phase5c-systemd-stop-restart-death", "result": "passed"}
+{"event": "RUNTIME_SERVICE_READY", "unit": "sigrund-phase5-service-aac29fbed7e54792989a4e3f2802b884.service"}
+{"gate": "phase5c-systemd-fatal-escalation", "result": "passed"}

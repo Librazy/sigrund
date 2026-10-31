@@ -554,7 +554,7 @@ fn verify_record_hmac(record: &[u8], key: &[u8; 32]) -> Result<()> {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0
+    if !value.len().is_multiple_of(2)
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())

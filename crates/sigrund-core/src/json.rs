@@ -35,10 +35,8 @@ pub fn canonical_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
                 // This subset never needs IEEE-754 rounding: timestamps and
                 // IDs fit the exact integer range of JCS's number model.
                 const MAX_EXACT: u64 = (1u64 << 53) - 1;
-                if !number.as_u64().is_some_and(|n| n <= MAX_EXACT)
-                    && !number
-                        .as_i64()
-                        .is_some_and(|n| n.unsigned_abs() <= MAX_EXACT)
+                if number.as_u64().is_none_or(|n| n > MAX_EXACT)
+                    && number.as_i64().is_none_or(|n| n.unsigned_abs() > MAX_EXACT)
                 {
                     return Err(CoreError::Json("JCS requires an exact integer".into()));
                 }

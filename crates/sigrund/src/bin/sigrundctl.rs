@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::{
         fd::AsRawFd,
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
@@ -19,6 +19,24 @@ use sigrund_core::{
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--help") {
+        println!(
+            "Usage: sigrundctl init-host [--state-dir PATH] [--log-path PATH]\n       sigrundctl csr-pae --status PATH --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
+        );
+        return ExitCode::SUCCESS;
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "csr-pae" | "pack-warrant"))
+    {
+        return match offline_warrant(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("sigrundctl: {error}");
+                ExitCode::from(65)
+            }
+        };
+    }
     if args.get(1).is_some_and(|arg| arg == "uuidv7") {
         println!("{}", new_uuidv7());
         return ExitCode::SUCCESS;
@@ -41,6 +59,61 @@ fn main() -> ExitCode {
     }
     eprintln!("sigrundctl: provisioning commands are not enabled in this build");
     ExitCode::from(78)
+}
+
+fn offline_warrant(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use sigrund::warrant_tools::{csr_pae, extract_csr, pack_warrant};
+    let expected: &[&str] = if args[0] == "csr-pae" {
+        &["--status", "--csr", "--pae"]
+    } else {
+        &["--csr", "--signature", "--signer-id", "--output"]
+    };
+    let mut options = BTreeMap::new();
+    for pair in args[1..].chunks(2) {
+        if pair.len() != 2
+            || !expected.contains(&pair[0].as_str())
+            || pair[1].is_empty()
+            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return Err("invalid, duplicate or incomplete offline option; see --help".into());
+        }
+    }
+    if options.len() != expected.len() {
+        return Err("missing offline option; see --help".into());
+    }
+    let bounded_read = |path: &str, max: u64| -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "input exceeds size bound",
+            ));
+        }
+        Ok(bytes)
+    };
+    let write_new = |path: &str, bytes: &[u8]| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    };
+    if args[0] == "csr-pae" {
+        let csr = extract_csr(&bounded_read(options["--status"], 524_288)?)?;
+        write_new(options["--csr"], csr.as_bytes())?;
+        write_new(options["--pae"], &csr_pae(&csr))?;
+    } else {
+        let envelope = pack_warrant(
+            &bounded_read(options["--csr"], 65_536)?,
+            &bounded_read(options["--signature"], 34_000)?,
+            options["--signer-id"],
+        )?;
+        write_new(options["--output"], &envelope)?;
+    }
+    Ok(())
 }
 
 fn init_host(args: &[String]) -> ExitCode {
@@ -71,7 +144,22 @@ fn init_host(args: &[String]) -> ExitCode {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     let directories = trusted_directory(&state_dir)
-        .and_then(|state| trusted_directory(log_parent).map(|log| (state, log)));
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("state directory {}: {error}", state_dir.display()),
+            )
+        })
+        .and_then(|state| {
+            trusted_directory(log_parent)
+                .map(|log| (state, log))
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("log directory {}: {error}", log_parent.display()),
+                    )
+                })
+        });
     let (state_directory, log_directory) = match directories {
         Ok(directories) => directories,
         Err(error) => {

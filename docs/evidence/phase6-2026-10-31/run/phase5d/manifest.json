@@ -1,0 +1,424 @@
+{
+  "phase": "5D",
+  "kernel": "7.0.0-34-generic",
+  "machine": "x86_64",
+  "command": [
+    "/home/lab/sigrund-phase6-current/scripts/verify-phase5-failures.py",
+    "--cgroup-parent",
+    "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-a26207bd8ac8432881f60e458e9fc00a.service",
+    "--binaries",
+    "/home/lab/sigrund-phase6-current/target/debug",
+    "--artifacts",
+    "/var/tmp/sigrund-phase6-current-acceptance/phase5d",
+    "--strace",
+    "/usr/bin/strace"
+  ],
+  "binaries": {
+    "sigrund": "4179e072ef97d7455a6abd963c70c8b22e4c26000801d86f6d4a12c5e7a2592b",
+    "sigrun": "85ad0f34a91a4616bec024abd18f53615439df79501f5a61e8253e0c0f6dd285",
+    "sigrundctl": "cb8bea1ed2f39b36fbbaeabbf6b255b8e7852af202d1b9edad7d65b477fcf7ab"
+  },
+  "gates": [
+    {
+      "gate": "startup-swap-unavailable",
+      "result": "passed",
+      "daemon_status": 78,
+      "listeners": false,
+      "diagnostics": "sigrund: foreground runtime failed closed: No such file or directory (os error 2)"
+    },
+    {
+      "gate": "startup-clone-fail",
+      "result": "passed",
+      "daemon_status": 78,
+      "listeners": false,
+      "diagnostics": "sigrund: foreground runtime failed closed: Function not implemented (os error 38)"
+    },
+    {
+      "gate": "startup-mount-unavailable",
+      "result": "passed",
+      "daemon_status": 78,
+      "listeners": false,
+      "diagnostics": "sigrund: foreground runtime failed closed: startup clone/mount probe failed: SetupFailed { step: 1, errno: 38 }"
+    },
+    {
+      "gate": "step-1",
+      "result": "passed",
+      "duration_secs": 0.047,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 1, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-2",
+      "result": "passed",
+      "duration_secs": 0.045,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 2, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-3",
+      "result": "passed",
+      "duration_secs": 0.052,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 3, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-4",
+      "result": "passed",
+      "duration_secs": 0.052,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 4, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-5",
+      "result": "passed",
+      "duration_secs": 0.052,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 5, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-6",
+      "result": "passed",
+      "duration_secs": 0.047,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 6, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-7",
+      "result": "passed",
+      "duration_secs": 0.053,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 7, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-8",
+      "result": "passed",
+      "duration_secs": 0.046,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 8, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-9",
+      "result": "passed",
+      "duration_secs": 0.039,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 9, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-10",
+      "result": "passed",
+      "duration_secs": 0.037,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 10, errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "step-11",
+      "result": "passed",
+      "duration_secs": 0.037,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: ExecFailed { errno: 5 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "fd-exhaust",
+      "result": "passed",
+      "duration_secs": 0.037,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SetupFailed { step: 1, errno: 24 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "clone-fail",
+      "result": "passed",
+      "duration_secs": 0.036,
+      "decision": "SPAWN_FAILED",
+      "reason": "child clone failed: Function not implemented (os error 38)",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "kill-before-ready",
+      "result": "passed",
+      "duration_secs": 0.043,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SpawnFailed",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "partial-ready",
+      "result": "passed",
+      "duration_secs": 0.045,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SpawnFailed",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "excess-ready",
+      "result": "passed",
+      "duration_secs": 0.052,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SpawnFailed",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "stop-before-ready",
+      "result": "passed",
+      "duration_secs": 2.059,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SpawnFailed",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "stop-after-ready",
+      "result": "passed",
+      "duration_secs": 2.056,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: SpawnFailed",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "kernel-exec-error",
+      "result": "passed",
+      "duration_secs": 0.031,
+      "decision": "SPAWN_FAILED",
+      "reason": "child setup failed: ExecFailed { errno: 8 }",
+      "replay": "REPLAY_DETECTED"
+    },
+    {
+      "gate": "post-token-pre-exec-death",
+      "result": "passed",
+      "decision": "READY_TO_EXEC",
+      "exec_outcome": "unknown",
+      "signal": 9
+    },
+    {
+      "gate": "root-tty-workflow",
+      "result": "passed",
+      "requester_uid": 65534,
+      "approver_uid": 0,
+      "target_uid": 0,
+      "signature": "ssh-ed25519",
+      "refusal_exit": 255,
+      "approved_exit": 0,
+      "approved_stdout": "0\n"
+    },
+    {
+      "gate": "control-and-exit-races",
+      "result": "passed",
+      "concurrent_pairs": 4,
+      "forwarded_signals": [
+        1,
+        2,
+        10,
+        12,
+        15
+      ],
+      "invalid_controls": [
+        "bad-signal",
+        "wrong-type",
+        "ancillary",
+        "partial-timeout"
+      ],
+      "idle_secs": 5.2,
+      "fd_baseline": 30
+    },
+    {
+      "gate": "post-exec-observations",
+      "result": "passed",
+      "combinations": [
+        {
+          "target_uid": 0,
+          "capabilities": [],
+          "observed": {
+            "uid": [
+              0,
+              0,
+              0
+            ],
+            "gid": [
+              0,
+              0,
+              0
+            ],
+            "groups": [
+              0
+            ],
+            "cap_effective": 0,
+            "cap_permitted": 0,
+            "cap_inheritable": 0,
+            "cap_bounding": 0,
+            "cap_ambient": 0,
+            "securebits": 47,
+            "no_new_privs": 1,
+            "umask": 23,
+            "cwd": "/",
+            "pid": 109743,
+            "session": 109743,
+            "mount_flags": 4111,
+            "fd_signal_checks": true
+          },
+          "status": [
+            {
+              "csr_payload": null,
+              "exec_id": "01a191c2-b078-7494-89db-9516a8c0748c",
+              "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+              "status": "READY_TO_EXEC"
+            },
+            {
+              "exit_code": 0,
+              "signal": null
+            }
+          ]
+        },
+        {
+          "target_uid": 0,
+          "capabilities": [
+            "CAP_NET_BIND_SERVICE"
+          ],
+          "observed": {
+            "uid": [
+              0,
+              0,
+              0
+            ],
+            "gid": [
+              0,
+              0,
+              0
+            ],
+            "groups": [
+              0
+            ],
+            "cap_effective": 1024,
+            "cap_permitted": 1024,
+            "cap_inheritable": 1024,
+            "cap_bounding": 1024,
+            "cap_ambient": 1024,
+            "securebits": 47,
+            "no_new_privs": 1,
+            "umask": 23,
+            "cwd": "/",
+            "pid": 109750,
+            "session": 109750,
+            "mount_flags": 4111,
+            "fd_signal_checks": true
+          },
+          "status": [
+            {
+              "csr_payload": null,
+              "exec_id": "01a191c2-b0ba-732a-a785-00673d1465d1",
+              "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+              "status": "READY_TO_EXEC"
+            },
+            {
+              "exit_code": 0,
+              "signal": null
+            }
+          ]
+        },
+        {
+          "target_uid": 33,
+          "capabilities": [],
+          "observed": {
+            "uid": [
+              33,
+              33,
+              33
+            ],
+            "gid": [
+              33,
+              33,
+              33
+            ],
+            "groups": [
+              33
+            ],
+            "cap_effective": 0,
+            "cap_permitted": 0,
+            "cap_inheritable": 0,
+            "cap_bounding": 0,
+            "cap_ambient": 0,
+            "securebits": 47,
+            "no_new_privs": 1,
+            "umask": 23,
+            "cwd": "/",
+            "pid": 109757,
+            "session": 109757,
+            "mount_flags": 4111,
+            "fd_signal_checks": true
+          },
+          "status": [
+            {
+              "csr_payload": null,
+              "exec_id": "01a191c2-b0ff-7794-96ba-a243f2267a71",
+              "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+              "status": "READY_TO_EXEC"
+            },
+            {
+              "exit_code": 0,
+              "signal": null
+            }
+          ]
+        },
+        {
+          "target_uid": 33,
+          "capabilities": [
+            "CAP_NET_BIND_SERVICE"
+          ],
+          "observed": {
+            "uid": [
+              33,
+              33,
+              33
+            ],
+            "gid": [
+              33,
+              33,
+              33
+            ],
+            "groups": [
+              33
+            ],
+            "cap_effective": 1024,
+            "cap_permitted": 1024,
+            "cap_inheritable": 1024,
+            "cap_bounding": 1024,
+            "cap_ambient": 1024,
+            "securebits": 47,
+            "no_new_privs": 1,
+            "umask": 23,
+            "cwd": "/",
+            "pid": 109764,
+            "session": 109764,
+            "mount_flags": 4111,
+            "fd_signal_checks": true
+          },
+          "status": [
+            {
+              "csr_payload": null,
+              "exec_id": "01a191c2-b145-71f5-8080-1e4a34e9addb",
+              "message": "Authorized and ready to attempt exec; exec outcome is unknown",
+              "status": "READY_TO_EXEC"
+            },
+            {
+              "exit_code": 0,
+              "signal": null
+            }
+          ]
+        }
+      ],
+      "hashed_stdin_bytes": 1048576,
+      "hashed_stdin_sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+      "trace_files": 43
+    }
+  ],
+  "result": "passed"
+}

@@ -1,0 +1,11 @@
+11:40:18.380853 fcntl(21, F_DUPFD_CLOEXEC, 3) = 36
+11:40:18.381143 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.381310 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.381444 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.381598 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.381722 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.381876 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.381999 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.382149 fcntl(38, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
+11:40:18.507882 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
+11:40:18.508134 +++ exited with 0 +++
