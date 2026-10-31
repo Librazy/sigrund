@@ -625,6 +625,10 @@ Exit gate:
 
 ### Phase 5D: execution failure and race verification
 
+The executable gate and evidence contract are prepared in
+[MVP_PHASE5D.md](docs/MVP_PHASE5D.md). Its real delegated execution and syscall
+trace results are pending; this phase is not marked complete.
+
 Exit gate:
 
 - `sigrun --socket ... -- /usr/bin/id` returns the approved child's exact

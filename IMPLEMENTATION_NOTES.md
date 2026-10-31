@@ -317,6 +317,12 @@ runtime and transient-service verification in
 [MVP_PHASE5C.md](docs/MVP_PHASE5C.md) remains pending approved execution;
 these ordinary checks do not establish delegated-host acceptance.
 
+Phase 5D's real failure/race harness is prepared in
+[MVP_PHASE5D.md](docs/MVP_PHASE5D.md). It adds startup feature failures,
+per-step child failures, readiness races, real root-TTY approval/execution,
+post-exec kernel observations and retained syscall traces. Its privileged
+acceptance remains pending; the complete phase and MVP are not yet verified.
+
 ## Deliberately incomplete runtime
 
 The following specification surfaces are still stubs and must not be treated
