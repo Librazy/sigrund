@@ -1,3 +1,0 @@
-11:40:18.509387 fcntl(26, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
-11:40:18.509574 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
-11:40:18.509792 +++ exited with 0 +++

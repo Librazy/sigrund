@@ -1,2 +1,0 @@
-11:40:18.507422 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
-11:40:18.507735 +++ exited with 0 +++

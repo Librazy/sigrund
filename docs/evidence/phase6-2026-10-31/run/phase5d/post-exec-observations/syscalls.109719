@@ -1,5 +1,0 @@
-11:40:18.141211 fcntl(38, F_SETFL, O_RDONLY|O_NONBLOCK) = 0
-11:40:18.141272 clone3({flags=CLONE_PIDFD|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_INTO_CGROUP, pidfd=0x7e7e9a5eef6c, exit_signal=SIGCHLD, stack=NULL, stack_size=0, cgroup=37} => {pidfd=[40]}, 88) = 109764
-11:40:18.141884 fcntl(39, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
-11:40:18.507354 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
-11:40:18.507668 +++ exited with 0 +++

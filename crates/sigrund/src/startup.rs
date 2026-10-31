@@ -104,7 +104,7 @@ impl StartupResources {
             ));
         }
         if config.mvp.is_none() || config.require_remote_audit_ack {
-            return Err(invalid("Phase 1 requires the local-audit [mvp] profile"));
+            return Err(invalid("runtime requires the local-audit [mvp] profile"));
         }
         let state_directory = open_pinned(state_dir)?;
         check_root_metadata(&state_directory, true, None)?;

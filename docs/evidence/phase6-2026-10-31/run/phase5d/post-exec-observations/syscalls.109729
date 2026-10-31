@@ -1,8 +1,0 @@
-11:40:18.328167 inotify_add_watch(39, "/proc/self/fd/37/cgroup.events", IN_MODIFY) = 1
-11:40:18.328327 fcntl(40, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
-11:40:18.328491 fcntl(40, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
-11:40:18.328560 fcntl(39, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
-11:40:18.328736 fcntl(37, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
-11:40:18.328801 fcntl(36, F_GETFD)      = 0x1 (flags FD_CLOEXEC)
-11:40:18.507795 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
-11:40:18.508072 +++ exited with 0 +++

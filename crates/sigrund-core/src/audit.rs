@@ -724,7 +724,7 @@ mod tests {
             writer
                 .append_event(
                     "AUTH_ABORTED_POST_COMMIT",
-                    serde_json::json!({"exec_id":"fixture","reason":"phase5 unavailable"}),
+                    serde_json::json!({"exec_id":"fixture","reason":"execution unavailable"}),
                     MAX_RECORD_BYTES
                 )
                 .unwrap(),

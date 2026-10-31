@@ -1,4 +1,4 @@
-//! Root approval broker documents. Transport/peer authentication is Phase 1.
+//! Root approval broker documents; peer authentication belongs to the transport.
 //!
 //! Broker frames are a four-byte big-endian body length followed by one JCS
 //! document. Both directions share the bounded body size below; no SCM_RIGHTS

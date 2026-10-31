@@ -3,7 +3,7 @@
 Design discussion recorded on 2026-10-31. These notes capture the intended
 separation of authorization, execution and destination routing. They propose
 follow-on work; they do not add protocol fields, CLI options or implementation
-claims to the current specification or MVP roadmap.
+claims to the current specification.
 
 The motivating use case is replacing a fragile personal pkexec workflow with
 one request, a root-TTY confirmation and SSH signature, execution, and a returned
@@ -133,13 +133,10 @@ own design and tests before such an adapter can be enabled.
 
 ## MVP boundary and follow-on gates
 
-Phases 5C/5D execute commands in the configured domain. Complete the Phase 6
-two-UID end-to-end fixture using execution in the
-daemon's configured domain, with the existing documented child-isolation
-changes. This boundary does not automatically follow the requester's
-namespaces or add cross-domain routing. The real Phase 5C/5D acceptance
-evidence is recorded in their phase documents; these design notes introduce
-no additional implementation claims.
+The local profile executes commands in the daemon's configured domain, with
+the documented child-isolation changes. It does not automatically follow the
+requester's namespaces or add cross-domain routing. Current scope and test
+entry points are summarized in [the implementation notes](../IMPLEMENTATION_NOTES.md).
 
 Before extending that boundary, decide whether independently deployed daemons
 or a host runtime adapter serve each supported destination, and version any
@@ -154,5 +151,5 @@ needed signed identity/context fields. Useful follow-on verification includes:
 - Route loss, cancellation, replay consumption, audit and cleanup ownership.
 
 These gates require additional design and implementation after the current
-MVP; they are not satisfied by the existing namespace-root or Phase 5A/5B
+MVP; they are not satisfied by the existing namespace-root or delegated
 platform tests.

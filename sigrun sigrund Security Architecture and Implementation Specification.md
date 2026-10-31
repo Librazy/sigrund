@@ -1128,8 +1128,6 @@ Both signed and unsigned requests must use `one_time`, `stdio`, `null` or
 even if the general configuration opts into it. Other unsupported profile
 values fail with `POLICY_VIOLATION`; malformed shapes retain their existing
 protocol errors. No setting or signed warrant can enable a deferred feature.
-The Phase 0/1 transport-only implementation lacks the new signer setting;
-it must continue rejecting execution until these additions are implemented.
 
 **Broker trust and bytes:** Use a distinct root:root `0600` `SOCK_STREAM`
 socket in a trusted root-owned directory. Authenticate `SO_PEERCRED.uid == 0`
@@ -1195,8 +1193,9 @@ Verification must cover real terminal output through the Section 2.3 relay,
 OpenSSH signing interoperability, complete sanitized display, no approver,
 busy admission, wrong key/PAE/namespace, refusal/EOF, slow signing, expired
 warrants, stale/duplicate replies, reconnect and disconnect at every boundary.
-M-01–M-15 in the MVP roadmap are the profile's release gates; they supplement
-the applicable Section 8 cases and do not establish full v1.0 conformance.
+The local-profile tests and reproduction commands are indexed in
+`IMPLEMENTATION_NOTES.md`. They supplement the applicable Section 8 cases;
+passing local-profile tests does not establish full v1.0 conformance.
 
 ---
 
@@ -1492,35 +1491,12 @@ hook, reload and remote subcases remain requirements for their owning features.
 
 ### 8.3 Implementation Status and Release Gate
 
-This specification is the target runtime contract. The current repository
-contains tested protocol, policy, snapshot, lifecycle, state, audit, framing,
-path, memfd, and cgroup helper primitives. Phases 0–3 provide typed request and
-broker contracts, bounded foreground transport, retained sealed snapshots,
-root-TTY approval, and SSH signing. Phase 4 now integrates the local thin
-profile authorization predicate, one bounded off-loop SQLite/audit sequencer,
-one-time consumption, authenticated `AUTH_COMMIT`/rejection records, and
-post-commit abort reconciliation. Phase 4.5 adds independent pre-commit denial
-responses, retained bounded audit ownership, admission windows and sticky
-storage-pressure gates, including post-append refresh.
-
-Phases 5A–5D integrate descriptor-pinned cgroup startup, bounded committed-job
-preparation/cleanup, the pending-spawn registration barrier, the syscall-only
-child transition, readiness/exit publication, central reaping, disconnect
-teardown and active-job shutdown. Normal foreground startup requires its
-isolated platform probe; `--authorization-only` explicitly selects the
-non-executing diagnostic profile. Delegated-host acceptance passed on
-2026-10-31 with actual post-exec credentials, setup/race failures, service
-restart and whole-service cleanup.
-
-Phase 6 supplies the two-UID operator lab, packaged and supervised foreground
-recipes, offline CSR/PAE/SSHSIG packaging and broader local MVP acceptance.
-Its disposable pvem run and ordinary-check manifests are recorded in
-`docs/evidence/phase6-2026-10-31/`; `docs/MVP_COVERAGE.md` distinguishes verified
-local subcases from unimplemented features. The current profile supports
-one-time SSH warrants with stdio and null/hashed stdin. Local privileged tests
-remain deferred; namespace-only fixtures do not substitute for the recorded
-real delegated VM gates. These results establish the thin local MVP boundary,
-not complete v1.0 conformance.
+This specification is the target runtime contract. Current implementation scope,
+operator instructions, module-based test coverage and deferred features are
+maintained in `IMPLEMENTATION_NOTES.md`. The implemented local profile supports
+one-time SSH warrants, root-TTY approval, stdio execution and null/hashed stdin;
+it does not establish complete v1.0 conformance. Namespace-only fixtures do not
+substitute for real delegated-host execution tests.
 
 The following integrations are required before claiming v1.0 conformance:
 

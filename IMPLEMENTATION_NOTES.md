@@ -1,416 +1,256 @@
 # sigrun/sigrund implementation notes
 
-These notes record the implementation boundary for the current `feat/mvp`
-branch. The security specification remains the normative contract. A helper is
-described as implemented only when its behavior is covered by a focused test;
-the helper alone does not establish the end-to-end daemon guarantee.
+The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
+is normative. These notes describe the implemented local approval profile,
+operator workflow, test layout and remaining scope. Historical milestone reports
+and acceptance artifacts remain in Git history.
 
-The executable delivery plan is in [MVP_ROADMAP.md](MVP_ROADMAP.md). It
-defines the thin `stdio` approval/signing workflow and the gates required
-before expanding to the full v1.0 surface.
+## Supported workflow and limits
 
-The midpoint roadmap revision adds explicit client defaults, terminal output
-relaying, signer/key selection, bounded root approval, off-loop cleanup and
-post-clone safety gates. Specification Section 6.3 now defines the target
-local-approval profile, including a required execution-time
-`mvp.approval_signer_id`. Phase 1.5 implements received-FD cleanup, retained
-request/snapshot ownership, root pinning, streaming snapshot builders and
-request-profile restrictions. Phases 2–3 add client options and relays, common
-snapshots, explicit signer/key selection, and foreground root approval. Phase 4
-adds local authorization, SQLite consumption and serialized durable audit.
-Phases 5A/5B add startup, ownership and child-transition foundations. Phase 5C
-wires live request execution, central reaping and shutdown; its ordinary
-regressions and real delegated runtime/service acceptance pass. Phase 5D adds
-verified execution failures, races, syscall traces and post-exec observations.
-M-01–M-15 and applicable V subcases gate the revised MVP. The Phase 0/1 evidence
-documents remain records of what was actually implemented and tested.
+An unprivileged requester runs `sigrun`; a foreground root approver reviews the
+complete request on its own controlling TTY and signs with an explicitly chosen
+SSH key. The daemon verifies the signature and policy, consumes the one-time
+grant, persists local audit, executes sealed input snapshots, and returns
+separate stdout/stderr and the primary child's exit status. Pre-signed warrants
+use the same authorization and execution gates without an online approver.
 
-## Current implementation
+Execution requires the `[mvp]` daemon profile and a configured
+`approval_signer_id` naming exactly one SSH signer. This profile supports
+`ssh-ed25519` and `sk-ssh-ed25519`, one-time grants, `stdio`, and null or hashed
+finite stdin. It rejects direct scripts, caller environment forwarding,
+same-UID execution, PTY, hooks and remote audit acknowledgements. Collector
+configuration is still mandatory and validated. The approval capacity is one;
+busy requests receive `RESOURCE_EXHAUSTED`. Without an approver, a completed
+request immediately returns `TIMEOUT_CSR` for offline signing. Refusal returns
+`REJECTED`; broker loss or the cumulative 120-second approval deadline returns
+`TIMEOUT_CSR`. None of these pre-commit outcomes consumes a grant.
 
-The repository currently contains tested building blocks for:
+The client defaults to UID/GID `0:0`, no supplementary groups or capabilities,
+its captured absolute cwd, exact environment `LANG=C.UTF-8` and
+`PATH=/usr/sbin:/usr/bin`, umask `077`, null stdin and a 900-second TTL subject
+to daemon/signer bounds. Executables require absolute canonical paths beneath
+configured roots. Arguments are exact values without shell evaluation or PATH
+search. `--stdin sha256` snapshots finite file/pipe input; TTY stdin is rejected.
+`--status-fd` must be separate from command output, including descriptor aliases.
+Authorization denial defaults to exit 255, protocol/disconnect failure to 254,
+and usage errors to 64; successful execution returns the child's status.
 
-- strict JSON preflight and schema validation, including duplicate-key,
-  nesting, string, array, frame, DSSE, child-exit, and audit-record limits;
-- canonical UUIDv7, Base64, digest, and DSSE/PAE helpers;
-- policy TOML parsing, signer/root consistency checks, immutable protocol
-  ceilings, collector key validation, and policy-generation snapshots;
-- anchored path-prefix selection, bounded executable/stdin copying, digest
-  calculation, cancellation checks, memfd sealing, and the Linux cgroup
-  startup probe;
-- lifecycle CAS transitions, readiness publication, reservation cancellation,
-  durable one-time-grant consumption, digest revocation normalization, and
-  hash-chained audit append/recovery primitives; and
-- bounded frame encoding/decoding and the exact `CLIENT_HELLO`, decision,
-  child-exit, and remote-batch shape validators.
+Root approves only with `y` or `yes` after every CSR field and the selected key
+fingerprint are displayed with escaped arguments. The root-owned identity may
+be a private key or a public key backed by root's SSH agent. Signing uses
+OpenSSH SSHSIG over DSSE PAE, with namespace `sigrun.warrant.v1` and SHA-512.
+Passphrases stay on the verified TTY; askpass is disabled, and terminal settings
+are restored after helper cancellation. Software, encrypted-key and agent paths
+have fixtures; simulated security-key signatures do not prove physical FIDO
+operation.
 
-The workspace suite includes the primitives above and a Phase 1 real-daemon
-fixture with namespace-root and non-root peers. These tests are not substitutes
-for the complete verification matrix in Section 8 of the specification.
+Interpreter approval grants programmable authority within the selected
+credentials. An executable digest does not bind mutable script files, libraries
+or imports. Jobs execute in the daemon's configured domain; requester namespaces
+are not followed automatically. Cross-container/host routing is unimplemented.
+See [interpreter and execution-domain design notes](docs/INTERPRETERS_AND_EXECUTION_DOMAINS.md).
 
-The minimum supported Rust version is 1.89, matching the active Linux locked
-dependencies (including `uuid` 1.29). The complete workspace test suite is
-verified with Rust 1.89 and the lockfile, as well as the development toolchain.
+## Code ownership and security boundaries
 
-The SSHSIG verifier now parses raw `SSHSIG` envelopes for `ssh-ed25519` and
-`sk-ssh-ed25519`, checks the warrant namespace and SHA-512 envelope, matches
-the configured public-key algorithm, and enforces the configured FIDO user
-presence and verification flags. OpenPGP and Sigstore adapters remain future
-integration work.
+| Area | Responsibility |
+| --- | --- |
+| `sigrund-core` | Strict bounded JSON, canonical warrant/CSR and broker schemas, policy validation, crypto, framing, lifecycle CAS, SQLite consumption and authenticated audit recovery. |
+| `cli`, `client`, `approver`, `warrant_tools` | Options, requester output/status and signal handling, root-TTY signing, and byte-preserving offline packaging. |
+| `daemon`, `transport`, `admission`, `workers`, `socket_disposal` | Coordinator transitions, credential checks, bounded socket/worker ownership, deadlines, framing and off-loop disposal. |
+| `linux`, `memfd`, `snapshot`, `preparation`, `authorization` | Pinned executable-root resolution, sealed snapshots, digest/signature binding and final authorization predicates. |
+| `sequencer`, `storage` | Serialized durable consumption/audit, retained denial-audit leases, poison handling and sticky storage-pressure admission gates. |
+| `startup`, `cgroup`, `jobs`, `execution`, `reaper`, `runtime`, `service` | Verified provisioning/startup, cgroup limits, syscall-only child transition, readiness, reaping, shutdown and service-manager supervision. |
 
-## Completed roadmap Phase 0
+The coordinator owns request transitions and the single authorization decision.
+Workers return owned results; FDs, snapshots, captured policy and quota charges
+move together. Caller-controlled metadata, reads, final descriptor/socket closes
+and filesystem persistence run off-loop. Timeout or disconnect cannot release a
+worker/RAM/audit reservation until its owner actually finishes cleanup. Sockets
+are unregistered from epoll before retirement, including when a worker retains
+a duplicate. Unmappable peer credentials reject only that connection.
 
-The thin-MVP boundary is implemented and documented in
-[docs/MVP_PHASE0.md](docs/MVP_PHASE0.md). `warrant` supplies typed command,
-execution-context, policy, warrant, immutable canonical-warrant, and completed
-CSR contracts. Canonical JSON sorts object keys recursively by UTF-16 code
-units and checks exact input/output bytes. `approval` defines bounded broker
-requests and approved/rejected responses, with execution-ID, selected-signer,
-and complete CSR binding. These operations validate syntax and binding; the
-runtime still must verify signatures and all authorization predicates.
+Executable and stdin snapshots share the same bounded preparation path for
+signed and unsigned requests. Root pinning permits mount crossings; executable
+resolution beneath a pinned root uses stricter `openat2` restrictions. Final
+authorization rechecks retained root identity, sealed bytes, policy, validity and
+revocation. Multi-signature envelopes select an eligible unrevoked signer under
+the serialized revocation gate. One-time consumption stores the raw SHA-256
+payload digest; database failures are distinguished from replay conflicts.
 
-An opt-in `[mvp]` daemon configuration table fixes `stdio`, disables hooks and
-PTY, requires local audit without remote ACK, and sets the active approval
-capacity to one. The profile is retained in captured policy generations. Only
-SSH Ed25519 signer adapters are accepted under that profile. The shared CLI
-parser defines daemon/client/approver commands and separate socket overrides;
-all three commands expose `--help`. The `sigrun` runtime now implements the
-Phase 2 requester path; `sigrund-approve` implements the Phase 3 root-TTY
-approval and SSH signing path described below.
+Pre-commit denials have bounded delivery independent of durable audit I/O;
+a separate bounded audit lease remains owned until persistence or fatal shutdown.
+Storage pressure latches after an append crosses the threshold. Commit/spawn
+reservations defer cancellation results until the operation is reconciled.
+Returned children are registered before the reaper's unpublished-spawn barrier
+opens; known children remain serviceable. The child tracks its actual error-pipe
+FD through remapping rather than assuming inherited FD 4 is safe. Readiness
+confirms setup, with exec outcome still unknown.
 
-The implement/verify/fix loop exercised golden canonical bytes, UTF-16 key
-ordering, maximum-size round trips, invalid schema and encoding cases,
-every CSR field's binding, checked TTL arithmetic, profile rejection, and real
-binary diagnostics. Verification exposed a Clippy style error, which was
-fixed. Contract inspection also removed a hardcoded default TTL from request
-shape validation: the CSR builder now enforces the captured configuration
-limit and checked timestamp arithmetic. Signed hellos reject unsigned-only
-fields, and supplementary GIDs reject the Linux overflow sentinel.
-Final inspection found that serializing absent hello fields as null could
-reject a valid request at the byte ceiling. Optional fields now remain absent
-on output, and the raw hello parser checks original wire lengths before
-deserialization and the unsigned limit after mode selection. Exact-ceiling
-tests cover both request modes and the unsigned serialized body.
+Startup pins and verifies trusted root-owned files/directories, locks state,
+recovers audit through verified descriptors, and probes required kernel and
+credential operations before exposing listeners. Each job enforces memory,
+swap and PID limits. Shutdown stops admission, reconciles reserved work, kills
+and reaps jobs, and retains cleanup ownership. Systemd supplies the final
+whole-service kill boundary for stalled cleanup; watchdog deadlines bound idle
+polling. `--authorization-only` is an explicit non-executing diagnostic mode.
 
-## Phase 1: foreground startup and sockets
+Provisioning uses private files, trusted directories, atomic ratchet-state
+publication and file/parent-directory fsync barriers. Audit recovery streams
+bounded records and verifies HMACs, sequence, host and hash links. It permits a
+partial tail only at a synchronized checkpoint, or one complete record ahead
+of state with no partial tail. Failed state publication poisons the writer until
+verified recovery. Retaining `initial_key_hex` enables history verification but
+provides neither forward secrecy after root/state compromise nor protection
+against whole-state rollback without an external checkpoint.
 
-The normal daemon path now runs a nonblocking epoll loop under the opt-in MVP
-profile. It verifies root ownership and permissions, pins executable roots and
-collector files, derives and checks the provisioned host identity, locks the
-state directory, removes a safe stale ratchet temporary file, and completes
-host-bound audit recovery before binding the sockets. The client endpoint is
-`root:root 0666`; the separate approval broker is `root:root 0600` and checks
-`SO_PEERCRED.uid == 0` before allocating a broker parser or receiving bytes.
+## Operator lab
 
-Admission enforces configured global/per-UID socket limits at `accept4()`.
-Every control receive uses `recvmsg(MSG_CMSG_CLOEXEC | MSG_DONTWAIT)` with
-bounded ancillary storage. Framing retains cumulative receive/send deadlines,
-checks the exact stdio FD matrix, and closes all pending/delivered rights on
-failure. A valid hello produces a `CLIENT_HELLO_VALIDATED` diagnostic with the
-kernel peer identity and one explicit `REJECTED` decision. Unsolicited broker
-responses never authorize a request. Diagnostics use a bounded off-loop queue;
-they are separate from the Phase 4 authorization audit records.
+Use a disposable native Linux systemd host with unified cgroup v2 and the
+required kernel operations. Root in a container alone does not establish
+working delegation, mount visibility or service-manager transport. The startup
+probe is authoritative; the lab does not implement namespace routing.
 
-Descriptor metadata validation runs on fixed off-loop workers, since even
-`fstat()` can block on FUSE or remote filesystems. Global/per-UID worker quotas
-and received FDs remain owned by a task after timeout/disconnect until actual
-cleanup; cancellation checks surround the metadata calls. Completion arrives
-through eventfd, and late results cannot change a terminal decision. Shutdown
-never joins a stalled worker. Invalid `SO_PEERCRED` results, including PID zero
-from an ancestor PID namespace, reject only the individual connection.
+Build as the workspace user. As root, prepare a fresh directory directly under
+a trusted root-owned parent, using an existing ordinary requester login distinct
+from UID 0, 33 and 65534:
 
-The implement/verify/fix loop added socketpair probes and a real-daemon fixture
-inside an unprivileged user namespace, with mapped UID 0, 65533, and 65534.
-Verification caught an inaccessible test executable for non-root peers and
-missing context on audit startup errors; both were corrected. Final inspection
-also added raw path-component validation before `Path` can normalize spelling
-and replaced timing guesses in admission tests with observed admission events.
-The fixture checks both audit recovery cases, host binding, startup refusal,
-actual quotas/deadlines, shutdown cleanup, and unchanged daemon FD counts after
-hostile requests. See [docs/MVP_PHASE1.md](docs/MVP_PHASE1.md) for the gate and
-its prerequisites.
-Review regressions additionally gate `fstat()` in the real daemon to verify
-worker isolation, quota pinning, late-result suppression, and responsive
-shutdown. A child PID-namespace fixture verifies that unmappable peers cannot
-stop either listener and that valid peers still work afterward.
+```sh
+export TEST_REPO=/absolute/sigrund
+python3 "$TEST_REPO/scripts/operator-lab.py" prepare \
+  --directory /var/lib/sigrund-demo --binaries "$TEST_REPO/target/debug" \
+  --requester requester
+source /var/lib/sigrund-demo/environment.sh
+python3 "$TEST_REPO/scripts/operator-lab.py" start --directory "$TEST_BASE"
+python3 "$TEST_REPO/scripts/operator-lab.py" status --directory "$TEST_BASE"
+```
 
-## Phase 1.5: ownership and snapshot foundations
+The helper copies binaries/native test commands and generates a disposable
+root-owned software signing key, signer policy and isolated state. Collector
+files are inactive placeholders for this local-only profile. It installs only
+a uniquely named temporary unit under `/run/systemd/system`. After stopping the
+service recipe, `foreground --directory "$TEST_BASE"` uses `systemd-run` with
+the same delegation, readiness, watchdog and whole-service cleanup. Use one
+recipe at a time. Packaged sockets are `/run/sigrund/client.sock` and
+`/run/sigrund/approve.sock`; bare binary defaults are `/run/sigrund.sock` and
+`/run/sigrund-approve.sock`. The lab exports its own socket paths.
 
-[docs/MVP_PHASE1_5.md](docs/MVP_PHASE1_5.md) tracks the five midpoint findings
-and their Implement–Verify–Fix evidence. The shared I/O pool now reserves
-global/per-UID capacity before receiving a frame and receives/parses/validates
-and disposes of caller rights on that worker. Quota refusal closes the local
-socket without receiving its queued rights. Partial-frame timeout, malformed
-ancillary data, JSON/profile failure, disconnect and stale results cannot
-close caller FDs on the control loop. Root broker receives use the same budget;
-idle broker connections consume no slot.
+In root's separate controlling terminal:
 
-Successful validation returns a lease retaining the hello, descriptors,
-captured policy, requester UID, deadline and cancellation flag. It may carry
-sealed executable/stdin snapshots and continue on the same reserved worker.
-Dropping the lease schedules disposal there; only cleanup completion releases
-the worker slot. Socket readiness is disabled while the worker receives, with
-disconnect/error events and coordinator deadlines still active.
-Every connection retirement explicitly removes its epoll registration before
-closing the coordinator's socket. A worker's duplicate socket may outlive it
-during blocked disposal; leaving the registration active would repeatedly
-deliver hangups for a removed token. The real-daemon fixture verifies removal
-while cleanup remains blocked.
+```sh
+source /var/lib/sigrund-demo/environment.sh
+"$TEST_BIN/sigrund-approve" --socket "$TEST_APPROVAL_SOCKET" --tty /dev/tty \
+  --signers "$TEST_SIGNERS" --identity "$TEST_SSH_IDENTITY"
+```
 
-Executable roots now use separate `O_PATH | O_DIRECTORY` pinning, while
-readable-file and executable-relative opens retain their appropriate flags.
-Worker-only snapshot builders stream/hash with fixed 64-KiB scratch storage,
-reserve aggregate RAM before memfd allocation, retain quotas through source
-close and ownership transfer, seal the destination, rewind it, and trim hashed
-stdin to actual length. Empty stdin is valid. The common snapshot coordinator
-and source-selection/signature gate are integrated in Phase 2 on the retained
-worker lease.
+In the requester login:
 
-The MVP request gate enforces one-time/stdio/null-or-hashed-stdin, no scripts,
-no forwarded caller environment and no same-UID execution using kernel peer
-UID. These restrictions apply before metadata for signed and unsigned requests;
-they do not replace signature verification or the full authorization predicate.
+```sh
+source /var/lib/sigrund-demo/environment.sh
+"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --cwd / --status-fd 3 \
+  -- "$TEST_COMMANDS/id" -u 3>request.status.jsonl
+```
 
-## Phase 2: client transport and common snapshots
+Approval prints the target UID and returns the child's status. A service-user
+request can add `--target-uid 33 --target-gid 33`; `--stdin sha256` binds piped
+or redirected input. Keep status in its own file and inspect it separately.
 
-The Phase 2 client captures and validates requester options before connecting,
-constructs the exact canonical hello with documented defaults, duplicates
-caller descriptors before allocating internal FDs, and sends stdout/stderr
-(plus hashed stdin when selected) with the first hello byte using bounded
-nonblocking `SCM_RIGHTS`. Separate relay threads keep control and cancellation
-responsive while local sinks block; status output remains newline-delimited and
-separate from child output. Malformed, wrong-state, fragmented, disconnected,
-and deadline-expired server responses are handled with the specified status
-codes, and output is drained through EOF after child exit.
+For offline signing, stop the approver and capture a fresh `TIMEOUT_CSR` using
+the requester invocation above. As root, extract and review the exact CSR, sign
+its PAE, and package the envelope:
 
-The daemon continues each validated request on its existing reserved worker.
-Preparation selects a pinned root, opens the executable beneath it with
-`openat2()`, snapshots and hashes sealed executable/stdin memfds, retains
-source/root identities and captured policy, and builds a canonical CSR from
-kernel peer credentials and the provisioned host identity. Signed DSSE
-requests verify an SSHSIG candidate and static policy before source opening,
-then compare signed executable/stdin digests against the sealed results.
-Snapshot memory and descriptor ownership remain charged until worker cleanup.
-No approval, durable authorization, or child spawn is attempted in this phase:
-unsigned requests receive `TIMEOUT_CSR`, and signed requests receive a bounded
-rejection after preparation.
+```sh
+"$TEST_BIN/sigrundctl" csr-pae --status /home/requester/request.status.jsonl \
+  --csr "$TEST_BASE/request.csr" --pae "$TEST_BASE/request.pae"
+python3 -m json.tool "$TEST_BASE/request.csr"
+# Review every field before signing.
+ssh-keygen -Y sign -n sigrun.warrant.v1 -O hashalg=sha512 \
+  -f "$TEST_SSH_IDENTITY" "$TEST_BASE/request.pae"
+"$TEST_BIN/sigrundctl" pack-warrant --csr "$TEST_BASE/request.csr" \
+  --signature "$TEST_BASE/request.pae.sig" --signer-id "$TEST_SIGNER_ID" \
+  --output "$TEST_BASE/request.warrant.json"
+chmod 0644 "$TEST_BASE/request.warrant.json"
+```
 
-Focused implementation–verification–fix evidence is recorded in
-[docs/MVP_PHASE2.md](docs/MVP_PHASE2.md).
+The original requester redeems before expiry with
+`"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --warrant "$TEST_BASE/request.warrant.json"`.
+A second redemption is replay-denied. Packaging preserves signed bytes and
+refuses output overwrite; it does not grant authorization or refresh validity.
 
-## Completed roadmap Phase 3
+Stop either lab recipe as root with
+`python3 "$TEST_REPO/scripts/operator-lab.py" stop --directory "$TEST_BASE"`.
+Verify the unit, sockets and cgroup are gone. State and keys remain private.
+After uncertain commit/spawn outcomes, inspect status, audit and consumption
+state before obtaining fresh approval. Do not retry automatically or delete
+consumption records. For storage pressure, stop, restore capacity without
+truncating history, and restart to revalidate. Keep host identity, full audit
+history, ratchet state, SQLite database and sidecars together.
 
-[docs/MVP_PHASE3.md](docs/MVP_PHASE3.md) maps each deliverable to its
-verification evidence. The daemon reserves one unsigned approval slot after
-static policy checks and before snapshots. It uses the same reserved worker,
-sealed executable/stdin, captured policy and exact CSR for broker exchange and
-SSH verification. No approver, refusal, busy admission, expiry and disconnect
-have bounded outcomes; cancellation invalidates the prompt and retains worker,
-FD and RAM reservations through cleanup.
+## Tests and reproduction
 
-`sigrund-approve` validates UID 0, its foreground controlling TTY, the trusted
-broker and root-controlled policy/identity. It displays every CSR field with
-escaped indexed arguments and signs only explicit `y`/`yes`. OpenSSH receives
-fixed arguments and DSSE PAE on stdin; the helper is bounded, killed and reaped
-on abort, and its signature is verified locally before delivery. Actual PTY
-fixtures cover software keys, encrypted private-key passphrase entry and
-public keys backed by an SSH agent. Physical FIDO signing remains unverified;
-existing simulated SK verification does not establish hardware operation.
+Rust integration suites and native fixtures are organized by their owning
+module. Tests inside source modules remain beside the implementation.
 
-The Phase 3 boundary now hands a successfully verified approval to the Phase 4
-authorization executor. The executor revalidates retained snapshots, signer,
-peer, environment, validity, and policy, consumes one-time grants in SQLite,
-and appends authenticated `AUTH_COMMIT`/`AUTH_ABORTED_POST_COMMIT` records.
-The local profile then returns `SPAWN_FAILED` with an explicit Phase 5 handoff;
-no elevated child or readiness frame is created.
+| Suite | Main coverage |
+| --- | --- |
+| `sigrund-core/tests/contracts/{warrant,approval,config,json,protocol}.rs` | Canonical bytes, bounds, every signed CSR field, exact broker schemas, profile/signer restrictions and wire ceilings. |
+| `sigrund/tests/{cli,client,transport}.rs` | CLI/defaults, malformed frames and rights, deadlines, status isolation, TTY/file/pipe relays, blocked/broken output and cancellation. |
+| `sigrund/tests/{linux,snapshot}.rs` | Root pinning, safe resolution, bounded sealed copying, mutation/EOF handling and retained RAM ownership. |
+| `sigrund/tests/daemon.rs` and `daemon/` | Real namespace-root daemon, non-root peers, startup/provisioning, approval/refusal/signing/reconnect, replay/revocation, blocked I/O/disposal, durable denials and storage pressure. |
+| `sigrund/tests/{cgroup,execution,reaper}.rs` | Delegated platform operations, child setup failures and FD sentinels, early exits and reaper registration barrier. |
+| `sigrund/tests/warrant_tools.rs` | Offline CSR/PAE/SSHSIG byte preservation and malformed/ambiguous input. |
+| `sigrund/tests/fixtures/{execution,storage,transport}/` | Native probes and fault interposers; fault switches never enter production builds. |
+| `scripts/tests/` | Acceptance cancellation observation order and operator-service lifetime guards. |
 
-Phase 4's completed checklist and verification evidence are in
-[docs/MVP_PHASE4.md](docs/MVP_PHASE4.md). Runtime tests cover concurrent
-matching-peer redemption, all three revocation selectors, signed null/hashed
-stdin, cancellation around commit, blocked WAL/audit sync, fatal persistence
-errors and startup recovery. Final authorization rehashes retained sealed
-bytes and checks root identity, mode/ownership/seals and ELF. SQLite database
-and sidecars stay under a verified directory FD; metadata verification closes
-its separate database FD before SQLite locks it so it cannot release SQLite's
-process-wide POSIX locks and hide later administrative revocations.
+Rust >= 1.89, Cargo/Clippy/rustfmt, a C compiler, Python 3, OpenSSH and uidmap
+utilities are required. Namespace fixtures need subordinate UID/GID mappings
+and permitted user namespaces. Run ordinary checks as an unprivileged user:
 
-## Completed roadmap Phase 4.5
+```sh
+python3 scripts/check.py --artifacts /tmp/sigrund-checks
+```
 
-Phase 4.5 closes the pre-execution response deadline gap. Each admitted
-request reserves one bounded audit lease at accept time, separately from its
-socket, worker and snapshot ownership. Timeout, refusal, policy and resource
-denials enqueue their record without waiting for SQLite or fsync, then publish
-one decision through the control socket. Closing the socket cannot discard the
-lease; the durable executor owns it until append completion or fail-closed
-shutdown. Admission counters use fixed monotonic windows with bounded UID
-state, and refused attempts are coalesced into one diagnostic slot.
+This runs the locked workspace build/tests, Clippy, formatting, diff and Python
+checks and discovers the delegated platform test executable through Cargo JSON.
+It binds source and binary digests to the temporary check manifest. Use fresh
+artifact directories after source changes; keep run output outside the checkout.
 
-`StoragePressure` checks the pinned audit/state filesystems with checked
-`fstatvfs` arithmetic and enforces the configured log high-water and free-space
-floors. Capacity checks run in the durable executor and startup; pressure is
-sticky until verified restart. ENOSPC/EIO and failed capacity queries stop the
-service without retrying uncertain authorization. The Phase 4 namespace gate
-reads `REQUEST_TIMEOUT` and `RESOURCE_EXHAUSTED` while a WAL/audit sync remains
-blocked, then verifies replay and shutdown behavior after releasing the gate.
-The pre-FD-4 child setup, pending-spawn reaper barrier and active-job shutdown
-contracts are frozen in the specification. Phase 5B implements the tracked
-child error descriptor; Phase 5C integrates the tested registration barrier
-and active-job shutdown. Phase 5D verifies the resulting real execution path.
+Privileged acceptance additionally needs systemd, actual delegated `memory`
+and `pids` controllers with swap controls, the required Linux namespace/mount
+and clone operations, strace and Python PyGObject. As root on a disposable test
+host, run:
 
-The durable sequencer also refreshes the pressure gate after every successful
-append. The owned record that reaches the high-water mark persists, while new
-requests are refused without waiting for a later durable operation. The
-`storage_pressure::exit_gate` namespace fixture starts with a verified log one
-byte below the threshold, crosses it with a real rejection, checks that the
-next connection is refused before admission, and reopens the resulting audit
-history. Removing the post-append check makes this regression test fail.
+```sh
+python3 /absolute/sigrund/scripts/verify-acceptance.py \
+  --checks /tmp/sigrund-checks/checks.json --binaries /absolute/sigrund/target/debug \
+  --requester requester --artifacts /tmp/sigrund-acceptance
+```
 
-## Landed Phase 5A/5B foundations
+The entry point supervises `verify-platform.py`, `verify-runtime.py` and
+`verify-execution.py`, then exercises offline signing, binding/concurrent replay,
+output/limits, post-commit failure, local recovery and both operator recipes.
+Checks include real root/service credentials, setup and registration races,
+shutdown/restart/escalation, and cancellation while output stays blocked.
+Operator units bind their lifetime to the acceptance service; deadlines and
+whole-service cleanup apply even if Python is killed. Require both suite
+success and supervisor cgroup removal. Namespace fixtures alone do not establish
+privileged runtime behavior. Generated manifests, logs and traces are disposable
+run output; historical results are available through Git history.
 
-Normal foreground startup now performs pinned cgroup initialization and an
-isolated kernel/credential/exec probe before publishing listeners. The explicit
-`--authorization-only` profile keeps non-executing diagnostics available.
-A committed job retains its original request, snapshots, selected signer,
-canonical warrant, environment, policy and audit owners through bounded
-off-loop cgroup preparation/cleanup. Failed partial setup retains a cleanup
-owner. A cancellation test holds this handoff blocked and checks that quotas
-remain pinned until actual owner disposal.
+## Remaining specification scope
 
-The standalone reaper reserves one unpublished clone, keeps registered pidfds
-serviceable, registers returned children before clearing the barrier, and
-requires a bounded deferred sweep before another reservation. A real-child
-fixture verifies concurrent early exits without status theft. The C child
-path covers the full descriptor/mount/credential transition with parent-owned
-buffers and syscall-only error/exec handling. Its fault matrix and sealed-ELF
-post-exec probes run unprivileged in a user namespace.
+The local workflow covers applicable portions of V-01–V-11, V-13–V-15 and
+V-17–V-19. Full rows remain incomplete wherever they include deferred features;
+V-12/PTY and V-16/hooks are outside this profile. Full v1.0 conformance requires:
 
-See [MVP_PHASE5A.md](docs/MVP_PHASE5A.md) and
-[MVP_PHASE5B.md](docs/MVP_PHASE5B.md) for exact evidence and commands. After
-landing, the privileged `phase5_platform` fixture passed on 2026-10-31 under
-a delegated, time-limited service; the service cgroup was removed after exit.
-The run required a coherent private cgroup mount view in the development
-container. It also exposed and fixed the startup probe's rejection of the
-distribution's `/usr/bin/true` symlink and a short-read assumption in the
-post-exec test's mountinfo reader. The startup probe resolves its fixed alias,
-then pins and validates the target before sealed execution. The test runner
-preserves service membership, and the fixture uses the discovered supervisor
-path rather than assuming it is at the cgroup mount root. These are the
-Phase 5A/5B foundations; Phase 5C integrates them as described below.
+- PTY transfer, window relaying, terminal cleanup and unrestricted input.
+- Hook execution/fallback and strict deadline/output integration.
+- Remote TLS collector service, replication/ACK, receipts, durable cursors,
+  provisioning anchors and external rollback/checkpoint protection. The
+  collector binary currently supplies validation diagnostics only.
+- Policy reload with aggregate generation quotas, scripts/reusable grants,
+  OpenPGP/Sigstore adapters and safe administrative revocation tooling.
+- Complete V-01–V-19 end-to-end cases for those integrations and real hardware
+  signing acceptance before claiming physical security-key support.
 
-## Phase 5C execution integration
-
-Authorized requests retain their snapshot, descriptor, policy, quota and audit
-owners through off-loop cgroup preparation, serialized clone dispatch, central
-reaping and cleanup. A pending-spawn context prevents P_ALL from consuming an
-unpublished child while registered primary pidfds remain serviceable. Readiness
-and exact terminal status follow authenticated audit completions; setup failures
-preserve grant consumption and emit no child-exit frame.
-
-Shutdown closes admission and controls immediately, reconciles reserved durable
-and spawn operations, and keeps the event loop/reaper alive until ownership
-drains. Stalled cleanup retains the instance lock and quotas pending external
-supervisor escalation. Optional systemd notifications support readiness,
-watchdog and stopping status. Existing blocked-I/O regression tests now verify
-cooperative completion after releasing their gates instead of process exit
-that discards unfinished owners.
-
-The complete workspace suite, Clippy, formatting and diff checks pass. Real
-runtime and transient-service verification in
-[MVP_PHASE5C.md](docs/MVP_PHASE5C.md) passed on 2026-10-31, including shutdown
-before commit/spawn/readiness, poisoned audit, blocked cleanup, unsafe restart
-layout rejection, prior-instance orphan recovery and automatic escalation.
-Retained hierarchies restart in a verified `G/supervisor` leaf, preserving
-controllers and prior jobs until reconciliation.
-
-Phase 5D's passing real failure/race harness is documented in
-[MVP_PHASE5D.md](docs/MVP_PHASE5D.md). It adds startup feature failures,
-per-step child failures, readiness races, real root-TTY approval/execution,
-post-exec kernel observations and retained syscall traces. Its 26 gates passed
-on 2026-10-31 alongside a repeated Phase 5A/5B platform gate. The controlled
-root-TTY workflow returned `0` with exit status zero to UID 65534 after root
-confirmation/signing and UID 0 execution. This completes Phases 5C/5D; the Phase 6
-section below records the packaged walkthrough and broader fixture. Evidence is retained
-in [docs/evidence/phase5-2026-10-31](docs/evidence/phase5-2026-10-31/README.md).
-
-The acceptance loop corrected fixture root ordering, sealed execution of
-hardened multicall tools, restart entry into a retained cgroup hierarchy, and
-client progress-diagnostic assertions. Standalone GNU alternatives are tested
-through a sealed memfd before copying. Executable byte authentication cannot
-make an executable support memfd execution; incompatible tools return their
-actual status without weakening executable resolution or readiness semantics.
-
-## Deliberately incomplete runtime
-
-The local MVP is implemented. The table distinguishes its working surfaces
-from specification features that remain unimplemented or unverified:
-
-| Surface | Current behavior | Required integration |
-| --- | --- | --- |
-| `sigrund` | Runs under `[mvp]` after the execution startup gate, or with explicit `--authorization-only`; signed/unsigned requests share retained snapshots, SQLite consumption and authenticated local audit. Authorized jobs execute through the verified clone/reaper/readiness/shutdown path. | Hooks, audit replication, PTY and reload. The Phase 6 operator fixture is implemented and verified. |
-| `sigrun` | Normal command supports unsigned construction or `--warrant PATH`, hello/descriptor transport, stdio relay, separate status reporting and signal/deadline handling. Signed input forbids field overrides and preserves canonical payload bytes. | PTY/window transport; stdio execution and the Phase 6 operator fixture are verified. |
-| `sigrund-approve` | Root peer/TTY verification, bounded broker transport, complete escaped prompting, OpenSSH key/agent signing and cancellation are implemented. | Physical FIDO signing evidence; native agent adapter is optional follow-on work. |
-| `sigrund-collector` | `--validate-batch` is available; the normal command exits with status 78. | TLS server, exact HTTP/DSSE framing, host authentication, batch verification, deduplication, cursor durability, and denial/receipt responses. |
-| `sigrundctl` | UUID helpers, root-only durable `init-host`, and exact-byte `csr-pae`/`pack-warrant` offline helpers are implemented. | Sealing/template commands, revocation administration and anchor-file output. |
-| Verification matrix | M-01–M-15 have focused or delegated integration evidence, tracked in `docs/MVP_COVERAGE.md`. | Complete V-01–V-19 rows, including deferred feature subcases; MVP evidence does not establish full v1.0 conformance. |
-
-Diagnostic options such as `--check-config`, `--check-cgroup`,
-`--validate-hello`, and `--validate-batch` validate inputs or a local probe;
-they do not open the production socket, authorize a request, spawn a child, or
-provide any runtime security guarantee.
-
-## Implementation order
-
-Follow [MVP_ROADMAP.md](MVP_ROADMAP.md) as the delivery order: preserve the
-completed transport, snapshot and root-approval gates (Phases 0–3), then add
-the completed authorization/commit/local-audit gates (Phases 4–4.5), followed by
-cgroup startup/child setup/reaping (Phase 5) and execution fixtures (Phase 6).
-Implement the applicable security subcases alongside each phase. PTY, hooks,
-remote replication, reload and additional signature adapters follow the thin
-workflow in separate milestones. Full v1.0 conformance still requires all
-V-01 through V-19, not just the MVP gates or unit tests and Clippy.
-
-## Contract clarifications made during implementation
-
-The implementation uses the following crash-recovery and durability rules:
-
-1. `audit_ratchet.state` retains `initial_key_hex` so startup can verify the
-   genesis record and replay HMACs across the complete log. It is protected by
-   the same `0600` state-file permissions and is never exposed in normal
-   request processing. Retaining this seed means the format is not
-   forward-secure after host/state compromise; the full limit and external
-   checkpoint boundary are explicit in specification Section 7.2.
-2. Once an audit record has been fsynced, any failure publishing the successor
-   state poisons that writer. It may not append another record with the old
-   sequence/key; restart or an equivalent verified reconciliation must recover
-   the durable log/state pair first.
-3. Partial-tail recovery requires a synchronized log/state checkpoint. A log
-   one complete record ahead of state plus any partial tail is corruption;
-   recovery leaves both files unchanged. Startup verifies one bounded record
-   at a time and retains only the current key, hashes, host, sequence, and byte
-   offset, so memory use does not grow with log history.
-4. Provisioning fsyncs the genesis log's parent directory before publishing
-   ratchet state. New directory hierarchies are synced through their ancestors
-   before use, and the state directory is synced after atomic state rename.
-   Any failed directory barrier prevents successful provisioning.
-
-
-## Phase 6 implementation
-
-The Phase 6 operator lab and acceptance entry points are implemented in
-`scripts/mvp-lab.py`, `scripts/check-mvp.py`, and `scripts/verify-mvp.py`.
-Offline CSR/SSHSIG packaging is exposed by `sigrundctl csr-pae` and
-`sigrundctl pack-warrant`, with byte-preservation tests in
-`crates/sigrund/tests/phase6_tools.rs`. The disposable pvem acceptance run
-passed on 2026-10-31; its non-secret manifest and ordinary-check evidence are
-retained in `docs/evidence/phase6-2026-10-31/`. Local privileged tests remain
-deferred. The acceptance wrapper passes the discovered `strace` path to the
-failure gate, and its execution interposer covers both Rust syscall and libc
-write paths for cgroup fault boundaries. See `docs/MVP_PHASE6.md` and
-`docs/MVP_COVERAGE.md`.
-
-The final repeat includes the watchdog-aware epoll timeout fix. Testing under
-the VM user's `0002` umask exposed a Phase 1 fixture which recreated the
-collector CA placeholder as group-writable after its missing-file test. The
-fixture now restores mode `0600`; production startup correctly continued to
-reject writable files. Both the local and VM ordinary check sets passed with
-the corrected fixture and identical runtime/build-input source digests,
-followed by all nine real delegated VM acceptance gates and supervisor cleanup.
+Interpreter artifact binding and selectable host/container execution domains
+need separate protocol and policy design before implementation.

@@ -105,7 +105,7 @@ pub struct MvpProfile {
     pub hooks_enabled: bool,
     pub pty_enabled: bool,
     pub max_active_approval_requests: u32,
-    /// Empty preserves the Phase 2 no-approver behavior; Phase 3 execution
+    /// Empty permits CSR-only diagnostics; execution
     /// requires an explicit configured signer identity.
     pub approval_signer_id: String,
 }

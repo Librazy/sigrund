@@ -1,4 +1,4 @@
-//! Phase 5 child-start primitives.
+//! Child setup, execution and readiness primitives.
 //!
 //! The coordinator owns the handoff, while this module contains the bounded
 //! syscall-only child transition and its parent-side sync-pipe classifier.

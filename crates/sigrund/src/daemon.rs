@@ -968,7 +968,7 @@ impl ForegroundDaemon {
         drop(logger);
         let _ = log.try_send(
             serde_json::json!({"event":"DAEMON_READY", "host_id":context.host_id,
-            "phase":"5C", "local_audit_forward_secure":false})
+            "profile":"local-approval", "local_audit_forward_secure":false})
             .to_string(),
         );
         let mut connections: HashMap<u64, Connection> = HashMap::new();
@@ -1027,7 +1027,7 @@ impl ForegroundDaemon {
                             if signal == libc::SIGCHLD as u32 {
                                 continue;
                             }
-                            let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is outside the Phase 1 MVP\"}".into());
+                            let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is unavailable in the local-approval profile\"}".into());
                             reload_diagnostic_pending = true;
                         }
                     } else if stopping.is_some()
