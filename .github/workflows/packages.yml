@@ -37,22 +37,36 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Resolve target image once
+        id: target-image
+        env:
+          IMAGE_REFERENCE: ${{ matrix.image }}
+        run: |
+          docker pull --platform linux/amd64 "$IMAGE_REFERENCE"
+          resolved_image=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REFERENCE")
+          image_id=$(docker image inspect --format '{{.Id}}' "$resolved_image")
+          [[ "$resolved_image" =~ @sha256:[0-9a-f]{64}$ ]]
+          printf 'image=%s\nid=%s\n' "$resolved_image" "$image_id" >> "$GITHUB_OUTPUT"
       - name: Build native release packages
         env:
           DISTRIBUTION: ${{ matrix.distribution }}
-          IMAGE: ${{ matrix.image }}
+          IMAGE_REFERENCE: ${{ matrix.image }}
+          IMAGE: ${{ steps.target-image.outputs.image }}
+          IMAGE_ID: ${{ steps.target-image.outputs.id }}
           FORMAT: ${{ matrix.format }}
         run: |
           mkdir -p "$RUNNER_TEMP/packages"
           export SOURCE_COMMIT=$(git rev-parse HEAD)
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           export PACKAGE_REVISION="0.$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S).git${SOURCE_COMMIT:0:12}.${DISTRIBUTION//-/}"
-          docker run --rm --env SOURCE_COMMIT --env SOURCE_DATE_EPOCH --env PACKAGE_REVISION \
+          docker run --rm --platform linux/amd64 \
+            --env SOURCE_COMMIT --env SOURCE_DATE_EPOCH --env PACKAGE_REVISION \
+            --env IMAGE_REFERENCE --env IMAGE --env IMAGE_ID \
             --volume "$GITHUB_WORKSPACE:/src:ro" --volume "$RUNNER_TEMP/packages:/out" \
             "$IMAGE" bash /src/packaging/build-container.sh "$FORMAT"
       - name: Install, upgrade and remove in a fresh target container
         env:
-          IMAGE: ${{ matrix.image }}
+          IMAGE: ${{ steps.target-image.outputs.image }}
           FORMAT: ${{ matrix.format }}
         run: |
           docker run --rm --volume "$GITHUB_WORKSPACE/packaging:/packaging:ro" \

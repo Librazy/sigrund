@@ -32,3 +32,5 @@ rustc --version > /out/packages/build-info.txt
 cargo --version >> /out/packages/build-info.txt
 cat /etc/os-release >> /out/packages/build-info.txt
 printf 'source=%s\nsource_date_epoch=%s\n' "$SOURCE_COMMIT" "$SOURCE_DATE_EPOCH" >> /out/packages/build-info.txt
+printf 'image_reference=%s\nimage_digest=%s\nimage_id=%s\n' \
+  "$IMAGE_REFERENCE" "$IMAGE" "$IMAGE_ID" >> /out/packages/build-info.txt

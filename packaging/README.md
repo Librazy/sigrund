@@ -4,7 +4,7 @@ GitHub Actions builds native **x86-64** packages in Fedora 44/45 and Ubuntu
 24.04/26.04 containers, using the repository's pinned Rust toolchain and locked
 dependencies. Download the `packages-<distribution>-x86_64` artifact from a
 successful **Packages** workflow run. Each archive contains two packages,
-`SHA256SUMS`, and source/toolchain information in `build-info.txt`.
+`SHA256SUMS`, and source/toolchain/image information in `build-info.txt`.
 
 | Package | Installed components | Runtime dependencies |
 | --- | --- | --- |
@@ -110,6 +110,13 @@ coherent persistent dataset.
 release binaries. `build.py` stages separate payloads, obtains Debian shared
 library dependencies with `dpkg-shlibdeps`, and uses RPM's automatic dependency
 generator. No setuid executables or file capabilities are installed.
+
+Each job resolves its distribution tag once and uses that immutable repository
+digest for both the build and smoke containers. Artifacts record the original
+tag, resolved digest and image ID. Distribution tags can change between runs;
+distribution package repositories and the rustup installer remain live inputs.
+This metadata supplies image provenance, not a bit-for-bit reproducibility
+guarantee.
 
 The workflow then starts a **fresh** target container to check checksums,
 client-only installation, a real version upgrade, binary entry points, service
