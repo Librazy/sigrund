@@ -39,7 +39,36 @@ def write(path, text, mode=0o600):
         output.write(text)
 
 
-def prepare(base, binaries, requester):
+def supervisor_properties(supervisor):
+    if supervisor is None:
+        return []
+    if not re.fullmatch(r'sigrund-mvp-gate-[0-9a-f]{32}\.service', supervisor):
+        raise ValueError('invalid acceptance supervisor unit')
+    # After orders shutdown before the supervisor; BindsTo also covers its
+    # unexpected death. The ceiling is independent of Python finally blocks.
+    return [('BindsTo', supervisor), ('After', supervisor), ('RuntimeMaxSec', '600s')]
+
+
+def bind_supervisor(unit, supervisor):
+    for key, value in supervisor_properties(supervisor):
+        section = '[Service]' if key == 'RuntimeMaxSec' else '[Unit]'
+        unit = unit.replace(section + '\n', section + '\n' + key + '=' + value + '\n', 1)
+    return unit
+
+
+def foreground_command(manifest):
+    command = ['systemd-run', '--unit=' + manifest['unit'], '--service-type=notify', '--pipe', '--wait', '--collect',
+               '--property=NotifyAccess=main', '--property=Delegate=yes', '--property=KillMode=control-group',
+               '--property=SendSIGKILL=yes', '--property=TimeoutStartSec=30s', '--property=TimeoutStopSec=15s',
+               '--property=WatchdogSec=3s', '--property=RuntimeDirectory=' + Path(manifest['runtime']).name,
+               '--property=RuntimeDirectoryMode=0755', '--property=UMask=0077']
+    command.extend('--property=' + key + '=' + value
+                   for key, value in supervisor_properties(manifest.get('supervisor_unit')))
+    return command + manifest['command']
+
+
+def prepare(base, binaries, requester, supervisor=None):
+    supervisor_properties(supervisor)  # Validate before creating any fixture state.
     trusted(base.parent)
     binaries = binaries.resolve(strict=True)
     account = pwd.getpwnam(requester)
@@ -105,10 +134,10 @@ def prepare(base, binaries, requester):
     unit = re.sub(r'^ExecStart=.*$', 'ExecStart=' + ' '.join(command), unit, flags=re.M)
     unit = unit.replace('RuntimeDirectory=sigrund', 'RuntimeDirectory=' + label)
     unit = unit.replace('StateDirectory=sigrund\n', '').replace('LogsDirectory=sigrund\n', '')
-    write(base / 'daemon.service', unit, 0o644)
+    write(base / 'daemon.service', bind_supervisor(unit, supervisor), 0o644)
     manifest = {'version': 1, 'base': str(base), 'unit': label + '.service', 'runtime': str(runtime),
                 'command': command, 'requester': requester, 'requester_uid': account.pw_uid,
-                'requester_gid': account.pw_gid, 'signer_id': 'mvp-root'}
+                'requester_gid': account.pw_gid, 'signer_id': 'mvp-root', 'supervisor_unit': supervisor}
     write(base / 'lab.json', json.dumps(manifest, indent=2) + '\n', 0o644)
     variables = {'TEST_BASE': base, 'TEST_CONFIG': base / 'config.toml', 'TEST_SIGNERS': base / 'signers.toml',
                  'TEST_STATE': base / 'state', 'TEST_LOG': base / 'log/audit.jsonl',
@@ -139,12 +168,13 @@ def main():
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--binaries', type=Path, default=REPO / 'target/debug')
     parser.add_argument('--requester', default='mvp-requester')
+    parser.add_argument('--supervisor-unit', help='bind prepared acceptance services to this gate unit')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('root required on a disposable test host')
     os.umask(0o077)
     if args.action == 'prepare':
-        prepare(args.directory, args.binaries, args.requester)
+        prepare(args.directory, args.binaries, args.requester, args.supervisor_unit)
         return
     manifest = load(args.directory)
     unit = manifest['unit']
@@ -164,11 +194,7 @@ def main():
     elif args.action == 'foreground':
         # Type=notify still waits for readiness, --pipe keeps diagnostics on this
         # root terminal, and systemd owns cleanup even if this terminal dies.
-        command = ['systemd-run', '--unit=' + unit, '--service-type=notify', '--pipe', '--wait', '--collect',
-                   '--property=NotifyAccess=main', '--property=Delegate=yes', '--property=KillMode=control-group',
-                   '--property=SendSIGKILL=yes', '--property=TimeoutStartSec=30s', '--property=TimeoutStopSec=15s',
-                   '--property=WatchdogSec=3s', '--property=RuntimeDirectory=' + Path(manifest['runtime']).name,
-                   '--property=RuntimeDirectoryMode=0755', '--property=UMask=0077', *manifest['command']]
+        command = foreground_command(manifest)
         os.execvp(command[0], command)
     else:
         subprocess.run(['systemctl', 'status', '--no-pager', unit], check=False)

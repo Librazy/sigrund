@@ -64,6 +64,13 @@ supervising service with a ten-minute runtime ceiling, a 15-second stop
 ceiling, and whole-service SIGKILL cleanup. Its runner moves into a leaf before
 enabling `memory pids` in the newly delegated root. The existing Phase 5
 runtime tests additionally create their own bounded transient services.
+Both operator lab recipes used by acceptance have `BindsTo=` and `After=`
+dependencies on the acceptance service, plus their own ten-minute runtime
+ceiling. Systemd therefore stops their whole cgroups when the supervisor stops
+or dies, including when Python cannot execute its cleanup. Standalone manual
+labs do not inherit these acceptance-only dependencies. Ordinary harness
+regressions check both generated service recipes; the retained 2026-10-31 VM
+run predates this lifetime correction, so privileged revalidation is pending.
 Only fresh fixture cgroups, units, processes and directories are changed.
 
 The loop is implement, run ordinary checks, run VM acceptance, inspect the

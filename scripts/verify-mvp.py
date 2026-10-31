@@ -300,7 +300,7 @@ def local_recovery(parent, binaries, evidence):
         f.cleanup()
 
 
-def operator_workflow(binaries, requester, evidence):
+def operator_workflow(binaries, requester, evidence, supervisor_unit):
     """Exercise both shipped service recipes with a real requester terminal."""
     import fcntl
     import pwd
@@ -313,7 +313,8 @@ def operator_workflow(binaries, requester, evidence):
     foreground = None
     masters = []
     try:
-        run([sys.executable, lab, 'prepare', '--directory', base, '--binaries', binaries, '--requester', requester],
+        run([sys.executable, lab, 'prepare', '--directory', base, '--binaries', binaries, '--requester', requester,
+             '--supervisor-unit', supervisor_unit],
             capture_output=True)
         manifest = json.loads((base / 'lab.json').read_text())
         tools = base / 'bin'
@@ -398,7 +399,7 @@ def operator_workflow(binaries, requester, evidence):
         run([sys.executable, lab, 'stop', '--directory', base], capture_output=True)
         assert not runtime.exists()
         # Start the exact foreground recipe against the retained state. It is
-        # supervised independently of this harness and must remove its sockets.
+        # bound to the same acceptance supervisor and must remove its sockets.
         foreground = subprocess.Popen([sys.executable, str(lab), 'foreground', '--directory', str(base)],
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         wait_for(lambda: (runtime / 'client.sock').exists(), 'foreground recipe startup')
@@ -495,7 +496,7 @@ def inside(args):
         output_and_limits(parent, args.binaries, evidence)
         failed_job_limit(parent, args.binaries, evidence)
         local_recovery(parent, args.binaries, evidence)
-        operator_workflow(args.binaries, args.requester, evidence)
+        operator_workflow(args.binaries, args.requester, evidence, parent.name)
         evidence.manifest['result'] = 'passed'
     except BaseException:
         evidence.manifest['result'] = 'failed'
