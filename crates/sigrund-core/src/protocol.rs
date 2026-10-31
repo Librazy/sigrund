@@ -786,8 +786,44 @@ pub fn parse_strict<T: for<'de> Deserialize<'de> + ProtocolSchema>(bytes: &[u8])
     Ok(value)
 }
 
+/// The only post-ready control request supported by the stdio MVP.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientSignal {
+    pub signal: i32,
+}
+impl ProtocolSchema for ClientSignal {}
+impl ClientSignal {
+    pub fn validate(&self) -> Result<()> {
+        if matches!(self.signal, 1 | 2 | 10 | 12 | 15) {
+            Ok(())
+        } else {
+            Err(CoreError::Protocol("unsupported forwarded signal".into()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signal_requests_reject_unknown_duplicate_and_unforwardable_fields() {
+        for signal in [1, 2, 10, 12, 15] {
+            let request: super::ClientSignal =
+                super::parse_strict(format!("{{\"signal\":{signal}}}").as_bytes()).unwrap();
+            request.validate().unwrap();
+        }
+        for input in [
+            br#"{}"#.as_slice(),
+            br#"{"signal":2,"signal":15}"#,
+            br#"{"signal":15,"extra":0}"#,
+            br#"{"signal":"15"}"#,
+        ] {
+            assert!(super::parse_strict::<super::ClientSignal>(input).is_err());
+        }
+        for signal in [-1, 0, 9, 19, 64, i32::MAX] {
+            assert!(super::ClientSignal { signal }.validate().is_err());
+        }
+    }
     use super::*;
     use crate::crypto::WARRANT_PAYLOAD_TYPE;
     use base64::{Engine as _, engine::general_purpose::STANDARD};

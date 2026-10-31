@@ -82,6 +82,11 @@ impl RequestLease {
         request.deferred_cleanup.push(control);
         fd
     }
+    /// Use the already-reserved worker for post-ready control reception. The
+    /// lease remains owned until cleanup; Dispose queues behind this monitor.
+    pub fn monitor(&self, operation: impl FnOnce() + Send + 'static) {
+        enqueue(&self.sender, Work::Monitor(Box::new(operation)));
+    }
     pub fn request(&self) -> &ValidatedRequest {
         self.request.as_ref().expect("live lease")
     }
@@ -138,9 +143,10 @@ impl Drop for RequestLease {
     }
 }
 
-// Exclusivity of a reservation permits exactly one outstanding command: its
-// task or lease owns the request. Workers catch operation panics and keep their
-// receiver alive until all leases are returned, even after pool shutdown.
+// A task or lease owns each reserved request. After readiness, one control
+// monitor can run on that same worker while the coordinator retains the lease;
+// final Dispose may queue behind it. No extra worker or quota is allocated.
+// Workers retain their receiver until all leases return, even after pool shutdown.
 fn enqueue(sender: &SyncSender<Work>, work: Work) {
     if let Err(error) = sender.try_send(work) {
         // An internal ownership invariant failed. Do not run arbitrary-FD
@@ -151,6 +157,7 @@ fn enqueue(sender: &SyncSender<Work>, work: Work) {
 }
 
 enum Work {
+    Monitor(Box<dyn FnOnce() + Send>),
     Read {
         token: u64,
         socket: OwnedFd,
@@ -325,7 +332,8 @@ impl IoWorkers {
         let (completed, completions) = sync_channel(count * 2);
         let mut senders = Vec::with_capacity(count);
         for slot in 0..count {
-            let (sender, tasks) = sync_channel::<Work>(1);
+            // A control monitor may be queued just before final Dispose.
+            let (sender, tasks) = sync_channel::<Work>(2);
             let completed = completed.clone();
             let wake = wake.clone();
             std::thread::Builder::new()
@@ -333,6 +341,7 @@ impl IoWorkers {
                 .spawn(move || {
                     for work in tasks {
                         match work {
+                            Work::Monitor(operation) => operation(),
                             Work::Read {
                                 token,
                                 socket,
@@ -390,6 +399,9 @@ impl IoWorkers {
             wake,
             per_uid: config.max_io_workers_per_uid as usize,
         })
+    }
+    pub fn is_idle(&self) -> bool {
+        self.reservations.is_empty()
     }
     pub fn fd(&self) -> i32 {
         self.wake.as_raw_fd()
@@ -818,10 +830,11 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         };
-        let SpawnOutcome::Failed { job, message } = returned else {
+        let SpawnOutcome::Prepared { owner, failure } = returned else {
             panic!("unexpected fatal stage")
         };
-        assert!(message.contains("cancelled"));
+        let job = owner.job;
+        assert!(failure.unwrap().contains("cancelled"));
         assert!(Arc::ptr_eq(&job.lease.request().policy, &policy));
         assert_eq!(budget.usage(1001), (8, 8));
         drop(job);

@@ -703,7 +703,7 @@ fn blocked_io_remains_bounded_and_responsive() {
                 ),
         )
         .unwrap();
-        let (mut gate, daemon) = Gate::launch(&f, point);
+        let (mut gate, mut daemon) = Gate::launch(&f, point);
         let pid = daemon.0.id();
         let threads = || fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
         assert_eq!(threads(), 5);
@@ -752,16 +752,21 @@ fn blocked_io_remains_bounded_and_responsive() {
         drop((partial, excess));
         assert_eq!(count(&f), 1);
         assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");
-        // A new blocked durable operation cannot delay signalfd shutdown.
+        // Shutdown must close controls without dropping durable ownership.
         let fresh = envelope(warrant(&f, 0), 7);
         gate.arm();
         let mut stalled = connect(&f.socket);
         send_signed(&stalled, &fresh);
         gate.arrive(&daemon);
         let start = Instant::now();
-        daemon.stop();
-        assert!(start.elapsed() < Duration::from_secs(2));
+        daemon.begin_stop();
         expect_closed(&mut stalled);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        let replacement = f.command().output().unwrap();
+        assert!(String::from_utf8_lossy(&replacement.stderr).contains("already in use"));
+        gate.release();
+        daemon.finish_stop();
         drop(stalled);
         let daemon = f.launch();
         assert_eq!(redeem(&f, &fresh).status, "REPLAY_DETECTED");

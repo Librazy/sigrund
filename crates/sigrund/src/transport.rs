@@ -225,6 +225,12 @@ impl ControlReader {
         }
     }
 
+    pub fn client_signal() -> Self {
+        Self {
+            expected_kind: Some(FrameType::ClientSignal),
+            ..Self::new(false)
+        }
+    }
     pub fn server_finished() -> Self {
         Self {
             reject_frames: true,

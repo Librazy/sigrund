@@ -71,6 +71,9 @@ impl Admission {
             // Keep a fixed-size aggregate if a previous window could not log.
         }
     }
+    pub fn is_idle(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
     pub fn refuse(&mut self) {
         self.refused = self.refused.saturating_add(1);
     }

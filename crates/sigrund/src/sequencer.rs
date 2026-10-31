@@ -34,6 +34,12 @@ pub(crate) struct AuthorizationTask {
     pub audit: AuditLease,
 }
 pub(crate) enum Work {
+    Execution {
+        token: u64,
+        records: Vec<(&'static str, serde_json::Value)>,
+        limit: usize,
+        owner: Option<Box<CommittedJob>>,
+    },
     Authorize(AuthorizationTask),
     Event {
         token: u64,
@@ -58,6 +64,9 @@ pub(crate) struct CommittedJob {
     pub commit_fields: serde_json::Value,
 }
 pub(crate) enum Completion {
+    Recorded {
+        token: u64,
+    },
     Reserve {
         token: u64,
         permit: SyncSender<bool>,
@@ -78,6 +87,7 @@ pub(crate) struct Sequencer {
     tasks: SyncSender<Work>,
     completions: Receiver<Completion>,
     wake: Arc<OwnedFd>,
+    _lifetime: std::sync::mpsc::Sender<()>,
 }
 impl Sequencer {
     pub fn new(
@@ -94,12 +104,47 @@ impl Sequencer {
         let (tasks, receiver) = sync_channel::<Work>(capacity);
         let (completed, completions) = sync_channel(capacity * 2);
         let thread_wake = wake.clone();
+        let (lifetime, released) = std::sync::mpsc::channel::<()>();
         std::thread::Builder::new()
             .name("authorization-audit".into())
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     for task in receiver {
                         let result = match task {
+                            Work::Execution {
+                                token,
+                                records,
+                                limit,
+                                owner,
+                            } => {
+                                let result = records.into_iter().try_for_each(|(event, fields)| {
+                                    append_event(&mut resources, &policy, event, fields, limit)
+                                        .map(|_| ())
+                                });
+                                match result {
+                                    Ok(()) => {
+                                        if let Some(owner) = owner {
+                                            let CommittedJob { lease, audit, .. } = *owner;
+                                            drop(lease);
+                                            drop(audit);
+                                        }
+                                        notify(
+                                            &completed,
+                                            &thread_wake,
+                                            Completion::Recorded { token },
+                                        )
+                                    }
+                                    Err(error) => {
+                                        drop(owner);
+                                        notify(
+                                            &completed,
+                                            &thread_wake,
+                                            Completion::Fatal(error.to_string()),
+                                        );
+                                        false
+                                    }
+                                }
+                            }
                             Work::Authorize(task) => {
                                 let token = task.token;
                                 let lifecycle = task.lifecycle.clone();
@@ -179,11 +224,16 @@ impl Sequencer {
                         ),
                     );
                 }
+                // A fatal writer remains poisoned and retains host state and
+                // the instance lock until coordinator cleanup really ends.
+                let _ = released.recv();
+                drop(resources);
             })?;
         Ok(Self {
             tasks,
             completions,
             wake,
+            _lifetime: lifetime,
         })
     }
     pub fn fd(&self) -> i32 {

@@ -316,6 +316,16 @@ fn limits(dir: &File, memory: u64, swap: u64, pids: u64) -> io::Result<()> {
     Ok(())
 }
 fn kill_wait(dir: &File, deadline: Instant) -> io::Result<()> {
+    // Watch before killing to avoid losing an empty-transition notification.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let notifications = unsafe { File::from_raw_fd(fd) };
+    let path = name(&format!("/proc/self/fd/{}/cgroup.events", dir.as_raw_fd()))?;
+    if unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_MODIFY) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
     write(dir, "cgroup.kill", b"1\n")?;
     loop {
         if read(dir, "cgroup.events")?
@@ -330,7 +340,25 @@ fn kill_wait(dir: &File, deadline: Instant) -> io::Result<()> {
                 "cgroup teardown stalled",
             ));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        let mut event = libc::pollfd {
+            fd: notifications.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(100) as i32;
+        if unsafe { libc::poll(&mut event, 1, remaining) } < 0
+            && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut events = [0u8; 4096];
+        // Drain bounded notifications; populated is always read back above.
+        unsafe {
+            libc::read(fd, events.as_mut_ptr().cast(), events.len());
+        }
     }
 }
 #[must_use = "explicit cleanup is required even when no child was created"]

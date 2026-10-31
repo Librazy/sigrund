@@ -2,8 +2,8 @@
 //!
 //! The coordinator owns the handoff, while this module contains the bounded
 //! syscall-only child transition and its parent-side sync-pipe classifier.
-//! Live authorization integration is deliberately a later wiring step; these
-//! primitives are usable by both job and hook launchers.
+//! The runtime coordinator dispatches these primitives only after durable
+//! authorization and registration-barrier reservation.
 use crate::startup::CgroupLayout;
 use std::{
     ffi::CString,

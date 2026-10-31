@@ -1,109 +1,173 @@
-//! Bounded preparation and cleanup of committed jobs before clone admission.
-use crate::{sequencer::CommittedJob, startup::CgroupLayout};
+//! Bounded off-loop cgroup and clone operations. All completions return owners.
+use crate::{
+    execution::{ChildProcess, PreparedChild},
+    sequencer::CommittedJob,
+    startup::{CgroupLayout, JobCgroup},
+};
 use std::{
     io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, SyncSender},
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-/// One bounded owner for cgroup operations. The coordinator never performs
-/// cgroupfs I/O. Until Phase 5C installs its reaper and shutdown protocol this
-/// stage prepares and disposes an empty cgroup, then explicitly aborts: it
-/// cannot invoke the clone primitive or publish readiness.
-pub(crate) struct JobSupervisor {
-    sender: std::sync::mpsc::SyncSender<CommittedJob>,
-    completed: std::sync::mpsc::Receiver<SpawnOutcome>,
-    wake: std::sync::Arc<OwnedFd>,
+pub(crate) struct PreparedJob {
+    pub job: CommittedJob,
+    pub cgroup: Option<JobCgroup>,
 }
-
+pub(crate) enum Task {
+    Prepare(CommittedJob),
+    Spawn(PreparedJob),
+    Cleanup(PreparedJob),
+}
 pub(crate) enum SpawnOutcome {
-    Failed {
-        job: Box<CommittedJob>,
-        message: String,
+    Prepared {
+        owner: Box<PreparedJob>,
+        failure: Option<String>,
     },
+    Spawned {
+        owner: Box<PreparedJob>,
+        child: io::Result<ChildProcess>,
+    },
+    Cleaned(Box<CommittedJob>),
+    Signal {
+        token: u64,
+        signal: i32,
+    },
+    ControlLost(u64),
     Fatal(String),
 }
-
+#[derive(Clone)]
+pub(crate) struct Notifier {
+    completed: SyncSender<SpawnOutcome>,
+    wake: Arc<OwnedFd>,
+}
+impl Notifier {
+    pub fn send(&self, outcome: SpawnOutcome) {
+        // At most one outstanding task per admitted job; control traffic uses
+        // try_send below. Losing an owned completion is an internal fatal error.
+        if self.completed.send(outcome).is_err() {
+            std::process::abort();
+        }
+        wake_coordinator(self.wake.as_raw_fd());
+    }
+    pub fn control(&self, outcome: SpawnOutcome) -> bool {
+        if self.completed.try_send(outcome).is_err() {
+            return false;
+        }
+        wake_coordinator(self.wake.as_raw_fd());
+        true
+    }
+}
+pub(crate) struct JobSupervisor {
+    sender: SyncSender<Task>,
+    completed: Receiver<SpawnOutcome>,
+    notifier: Notifier,
+}
 impl JobSupervisor {
-    pub(crate) fn new(layout: Option<CgroupLayout>, capacity: usize) -> io::Result<Self> {
+    pub fn new(layout: Option<CgroupLayout>, capacity: usize) -> io::Result<Self> {
         Self::with_operation(layout, capacity, prepare_job)
     }
-    pub(crate) fn with_operation(
+    pub fn with_operation(
         layout: Option<CgroupLayout>,
         capacity: usize,
-        operation: impl Fn(
-            Option<&CgroupLayout>,
-            &CommittedJob,
-        ) -> (Option<crate::startup::JobCgroup>, String)
+        operation: impl Fn(Option<&CgroupLayout>, &CommittedJob) -> (Option<JobCgroup>, String)
         + Send
+        + Sync
         + 'static,
     ) -> io::Result<Self> {
-        use std::sync::{Arc, mpsc::sync_channel};
         if capacity == 0 || capacity > 16 {
-            return Err(io::Error::other("invalid job preparation capacity"));
+            return Err(io::Error::other("invalid job executor capacity"));
         }
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-        let (sender, tasks) = sync_channel::<CommittedJob>(capacity);
-        let (finished, completed) = sync_channel(capacity);
-        if layout.is_none() {
-            return Ok(Self {
-                sender,
-                completed,
-                wake,
-            });
-        }
-        let signal = wake.clone();
-        std::thread::Builder::new()
-            .name("job-cgroup-owner".into())
-            .spawn(move || {
-                for job in tasks {
-                    let (cgroup, message) = operation(layout.as_ref(), &job);
-                    if let Some(cgroup) = cgroup
-                        && let Err((owner, error)) = cgroup.cleanup()
-                    {
-                        let _ = finished
-                            .send(SpawnOutcome::Fatal(format!("job cleanup failed: {error}")));
-                        wake_coordinator(signal.as_raw_fd());
-                        // A failed cleanup keeps all original owners and quota.
-                        // It never releases capacity to replacement work.
-                        let _retained = (owner, job);
+        let (sender, tasks) = mpsc::sync_channel::<Task>(capacity);
+        let (completed, receiver) = mpsc::sync_channel(capacity * 8);
+        let notifier = Notifier { completed, wake };
+        if layout.is_some() {
+            let tasks = Arc::new(Mutex::new(tasks));
+            let operation = Arc::new(operation);
+            for slot in 0..capacity {
+                let tasks = tasks.clone();
+                let notifier = notifier.clone();
+                let layout = layout.clone();
+                let operation = operation.clone();
+                std::thread::Builder::new()
+                    .name(format!("job-owner-{slot}"))
+                    .spawn(move || {
                         loop {
-                            std::thread::park();
+                            let task = tasks.lock().expect("job receiver").recv();
+                            let Ok(task) = task else { break };
+                            match task {
+                                Task::Prepare(job) => {
+                                    let (cgroup, message) = operation(layout.as_ref(), &job);
+                                    let failure = (!message.is_empty()).then_some(message);
+                                    notifier.send(SpawnOutcome::Prepared {
+                                        owner: Box::new(PreparedJob { job, cgroup }),
+                                        failure,
+                                    });
+                                }
+                                Task::Spawn(mut owner) => {
+                                    let child = spawn(&mut owner);
+                                    notifier.send(SpawnOutcome::Spawned {
+                                        owner: Box::new(owner),
+                                        child,
+                                    });
+                                }
+                                Task::Cleanup(mut owner) => {
+                                    if let Some(cgroup) = owner.cgroup.take()
+                                        && let Err((cgroup, error)) = cgroup.cleanup()
+                                    {
+                                        notifier.send(SpawnOutcome::Fatal(format!(
+                                            "job cleanup failed: {error}"
+                                        )));
+                                        // Failed cleanup must retain every request/quota owner.
+                                        let _retained = (cgroup, owner);
+                                        loop {
+                                            std::thread::park();
+                                        }
+                                    }
+                                    notifier.send(SpawnOutcome::Cleaned(Box::new(owner.job)));
+                                }
+                            }
                         }
-                    }
-                    if finished
-                        .send(SpawnOutcome::Failed {
-                            job: Box::new(job),
-                            message,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                    wake_coordinator(signal.as_raw_fd());
-                }
-            })?;
+                    })?;
+            }
+        }
         Ok(Self {
             sender,
-            completed,
-            wake,
+            completed: receiver,
+            notifier,
         })
     }
-    pub(crate) fn fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+    pub fn notifier(&self) -> Notifier {
+        self.notifier.clone()
     }
-    pub(crate) fn submit(&self, job: CommittedJob) -> Result<(), Box<CommittedJob>> {
-        self.sender.try_send(job).map_err(|error| {
-            Box::new(match error {
-                std::sync::mpsc::TrySendError::Full(job)
-                | std::sync::mpsc::TrySendError::Disconnected(job) => job,
+    pub fn fd(&self) -> RawFd {
+        self.notifier.wake.as_raw_fd()
+    }
+    pub fn submit(&self, job: CommittedJob) -> Result<(), Box<CommittedJob>> {
+        self.send(Task::Prepare(job)).map_err(|task| {
+            let Task::Prepare(job) = *task else {
+                unreachable!()
+            };
+            Box::new(job)
+        })
+    }
+    pub fn send(&self, task: Task) -> Result<(), Box<Task>> {
+        self.sender.try_send(task).map_err(|e| {
+            Box::new(match e {
+                mpsc::TrySendError::Full(task) | mpsc::TrySendError::Disconnected(task) => task,
             })
         })
     }
-    pub(crate) fn drain(&self) -> Vec<SpawnOutcome> {
+    pub fn drain(&self) -> Vec<SpawnOutcome> {
         let mut count = 0u64;
         loop {
             if unsafe { libc::read(self.fd(), (&mut count as *mut u64).cast(), 8) } >= 0
@@ -125,42 +189,87 @@ fn wake_coordinator(fd: RawFd) {
         }
     }
 }
+fn eligible(job: &CommittedJob) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if job.lifecycle.cancelled.load(Ordering::Acquire)
+        || !crate::sequencer::connection_live(job.control)
+    {
+        return Err(io::Error::other("committed job cancelled before spawn"));
+    }
+    job.lease.request().check()?;
+    let w = job.authorized.warrant.warrant();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs();
+    if now < w.policy.not_before as u64 || w.policy.not_after.is_some_and(|end| now > end as u64) {
+        return Err(io::Error::other("warrant expired before spawn"));
+    }
+    Ok(())
+}
+fn spawn(owner: &mut PreparedJob) -> io::Result<ChildProcess> {
+    let request = owner.job.lease.request();
+    let mut command = PreparedChild::new(
+        owner.job.authorized.warrant.warrant(),
+        owner.job.authorized.envp.clone(),
+    )?;
+    let snapshot = request
+        .snapshots
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing sealed snapshots"))?;
+    let input = snapshot
+        .stdin
+        .as_ref()
+        .map(|s| s.as_fd().as_raw_fd())
+        .or_else(|| {
+            request
+                .prepared
+                .as_ref()
+                .and_then(|p| p.null_stdin.as_ref().map(AsRawFd::as_raw_fd))
+        })
+        .or_else(|| request.rights.first().map(AsRawFd::as_raw_fd))
+        .ok_or_else(|| io::Error::other("missing stdin"))?;
+    let n = request.rights.len();
+    if n < 2 {
+        return Err(io::Error::other("missing output rights"));
+    }
+    eligible(&owner.job)?;
+    command.spawn(
+        owner.cgroup.as_ref().expect("prepared cgroup").fd(),
+        [
+            input,
+            request.rights[n - 2].as_raw_fd(),
+            request.rights[n - 1].as_raw_fd(),
+            snapshot.executable.as_fd().as_raw_fd(),
+        ],
+    )
+}
 pub(crate) fn prepare_job(
     layout: Option<&CgroupLayout>,
     job: &CommittedJob,
-) -> (Option<crate::startup::JobCgroup>, String) {
-    use std::sync::atomic::Ordering;
-    let request = job.lease.request();
-    let warrant = job.authorized.warrant.warrant();
-    if job.lifecycle.cancelled.load(Ordering::Acquire)
-        || !crate::sequencer::connection_live(job.control)
-        || job.lifecycle.state().0 != sigrund_core::lifecycle::Phase::Committed
-    {
-        return (
-            None,
-            "committed job cancelled before cgroup preparation".into(),
-        );
+) -> (Option<JobCgroup>, String) {
+    if let Err(error) = eligible(job) {
+        return (None, error.to_string());
     }
-    if job.gid != warrant.requester_gid || !job.authorized.signer_ids.contains(&job.signer_id) {
+    if job.lifecycle.state().0 != sigrund_core::lifecycle::Phase::Committed {
+        return (None, "cancelled job preparation".into());
+    }
+    if job.gid != job.authorized.warrant.warrant().requester_gid
+        || !job.authorized.signer_ids.contains(&job.signer_id)
+    {
         return (None, "committed job identity mismatch".into());
     }
     let Some(layout) = layout else {
         return (None, "execution disabled".into());
     };
+    let p = &job.lease.request().policy;
     match layout.create_job(
         &job.exec_id,
-        request.policy.job_memory_max_bytes,
-        request.policy.job_memory_swap_max_bytes,
-        request.policy.job_pids_max,
+        p.job_memory_max_bytes,
+        p.job_memory_swap_max_bytes,
+        p.job_pids_max,
     ) {
-        Ok(cgroup) => (
-            Some(cgroup),
-            concat!(
-                "child launch awaits Phase 5C reaper and shutdown integration; ",
-                "one-time grant remains consumed"
-            )
-            .into(),
-        ),
+        Ok(cgroup) => (Some(cgroup), String::new()),
         Err(error) => (
             error.owner,
             format!("job cgroup setup failed: {}", error.error),

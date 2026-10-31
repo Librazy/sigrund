@@ -2,7 +2,7 @@
 //!
 //! A pending clone blocks P_ALL sweeps, while registered primary pidfds remain
 //! serviceable. Completing a clone requires a deferred sweep before the next
-//! reservation. Request execution wires these operations in Phase 5C.
+//! reservation. The runtime coordinator owns this barrier for every job clone.
 use std::{
     collections::HashMap,
     io,
@@ -120,6 +120,15 @@ impl Reaper {
             }
         }
         Ok(exits)
+    }
+    pub fn registered_fd(&self, pid: libc::pid_t) -> Option<i32> {
+        self.primaries.get(&pid).map(|(_, fd)| fd.as_raw_fd())
+    }
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_none() && self.primaries.is_empty() && !self.needs_sweep
     }
     pub fn sweep_required(&self) -> bool {
         self.needs_sweep

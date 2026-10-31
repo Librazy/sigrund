@@ -376,8 +376,14 @@ impl Fixture {
 
 struct DaemonChild(Child);
 impl DaemonChild {
-    fn stop(mut self) {
+    fn begin_stop(&mut self) {
         assert_eq!(unsafe { libc::kill(self.0.id() as _, libc::SIGTERM) }, 0);
+    }
+    fn stop(mut self) {
+        self.begin_stop();
+        self.finish_stop();
+    }
+    fn finish_stop(mut self) {
         wait_for(|| self.0.try_wait().unwrap().is_some());
         assert!(self.0.wait().unwrap().success());
     }
@@ -1281,7 +1287,8 @@ fn verify_blocked_metadata() {
     release.write_all(b"x").unwrap();
     wait_for(|| completed_count() == completed_before + 1);
     wait_for(|| fd_count() == baseline);
-    // Shutdown must not join or wait for a worker stuck in fstat().
+    // Shutdown closes controls immediately but retains the instance and quota
+    // until the off-loop fstat owner returns.
     let mut stalled = connect(&fixture.socket);
     send_fds(
         &stalled,
@@ -1291,8 +1298,13 @@ fn verify_blocked_metadata() {
     stalled.write_all(&encoded[1..]).unwrap();
     entered.read_exact(&mut tid).unwrap();
     assert!(daemon.0.try_wait().unwrap().is_none());
-    daemon.stop();
+    daemon.begin_stop();
     expect_closed(&mut stalled);
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    let replacement = fixture.command().output().unwrap();
+    assert!(String::from_utf8_lossy(&replacement.stderr).contains("already in use"));
+    release.write_all(b"x").unwrap();
+    daemon.finish_stop();
     assert!(!fixture.socket.exists() && !fixture.broker.exists());
 }
 
@@ -1351,7 +1363,7 @@ fn verify_blocked_cleanup() {
             Ok(())
         });
     }
-    let daemon = fixture.launch_command(command);
+    let mut daemon = fixture.launch_command(command);
     drop((worker_entered, worker_release));
     let pid = daemon.0.id();
     let fd_count = || fs::read_dir(format!("/proc/{pid}/fd")).unwrap().count();
@@ -1554,7 +1566,7 @@ fn verify_blocked_cleanup() {
         });
         wait_for(|| fd_count() == baseline);
     }
-    // A worker still blocked in close must not make SIGTERM wait for cleanup.
+    // A blocked close does not delay control shutdown or release the instance lock.
     let mut stalled = connect(&fixture.socket);
     send_fds(
         &stalled,
@@ -1565,8 +1577,13 @@ fn verify_blocked_cleanup() {
     let mut tid = [0u8; 8];
     entered.read_exact(&mut tid).unwrap();
     assert_eq!(decision(&mut stalled).status, "TIMEOUT_CSR");
-    daemon.stop();
+    daemon.begin_stop();
     expect_closed(&mut stalled);
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    let replacement = fixture.command().output().unwrap();
+    assert!(String::from_utf8_lossy(&replacement.stderr).contains("already in use"));
+    release.write_all(b"x").unwrap();
+    daemon.finish_stop();
     assert!(!fixture.socket.exists() && !fixture.broker.exists());
 }
 

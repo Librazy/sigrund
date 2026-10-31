@@ -1,10 +1,11 @@
 //! Foreground coordinator for snapshots, approval and durable authorization.
-//! Child setup and readiness remain the Phase 5 execution boundary.
+//! Runtime ownership outlives control connections through cleanup and auditing.
 use crate::{
     admission::{Admission, AuditLease},
-    jobs::{JobSupervisor, SpawnOutcome},
+    jobs::JobSupervisor,
     linux::validate_absolute_path,
     preparation::{self, Context, Document, PinnedRoot},
+    runtime::{Execution, Notice, PID_TAG, SYNC_TAG},
     sequencer::{self, Sequencer},
     snapshot::SnapshotBudget,
     startup::{StartupResources, check_root_metadata, open_pinned},
@@ -266,9 +267,21 @@ impl Drop for SignalSource {
 enum Input {
     Client,
     Approval,
-    Serving { requester: u64 },
-    Validating { _task: ValidationHandle },
-    Authorizing { _task: ValidationHandle },
+    Serving {
+        requester: u64,
+    },
+    Validating {
+        _task: ValidationHandle,
+    },
+    Authorizing {
+        _task: ValidationHandle,
+    },
+    Executing {
+        _task: ValidationHandle,
+        ready_sent: bool,
+        finishing: bool,
+        terminal: Option<FrameWriter>,
+    },
 }
 
 struct Connection {
@@ -371,7 +384,10 @@ impl Connection {
         self.output.is_none()
             && !matches!(
                 self.input,
-                Input::Validating { .. } | Input::Authorizing { .. } | Input::Serving { .. }
+                Input::Validating { .. }
+                    | Input::Authorizing { .. }
+                    | Input::Serving { .. }
+                    | Input::Executing { .. }
             )
     }
 
@@ -594,9 +610,25 @@ impl Connection {
         log: &SyncSender<String>,
     ) -> io::Result<bool> {
         if let Some(output) = &mut self.output {
-            return output
-                .write(self.fd.as_raw_fd(), now)
-                .map(|complete| !complete);
+            if !output.write(self.fd.as_raw_fd(), now)? {
+                return Ok(true);
+            }
+            if let Input::Executing {
+                ready_sent,
+                finishing,
+                terminal,
+                ..
+            } = &mut self.input
+            {
+                if *finishing {
+                    return Ok(false);
+                }
+                *ready_sent = true;
+                self.output = terminal.take();
+                *finishing = self.output.is_some();
+                return Ok(true);
+            }
+            return Ok(false);
         }
         if self.deadline().is_some_and(|deadline| now >= deadline) {
             return match self.input {
@@ -613,7 +645,10 @@ impl Connection {
                     }
                     Ok(true)
                 }
-                Input::Approval | Input::Serving { .. } | Input::Authorizing { .. } => Ok(false),
+                Input::Approval
+                | Input::Serving { .. }
+                | Input::Authorizing { .. }
+                | Input::Executing { .. } => Ok(false),
             };
         }
         match &self.input {
@@ -646,7 +681,10 @@ impl Connection {
             }
             // EPOLLIN is disabled while the worker receives/validates. The
             // remaining socket events are disconnect/error notifications.
-            Input::Validating { .. } | Input::Serving { .. } | Input::Authorizing { .. } => {
+            Input::Validating { .. }
+            | Input::Serving { .. }
+            | Input::Authorizing { .. }
+            | Input::Executing { .. } => {
                 return Ok(false);
             }
         }
@@ -669,25 +707,83 @@ impl Drop for Connection {
     }
 }
 
-fn queue_post_commit_abort(
-    durable: &SyncSender<sequencer::Work>,
-    job: sequencer::CommittedJob,
-    reason: &str,
+fn publish_notices(
+    notices: Vec<Notice>,
+    connections: &mut HashMap<u64, Connection>,
+    epoll: RawFd,
 ) -> io::Result<()> {
-    let limit = job.lease.request().policy.audit_record_max_bytes as usize;
-    let mut fields = job.commit_fields;
-    fields["status"] = "SPAWN_FAILED".into();
-    fields["reason"] = reason.into();
-    durable
-        .try_send(sequencer::Work::Event {
-            token: job.token,
-            event_type: "AUTH_ABORTED_POST_COMMIT",
-            fields,
-            limit,
-            _audit: job.audit,
-        })
-        .map_err(|_| invalid("post-commit audit executor capacity unavailable"))?;
-    drop(job.lease);
+    for notice in notices {
+        let token = match &notice {
+            Notice::Ready(t) | Notice::Failed(t, _) | Notice::Exit(t, _) => *t,
+        };
+        let Some(connection) = connections.get_mut(&token) else {
+            continue;
+        };
+        match notice {
+            Notice::Ready(_) => {
+                if !sequencer::connection_live(connection.fd.as_raw_fd()) {
+                    connection.lifecycle.cancel();
+                    continue;
+                }
+                let Input::Authorizing { _task } =
+                    std::mem::replace(&mut connection.input, Input::Client)
+                else {
+                    return Err(invalid("missing running validation owner"));
+                };
+                connection.input = Input::Executing {
+                    _task,
+                    ready_sent: false,
+                    finishing: false,
+                    terminal: None,
+                };
+                let decision = Decision {
+                    csr_payload: None,
+                    exec_id: connection.exec_id.clone(),
+                    status: "READY_TO_EXEC".into(),
+                    message: "Authorized and ready to attempt exec; exec outcome is unknown".into(),
+                };
+                connection.output = Some(FrameWriter::control(
+                    FrameType::ServerAuthDecision,
+                    &serde_json::to_vec(&decision)?,
+                    Instant::now(),
+                )?);
+            }
+            Notice::Failed(_, message) => {
+                connection.respond_inner("SPAWN_FAILED", &message, None, Instant::now(), true)?;
+            }
+            Notice::Exit(_, exit) => {
+                exit.validate().map_err(|e| invalid(e.to_string()))?;
+                let writer = FrameWriter::control(
+                    FrameType::ServerChildExit,
+                    &serde_json::to_vec(&exit)?,
+                    Instant::now(),
+                )?;
+                let Input::Executing {
+                    ready_sent,
+                    finishing,
+                    terminal,
+                    ..
+                } = &mut connection.input
+                else {
+                    return Err(invalid("exit before readiness"));
+                };
+                if *ready_sent {
+                    connection.output = Some(writer);
+                    *finishing = true;
+                } else {
+                    *terminal = Some(writer);
+                }
+            }
+        }
+        register(
+            epoll,
+            libc::EPOLL_CTL_MOD,
+            connection.fd.as_raw_fd(),
+            token,
+            true,
+            false,
+        )?;
+    }
     Ok(())
 }
 
@@ -805,6 +901,7 @@ impl ForegroundDaemon {
         )?;
         let supervisor =
             JobSupervisor::new(execution_layout, self.config.max_io_workers_global as usize)?;
+        let mut execution = Execution::new(supervisor, sequencer.sender());
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
@@ -816,7 +913,7 @@ impl ForegroundDaemon {
             (signals.fd.as_raw_fd(), SIGNALS),
             (workers.fd(), IO_COMPLETE),
             (sequencer.fd(), AUDIT_COMPLETE),
-            (supervisor.fd(), JOB_COMPLETE),
+            (execution.supervisor.fd(), JOB_COMPLETE),
         ] {
             register(
                 epoll.as_raw_fd(),
@@ -839,13 +936,19 @@ impl ForegroundDaemon {
         drop(logger);
         let _ = log.try_send(
             serde_json::json!({"event":"DAEMON_READY", "host_id":context.host_id,
-            "phase":4, "local_audit_forward_secure":false})
+            "phase":"5C", "local_audit_forward_secure":false})
             .to_string(),
         );
         let mut connections: HashMap<u64, Connection> = HashMap::new();
         let mut next_token = FIRST_CONNECTION;
         let mut reload_diagnostic_pending = false;
         let mut events: [libc::epoll_event; 64] = unsafe { zeroed() };
+        let mut stopping: Option<Instant> = None;
+        let mut fatal_error = None;
+        let mut grace_reported = false;
+        let mut service = crate::service::Service::new()?;
+        let mut stop_notified = false;
+        service.ready();
         loop {
             let now = Instant::now();
             let timeout = connections
@@ -854,444 +957,516 @@ impl ForegroundDaemon {
                 .min()
                 .map(|deadline| deadline.saturating_duration_since(now))
                 .unwrap_or(Duration::from_secs(1));
-            let milliseconds = timeout.as_millis().saturating_add(1).min(1000) as i32;
-            let count = unsafe {
-                libc::epoll_wait(
-                    epoll.as_raw_fd(),
-                    events.as_mut_ptr(),
-                    events.len() as _,
-                    milliseconds,
-                )
-            };
-            if count < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            for event in &events[..count as usize] {
-                let token = event.u64;
-                if token == SIGNALS {
-                    while let Some(signal) = signals.next()? {
-                        if signal == libc::SIGINT as u32 || signal == libc::SIGTERM as u32 {
-                            return Ok(());
-                        }
-                        if signal == libc::SIGCHLD as u32 {
-                            continue;
-                        }
-                        let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is outside the Phase 1 MVP\"}".into());
-                        reload_diagnostic_pending = true;
+            let milliseconds = timeout.as_millis().saturating_add(1).min(
+                if execution.active() || stopping.is_some() {
+                    20
+                } else {
+                    1000
+                },
+            ) as i32;
+            let iteration = (|| -> io::Result<()> {
+                let count = unsafe {
+                    libc::epoll_wait(
+                        epoll.as_raw_fd(),
+                        events.as_mut_ptr(),
+                        events.len() as _,
+                        milliseconds,
+                    )
+                };
+                if count < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        return Ok(());
                     }
-                } else if token == AUDIT_COMPLETE {
-                    for completion in sequencer.drain() {
-                        match completion {
-                            sequencer::Completion::Reserve { token, permit } => {
-                                let allowed = connections.get(&token).is_some_and(|c| {
-                                    matches!(c.input, Input::Authorizing { .. })
-                                        && sequencer::connection_live(c.fd.as_raw_fd())
-                                        && !c
-                                            .lifecycle
-                                            .cancelled
-                                            .load(std::sync::atomic::Ordering::Acquire)
-                                        && c.lifecycle
-                                            .transition(Phase::Authorizing, Phase::Committing)
-                                });
-                                let _ = permit.send(allowed);
-                            }
-                            sequencer::Completion::Finished {
-                                token,
-                                lease,
-                                denial,
-                            } => {
-                                if let Some(c) = connections.get_mut(&token)
-                                    && c.lifecycle.state().1 == LifecycleDecision::Undecided
-                                {
-                                    c.respond_inner(
-                                        denial.status,
-                                        denial.message,
-                                        None,
-                                        Instant::now(),
-                                        true,
-                                    )?;
-                                    register(
-                                        epoll.as_raw_fd(),
-                                        libc::EPOLL_CTL_MOD,
-                                        c.fd.as_raw_fd(),
-                                        token,
-                                        true,
-                                        false,
-                                    )?;
+                    return Err(error);
+                }
+                for event in &events[..count as usize] {
+                    let token = event.u64;
+                    if token == SIGNALS {
+                        while let Some(signal) = signals.next()? {
+                            if signal == libc::SIGINT as u32 || signal == libc::SIGTERM as u32 {
+                                if stopping.is_none() {
+                                    stopping = Some(Instant::now());
                                 }
-                                drop(lease);
+                                break;
                             }
-                            sequencer::Completion::Committed(job) => {
-                                let job = *job;
-                                let token = job.token;
-                                if let Err(job) = supervisor.submit(job) {
-                                    queue_post_commit_abort(
-                                        &sequencer.sender(),
-                                        *job,
-                                        "bounded job preparation executor unavailable",
-                                    )?;
-                                    if let Some(connection) = connections.get_mut(&token) {
-                                        connection.respond_inner(
-                                            "SPAWN_FAILED",
-                                            concat!("Authorization committed; job preparation unavailable; ",
-                                                "one-time grant remains consumed"),
-                                            None, Instant::now(), true,
+                            if signal == libc::SIGCHLD as u32 {
+                                continue;
+                            }
+                            let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is outside the Phase 1 MVP\"}".into());
+                            reload_diagnostic_pending = true;
+                        }
+                    } else if stopping.is_some()
+                        && (token == CLIENT_LISTENER || token == APPROVAL_LISTENER)
+                    {
+                        continue;
+                    } else if token == AUDIT_COMPLETE {
+                        for completion in sequencer.drain() {
+                            match completion {
+                                sequencer::Completion::Recorded { token } => {
+                                    let notices = execution.recorded(token);
+                                    if stopping.is_none() {
+                                        publish_notices(
+                                            notices,
+                                            &mut connections,
+                                            epoll.as_raw_fd(),
+                                        )?;
+                                    }
+                                }
+                                sequencer::Completion::Reserve { token, permit } => {
+                                    let allowed = stopping.is_none()
+                                        && connections.get(&token).is_some_and(|c| {
+                                            matches!(c.input, Input::Authorizing { .. })
+                                                && sequencer::connection_live(c.fd.as_raw_fd())
+                                                && !c
+                                                    .lifecycle
+                                                    .cancelled
+                                                    .load(std::sync::atomic::Ordering::Acquire)
+                                                && c.lifecycle.transition(
+                                                    Phase::Authorizing,
+                                                    Phase::Committing,
+                                                )
+                                        });
+                                    let _ = permit.send(allowed);
+                                }
+                                sequencer::Completion::Finished {
+                                    token,
+                                    lease,
+                                    denial,
+                                } => {
+                                    if let Some(c) = connections.get_mut(&token)
+                                        && c.lifecycle.state().1 == LifecycleDecision::Undecided
+                                    {
+                                        c.respond_inner(
+                                            denial.status,
+                                            denial.message,
+                                            None,
+                                            Instant::now(),
+                                            true,
                                         )?;
                                         register(
                                             epoll.as_raw_fd(),
                                             libc::EPOLL_CTL_MOD,
-                                            connection.fd.as_raw_fd(),
+                                            c.fd.as_raw_fd(),
+                                            token,
+                                            true,
+                                            false,
+                                        )?;
+                                    }
+                                    drop(lease);
+                                }
+                                sequencer::Completion::Committed(job) => {
+                                    execution.submit(*job)?;
+                                }
+                                sequencer::Completion::Denied { token, denial } => {
+                                    if let Some(c) = connections.get_mut(&token)
+                                        && c.lifecycle.state().1 == LifecycleDecision::Undecided
+                                    {
+                                        c.respond_inner(
+                                            denial.status,
+                                            denial.message,
+                                            None,
+                                            Instant::now(),
+                                            true,
+                                        )?;
+                                        register(
+                                            epoll.as_raw_fd(),
+                                            libc::EPOLL_CTL_MOD,
+                                            c.fd.as_raw_fd(),
                                             token,
                                             true,
                                             false,
                                         )?;
                                     }
                                 }
-                            }
-                            sequencer::Completion::Denied { token, denial } => {
-                                if let Some(c) = connections.get_mut(&token)
-                                    && c.lifecycle.state().1 == LifecycleDecision::Undecided
-                                {
-                                    c.respond_inner(
-                                        denial.status,
-                                        denial.message,
-                                        None,
-                                        Instant::now(),
-                                        true,
-                                    )?;
-                                    register(
-                                        epoll.as_raw_fd(),
-                                        libc::EPOLL_CTL_MOD,
-                                        c.fd.as_raw_fd(),
-                                        token,
-                                        true,
-                                        false,
-                                    )?;
+                                sequencer::Completion::Fatal(error) => {
+                                    execution.shutdown(true);
+                                    return Err(invalid(format!(
+                                        "durable executor failed closed: {error}"
+                                    )));
                                 }
                             }
-                            sequencer::Completion::Fatal(error) => {
-                                return Err(invalid(format!(
-                                    "durable executor failed closed: {error}"
-                                )));
-                            }
                         }
-                    }
-                } else if token == JOB_COMPLETE {
-                    for outcome in supervisor.drain() {
-                        match outcome {
-                            SpawnOutcome::Failed { job, message } => {
-                                if let Some(connection) = connections.get_mut(&job.token) {
-                                    connection.respond_inner(
-                                        "SPAWN_FAILED",
-                                        concat!("Authorization committed; child launch awaits Phase 5C; ",
-                                            "one-time grant remains consumed"),
-                                        None, Instant::now(), true,
-                                    )?;
+                    } else if token == JOB_COMPLETE {
+                        execution.drain(epoll.as_raw_fd())?;
+                    } else if token & (SYNC_TAG | PID_TAG) != 0 {
+                        // Sync/pidfd readiness is serviced centrally below, after
+                        // processing all returned spawn owners in this dispatch.
+                    } else if token == IO_COMPLETE {
+                        for completion in workers.drain() {
+                            let (token, result) = match completion {
+                                Completion::Released { token } => {
+                                    let _ = log.try_send(serde_json::json!({"event":"FD_VALIDATION_COMPLETE", "worker_task":token}).to_string());
+                                    continue;
+                                }
+                                Completion::Validated { token, result } => {
+                                    if result.is_err() {
+                                        let _ = log.try_send(serde_json::json!({"event":"FD_VALIDATION_COMPLETE", "worker_task":token}).to_string());
+                                    }
+                                    (token, result)
+                                }
+                            };
+                            if let Some(mut connection) = connections.remove(&token) {
+                                let approval_busy = connections
+                                    .values()
+                                    .any(|c| c.approval_reserved && c.output.is_none());
+                                let broker = if result.as_ref().is_ok_and(|lease| {
+                                    lease.prepared().is_some_and(|p| {
+                                        matches!(p.document, Document::Unsigned(_))
+                                    })
+                                }) {
+                                    connections
+                                        .iter()
+                                        .find(|(_, c)| {
+                                            c.broker && matches!(c.input, Input::Approval)
+                                        })
+                                        .map(|(id, c)| c.fd.try_clone().map(|fd| (*id, fd)))
+                                        .transpose()?
+                                } else {
+                                    None
+                                };
+                                if connection
+                                    .finish_validation(
+                                        result,
+                                        Instant::now(),
+                                        &log,
+                                        &context,
+                                        &budget,
+                                        ApprovalAvailability {
+                                            busy: approval_busy,
+                                            broker,
+                                        },
+                                    )
+                                    .is_ok()
+                                {
+                                    if connection.approval_reusable
+                                        && let Some(id) = connection.approval_broker.take()
+                                        && let Some(broker) = connections.get_mut(&id)
+                                    {
+                                        broker.input = Input::Approval;
+                                        register(
+                                            epoll.as_raw_fd(),
+                                            libc::EPOLL_CTL_MOD,
+                                            broker.fd.as_raw_fd(),
+                                            id,
+                                            false,
+                                            true,
+                                        )?;
+                                    }
+                                    if connection.output.is_none()
+                                        && let Some(broker_token) = connection.approval_broker
+                                        && let Some(broker) = connections.get_mut(&broker_token)
+                                    {
+                                        broker.input = Input::Serving { requester: token };
+                                        register(
+                                            epoll.as_raw_fd(),
+                                            libc::EPOLL_CTL_MOD,
+                                            broker.fd.as_raw_fd(),
+                                            broker_token,
+                                            false,
+                                            false,
+                                        )?;
+                                    }
                                     register(
                                         epoll.as_raw_fd(),
                                         libc::EPOLL_CTL_MOD,
                                         connection.fd.as_raw_fd(),
-                                        job.token,
-                                        true,
+                                        token,
+                                        connection.output.is_some(),
                                         false,
                                     )?;
+                                    connections.insert(token, connection);
+                                } else {
+                                    unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
                                 }
-                                queue_post_commit_abort(&sequencer.sender(), *job, &message)?;
                             }
-                            SpawnOutcome::Fatal(message) => return Err(invalid(message)),
                         }
-                    }
-                } else if token == IO_COMPLETE {
-                    for completion in workers.drain() {
-                        let (token, result) = match completion {
-                            Completion::Released { token } => {
-                                let _ = log.try_send(serde_json::json!({"event":"FD_VALIDATION_COMPLETE", "worker_task":token}).to_string());
+                    } else if token == CLIENT_LISTENER || token == APPROVAL_LISTENER {
+                        let listener = if token == CLIENT_LISTENER {
+                            &self.client
+                        } else {
+                            &self.approval
+                        };
+                        // An accept flood cannot starve active frames or timers.
+                        for _ in 0..64 {
+                            let Some(fd) = listener.accept()? else {
+                                break;
+                            };
+                            let accepted = Instant::now();
+                            let Ok(peer) = peer_credentials(fd.as_raw_fd()) else {
+                                // SO_PEERCRED can contain pid=0 for an ancestor
+                                // PID-namespace peer. Reject this connection only.
+                                continue;
+                            };
+                            let broker = token == APPROVAL_LISTENER;
+                            // Authenticate before constructing a broker parser or
+                            // reading a single byte (including queued signatures).
+                            if broker && peer.uid != 0 {
                                 continue;
                             }
-                            Completion::Validated { token, result } => {
-                                if result.is_err() {
-                                    let _ = log.try_send(serde_json::json!({"event":"FD_VALIDATION_COMPLETE", "worker_task":token}).to_string());
-                                }
-                                (token, result)
-                            }
-                        };
-                        if let Some(mut connection) = connections.remove(&token) {
-                            let approval_busy = connections
-                                .values()
-                                .any(|c| c.approval_reserved && c.output.is_none());
-                            let broker = if result.as_ref().is_ok_and(|lease| {
-                                lease
-                                    .prepared()
-                                    .is_some_and(|p| matches!(p.document, Document::Unsigned(_)))
-                            }) {
-                                connections
-                                    .iter()
-                                    .find(|(_, c)| c.broker && matches!(c.input, Input::Approval))
-                                    .map(|(id, c)| c.fd.try_clone().map(|fd| (*id, fd)))
-                                    .transpose()?
-                            } else {
-                                None
-                            };
-                            if connection
-                                .finish_validation(
-                                    result,
-                                    Instant::now(),
-                                    &log,
-                                    &context,
-                                    &budget,
-                                    ApprovalAvailability {
-                                        busy: approval_busy,
-                                        broker,
-                                    },
-                                )
-                                .is_ok()
+                            let clients = connections.values().filter(|c| !c.broker);
+                            let client_count = clients.clone().count();
+                            let uid_count = clients.filter(|c| c.peer.uid == peer.uid).count();
+                            if !broker
+                                && (client_count >= self.config.max_active_sockets_global as usize
+                                    || uid_count >= self.config.max_active_sockets_per_uid as usize)
                             {
-                                if connection.approval_reusable
-                                    && let Some(id) = connection.approval_broker.take()
-                                    && let Some(broker) = connections.get_mut(&id)
-                                {
-                                    broker.input = Input::Approval;
-                                    register(
-                                        epoll.as_raw_fd(),
-                                        libc::EPOLL_CTL_MOD,
-                                        broker.fd.as_raw_fd(),
-                                        id,
-                                        false,
-                                        true,
-                                    )?;
-                                }
-                                if connection.output.is_none()
-                                    && let Some(broker_token) = connection.approval_broker
-                                    && let Some(broker) = connections.get_mut(&broker_token)
-                                {
-                                    broker.input = Input::Serving { requester: token };
-                                    register(
-                                        epoll.as_raw_fd(),
-                                        libc::EPOLL_CTL_MOD,
-                                        broker.fd.as_raw_fd(),
-                                        broker_token,
-                                        false,
-                                        false,
-                                    )?;
-                                }
-                                register(
-                                    epoll.as_raw_fd(),
-                                    libc::EPOLL_CTL_MOD,
-                                    connection.fd.as_raw_fd(),
-                                    token,
-                                    connection.output.is_some(),
-                                    false,
-                                )?;
-                                connections.insert(token, connection);
-                            } else {
-                                unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
-                            }
-                        }
-                    }
-                } else if token == CLIENT_LISTENER || token == APPROVAL_LISTENER {
-                    let listener = if token == CLIENT_LISTENER {
-                        &self.client
-                    } else {
-                        &self.approval
-                    };
-                    // An accept flood cannot starve active frames or timers.
-                    for _ in 0..64 {
-                        let Some(fd) = listener.accept()? else {
-                            break;
-                        };
-                        let accepted = Instant::now();
-                        let Ok(peer) = peer_credentials(fd.as_raw_fd()) else {
-                            // SO_PEERCRED can contain pid=0 for an ancestor
-                            // PID-namespace peer. Reject this connection only.
-                            continue;
-                        };
-                        let broker = token == APPROVAL_LISTENER;
-                        // Authenticate before constructing a broker parser or
-                        // reading a single byte (including queued signatures).
-                        if broker && peer.uid != 0 {
-                            continue;
-                        }
-                        let clients = connections.values().filter(|c| !c.broker);
-                        let client_count = clients.clone().count();
-                        let uid_count = clients.filter(|c| c.peer.uid == peer.uid).count();
-                        if !broker
-                            && (client_count >= self.config.max_active_sockets_global as usize
-                                || uid_count >= self.config.max_active_sockets_per_uid as usize)
-                        {
-                            admission.refuse();
-                            continue;
-                        }
-                        if broker && connections.values().any(|c| c.broker) {
-                            continue;
-                        }
-                        if disable_ancillary_credentials(fd.as_raw_fd()).is_err() {
-                            continue;
-                        }
-                        let audit = if broker {
-                            None
-                        } else {
-                            if storage_closed.load(std::sync::atomic::Ordering::Acquire) {
                                 admission.refuse();
                                 continue;
                             }
-                            let Some(lease) = admission.admit(peer.uid, &self.config, accepted)
-                            else {
+                            if broker && connections.values().any(|c| c.broker) {
                                 continue;
-                            };
-                            Some(lease)
-                        };
-                        let connection = Connection {
-                            token: next_token,
-                            fd,
-                            peer,
-                            broker,
-                            input: if broker {
-                                Input::Approval
+                            }
+                            if disable_ancillary_credentials(fd.as_raw_fd()).is_err() {
+                                continue;
+                            }
+                            let audit = if broker {
+                                None
                             } else {
-                                Input::Client
-                            },
-                            output: None,
-                            audit,
-                            request_deadline: (!broker).then_some(
-                                accepted
-                                    + Duration::from_millis(self.config.request_deadline_ms.into()),
-                            ),
-                            exec_id: new_uuidv7().to_string(),
-                            policy: self.config.clone(),
-                            lifecycle: Arc::new(Lifecycle::new()),
-                            durable: sequencer.sender(),
-                            approval_reserved: false,
-                            approval_broker: None,
-                            approval_csr: None,
-                            approval_reusable: false,
-                        };
-                        let id = next_token;
-                        next_token = next_token
-                            .checked_add(1)
-                            .ok_or_else(|| invalid("connection token overflow"))?;
-                        register(
-                            epoll.as_raw_fd(),
-                            libc::EPOLL_CTL_ADD,
-                            connection.fd.as_raw_fd(),
-                            id,
-                            false,
-                            true,
-                        )?;
-                        let _ = log.try_send(
+                                if storage_closed.load(std::sync::atomic::Ordering::Acquire) {
+                                    admission.refuse();
+                                    continue;
+                                }
+                                let Some(lease) = admission.admit(peer.uid, &self.config, accepted)
+                                else {
+                                    continue;
+                                };
+                                Some(lease)
+                            };
+                            let connection = Connection {
+                                token: next_token,
+                                fd,
+                                peer,
+                                broker,
+                                input: if broker {
+                                    Input::Approval
+                                } else {
+                                    Input::Client
+                                },
+                                output: None,
+                                audit,
+                                request_deadline: (!broker).then_some(
+                                    accepted
+                                        + Duration::from_millis(
+                                            self.config.request_deadline_ms.into(),
+                                        ),
+                                ),
+                                exec_id: new_uuidv7().to_string(),
+                                policy: self.config.clone(),
+                                lifecycle: Arc::new(Lifecycle::new()),
+                                durable: sequencer.sender(),
+                                approval_reserved: false,
+                                approval_broker: None,
+                                approval_csr: None,
+                                approval_reusable: false,
+                            };
+                            let id = next_token;
+                            next_token = next_token
+                                .checked_add(1)
+                                .filter(|token| *token < PID_TAG)
+                                .ok_or_else(|| invalid("connection token overflow"))?;
+                            register(
+                                epoll.as_raw_fd(),
+                                libc::EPOLL_CTL_ADD,
+                                connection.fd.as_raw_fd(),
+                                id,
+                                false,
+                                true,
+                            )?;
+                            let _ = log.try_send(
                             serde_json::json!({"event":"SOCKET_ADMITTED", "worker_task":id, "broker":broker,"requester_pid":peer.pid,
                             "requester_uid":peer.uid,"requester_gid":peer.gid})
                             .to_string(),
                         );
-                        connections.insert(id, connection);
-                    }
-                } else if let Some(mut connection) = connections.remove(&token) {
-                    if connection
-                        .dispatch(token, Instant::now(), &mut workers, &log)
-                        .unwrap_or(false)
-                    {
-                        register(
-                            epoll.as_raw_fd(),
-                            libc::EPOLL_CTL_MOD,
-                            connection.fd.as_raw_fd(),
-                            token,
-                            connection.output.is_some(),
-                            connection.reading(),
-                        )?;
-                        connections.insert(token, connection);
-                    } else {
-                        unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
-                    }
-                }
-            }
-            // One diagnostic slot is reserved separately from requester
-            // ownership. Reconnect floods cannot allocate a durable side queue.
-            if let Some((audit, refused)) =
-                admission.diagnostic(Instant::now(), reload_diagnostic_pending)
-            {
-                let work = sequencer::Work::Event {
-                    token: 0,
-                    event_type: if reload_diagnostic_pending {
-                        "RELOAD_UNAVAILABLE"
-                    } else {
-                        "ADMISSION_REFUSED"
-                    },
-                    fields: serde_json::json!({"refused":refused,"reload_supported":false}),
-                    limit: self.config.audit_record_max_bytes as usize,
-                    _audit: audit,
-                };
-                reload_diagnostic_pending = false;
-                sequencer
-                    .sender()
-                    .try_send(work)
-                    .map_err(|_| invalid("reserved diagnostic capacity unavailable"))?;
-            }
-            // Expiry is independent of socket readiness and read progress.
-            let now = Instant::now();
-            let expired: Vec<u64> = connections
-                .iter()
-                .filter_map(|(id, c)| {
-                    c.deadline()
-                        .filter(|deadline| now >= *deadline)
-                        .map(|_| *id)
-                })
-                .collect();
-            for id in expired {
-                if let Some(mut connection) = connections.remove(&id) {
-                    if connection
-                        .dispatch(id, now, &mut workers, &log)
-                        .unwrap_or(false)
-                    {
-                        register(
-                            epoll.as_raw_fd(),
-                            libc::EPOLL_CTL_MOD,
-                            connection.fd.as_raw_fd(),
-                            id,
-                            connection.output.is_some(),
-                            connection.reading(),
-                        )?;
-                        connections.insert(id, connection);
-                    } else {
-                        unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
-                    }
-                }
-            }
-            // Retiring a requester invalidates its prompt. Only a completely
-            // verified response (or explicit refusal) permits broker reuse.
-            let finished: Vec<(u64, bool)> = connections
-                .iter()
-                .filter_map(|(id, c)| {
-                    if let Input::Serving { requester } = c.input {
-                        match connections.get(&requester) {
-                            Some(request) if request.output.is_none() => None,
-                            Some(request) => Some((*id, request.approval_reusable)),
-                            None => Some((*id, false)),
+                            connections.insert(id, connection);
                         }
-                    } else {
-                        None
+                    } else if let Some(mut connection) = connections.remove(&token) {
+                        if connection
+                            .dispatch(token, Instant::now(), &mut workers, &log)
+                            .unwrap_or(false)
+                        {
+                            register(
+                                epoll.as_raw_fd(),
+                                libc::EPOLL_CTL_MOD,
+                                connection.fd.as_raw_fd(),
+                                token,
+                                connection.output.is_some(),
+                                connection.reading(),
+                            )?;
+                            connections.insert(token, connection);
+                        } else {
+                            unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
+                        }
                     }
-                })
-                .collect();
-            for (id, reusable) in finished {
-                if reusable {
-                    let broker = connections.get_mut(&id).expect("live broker");
-                    broker.input = Input::Approval;
-                    register(
-                        epoll.as_raw_fd(),
-                        libc::EPOLL_CTL_MOD,
-                        broker.fd.as_raw_fd(),
-                        id,
-                        false,
-                        true,
-                    )?;
-                } else if let Some(broker) = connections.remove(&id) {
-                    unregister(epoll.as_raw_fd(), broker.fd.as_raw_fd())?;
+                }
+                // One diagnostic slot is reserved separately from requester
+                // ownership. Reconnect floods cannot allocate a durable side queue.
+                if stopping.is_none()
+                    && let Some((audit, refused)) =
+                        admission.diagnostic(Instant::now(), reload_diagnostic_pending)
+                {
+                    let work = sequencer::Work::Event {
+                        token: 0,
+                        event_type: if reload_diagnostic_pending {
+                            "RELOAD_UNAVAILABLE"
+                        } else {
+                            "ADMISSION_REFUSED"
+                        },
+                        fields: serde_json::json!({"refused":refused,"reload_supported":false}),
+                        limit: self.config.audit_record_max_bytes as usize,
+                        _audit: audit,
+                    };
+                    reload_diagnostic_pending = false;
+                    sequencer
+                        .sender()
+                        .try_send(work)
+                        .map_err(|_| invalid("reserved diagnostic capacity unavailable"))?;
+                }
+                // Expiry is independent of socket readiness and read progress.
+                let now = Instant::now();
+                let expired: Vec<u64> = connections
+                    .iter()
+                    .filter_map(|(id, c)| {
+                        c.deadline()
+                            .filter(|deadline| now >= *deadline)
+                            .map(|_| *id)
+                    })
+                    .collect();
+                for id in expired {
+                    if let Some(mut connection) = connections.remove(&id) {
+                        if connection
+                            .dispatch(id, now, &mut workers, &log)
+                            .unwrap_or(false)
+                        {
+                            register(
+                                epoll.as_raw_fd(),
+                                libc::EPOLL_CTL_MOD,
+                                connection.fd.as_raw_fd(),
+                                id,
+                                connection.output.is_some(),
+                                connection.reading(),
+                            )?;
+                            connections.insert(id, connection);
+                        } else {
+                            unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd())?;
+                        }
+                    }
+                }
+                // Retiring a requester invalidates its prompt. Only a completely
+                // verified response (or explicit refusal) permits broker reuse.
+                let finished: Vec<(u64, bool)> = connections
+                    .iter()
+                    .filter_map(|(id, c)| {
+                        if let Input::Serving { requester } = c.input {
+                            match connections.get(&requester) {
+                                Some(request) if request.output.is_none() => None,
+                                Some(request) => Some((*id, request.approval_reusable)),
+                                None => Some((*id, false)),
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for (id, reusable) in finished {
+                    if reusable {
+                        let broker = connections.get_mut(&id).expect("live broker");
+                        broker.input = Input::Approval;
+                        register(
+                            epoll.as_raw_fd(),
+                            libc::EPOLL_CTL_MOD,
+                            broker.fd.as_raw_fd(),
+                            id,
+                            false,
+                            true,
+                        )?;
+                    } else if let Some(broker) = connections.remove(&id) {
+                        unregister(epoll.as_raw_fd(), broker.fd.as_raw_fd())?;
+                        unsafe {
+                            libc::shutdown(broker.fd.as_raw_fd(), libc::SHUT_RDWR);
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = iteration {
+                if fatal_error.is_none() {
+                    fatal_error = Some(error);
+                }
+                if stopping.is_none() {
+                    stopping = Some(Instant::now());
+                }
+            }
+            if stopping.is_some() {
+                if !stop_notified {
+                    service.stopping();
+                    stop_notified = true;
+                }
+                execution.shutdown(false);
+                // Close both listening endpoints and all control connections
+                // once. Worker-held duplicates observe shutdown immediately.
+                for listener in [&self.client, &self.approval] {
                     unsafe {
-                        libc::shutdown(broker.fd.as_raw_fd(), libc::SHUT_RDWR);
+                        libc::epoll_ctl(
+                            epoll.as_raw_fd(),
+                            libc::EPOLL_CTL_DEL,
+                            listener.fd.as_raw_fd(),
+                            std::ptr::null_mut(),
+                        );
+                        libc::shutdown(listener.fd.as_raw_fd(), libc::SHUT_RDWR);
                     }
+                }
+                for (_, connection) in connections.drain() {
+                    let _ = unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd());
+                    unsafe {
+                        libc::shutdown(connection.fd.as_raw_fd(), libc::SHUT_RDWR);
+                    }
+                }
+            }
+            if let Err(error) = execution.tick(epoll.as_raw_fd()) {
+                if fatal_error.is_none() {
+                    fatal_error = Some(error);
+                }
+                if stopping.is_none() {
+                    stopping = Some(Instant::now());
+                }
+                execution.shutdown(false);
+            }
+            for token in execution.cancelled_connections() {
+                if let Some(connection) = connections.remove(&token) {
+                    let _ = unregister(epoll.as_raw_fd(), connection.fd.as_raw_fd());
+                    unsafe {
+                        libc::shutdown(connection.fd.as_raw_fd(), libc::SHUT_RDWR);
+                    }
+                }
+            }
+            for (token, connection) in &connections {
+                if matches!(
+                    connection.input,
+                    Input::Executing {
+                        ready_sent: true,
+                        ..
+                    }
+                ) && let Err(error) = execution.monitor(*token)
+                {
+                    fatal_error.get_or_insert(error);
+                    stopping.get_or_insert(Instant::now());
+                    execution.shutdown(false);
+                }
+            }
+            if stopping.is_none() {
+                service.tick();
+            }
+            if let Some(start) = stopping {
+                if execution.is_idle() && workers.is_idle() && admission.is_idle() {
+                    return fatal_error.map_or(Ok(()), Err);
+                }
+                if !grace_reported
+                    && start.elapsed()
+                        >= Duration::from_millis(self.config.shutdown_grace_ms.into())
+                {
+                    grace_reported = true;
+                    let _=log.try_send("{\"event\":\"SHUTDOWN_CLEANUP_STALLED\",\"message\":\"ownership retained; supervisor escalation required\"}".into());
                 }
             }
         }
