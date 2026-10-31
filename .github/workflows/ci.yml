@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    name: Format (Rust 1.89.0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install production toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  checks:
+    name: Build, Clippy and tests (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.89.0", "1.99.1"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-linux
+      - name: Install selected toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-checks-rust-${{ matrix.rust }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-checks-rust-${{ matrix.rust }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked -- --test-threads=1
+
+  acceptance:
+    name: Full privileged acceptance (Rust 1.89.0)
+    needs: [fmt, checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RUSTUP_TOOLCHAIN: "1.89.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-linux
+      - name: Install production toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-acceptance-rust-1.89.0-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-acceptance-rust-1.89.0-${{ hashFiles('Cargo.lock') }}-
+      - name: Check exact acceptance build as the unprivileged runner
+        run: /usr/bin/python3 scripts/check.py --artifacts "$RUNNER_TEMP/sigrund-checks"
+      - name: Run full acceptance with real delegation and identities
+        run: |
+          sudo useradd --create-home --shell /bin/bash sigrund-ci
+          sudo /usr/bin/bash -c 'umask 077; exec /usr/bin/python3 "$@"' -- \
+            "$GITHUB_WORKSPACE/scripts/verify-acceptance.py" \
+            --checks "$RUNNER_TEMP/sigrund-checks/checks.json" \
+            --binaries "$GITHUB_WORKSPACE/target/debug" \
+            --requester sigrund-ci --artifacts "$RUNNER_TEMP/sigrund-acceptance"
+      - name: Collect diagnostics and summarize acceptance
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/sigrund-diagnostics"
+          {
+            uname -a
+            systemctl --version
+            findmnt /sys/fs/cgroup
+            cat /proc/self/cgroup
+            sudo systemctl list-units 'sigrund-*' --all --no-pager
+          } > "$RUNNER_TEMP/sigrund-diagnostics/runner.log" 2>&1
+          for directory in sigrund-checks sigrund-acceptance; do
+            if [[ -d "$RUNNER_TEMP/$directory" ]]; then
+              sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/$directory"
+            fi
+          done
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'sigrund-acceptance'
+          def load(name):
+              path = root / name
+              return json.loads(path.read_text()) if path.exists() else {}
+          manifest, supervisor = load('manifest.json'), load('supervisor.json')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('### Full privileged acceptance · Rust 1.89.0\n\n')
+              output.write(f"Result: **{manifest.get('result', 'not completed')}**\n\n")
+              output.write(f"Supervisor cgroup removed: **{supervisor.get('cgroup_removed', False)}**\n\n")
+              for gate in manifest.get('gates', []):
+                  output.write(f"- {gate['gate']}: {gate['result']}\n")
+          PY
+      - name: Upload non-secret run diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/sigrund-diagnostics/*.log
+            ${{ runner.temp }}/sigrund-checks/*.json
+            ${{ runner.temp }}/sigrund-checks/*.log
+            ${{ runner.temp }}/sigrund-acceptance/**/*.json
+            ${{ runner.temp }}/sigrund-acceptance/**/*.jsonl
+            ${{ runner.temp }}/sigrund-acceptance/**/*.log
+            ${{ runner.temp }}/sigrund-acceptance/**/syscalls.*
+            ${{ runner.temp }}/sigrund-acceptance/**/*.prompt
+            ${{ runner.temp }}/sigrund-acceptance/**/*.terminal
+            ${{ runner.temp }}/sigrund-acceptance/**/*.txt
+            !${{ runner.temp }}/**/*key*
+            !${{ runner.temp }}/**/audit_ratchet.state*
+            !${{ runner.temp }}/**/*.sqlite*
+            !${{ runner.temp }}/**/*anchor*

@@ -39,6 +39,7 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
     }
 }
 
+#[track_caller]
 fn send_rights(socket: &UnixStream, bytes: &[u8], count: usize) {
     let null = OpenOptions::new()
         .read(true)
@@ -48,6 +49,7 @@ fn send_rights(socket: &UnixStream, bytes: &[u8], count: usize) {
     send_fds(socket, bytes, &vec![null.as_raw_fd(); count]);
 }
 
+#[track_caller]
 fn send_fds(socket: &UnixStream, bytes: &[u8], rights: &[RawFd]) {
     let count = rights.len();
     let mut control = [0usize; 16];
@@ -72,9 +74,12 @@ fn send_fds(socket: &UnixStream, bytes: &[u8], rights: &[RawFd]) {
             }
         }
     }
+    let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
     assert_eq!(
-        unsafe { libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) },
-        bytes.len() as isize
+        sent,
+        bytes.len() as isize,
+        "sendmsg: {}",
+        io::Error::last_os_error()
     );
 }
 
@@ -134,6 +139,17 @@ struct Fixture {
     socket: PathBuf,
     broker: PathBuf,
     diagnostics: PathBuf,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!(
+                "daemon diagnostics:\n{}",
+                fs::read_to_string(&self.diagnostics).unwrap_or_default()
+            );
+        }
+    }
 }
 
 impl Fixture {
@@ -526,7 +542,8 @@ fn daemon_namespace_fixture() {
         // A truncated ancillary set can be rejected on the first byte before
         // the remaining write. SIGPIPE is suppressed by Rust's socket writes.
         let _ = socket.write_all(&encoded[1..]);
-        let status = decision(&mut socket).status;
+        let response = decision(&mut socket);
+        let status = response.status;
         assert!(
             matches!(status.as_str(), "INVALID_REQUEST" | "TIMEOUT_CSR"),
             "iteration {iteration}: unexpected status {status}"
@@ -536,6 +553,16 @@ fn daemon_namespace_fixture() {
         // actual cleanup so the next serial probe tests parsing, not quota
         // exhaustion caused by deliberately retained disposal reservations.
         fixture.wait_for_cleanup(events_before);
+        // Denial delivery is independent of durable auditing. A fast runner
+        // can exhaust the pending-audit quota even after FD cleanup; keep
+        // this parser sweep serial with respect to audit publication too.
+        wait_for(|| {
+            fs::read_to_string(&fixture.log)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|record| record["exec_id"] == response.exec_id)
+        });
     }
     let events_before = fixture.diagnostic_count();
     let mut oversized = connect(&fixture.socket);
@@ -710,6 +737,7 @@ fn daemon_namespace_fixture() {
     verify_ancestor_pid_peer();
 }
 
+#[track_caller]
 fn send_hello(socket: &mut UnixStream, executable: &Path) {
     let encoded = encode_frame(FrameType::ClientHello, &hello(executable)).unwrap();
     // Quota denial can close the socket immediately after the first byte.

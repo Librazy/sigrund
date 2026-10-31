@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def source_digest():
-    files = [REPO / 'Cargo.toml', REPO / 'Cargo.lock']
+    files = [REPO / 'Cargo.toml', REPO / 'Cargo.lock', REPO / 'rust-toolchain.toml']
     for name in ('crates', 'scripts', 'config', 'packaging'):
         files.extend(p for p in (REPO / name).rglob('*') if p.is_file() and '__pycache__' not in p.parts)
     digest = hashlib.sha256()
@@ -30,7 +30,9 @@ def main():
     if os.geteuid() == 0:
         parser.error('run the build/regression checks as an unprivileged workspace user')
     args.artifacts.mkdir(parents=True, exist_ok=False)
-    manifest = {'result': 'incomplete', 'kernel': platform.release(), 'source_sha256': source_digest(), 'checks': []}
+    manifest = {'result': 'incomplete', 'kernel': platform.release(), 'source_sha256': source_digest(),
+                'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+                'cargo': subprocess.check_output(['cargo', '--version'], text=True).strip(), 'checks': []}
     def save():
         (args.artifacts / 'checks.json').write_text(json.dumps(manifest, indent=2) + '\n')
     save()

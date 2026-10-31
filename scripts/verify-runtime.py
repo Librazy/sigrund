@@ -263,7 +263,7 @@ class Gate:
         self.arm_path = fixture.base / 'armed'
         self.durable = durable
         library = fixture.base / 'gate.so'
-        name = 'durable_gate.c' if durable else 'execution_gate.c'
+        name = 'storage/durable.c' if durable else 'execution/faults.c'
         subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Werror', '-o', str(library),
                         str(REPO / 'crates/sigrund/tests/fixtures' / name), '-ldl'], check=True)
         prefix = 'SIGRUND_DURABLE_' if durable else 'SIGRUND_EXEC_'

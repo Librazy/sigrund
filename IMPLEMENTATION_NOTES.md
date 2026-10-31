@@ -201,7 +201,8 @@ module. Tests inside source modules remain beside the implementation.
 | `sigrund/tests/fixtures/{execution,storage,transport}/` | Native probes and fault interposers; fault switches never enter production builds. |
 | `scripts/tests/` | Acceptance cancellation observation order and operator-service lifetime guards. |
 
-Rust >= 1.89, Cargo/Clippy/rustfmt, a C compiler, Python 3, OpenSSH and uidmap
+The production toolchain is pinned to Rust 1.89.0 in `rust-toolchain.toml`,
+including Clippy and rustfmt. A C compiler, Python 3, OpenSSH and uidmap
 utilities are required. Namespace fixtures need subordinate UID/GID mappings
 and permitted user namespaces. Run ordinary checks as an unprivileged user:
 
@@ -235,6 +236,29 @@ whole-service cleanup apply even if Python is killed. Require both suite
 success and supervisor cgroup removal. Namespace fixtures alone do not establish
 privileged runtime behavior. Generated manifests, logs and traces are disposable
 run output; historical results are available through Git history.
+
+## Continuous integration
+
+GitHub Actions runs on pushes, pull requests and manual dispatch using disposable
+native `ubuntu-24.04` x86-64 VMs. Formatting uses production Rust 1.89.0;
+the build/Clippy/test matrix explicitly overrides the repository pin with
+1.89.0 and the fixed latest-stable compatibility version 1.99.1. Update that
+compatibility pin deliberately; production and privileged acceptance remain on
+1.89.0. Clippy treats warnings as errors and Cargo uses the lockfile.
+
+Full privileged acceptance follows successful formatting and both matrix jobs.
+It repeats `scripts/check.py` as the unprivileged runner before running the
+root acceptance harness against that exact source/build. Check manifests bind
+the toolchain file and record compiler/Cargo versions. Runner preparation
+installs Linux test tools, configures subordinate IDs and permits the namespace
+fixtures. These changes apply only to disposable hosted VMs. Unsupported kernel
+features, failed acceptance gates and retained supervisor cgroups fail CI.
+
+The acceptance job summary lists gate outcomes and cgroup cleanup. Non-secret
+logs, manifests and syscall traces are uploaded on success or failure as
+seven-day Actions artifacts; signing keys, ratchet state, anchors and databases
+are excluded. Results stay outside the checkout. Automated TTY/SSHSIG tests
+exercise software keys, not physical FIDO interaction.
 
 ## Remaining specification scope
 
