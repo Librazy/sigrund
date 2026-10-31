@@ -1,5 +1,7 @@
 # sigrun / sigrund
 
+[MIT licensed](LICENSE).
+
 Signed command elevation for Linux. An unprivileged user requests a command;
 a root operator reviews it on their own terminal and signs it with an SSH key.
 The daemon verifies the signature and policy, records the authorization,
@@ -23,6 +25,15 @@ includes features that are not yet implemented; see [current scope](#current-sco
 
 `sigrundctl` provisions host state and packages offline warrants. The
 `sigrund-collector` binary currently provides validation diagnostics only.
+
+## Packages
+
+The [Packages workflow](https://github.com/Librazy/sigrund/actions/workflows/packages.yml)
+builds RPMs for Fedora 44/45 and DEBs for Ubuntu 24.04/26.04 on x86-64.
+Install `sigrun` alone for the client; `sigrund` contains the daemon, SSH approver,
+administration tool and systemd unit. Packages require explicit configuration
+and provisioning before starting the daemon. See the
+[package guide](packaging/README.md) for artifacts, installation and upgrades.
 
 ## Build
 

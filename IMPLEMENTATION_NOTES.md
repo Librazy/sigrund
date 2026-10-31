@@ -262,6 +262,13 @@ exercise software keys, not physical FIDO interaction.
 
 ## Remaining specification scope
 
+Distribution packaging is described in the [package guide](packaging/README.md).
+The separate Packages workflow builds Fedora 44/45 RPMs and Ubuntu 24.04/26.04
+DEBs on x86-64, with independent client and daemon packages. Fresh-container
+installation/upgrade/removal tests validate packaging; they do not replace the
+native privileged execution gates. Packages never provision or automatically
+start the daemon, and preserve operator state on removal.
+
 The local workflow covers applicable portions of V-01–V-11, V-13–V-15 and
 V-17–V-19. Full rows remain incomplete wherever they include deferred features;
 V-12/PTY and V-16/hooks are outside this profile. Full v1.0 conformance requires:

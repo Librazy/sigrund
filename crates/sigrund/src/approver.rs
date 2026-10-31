@@ -679,6 +679,7 @@ fn sign_with_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::os::{fd::FromRawFd, unix::fs::PermissionsExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -781,22 +782,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (key, signer) = identity(dir.path(), "key");
         let (_master, tty) = terminal();
-        let pid_path = dir.path().join("pid");
         let helper = dir.path().join("helper");
-        fs::write(
-            &helper,
-            format!(
-                "#!/bin/sh\n/usr/bin/stty -echo <&2\necho $$ > '{}'\nexec /usr/bin/sleep 60\n",
-                pid_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-        for kind in [
+        for (attempt, kind) in [
             io::ErrorKind::Interrupted,
             io::ErrorKind::TimedOut,
             io::ErrorKind::UnexpectedEof,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Each attempt publishes its own complete PID after disabling echo.
+            // A delayed helper must not leave an empty or stale PID to inspect.
+            let attempt_dir = dir.path().join(attempt.to_string());
+            fs::create_dir(&attempt_dir).unwrap();
+            let pending_pid = attempt_dir.join("pid");
+            let ready_pid = attempt_dir.join("ready");
+            fs::write(
+                &helper,
+                format!(
+                    "#!/bin/sh\nset -e\n/usr/bin/stty -echo <&2\necho $$ > '{}'\n/usr/bin/mv '{}' '{}'\nexec /usr/bin/sleep 60\n",
+                    pending_pid.display(),
+                    pending_pid.display(),
+                    ready_pid.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
             let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
             assert_eq!(
                 unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut original) },
@@ -805,23 +816,47 @@ mod tests {
             assert_ne!(original.c_lflag & libc::ECHO, 0);
             let start = Instant::now();
             let checks = AtomicUsize::new(0);
+            let ready_at = Cell::new(None);
+            let cancelled_at = Cell::new(None);
+            let helper_pid = Cell::new(None);
             let result =
                 sign_with_helper(&helper, &key, &tty, &signer, &vec![b'x'; 65_536], || {
                     checks.fetch_add(1, Ordering::Relaxed);
-                    if start.elapsed() >= Duration::from_millis(100) {
+                    if ready_at.get().is_none() {
+                        match fs::read_to_string(&ready_pid) {
+                            Ok(pid) => {
+                                helper_pid.set(Some(pid.trim().parse::<i32>().unwrap()));
+                                let mut settings = unsafe { std::mem::zeroed::<libc::termios>() };
+                                assert_eq!(
+                                    unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut settings) },
+                                    0
+                                );
+                                assert_eq!(settings.c_lflag & libc::ECHO, 0);
+                                ready_at.set(Some(Instant::now()));
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                assert!(
+                                    start.elapsed() < Duration::from_secs(5),
+                                    "helper did not publish readiness"
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if ready_at
+                        .get()
+                        .is_some_and(|ready| ready.elapsed() >= Duration::from_millis(100))
+                    {
+                        cancelled_at.set(Some(Instant::now()));
                         Err(kind.into())
                     } else {
                         Ok(())
                     }
                 });
             assert_eq!(result.unwrap_err().kind(), kind);
-            assert!(start.elapsed() < Duration::from_secs(2));
+            assert!(cancelled_at.get().unwrap().elapsed() < Duration::from_secs(2));
             assert!(checks.load(Ordering::Relaxed) > 2);
-            let pid: i32 = fs::read_to_string(&pid_path)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            let pid = helper_pid.get().unwrap();
             assert_eq!(
                 unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
                 -1

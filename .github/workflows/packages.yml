@@ -1,0 +1,84 @@
+name: Packages
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packages:
+    name: ${{ matrix.distribution }} (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distribution: fedora-44
+            image: fedora:44
+            format: rpm
+          - distribution: fedora-45
+            image: fedora:45
+            format: rpm
+          - distribution: ubuntu-24.04
+            image: ubuntu:24.04
+            format: deb
+          - distribution: ubuntu-26.04
+            image: ubuntu:26.04
+            format: deb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve target image once
+        id: target-image
+        env:
+          IMAGE_REFERENCE: ${{ matrix.image }}
+        run: |
+          docker pull --platform linux/amd64 "$IMAGE_REFERENCE"
+          resolved_image=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REFERENCE")
+          image_id=$(docker image inspect --format '{{.Id}}' "$resolved_image")
+          [[ "$resolved_image" =~ @sha256:[0-9a-f]{64}$ ]]
+          printf 'image=%s\nid=%s\n' "$resolved_image" "$image_id" >> "$GITHUB_OUTPUT"
+      - name: Build native release packages
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+          IMAGE_REFERENCE: ${{ matrix.image }}
+          IMAGE: ${{ steps.target-image.outputs.image }}
+          IMAGE_ID: ${{ steps.target-image.outputs.id }}
+          FORMAT: ${{ matrix.format }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/packages"
+          export SOURCE_COMMIT=$(git rev-parse HEAD)
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export PACKAGE_REVISION="0.$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S).git${SOURCE_COMMIT:0:12}.${DISTRIBUTION//-/}"
+          docker run --rm --platform linux/amd64 \
+            --env SOURCE_COMMIT --env SOURCE_DATE_EPOCH --env PACKAGE_REVISION \
+            --env IMAGE_REFERENCE --env IMAGE --env IMAGE_ID \
+            --volume "$GITHUB_WORKSPACE:/src:ro" --volume "$RUNNER_TEMP/packages:/out" \
+            "$IMAGE" bash /src/packaging/build-container.sh "$FORMAT"
+      - name: Test daemon-only and combined installation in fresh containers
+        env:
+          IMAGE: ${{ steps.target-image.outputs.image }}
+          FORMAT: ${{ matrix.format }}
+        run: |
+          for scenario in daemon-only combined; do
+            docker run --rm --platform linux/amd64 \
+              --volume "$GITHUB_WORKSPACE/packaging:/packaging:ro" \
+              --volume "$RUNNER_TEMP/packages:/out:ro" \
+              "$IMAGE" bash /packaging/smoke-container.sh "$FORMAT" "$scenario"
+          done
+      - name: Upload tested packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages-${{ matrix.distribution }}-x86_64
+          retention-days: 14
+          if-no-files-found: error
+          path: ${{ runner.temp }}/packages/packages/*
