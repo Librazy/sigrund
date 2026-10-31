@@ -1,5 +1,7 @@
 # sigrun / sigrund
 
+[MIT licensed](LICENSE).
+
 Signed command elevation for Linux. An unprivileged user requests a command;
 a root operator reviews it on their own terminal and signs it with an SSH key.
 The daemon verifies the signature and policy, records the authorization,

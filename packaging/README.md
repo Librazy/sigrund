@@ -1,5 +1,9 @@
 # Distribution packages
 
+The project and both packages are MIT licensed. Each DEB ships the license in
+`/usr/share/doc/<package>/copyright`; each RPM declares `License: MIT` and ships
+it in `/usr/share/licenses/<package>/LICENSE`.
+
 GitHub Actions builds native **x86-64** packages in Fedora 44/45 and Ubuntu
 24.04/26.04 containers, using the repository's pinned Rust toolchain and locked
 dependencies. Download the `packages-<distribution>-x86_64` artifact from a

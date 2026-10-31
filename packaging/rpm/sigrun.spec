@@ -2,7 +2,7 @@ Name:           sigrun
 Version:        %{package_version}
 Release:        %{package_release}%{?dist}
 Summary:        Client for signed command elevation
-License:        Apache-2.0
+License:        MIT
 URL:            https://github.com/Librazy/sigrund
 Source0:        payload.tar.gz
 
