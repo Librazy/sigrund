@@ -3,6 +3,56 @@
 use super::*;
 use std::os::fd::FromRawFd;
 
+impl Fixture {
+    fn admitted_client(&self) -> UnixStream {
+        let mut candidate = None;
+        let mut before = 0;
+        wait_for(|| {
+            if candidate.is_none() {
+                before = self.diagnostic_count();
+                candidate = Some(connect(&self.socket));
+            }
+            if fs::read_to_string(&self.diagnostics)
+                .unwrap()
+                .lines()
+                .skip(before)
+                .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":false"))
+            {
+                return true;
+            }
+            // Denial delivery precedes durable audit completion. Rapid cases
+            // can legitimately exhaust the eight per-UID audit reservations.
+            // Retry only a closed pre-admission socket: no hello, rights or
+            // authorization has been sent. wait_for bounds admission recovery.
+            let mut byte = 0u8;
+            match unsafe {
+                libc::recv(
+                    candidate.as_ref().unwrap().as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            } {
+                0 => candidate = None,
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::ConnectionReset {
+                        candidate = None;
+                    } else {
+                        assert!(matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ));
+                    }
+                }
+                result => panic!("unexpected response before client hello: {result}"),
+            }
+            false
+        });
+        candidate.unwrap()
+    }
+}
+
 #[test]
 fn exit_gate() {
     let _gate = NAMESPACE_GATE.lock().unwrap();
@@ -68,7 +118,7 @@ fn namespace_fixture() {
     let initial_log = fs::read(&fixture.log).unwrap();
     // No approver: completed canonical CSR is returned immediately.
     let before = fixture.diagnostic_count();
-    let mut socket = connect(&fixture.socket);
+    let mut socket = fixture.admitted_client();
     send_hello(&mut socket, &fixture.executable);
     assert_eq!(decision(&mut socket).status, "TIMEOUT_CSR");
     drop(socket);
@@ -167,7 +217,7 @@ fn namespace_fixture() {
     // now contains different bytes; the daemon must not silently resnapshot.
     fs::write(&fixture.executable, b"\x7fELFreplacement-after-prompt").unwrap();
     // A busy request must be denied before another snapshot can start.
-    let mut busy = connect(&fixture.socket);
+    let mut busy = fixture.admitted_client();
     send_hello(
         &mut busy,
         &fixture
@@ -176,7 +226,7 @@ fn namespace_fixture() {
     );
     assert_eq!(decision(&mut busy).status, "RESOURCE_EXHAUSTED");
     drop(busy);
-    let mut invalid_policy = connect(&fixture.socket);
+    let mut invalid_policy = fixture.admitted_client();
     let mut invalid_hello: serde_json::Value =
         serde_json::from_slice(&hello(&fixture.executable)).unwrap();
     invalid_hello["requested_execution_context"]["target_uid"] = 77.into();
@@ -213,7 +263,7 @@ fn namespace_fixture() {
     // Blank and explicit no are default-deny and reuse the same idle broker.
     for answer in [b"\n".as_slice(), b"no\n", b"\x04"] {
         let before = fixture.diagnostic_count();
-        let mut socket = connect(&fixture.socket);
+        let mut socket = fixture.admitted_client();
         send_hello(&mut socket, &fixture.executable);
         prompt(&mut terminal);
         terminal.write_all(answer).unwrap();
@@ -229,7 +279,7 @@ fn namespace_fixture() {
     }
     // Requester cancellation invalidates the prompt and stops the watcher.
     let before = fixture.diagnostic_count();
-    let mut socket = connect(&fixture.socket);
+    let mut socket = fixture.admitted_client();
     send_hello(&mut socket, &fixture.executable);
     prompt(&mut terminal);
     drop(socket);
@@ -379,7 +429,7 @@ fn broker_send(socket: &mut UnixStream, value: &serde_json::Value) {
 fn revocation_after_approval_request(fixture: &Fixture, identity: &Path) {
     let mut broker = admitted_broker(fixture);
     let before = fixture.diagnostic_count();
-    let mut client = connect(&fixture.socket);
+    let mut client = fixture.admitted_client();
     send_hello(&mut client, &fixture.executable);
     let approval = broker_request(&mut broker);
     let csr = sigrund_core::warrant::Csr::parse(approval.csr_payload.as_bytes()).unwrap();
@@ -460,7 +510,7 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
     ] {
         let mut broker = admitted_broker(fixture);
         let before = fixture.diagnostic_count();
-        let mut client = connect(&fixture.socket);
+        let mut client = fixture.admitted_client();
         if field == "expired" {
             let mut hello: serde_json::Value =
                 serde_json::from_slice(&hello(&fixture.executable)).unwrap();
@@ -529,7 +579,7 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
     // response is unsolicited and must retire it rather than authorize again.
     let mut broker = admitted_broker(fixture);
     let before = fixture.diagnostic_count();
-    let mut client = connect(&fixture.socket);
+    let mut client = fixture.admitted_client();
     send_hello(&mut client, &fixture.executable);
     let request = broker_request(&mut broker);
     let response = signed_response(&request, identity, |_| {});
@@ -579,7 +629,7 @@ fn operator_failures_and_expiry(fixture: &Fixture, identity: &Path) {
             .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
     });
     let before = fixture.diagnostic_count();
-    let mut client = connect(&fixture.socket);
+    let mut client = fixture.admitted_client();
     let mut hello: serde_json::Value = serde_json::from_slice(&hello(&fixture.executable)).unwrap();
     hello["requested_policy"]["ttl_secs"] = 1.into();
     send_rights(
@@ -597,7 +647,7 @@ fn operator_failures_and_expiry(fixture: &Fixture, identity: &Path) {
     fixture.wait_for_cleanup(before);
     // Losing the root's TTY invalidates an outstanding prompt.
     let before = fixture.diagnostic_count();
-    let mut client = connect(&fixture.socket);
+    let mut client = fixture.admitted_client();
     send_hello(&mut client, &fixture.executable);
     prompt(&mut terminal);
     drop(terminal);
@@ -627,7 +677,7 @@ fn slow_signing_cancellation(fixture: &Fixture, identity: &Path) {
             .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
     });
     let before = fixture.diagnostic_count();
-    let mut client = connect(&fixture.socket);
+    let mut client = fixture.admitted_client();
     send_hello(&mut client, &fixture.executable);
     prompt(&mut terminal);
     terminal.write_all(b"yes\n").unwrap();
@@ -734,7 +784,7 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
                 .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
         });
         let before = fixture.diagnostic_count();
-        let mut client = connect(&fixture.socket);
+        let mut client = fixture.admitted_client();
         send_hello(&mut client, &fixture.executable);
         prompt(&mut terminal);
         terminal.write_all(b"yes\n").unwrap();
@@ -760,7 +810,7 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
         drop(client);
         fixture.wait_for_cleanup(before);
         let before = fixture.diagnostic_count();
-        let mut client = connect(&fixture.socket);
+        let mut client = fixture.admitted_client();
         send_hello(&mut client, &fixture.executable);
         prompt(&mut terminal);
         drop(client);
@@ -811,7 +861,7 @@ fn wrong_operator_identity(fixture: &Fixture) {
             .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
     });
     let before = fixture.diagnostic_count();
-    let mut client = connect(&fixture.socket);
+    let mut client = fixture.admitted_client();
     send_hello(&mut client, &fixture.executable);
     assert_eq!(decision(&mut client).status, "TIMEOUT_CSR");
     drop(client);
@@ -867,7 +917,7 @@ fn encrypted_signing_cancellation_restores_terminal(fixture: &Fixture, identity:
                 .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
         });
         let before = fixture.diagnostic_count();
-        let mut client = connect(&fixture.socket);
+        let mut client = fixture.admitted_client();
         send_hello(&mut client, &fixture.executable);
         prompt(&mut terminal);
         terminal.write_all(b"yes\n").unwrap();
