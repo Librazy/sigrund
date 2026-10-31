@@ -27,6 +27,7 @@ SHARED = runpy.run_path(str(Path(__file__).with_name('verify-phase5-runtime.py')
 Fixture, Gate = SHARED['Fixture'], SHARED['Gate']
 canonical, frame, receive = SHARED['canonical'], SHARED['frame'], SHARED['receive']
 wait_for, unprivileged, REPO = SHARED['wait_for'], SHARED['unprivileged'], SHARED['REPO']
+CLIENT_PROGRESS = SHARED['CLIENT_PROGRESS']
 
 
 class Evidence:
@@ -255,7 +256,7 @@ def root_tty_workflow(parent, binaries, evidence):
                 status.seek(0)
                 events = [json.loads(line) for line in status]
             if approve:
-                assert client.returncode == 0 and stdout == b'0\n' and not stderr, (client.returncode, stdout, stderr, events)
+                assert client.returncode == 0 and stdout == b'0\n' and stderr == CLIENT_PROGRESS, (client.returncode, stdout, stderr, events)
                 assert [e.get('status') for e in events] == ['READY_TO_EXEC', None], events
                 assert events[1] == {'exit_code': 0, 'signal': None}
                 records = records_for(fixture, events[0])
@@ -375,7 +376,7 @@ def observed_execution(parent, binaries, evidence, strace):
                 code, out, err, status = run_cli(fixture, probe, ('--observe',), target_uid=uid,
                                                capabilities=caps, supplementary_gids=(uid,),
                                                env_exact={'P5_UID': str(uid), 'P5_CAPS': '1024' if caps else '0', 'P5_ISOLATED': '1'})
-                assert code == 0 and not err, (code, out, err, status)
+                assert code == 0 and err == CLIENT_PROGRESS, (code, out, err, status)
                 observed = json.loads(out)
                 assert observed['uid'] == [uid] * 3 and observed['gid'] == [uid] * 3, observed
                 assert observed['groups'] == [uid]
@@ -390,11 +391,11 @@ def observed_execution(parent, binaries, evidence, strace):
                 wait_for(fixture.empty, 'post-exec probe cleanup')
         content = bytes(range(256)) * 4096
         code, out, err, status = run_cli(fixture, fixture.commands / 'cat', input_bytes=content)
-        assert code == 0 and out == content and not err, (code, len(out), err, status)
+        assert code == 0 and out == content and err == CLIENT_PROGRESS, (code, len(out), err, status)
         assert status[1] == {'exit_code': 0, 'signal': None}
         for name, expected in [('id', 0), ('true', 0), ('false', 1)]:
             code, out, err, status = run_cli(fixture, fixture.commands / name)
-            assert code == expected and not err, (code, out, err, status)
+            assert code == expected and err == CLIENT_PROGRESS, (code, out, err, status)
             if name == 'id':
                 assert b'uid=33' in out and b'gid=33' in out, out
             assert status[1] == {'exit_code': expected, 'signal': None}
