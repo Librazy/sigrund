@@ -1,9 +1,10 @@
 # Phase 5C: execution ownership, reaping and shutdown
 
-Implementation and verification are in progress. The workspace suite, Clippy,
-formatting and the existing child/reaper tests pass. The prepared real
-execution/service fixtures have not yet run; Phase 5C acceptance and its final
-commit remain pending that evidence.
+The runtime and verification fixtures are committed in `3d16f0c`, with
+documentation in `147c730` and the authorization-only diagnostic correction in
+`7f476ba`. The workspace suite, Clippy, formatting and the existing child/reaper
+tests pass. The prepared real execution/service fixtures have not yet run;
+Phase 5C acceptance remains pending that evidence.
 
 ## Runtime ownership
 
