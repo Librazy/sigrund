@@ -2,6 +2,11 @@
 # Runs in a fresh disposable target container, not the build container or host.
 set -euo pipefail
 kind=$1
+scenario=${2:-combined}
+case "$scenario" in
+  daemon-only|combined) ;;
+  *) exit 64 ;;
+esac
 assert_absent() {
   if installed "$1"; then
     echo "Unexpected installed package: $1" >&2
@@ -39,15 +44,28 @@ if grep -E 'sigrund|systemd|openssh' <<< "$client_dependencies"; then
   echo 'Client package has an unexpected service dependency' >&2
   exit 1
 fi
-install_packages "${client_old[0]}"
-sigrun --help
+daemon_dependencies=$(dependencies "${daemon_new[0]}")
+if grep -E '(^|[[:space:],|(])sigrun(:[[:alnum:]-]+)?([[:space:](,|<>=]|$)' <<< "$daemon_dependencies"; then
+  echo 'Daemon package has an unexpected client dependency' >&2
+  exit 1
+fi
+assert_absent sigrun
 assert_absent sigrund
-test ! -e /usr/libexec/sigrund/sigrund
-test ! -e /usr/lib/systemd/system/sigrund.service
-install_packages "${client_new[0]}"
-sigrun --help
+if [[ "$scenario" == combined ]]; then
+  install_packages "${client_old[0]}"
+  sigrun --help
+  assert_absent sigrund
+  test ! -e /usr/libexec/sigrund/sigrund
+  test ! -e /usr/lib/systemd/system/sigrund.service
+  install_packages "${client_new[0]}"
+  sigrun --help
+fi
 
 install_packages "${daemon_old[0]}"
+if [[ "$scenario" == daemon-only ]]; then
+  assert_absent sigrun
+  test ! -e /usr/bin/sigrun
+fi
 /usr/libexec/sigrund/sigrund --help
 sigrund-approve --help
 sigrundctl --validate-uuid "$(sigrundctl uuidv7)"
@@ -63,17 +81,27 @@ printf 'identity and consumption sentinel\n' > /var/lib/sigrund/package-test
 printf 'audit history sentinel\n' > /var/log/sigrund/package-test
 sha256sum /etc/sigrund/config.toml /var/lib/sigrund/package-test /var/log/sigrund/package-test > /tmp/preserved.sha256
 install_packages "${daemon_new[0]}"
+if [[ "$scenario" == daemon-only ]]; then
+  assert_absent sigrun
+  test ! -e /usr/bin/sigrun
+fi
 sha256sum --check /tmp/preserved.sha256
 test ! -e /etc/systemd/system/multi-user.target.wants/sigrund.service
-for executable in /usr/bin/sigrun /usr/bin/sigrundctl /usr/bin/sigrund-approve /usr/libexec/sigrund/sigrund; do
+executables=(/usr/bin/sigrundctl /usr/bin/sigrund-approve /usr/libexec/sigrund/sigrund)
+if [[ "$scenario" == combined ]]; then
+  executables+=(/usr/bin/sigrun)
+fi
+for executable in "${executables[@]}"; do
   test "$(stat -c '%u:%g:%a' "$executable")" = 0:0:755
 done
 remove_packages sigrund
 sha256sum --check /tmp/preserved.sha256
 assert_absent sigrund
 test ! -e /usr/libexec/sigrund/sigrund
-sigrun --help
-remove_packages sigrun
+if [[ "$scenario" == combined ]]; then
+  sigrun --help
+  remove_packages sigrun
+fi
 assert_absent sigrun
 test ! -e /usr/bin/sigrun
-echo 'Package install, upgrade, independence and removal checks passed.'
+echo "Package install, upgrade, independence and removal checks passed ($scenario)."

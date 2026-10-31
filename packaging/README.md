@@ -118,9 +118,13 @@ distribution package repositories and the rustup installer remain live inputs.
 This metadata supplies image provenance, not a bit-for-bit reproducibility
 guarantee.
 
-The workflow then starts a **fresh** target container to check checksums,
-client-only installation, a real version upgrade, binary entry points, service
-unit syntax, root ownership/modes, package independence and preservation of
+The workflow starts separate **fresh** target containers for daemon-only and
+combined scenarios. It checks dependency metadata in both directions and
+asserts that daemon-only installation and upgrade leave the client absent.
+The combined scenario begins with client-only installation, checks that the
+daemon is absent, then installs both packages and verifies the client survives
+daemon removal. Both scenarios check checksums, real version upgrades, binary
+entry points, service unit syntax, root ownership/modes and preservation of
 operator data through upgrade/removal. The service stays disabled throughout.
 These are packaging smoke tests, not execution acceptance: the existing CI
 workflow separately tests actual kernel execution and service supervision on a
