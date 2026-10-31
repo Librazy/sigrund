@@ -1,5 +1,12 @@
 # Phase 6 acceptance evidence
 
+Review follow-up: the run below predates the strengthened blocked-output
+cancellation check. That check now keeps the pipe full until SIGINT status and
+job cleanup are observed, then verifies client exit 130. Ordinary regression
+tests cover ignored signals, incorrect exit status, and missing cleanup. The
+privileged acceptance gate has not been rerun with this correction; the retained
+manifest is historical evidence, not acceptance of the corrected harness.
+
 The Phase 6 MVP gate passed on 2026-10-31 in the disposable pvem guest
 `sigrund-phase6` (VM 9012), Ubuntu 26.04, kernel
 `7.0.0-34-generic`, x86-64. The final run used a distinct unprivileged

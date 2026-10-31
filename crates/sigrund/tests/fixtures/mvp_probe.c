@@ -11,6 +11,13 @@
 /* Native workloads for actual job-limit and bounded-output acceptance. */
 int main(int argc, char **argv) {
     if (argc != 2) return 64;
+    if (!strcmp(argv[1], "blocked-output")) {
+        /* No finite successful completion can masquerade as cancellation. */
+        unsigned char block[4096] = {0};
+        for (;;) {
+            if (write(STDOUT_FILENO, block, sizeof(block)) < 0 && errno != EINTR) return 70;
+        }
+    }
     if (!strcmp(argv[1], "output")) {
         unsigned char block[4096];
         for (size_t i=0;i<sizeof(block);i++) block[i]=(unsigned char)i;

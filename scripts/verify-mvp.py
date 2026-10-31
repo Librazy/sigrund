@@ -10,6 +10,7 @@ import argparse
 import array
 import base64
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -65,6 +66,33 @@ def finish(client, output, input_bytes=None):
             client.kill()
             client.communicate(timeout=5)
         output.close()
+
+
+def cancel_blocked_output(client, output, status_path, jobs_empty, *, timeout=6):
+    """Observe cancellation through status/cgroups before reading either pipe."""
+    def pipe_full():
+        pending = array.array('i', [0])
+        fcntl.ioctl(client.stdout.fileno(), termios.FIONREAD, pending)
+        return pending[0] == fcntl.fcntl(client.stdout.fileno(), fcntl.F_GETPIPE_SZ)
+
+    def events():
+        # The status writer may be between writes; only inspect complete lines.
+        return [json.loads(line) for line in status_path.read_bytes().split(b'\n')[:-1]]
+
+    wait_for(pipe_full, 'full output pipe without reads', timeout=timeout)
+    wait_for(lambda: any(e.get('status') == 'READY_TO_EXEC' for e in events()),
+             'blocked output client readiness', timeout=timeout)
+    assert client.poll() is None and not jobs_empty(), 'workload completed before cancellation'
+    client.send_signal(signal.SIGINT)
+    wait_for(lambda: any('signal' in e for e in events()),
+             'child signal outcome while output remains blocked', timeout=timeout)
+    assert events()[-1] == {'exit_code': None, 'signal': signal.SIGINT}, events()
+    wait_for(jobs_empty, 'blocked-output cancellation cleanup without reads', timeout=timeout)
+    assert pipe_full(), 'output was drained before cancellation was verified'
+    # The client legitimately waits for its relays to drain after child exit.
+    code, _, _, result = finish(client, output)
+    assert code == 128 + signal.SIGINT and result[-1] == {'exit_code': None, 'signal': signal.SIGINT}, (code, result)
+    return {'signal': signal.SIGINT, 'exit_code': code, 'cleanup_before_drain': True}
 
 
 def deny(f, warrant, status, input_bytes=None):
@@ -178,21 +206,19 @@ def output_and_limits(parent, binaries, evidence):
         assert code == 23 and out == expected and err == SHARED['CLIENT_PROGRESS'] + expected, (code, len(out), len(err), events)
         assert events[-1] == {'exit_code': 23, 'signal': None}
         # A genuinely blocked local sink must not prevent a signal cancellation.
-        blocked, _ = f.signed(probe, ('output',))
-        client, output, _ = cli(f, blocked)
+        blocked, _ = f.signed(probe, ('blocked-output',))
+        client, output, status_path = cli(f, blocked)
         try:
-            wait_for(lambda: any(r.get('event_type') == 'EXEC_READY_TO_EXEC' and r.get('grant_id') ==
-                                json.loads(base64.b64decode(json.loads(blocked.read_bytes())['payload']))['grant_id']
-                                for r in f.records()), 'blocked output readiness')
-            client.send_signal(signal.SIGINT)
-            code, _, _, events = finish(client, output)
+            cancellation = cancel_blocked_output(client, output, status_path, f.empty)
         finally:
             if client.poll() is None:
                 client.kill()
                 client.wait(timeout=5)
             if not output.closed:
                 output.close()
-        wait_for(f.empty, 'blocked-output cancellation cleanup')
+            for stream in (client.stdin, client.stdout, client.stderr):
+                if stream:
+                    stream.close()
         # Memory and pids are actually enforced, beyond control read-back.
         memory, _ = f.signed(probe, ('memory',))
         gate.arm()
@@ -218,6 +244,7 @@ def output_and_limits(parent, binaries, evidence):
         wait_for(f.empty, 'background descendants cleaned with job')
         f.stop()
         evidence.passed('output-and-enforced-limits', stdout_bytes=len(expected), stderr_bytes=len(expected),
+                        blocked_output_cancellation=cancellation,
                         oom_signal=9, fork_denied_after=denied_at, descendants_cleaned=True, memory_events=memory_events, pids_events=pids_events)
     finally:
         evidence.capture(f, 'output-and-enforced-limits')

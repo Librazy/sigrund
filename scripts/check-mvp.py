@@ -41,6 +41,7 @@ def main():
         ('format', ['cargo', 'fmt', '--all', '--', '--check']),
         ('diff', ['git', 'diff', '--check']),
         ('python', [sys.executable, '-c', "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').glob('*.py')]"]),
+        ('harness-tests', [sys.executable, '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-v']),
         ('platform-build', ['cargo', 'test', '-p', 'sigrund', '--test', 'phase5_platform', '--locked', '--no-run', '--message-format=json']),
     ]
     try:
