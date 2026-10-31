@@ -1,6 +1,6 @@
 # `sigrun` & `sigrund` Security Architecture and Implementation Specification (v1.0)
 
-This document is the complete, self-contained v1.0 specification for `sigrun` (unprivileged CLI client) and `sigrund` (root execution daemon). It defines the trust boundaries, cgroup v2 hierarchy initialization, admission and quota controls, wire protocol, cryptographic envelopes, unified authorization predicate (including same-UID injection prevention), child credential and mount transitions, hook sandboxing, contiguous audit replication and collector deduplication, audit crash-recovery state machine, and cumulative verification matrix.
+This document is the complete, self-contained v1.0 specification for `sigrun` (unprivileged CLI client) and `sigrund` (root execution daemon). It defines the trust boundaries, cgroup v2 hierarchy initialization, admission and quota controls, wire protocol, cryptographic envelopes, unified authorization predicate (including same-UID injection prevention), child credential and mount transitions, hook sandboxing, contiguous audit replication and collector deduplication, audit crash-recovery state machine, and cumulative verification matrix. Section 8.3 records the current implementation boundary and release gate; a validated helper or command-line probe is not an implementation of the runtime contract by itself.
 
 ---
 
@@ -33,6 +33,15 @@ This document is the complete, self-contained v1.0 specification for `sigrun` (u
 5. **Script & Dynamic Dependency Boundary:**
 * Sealing and hashing the target binary (`exec_memfd`) and standard input (`stdin_memfd`) authenticates only those exact byte streams. It does not authenticate dynamically linked libraries resolved from mutable paths, configuration files read after startup, or files sourced by an interpreter.
 
+Approval delegates the effects of the complete command, including argv,
+environment, input and working directory. A signed shell/interpreter or a
+privileged tool accepting caller-selected paths can confer broad authority
+despite an authentic executable digest. The cwd is a signed path, not a sealed
+directory tree. Operators must review those effects; host UID 0 with an empty
+capability set still has ownership-based authority, but does not have every
+Linux capability (Section 5.3). Local audit protection has the protected-state
+and key-compromise limits in Section 7.2.
+
 
 
 ### 1.2 Startup Cgroup v2 Initialization & Supervisor Leaf
@@ -42,7 +51,16 @@ This document is the complete, self-contained v1.0 specification for `sigrun` (u
 Before opening `/run/sigrund.sock`, `sigrund` executes the following mandatory startup sequence and fails closed (exiting with a fatal error) if any step fails:
 
 1. **Subreaper Registration:** Calls `prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)` so orphaned descendants of this daemon are reparented to it while it remains alive. This does not adopt processes already reparented to PID 1 or another subreaper after an earlier daemon instance died.
-2. **Directory Creation:** Resolves its own delegated service cgroup path $G$ (e.g., `/sys/fs/cgroup/system.slice/sigrund.service`) and creates three subdirectories (`0755 root:root`): $G\text{/supervisor}$, $G\text{/jobs}$, and $G\text{/hooks}$.
+2. **Directory Creation:** Resolves and pins its own delegated service cgroup path $G$ before migration (e.g., `/sys/fs/cgroup/system.slice/sigrund.service`), using its cgroup membership and the verified cgroup v2 mount rather than a hardcoded unit name, and creates three subdirectories (`0755 root:root`): $G\text{/supervisor}$, $G\text{/jobs}$, and $G\text{/hooks}$.
+   On restart with a retained hierarchy whose domain controllers remain enabled,
+   the external supervisor may start the daemon directly in `G/supervisor`.
+   Only that exact leaf name permits selecting its immediate parent as `G`:
+   startup pins and verifies root-owned, non-writable, no-symlink `G`,
+   `supervisor`, `jobs` and `hooks`, requires `G/cgroup.procs` empty,
+   the supervisor leaf's `cgroup.subtree_control` empty, and no other process
+   in the supervisor leaf. Normal initialization and orphan reconciliation
+   still run before listeners. Do not disable controllers to enter `G`, infer
+   arbitrary ancestors, or use requester-supplied cgroup/namespace identities.
 3. **Daemon Migration to Supervisor Leaf:** Writes its own PID (`getpid()`) to $G\text{/supervisor/cgroup.procs}$, vacating the root of $G$.
 4. **Controller Enablement:** Reads $G\text{/cgroup.controllers}$, verifies both `memory` and `pids` are present, and writes `"+memory +pids\n"` sequentially to $G\text{/cgroup.subtree\_control}$, $G\text{/jobs/cgroup.subtree\_control}$, and $G\text{/hooks/cgroup.subtree\_control}$.
 5. **Orphan Cleanup from Prior Crashes:** Iterates over any existing `job-*` directories under $G\text{/jobs}$ and `hook-*` directories under $G\text{/hooks}$, writes `"1\n"` to each `cgroup.kill`, waits for `populated 0` in `cgroup.events`, drains only processes that are actually children of the current daemon via the Central Reaper (`waitid(P_ALL, 0, ..., WEXITED | WNOHANG)`), logs an `ORPHAN_CLEANUP` audit entry, and removes the directories via `rmdir()`. Prior-instance processes may already belong to PID 1 or another subreaper; the new daemon can kill their cgroups but cannot generally reap them or recover their exit status. Their current parent is responsible for reaping; cleanup completion requires `populated 0`, not successful `waitid()` for those non-children.
@@ -55,7 +73,20 @@ Regular files (`S_ISREG`) do not support `epoll` and ignore `O_NONBLOCK` on loca
 Therefore, `sigrund` enforces the following **Response Deadline and Quota-Pinning Contract**:
 
 1. **Main Control Thread Non-Blocking Invariant:** The main `epoll` event loop handles control sockets, nonblocking hook pipes, child sync pipes, `pidfd`/`signalfd(SIGCHLD)` notifications, `inotify` events, and timers. It never reads filesystem binaries or client-passed `SCM_RIGHTS` descriptors, performs blocking hook-pipe writes, or waits on SQLite/fsync/network operations. Such blocking work is dispatched off-loop; its completion is delivered back to the request coordinator.
+   This includes potentially blocking `openat2`, `fstat`, `close`, and cleanup
+   of caller-controlled descriptors, even on malformed-request, excess-rights,
+   timeout and stale-completion paths. Metadata-only operations and RAII
+   destruction are not exemptions. Before receiving rights, reserve bounded
+   capacity for their eventual off-loop disposal; if unavailable, stop admission
+   before receiving more rights. The owning task retains quota through actual
+   cleanup. Cgroup filesystem operations and durable audit/database work also
+   run off-loop with bounded queues; a blocked operation cannot stall socket
+   deadlines, signal dispatch or other connections.
 2. **Policy-Generation I/O Worker Pool:** Potentially blocking reads (`exec_memfd` binary copying and `stdin_memfd` input collection) are dispatched to a pool sized by the admitted request's captured `max_io_workers_global` and `max_io_workers_per_uid` values (defaults `16` and `2`). The pool is fixed for that policy generation; no replacement threads exceed the captured global value. These values may be lowered by configuration but never exceed immutable ceilings of `16` global and `2` per UID.
+   Metadata, copy and descriptor-cleanup stages share this budget; separate
+   stage pools cannot each claim the full allowance. Uninterruptible tasks
+   may exhaust capacity and cause `RESOURCE_EXHAUSTED`; responsiveness does
+   not guarantee recovery of capacity until those tasks actually finish.
 3. **Response Deadline vs. Resource Reclamation:**
 * Each request is assigned the captured policy-generation `request_deadline_ms` snapshot/initial-response deadline (`5000 ms` default; immutable ceiling `5000 ms`) upon `accept4()`. It covers hello assembly and common executable/stdin snapshotting through the handoff to authorization; it is disarmed when Section 1.3.1 advances to `AUTHORIZING`. Hook, remote RPC, partial-frame, and final-expiry phases use their own deadlines and do not inherit or reset this one.
 * Before and after every immutable `65536`-byte read chunk, the worker checks `clock_gettime(CLOCK_MONOTONIC)` against the deadline and checks an atomic `cancelled` flag.
@@ -69,7 +100,8 @@ Therefore, `sigrund` enforces the following **Response Deadline and Quota-Pinnin
 
 | Resource / Parameter | Enforced Limit | Enforcement Stage & Failure Code |
 | --- | --- | --- |
-| **Global / Per-UID Active Control Sockets** | Captured `max_active_sockets_global` / `max_active_sockets_per_uid` (defaults `64` / `4`; immutable ceilings `64` / `4`) | Enforced on `accept4()`; excess connections closed immediately. |
+| **Global / Per-UID Active Control Sockets** | Captured `max_active_sockets_global` / `max_active_sockets_per_uid` (defaults `64` / `4`; immutable ceilings `64` / `4`) | Enforced on `accept4()`; excess connections retired immediately and their final close scheduled off the coordinator. |
+| **Total Owned Unix Sockets / Final-Close Workers** | Immutable `128` sockets (including both listeners, admitted, worker-retained and rejected sockets) / `2` disposal workers | Reserve before `accept4()`; retain until actual final close completes. Pause both listeners when full; resume on disposal completion. No replacement workers or unbounded cleanup queue. |
 | **Global / Per-UID Pinned I/O Workers** | Captured `max_io_workers_global` / `max_io_workers_per_uid` (defaults `16` / `2`; immutable ceilings `16` / `2`) | Accounted until worker thread completes cleanup; returns `RESOURCE_EXHAUSTED`. |
 | **Requester Handshake/Snapshot Deadline** | Captured `request_deadline_ms` (default `5000 ms`; immutable ceiling `5000 ms`) | Cumulative deadline from `accept4()` through `CLIENT_HELLO`, common executable/stdin snapshotting, and coordinator handoff; returns `REQUEST_TIMEOUT` only while that phase is active. |
 | **Control Frame Payload Limits (Both Directions)** | `CLIENT_HELLO`: `196608` bytes; `SERVER_AUTH_DECISION`: `524288` bytes; `CLIENT_SIGNAL`: `64` bytes; `CLIENT_WINSIZE`: `128` bytes; `SERVER_CHILD_EXIT`: `128` bytes | Section 2.1.1: reject an unknown/out-of-state type immediately; reject an oversized length before allocation or payload reads. |
@@ -79,6 +111,8 @@ Therefore, `sigrund` enforces the following **Response Deadline and Quota-Pinnin
 | **Global / Per-UID Pinned Snapshot RAM** | Captured `snapshot_ram_global_bytes` / `snapshot_ram_per_uid_bytes` (defaults `512 MiB` / `128 MiB`; immutable ceilings equal defaults) | Reserved before `memfd_create` and held until `close(memfd)` completes; returns `RESOURCE_EXHAUSTED`. |
 | **Max Executable Size** | Captured `max_executable_bytes` (default `67108864`; immutable ceiling `67108864`) | Checked via `fstat()` and after every `65536`-byte read chunk. |
 | **Max Hashed `stdin` Size** | Captured `max_stdin_bytes` (default `16777216`; immutable ceiling `16777216`) | Reserved up front (the captured `max_stdin_bytes` against UID quota during read, trimmed to actual size at `EOF`) and checked on every chunk. |
+
+Closing a Unix control socket can release unread queued `SCM_RIGHTS`, including descriptors whose final close blocks. The coordinator must never perform that final close, even for invalid credentials, unauthorized or duplicate brokers, quota/rate/storage rejections, errors before parsing, or shutdown. Shared control-socket owners retain one final-close reservation until all owners release it and an off-loop disposal worker completes the actual close. Retiring the final shared owner may call Unix `shutdown(SHUT_RDWR)` to notify peers promptly; queued rights remain owned until off-loop close. Remove retired connections from epoll before releasing ownership. Listener final closes, including pending unaccepted connections, also use this bounded disposal path. When disposal capacity is full, remove listeners from epoll rather than spin on their readiness; existing connection deadlines, cancellation, signalfd and watchdog delivery continue. Shutdown retains the instance lock until disposal completes, reporting stalled cleanup and leaving final escalation to the service manager as specified in Section 2.4.1.
 
 ---
 
@@ -91,6 +125,52 @@ Each request has an atomic lifecycle state `SNAPSHOTTING -> AUTHORIZING -> COMMI
 * **Commit reservation:** Immediately before database `COMMIT`, recheck `cancelled`, connection liveness, and the current phase deadline, then CAS `AUTHORIZING -> COMMITTING`. A cancellation that already won prevents the CAS and forces `ROLLBACK`. The commit executor checks cancellation again immediately before issuing `COMMIT`; otherwise it rolls back. `COMMITTING` reserves the operation against a competing terminal-state transition. Cancellation arriving during that reservation sets the flag and is reconciled when the operation returns: a completed commit may have consumed a one-time grant, but cancellation prevents further authorization/spawn. On success, advance to `COMMITTED`; if cancellation is pending, immediately claim `CANCELLED`, append the required local `AUTH_COMMIT` and post-commit abort, and do not spawn. This audit reconciliation is serialized by the Audit & Replication Sequencer even when the client has disconnected. Never tell a client that a timeout rolled back an already-completed commit.
 * **Spawn reservation:** After audit/collector authorization, recheck cancellation, connection liveness, active phase deadlines, and warrant expiry immediately before CAS `COMMITTED -> SPAWNING`. Recheck cancellation once more immediately before `clone3()`. A prior terminal-state winner prevents spawn. If cancellation arrives after the reservation/final check, the syscall may already be in flight: do not publish a cancellation decision while claiming no child could exist. Register the returned PID/pidfd, reconcile cancellation, kill the new job cgroup and reap the child if necessary, then finish cancellation without reporting readiness. Only a non-cancelled successful clone advances to `RUNNING` and sync-handshake classification.
 * **Reservation semantics:** Commit and spawn admission linearize at their CAS reservations. No terminal timeout response may race with a reserved operation and then be followed by untracked side effects. Pending cancellation during a reservation is resolved only after that operation's result is known and cleanup is arranged; an uninterruptible kernel operation can delay this response, just as it can delay resource reclamation. A check alone cannot eliminate the interval between a userspace check and a syscall. Test these races with deterministic gates, not timing assumptions.
+
+### 1.3.2 Independent Denial Delivery and Audit Ownership
+
+Before admitting a requester, reserve one bounded rejection-audit slot against
+both UID and global limits. The reservation includes storage for at most one
+`audit_record_max_bytes` record plus bounded metadata, and remains charged
+through queued/in-flight persistence or fatal shutdown, independently of the
+socket and I/O-worker leases. Transfer ownership exactly once. A queue entry
+must never depend on a live connection object to remain owned.
+
+A pre-commit terminal winner (timeout, refusal, policy denial, unavailable
+approver or resource denial) publishes its decision immediately on the
+nonblocking control path, with the existing five-second send deadline. It
+queues its rejection record using that reserved capacity; it does not wait
+for SQLite, audit fsync, or descriptor disposal. A late audit completion can
+release ownership but cannot publish another decision or revive the request.
+A denial therefore does not promise that its audit record is already durable;
+a crash may lose a queued rejection. Authorization retains the durable
+`AUTH_COMMIT` and optional remote-ACK requirements before spawning. Cancellation
+in `COMMITTING` or `SPAWNING` still follows Section 1.3.1 reconciliation and
+cannot use this rule to report an unreserved outcome.
+
+If admission cannot reserve audit capacity, close the new connection before
+receiving rights or parsing a request. Do not enqueue an individual durable
+record for that refusal. Aggregate admission-refusal counts in fixed-size,
+saturating counters and emit at most one coalesced diagnostic per admission
+window when bounded audit capacity is available. Reserve one global diagnostic
+slot within the configured global audit limit; diagnostics cannot consume
+request reservations. Repeated errors must not create an unbounded side queue.
+For accepted requests, transfer the reservation into the committed-job context
+and retain it through the last required outcome record. Emit that context's
+records sequentially, reusing its bounded capacity after each append completes;
+never accumulate an unbounded per-job event list. Hook/replication diagnostics
+must also obtain bounded capacity before producing records.
+An admitted request that later lacks worker capacity can use its already-owned
+audit reservation to report `RESOURCE_EXHAUSTED`. Fatal persistence failure
+stops admission and invokes Section 2.4.1; it never permits execution merely
+because a rejection was already delivered.
+
+Successful authorization transfers an owned committed-job context to the
+coordinator: exact warrant bytes, selected eligible unrevoked signer,
+consumption/commit identity, sealed snapshots, validated argv/envp, captured
+policy/root identities and all resource leases. The coordinator alone reserves
+spawning. Neither reconnection nor a worker completion may recopy the binary,
+change signed inputs, consume again or independently spawn. Pending-spawn,
+live-job and cleanup ownership survive loss of the client connection.
 
 ### 1.4 Normative Daemon Configuration and Policy Generations
 
@@ -121,11 +201,17 @@ snapshot_ram_per_uid_bytes = 134217728  # positive uint64
 max_executable_bytes = 67108864         # positive uint64
 max_stdin_bytes = 16777216              # positive uint64
 request_deadline_ms = 5000              # positive uint32
+request_admissions_global = 256        # uint32, 1..=4096 per admission_window_secs
+request_admissions_per_uid = 16        # uint32, 1..=request_admissions_global
+admission_window_secs = 60             # uint32, 1..=3600; restart-only
+max_pending_audits_global = 128        # uint32, 2..=128, includes one diagnostic slot
+max_pending_audits_per_uid = 8          # uint32, 1..=8 and < global limit
 
 # Job cgroups
 job_memory_max_bytes = 268435456        # positive finite uint64
 job_memory_swap_max_bytes = 0           # finite uint64
 job_pids_max = 128                      # positive uint64
+shutdown_grace_ms = 10000              # uint32, 1..=60000; restart-only
 
 # Collector (always required and validated; network use requires require_remote_audit_ack=true)
 collector_base_url = "https://collector.example.invalid" # absolute https URL, no fragment/userinfo
@@ -139,6 +225,8 @@ collector_rpc_timeout_ms = 3000                           # positive uint32
 
 # Audit and path policy
 audit_record_max_bytes = 65536          # fixed; may not be increased
+audit_log_high_water_bytes = 1073741824 # positive uint64; >= audit_record_max_bytes
+audit_min_free_bytes = 67108864         # positive uint64; >= audit_record_max_bytes
 max_onetime_window_secs = 3600          # positive uint64
 max_ttl_secs = 31536000                  # positive uint64, checked timestamp arithmetic ceiling
 
@@ -146,9 +234,42 @@ max_ttl_secs = 31536000                  # positive uint64, checked timestamp ar
 
 `csr_allowed_executable_dirs` is a sorted, duplicate-free list of absolute directory paths that are neither `/` nor descendants with `.`/`..`/empty components. Every `[[signers]]` entry must contain an exactly equal canonical list in `allowed_executable_dirs`; a signer list that differs, is broader, or is absent rejects the complete configuration. The daemon pre-opens and pins these roots once per policy generation. `collector_base_url`, TLS files, key ID, and public key are required and validated for every configuration generation, even when remote ACK is disabled; network use is disabled in that mode. Hook UID/GID, all quotas, and job limits are root-controlled configuration and cannot be raised by warrants. The host must expose a writable `memory.swap.max` file in the delegated hierarchy; `job_memory_swap_max_bytes` may be zero or a finite nonnegative value and is written/read back on every startup probe and job cgroup. Missing swap control is a startup failure. `max`/unlimited values are rejected.
 
-The following are immutable protocol/security ceilings, not freely adjustable limits: frame payload maxima and JSON structural limits in Section 2.1.1; `max_active_sockets_global/per_uid <= 64/4`; `max_io_workers_global/per_uid <= 16/2`; `request_deadline_ms <= 5000`; `snapshot_ram_global_bytes <= 536870912` and `snapshot_ram_per_uid_bytes <= 134217728`; `max_executable_bytes <= 67108864`; `max_stdin_bytes <= 16777216`; `hook_timeout_ms <= 25000`; `collector_rpc_timeout_ms <= 3000`; control-frame assembly/send deadlines remain the immutable `5000 ms` protocol deadline; `audit_record_max_bytes == 65536`; and finite numeric/identifier bounds in Section 3.5. All other listed numeric values are captured from the policy generation at request admission and used consistently for that request, hook pipeline, RPC, snapshots, and job cgroup. A lower value may reduce availability or resource consumption; no reload or warrant may exceed a ceiling.
+The following are immutable protocol/security ceilings, not freely adjustable limits: frame payload maxima and JSON structural limits in Section 2.1.1; `max_active_sockets_global/per_uid <= 64/4`; `max_io_workers_global/per_uid <= 16/2`; total owned Unix sockets `<= 128` with exactly `2` fixed final-close workers; `request_deadline_ms <= 5000`; `snapshot_ram_global_bytes <= 536870912` and `snapshot_ram_per_uid_bytes <= 134217728`; `max_executable_bytes <= 67108864`; `max_stdin_bytes <= 16777216`; `hook_timeout_ms <= 25000`; `collector_rpc_timeout_ms <= 3000`; control-frame assembly/send deadlines remain the immutable `5000 ms` protocol deadline; `audit_record_max_bytes == 65536`; and finite numeric/identifier bounds in Section 3.5. Admission counters, audit reservations and storage/shutdown controls follow the process-wide rules below; their stated maxima are immutable. All other listed numeric values are captured from the policy generation at request admission and used consistently for that request, hook pipeline, RPC, snapshots, and job cgroup. A lower value may reduce availability or resource consumption; no reload or warrant may exceed a ceiling.
 
 A successful `SIGHUP` parses and validates a complete replacement, checks all signer/root relationships and filesystem identities, then atomically installs it with a new monotonically increasing `policy_generation`. Existing requests retain the generation, signer ceilings, root FDs, hook identity, quotas, collector settings, and job limits captured at admission; a reload never mutates an active job or hook. New requests use only the new generation. Failed reloads leave the prior generation active and emit an audit diagnostic without changing authorization policy. A restart repeats full validation before opening the socket. Security-sensitive keys cannot be changed by partial file edits or per-request fields.
+
+Resource accounting spans all live policy generations. Admission checks the
+aggregate global/per-UID sockets, workers and snapshot bytes against the new
+request's captured limits and the immutable ceilings. Lowering a limit does
+not evict existing owners, but blocks new reservations until aggregate usage
+permits them. Reload cannot create replacement capacity for pinned old workers.
+Admission rates use fixed windows of `admission_window_secs` measured with
+`CLOCK_MONOTONIC` from daemon startup, shared by every requester UID and policy
+generation. Before parsing or receiving rights, atomically check the active
+socket limits, global/per-UID window counts and audit reservation capacity.
+Only a successful admission increments both counters; charges are not refunded
+on disconnect or early rejection. Excess connections close immediately and
+never reach snapshots or signature verification. Window boundaries can admit
+a burst on each side; concurrency and retained-ownership limits still apply.
+Keep at most 4096 per-UID counter entries (the immutable global window ceiling);
+refuse a new UID if no entry is available. Clear expired window counters;
+resource leases live separately and are never cleared by a window rollover.
+The root-only broker retains its separate connection/pipeline limits and
+cannot create unbounded diagnostics through repeated reconnects.
+
+Reload preserves the current window's counts and all pending-audit charges.
+New admission uses the new limits against aggregate usage; lowering them
+blocks new owners without evicting existing ones. `admission_window_secs` and
+`shutdown_grace_ms` changes require restart and reject an attempted reload.
+The latest validated storage thresholds govern new authorization admission
+process-wide; they do not rewrite an active job's limits. All counters, byte
+reservations and deadline arithmetic are checked for overflow and fail closed.
+These rate controls bound work per window, not cumulative disk usage or
+fairness against an attacker exhausting the global window. Section 7.2.1
+provides the independent disk-pressure gate.
+
+The optional restricted local approval profile is defined in Section 6.3;
+it disables reload and does not relax the startup, descriptor or execution gates.
 
 ## 2. Wire Protocol, Request Shapes, and Job Lifecycle
 
@@ -300,6 +421,18 @@ Both request modes must complete the common phase below. Unsigned requests do no
 | **`"pty"`** | **`"unrestricted_interactive"`** | **0 FDs** (any `SCM_RIGHTS` rejected) | `sigrund` allocates a fresh PTY pair via `posix_openpt(O_RDWR | O_NOCTTY)` and passes exactly one master PTY FD to `sigrun` on the type byte of `SERVER_AUTH_DECISION` (`"READY_TO_EXEC"`) under Section 2.3.2. | Must be `null`. |
 | **`"pty"`** | **`"null"`** or **`"sha256"`** | **FORBIDDEN** | Rejected with `INVALID_TTY_STDIN_COMBINATION`. | N/A |
 
+For a requester invoked from a terminal in `stdio/null` or `stdio/sha256`
+mode, `sigrun` must provide pipe write ends for stdout/stderr and relay their
+read ends to the local sinks. It must not pass TTY descriptors or silently
+switch to unrestricted input to make the request succeed. Keep the two output
+streams separate and queues bounded; service control frames and cancellation
+under sink backpressure, including sinks whose writes may block. After receiving
+the child-exit frame, drain pending output through pipe EOF before returning
+the child status. Broken sinks abort the request and close its control socket.
+Before readiness, user cancellation closes the socket; afterward only the
+specified signals are forwarded. No PTY or raw-terminal setup is implied by
+this relay. Child output remains untrusted and never feeds an approval prompt.
+
 ### 2.3.1 Normative `recvmsg()` and Descriptor Ownership Rules
 
 The following rules govern all client-to-daemon reads on the `SOCK_STREAM` control socket; the FD matrix alone is insufficient:
@@ -346,9 +479,10 @@ The following rules govern all client-to-daemon reads on the `SOCK_STREAM` contr
 * All job and hook `clone3()` calls set the separate `args.exit_signal = SIGCHLD` field (Sections 5.1 and 6.1); it is not part of `args.flags`. The daemon blocks `SIGCHLD` in all threads for `signalfd` delivery, retains its default disposition, and must not set `SIG_IGN` or `SA_NOCLDWAIT`, so direct children remain waitable with ordinary `WEXITED | WNOHANG` (no `__WCLONE`/`__WALL` needed for these children).
 * Instead, `sigrund` maintains a single-threaded **Central Reaper** on the main `epoll` loop backed by a registry `active_primary_pids: HashMap<pid_t, ContextId>` (containing the `child_pid` of every active job and `hook_pid` of every active hook):
 * Whenever a tracked `child_pidfd` signals `EPOLLIN`, the Central Reaper calls `waitid(P_PIDFD, child_pidfd, &siginfo, WEXITED | WNOHANG)` to harvest that specific process's `(si_code, si_status)`, removes `child_pid` from `active_primary_pids`, and records the terminal status on the owning job/hook context.
-* Whenever the daemon's `signalfd(SIGCHLD)` fires or a cgroup's `cgroup.events` reaches `populated 0`, the Central Reaper loops on `waitid(P_ALL, 0, &siginfo, WEXITED | WNOHANG)`:
+* **Pending-spawn registration barrier:** Before dispatching any off-loop job or hook clone, the coordinator registers a bounded pending-spawn context retaining its lifecycle reservation, inputs and cgroup cleanup owner. While any clone result is unpublished, the Central Reaper must not issue `waitid(P_ALL, ...)`: an unregistered primary may already have exited. It continues servicing registered primaries with `waitid(P_PIDFD, ...)`. The spawn completion transfers PID/pidfd into `active_primary_pids` before releasing its pending context, including after cancellation or shutdown; a failed clone releases the barrier only after confirming no child exists. On clearing the last barrier, immediately sweep for waitable children even if the original SIGCHLD notification was already consumed. Serialize clone dispatch: at most one unpublished clone result may exist, and perform the deferred sweep before dispatching the next clone. This prevents a stream of new clones from indefinitely extending the barrier. No PID status is discarded or guessed during the barrier. This bounded ownership may delay orphan reaping while a clone is blocked; it does not authorize replacement workers or unbounded new spawns.
+* Whenever the daemon's `signalfd(SIGCHLD)` fires or a cgroup's `cgroup.events` reaches `populated 0`, and no pending-spawn barrier exists, the Central Reaper loops on `waitid(P_ALL, 0, &siginfo, WEXITED | WNOHANG)`:
 * If `siginfo.si_pid` is present in `active_primary_pids`, the Central Reaper removes it from `active_primary_pids` and delivers `(si_code, si_status)` directly to that owning job/hook context (so its exit status is never lost even if `waitid(P_ALL, ...)` reaped it before its `pidfd` event was processed).
-* If `siginfo.si_pid` is **not** in `active_primary_pids`, it is a reparented orphan descendant (`PR_SET_CHILD_SUBREAPER`) and is safely discarded.
+* If `siginfo.si_pid` is **not** in `active_primary_pids`, with no pending-spawn barrier it is an unregistered descendant (`PR_SET_CHILD_SUBREAPER`) and its status can be discarded. Every direct job/hook child must use the registration contract above.
 
 
 
@@ -366,6 +500,45 @@ The following rules govern all client-to-daemon reads on the `SOCK_STREAM` contr
 * **Client Disconnect (`EPOLLHUP` / `EPOLLERR`):** If the client socket closes while the job is active, `sigrund` writes `"1\n"` to `job-<exec_id>/cgroup.kill`, waits for `populated 0`, collects the primary child's termination status via the Central Reaper, releases quotas, removes `job-<exec_id>` via `rmdir()`, and appends `EXEC_EXIT` (`exit_code`, `signal`, `disconnected: true`).
 
 
+
+### 2.4.1 Daemon Shutdown and External Cleanup
+
+Block SIGINT/SIGTERM/SIGCHLD before creating threads and receive them through
+signalfd. SIGINT/SIGTERM or a fatal durable-store error enters one irreversible
+shutdown state: stop both listeners and new commit/spawn reservations, close
+control connections, and cancel every request. No new readiness is published
+after this transition. Already-reserved operations must reconcile their actual
+results under Section 1.3.1; every returned child is registered and scheduled
+for cgroup teardown even if its client has gone. A consumed grant is never
+rolled back to make a shutdown look retryable.
+
+Keep the event loop, pending-spawn registry and Central Reaper alive while
+bounded off-loop owners kill cgroups, observe `populated 0`, dispose of FDs and
+persist outcomes when the audit writer is healthy. Never append through a
+poisoned writer or wait synchronously for a blocked worker. Retain the daemon
+instance lock and all outstanding ownership until cleanup completes or the
+external supervisor terminates the process. `shutdown_grace_ms` is the deadline
+for cooperative cleanup, not proof that uninterruptible kernel work stopped.
+On expiry, emit a bounded best-effort diagnostic and remain quiescent with
+cleanup ownership intact pending completion or supervisor escalation; do not
+resume admission, drop live jobs or falsely report successful cleanup.
+
+Execution deployments, including foreground tests, require a dedicated
+supervising service with cgroup delegation and whole-service cleanup on daemon
+death. For systemd, use `Delegate=yes`, `KillMode=control-group`,
+`SendSIGKILL=yes`, and `TimeoutStopSec` greater than `shutdown_grace_ms`.
+The supervisor must also detect internally initiated shutdown or a stalled
+daemon (for example through a service watchdog) and initiate bounded stop/kill
+escalation; a stop timeout alone does not run merely because the daemon entered
+its own fatal state. The integration recipe must configure and test that path.
+The foreground recipe must run inside such a service, not an ordinary root
+shell or a scope whose cleanup depends on that shell exiting. SIGKILL or host
+failure cannot run daemon cleanup; the supervisor kills remaining service
+processes, and restart performs Section 1.2 orphan cleanup before listening.
+Tasks stuck in uninterruptible kernel waits may delay even external cleanup;
+never reopen admission over surviving unverified jobs. Escaped root or
+out-of-profile workloads retain Section 1.1's best-effort limitation. Prior
+instance children are not assumed to be waitable by the new daemon.
 
 ---
 
@@ -459,7 +632,7 @@ DSSEv1 38 application/vnd.sigrun.warrant.v1+json 67 {"grant_id":"0192d8f4-7c1b-7
 1. `sigrund` Base64-decodes `dsse_envelope.payload` (strict RFC 4648 standard alphabet, no whitespace) and rejects payloads over `65536` bytes.
 2. `sigrund` parses the JSON into `Warrant`, rejecting duplicate keys at any depth, unknown fields, non-integer numbers, strings exceeding `4096` UTF-8 bytes, and any string containing C0 controls (`U+0000`..`U+001F`), DEL/C1 controls (`U+007F`..`U+009F`), or Unicode BiDi control characters (`U+061C`, `U+200E`, `U+200F`, `U+202A`..`U+202E`, `U+2066`..`U+2069`).
 3. `sigrund` re-serializes `Warrant` using RFC 8785 (JCS) and asserts **byte-for-byte equality** with the raw decoded `payload` bytes. Exact-name `caller_env_allowlist` is the only v1.0 caller-environment forwarding field; obsolete `env_wildcard_allowlist` is rejected, never interpreted as a regex policy.
-4. Canonical wire/status/CSR document outputs retain their specified JSON bytes; for `TIMEOUT_CSR`, the client prints the canonical CSR document followed by one newline, without PEM armor or escaping its structural JSON syntax. Whenever `sigrun`, `sigrund`, or a hook interpolates an individual warrant/CSR field into other display text, logs, or chat webhooks, all bytes outside printable ASCII (`0x20..0x7E`) as well as `\` and `"` are escaped as `\xXX` or `\u{XXXX}`.
+4. Canonical wire/status/CSR document outputs retain their specified JSON bytes; for `TIMEOUT_CSR`, the client prints the canonical CSR document followed by one newline, without PEM armor or escaping its structural JSON syntax. Whenever `sigrun`, `sigrund`, `sigrund-approve`, or a hook interpolates an individual warrant/CSR field into other display text, logs, or chat webhooks, all bytes outside printable ASCII (`0x20..0x7E`) as well as `\` and `"` are escaped as `\xXX` or `\u{XXXX}`.
 
 ### 3.4 Signature Verification Adapters & Single-Signer Rule
 
@@ -764,7 +937,7 @@ After durably committing the ingested chain checkpoint and any grant-consumption
 
 ### 5.1 Per-Invocation Job Cgroup & `clone3()` Flags
 
-For each authorized execution `exec_id`, `sigrund` creates `/sys/fs/cgroup/system.slice/sigrund.service/jobs/job-<exec_id>` and opens `cgroup_fd`. **Before `clone3()`**, write and read back all of these root-controlled limits:
+For each authorized execution `exec_id`, `sigrund` creates `G/jobs/job-<exec_id>` beneath the pinned delegated root from Section 1.2 and opens `cgroup_fd`. **Before `clone3()`**, write and read back all of these root-controlled limits:
 
 | Job Cgroup File | Default Value | Daemon Configuration |
 | --- | --- | --- |
@@ -793,11 +966,36 @@ The daemon config may set other finite values; `max`/unlimited values are reject
 
 ### 5.3 10-Step Child Transition Sequence
 
-On any error in Steps 1–10 prior to `execveat()`, the child writes `{ u32 step, i32 errno }` (`step` in `1..=10`) to `FD 4` and calls `_exit(127)`:
+The daemon is multithreaded. Before `clone3()`, prepare immutable argv/envp
+storage, descriptor actions and bounded buffers for the setup checks. From
+the child return of `clone3()` until `execveat()` or `_exit()`, use only an
+audited syscall-only/async-signal-safe path: no heap allocation, Rust formatting,
+logging, mutexes, unwinding, general library parsers or destructor-driven exit.
+Mountinfo verification uses a bounded allocation-free parser and fails closed
+on overflow. Preserve syscall errno when emitting a setup-error frame.
+The parent registers the returned PID/pidfd with the Central Reaper before
+processing queued child-exit notifications; a fast exit must not be discarded
+as an untracked orphan. These requirements also apply to hook child setup.
+
+On any error in Steps 1–10 prior to `execveat()`, preserve errno, attempt one
+8-byte `{ u32 step, i32 errno }` error frame (`step` in `1..=10`) on the tracked
+sync-pipe write descriptor, then call `_exit(127)`. Initially this is the actual
+inherited `sync_pipe_w`, not descriptor number 4. Duplicate that write end
+first to a safe temporary descriptor and update the tracked number only after
+a successful syscall. Keep it valid through every subsequent duplication and
+remap; change the tracked number to 4 only after `dup3(tmp_sync, 4, O_CLOEXEC)`
+succeeds. All other source descriptors are duplicated before remapping 0–4.
+Thus unshare/duplication failures, EMFILE, and initially closed or unrelated
+FDs 0–4 cannot cause an error write into an unrelated inherited descriptor.
+If the error write fails or is short, exit without exec; the parent treats
+missing/partial evidence as `SPAWN_FAILED`. Apply the same rule to hook H1,
+using the actual hook sync writer until FD 3 is successfully installed.
+
+The setup sequence is:
 
 1. **Descriptors, Recursive Read-Only Cgroup Mount, & Session:**
 * Call `unshare(CLONE_FILES)`.
-* Duplicate `child_stdin`, `child_stdout`, `child_stderr`, `exec_memfd`, and `sync_pipe_w` to temporary descriptors `>= 5` via `fcntl(fd, F_DUPFD_CLOEXEC, 5)`.
+* Duplicate `sync_pipe_w` first, then `child_stdin`, `child_stdout`, `child_stderr`, and `exec_memfd` to temporary descriptors `>= 5` via `fcntl(fd, F_DUPFD_CLOEXEC, 5)`, tracking the error writer as specified above.
 * Assign `dup2(tmp_in, 0)`, `dup2(tmp_out, 1)`, `dup2(tmp_err, 2)`, `dup3(tmp_exec, 3, exec_cloexec_flag)`, `dup3(tmp_sync, 4, O_CLOEXEC)`, and call `close_range(5, ~0U, 0)`.
 * If spawned without `CAP_SYS_ADMIN` (with `CLONE_NEWNS | CLONE_NEWCGROUP`), execute the following exact mount lock sequence while the setup child still has its initial mount authority. The existing cgroup v2 mount is already copied into the child's mount namespace: make propagation private, then apply `mount_setattr()` directly to that mount and its submounts. Do not bind `/sys/fs/cgroup` onto itself. Every syscall failure is a Step 1 failure; unsupported kernels fail closed rather than using a fallback mount operation. Here `fail_step1(err)` writes `{ step: 1, errno: err }` to `FD 4` and calls `_exit(127)`:
 ```c
@@ -847,12 +1045,12 @@ if ((stv.f_flag & req) != req)
 ### 6.1 Hook Quotas & Complete `pivot_root` Sandbox Sequence
 
 * **Admission Quotas:** Each request captures `max_active_hooks_per_uid`, `max_active_hooks_global`, `hook_invocations_per_uid`, and `hook_window_secs` from its policy generation (defaults `1`, `8`, `5`, and `60`). `sigrund` permits at most the captured active pipelines per UID/global and enforces the captured token bucket for unsigned invocations; excess requests return `RESOURCE_EXHAUSTED`. Reloads affect only requests admitted under the new generation; active hook pipelines retain their captured quotas and window.
-* **Per-Hook Cgroup & Namespace Isolation:** Each hook executable in `/etc/sigrund/hooks.d/` (regular files owned by `root:root`, mode `0755`, evaluated in lexicographical filename order) is spawned into `/sys/fs/cgroup/system.slice/sigrund.service/hooks/hook-<hook_exec_id>` with `memory.max = 67108864` (64 MiB), `memory.swap.max = 0`, and `pids.max = 32`, via `clone3()` with `args.flags = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWCGROUP | CLONE_INTO_CGROUP | CLONE_PIDFD`, `args.exit_signal = SIGCHLD`, `args.cgroup = hook_cgroup_fd`, and `args.pidfd` pointing to writable parent storage for the returned pidfd (all unused fields zero). The separate exit signal makes hooks ordinary waitable children of the daemon in the daemon's PID namespace, including hooks that die before exec.
+* **Per-Hook Cgroup & Namespace Isolation:** Each hook executable in `/etc/sigrund/hooks.d/` (regular files owned by `root:root`, mode `0755`, evaluated in lexicographical filename order) is spawned into `G/hooks/hook-<hook_exec_id>` beneath the pinned delegated root from Section 1.2 with `memory.max = 67108864` (64 MiB), `memory.swap.max = 0`, and `pids.max = 32`, via `clone3()` with `args.flags = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWCGROUP | CLONE_INTO_CGROUP | CLONE_PIDFD`, `args.exit_signal = SIGCHLD`, `args.cgroup = hook_cgroup_fd`, and `args.pidfd` pointing to writable parent storage for the returned pidfd (all unused fields zero). The separate exit signal makes hooks ordinary waitable children of the daemon in the daemon's PID namespace, including hooks that die before exec.
 * The hook sync pipe uses the same 8-byte native-endian `{ u32 step, i32 errno }` frame format as Section 2.4. A setup failure reports `{ step: 1..4, errno: >0 }` (H1..H4) and exits `127`; after descriptor assignment the write end is `FD 3`.
 
 1. **Step H1 (Contiguous `FDs 0..=3` & `close_range(4, ~0U, 0)`):**
 * Call `unshare(CLONE_FILES)`.
-* Duplicate `hook_stdin`, `hook_stdout`, `hook_stderr`, and `hook_sync_pipe_w` to temporary FDs `>= 4`.
+* Duplicate `hook_sync_pipe_w` first, then `hook_stdin`, `hook_stdout`, and `hook_stderr` to temporary FDs `>= 4`, tracking the actual error writer according to Section 5.3 until FD 3 is installed.
 * Assign `dup2(tmp_in, 0)`, `dup2(tmp_out, 1)`, `dup2(tmp_err, 2)`, and `dup3(tmp_sync, 3, O_CLOEXEC)`.
 * Call `close_range(4, ~0U, 0)` and `setsid()`. Reset daemon-modified signal dispositions to `SIG_DFL` and clear the blocked signal mask before hook exec, as for jobs.
 
@@ -906,6 +1104,101 @@ if ((stv.f_flag & req) != req)
 
 ---
 
+### 6.3 Optional Local Root-TTY Approval Profile
+
+This optional profile implements the first local human-approval workflow.
+It replaces Section 6.2 hook dispatch for unsigned requests with a separate
+root foreground approver. It never bypasses the common snapshot phase,
+Sections 3–4 authorization, audit durability, or Section 5 child setup.
+Signed requests use the same gates without consulting the broker.
+
+**Profile configuration and scope:** A `[mvp]` table selects this profile.
+Its exact fields are `tty_mode = "stdio"`, `hooks_enabled = false`,
+`pty_enabled = false`, `max_active_approval_requests = 1`, and
+`approval_signer_id = "<configured SSH signer ID>"`. The first four fields
+default to the shown values and reject alternatives; the signer ID is required
+before enabling execution, references exactly one signer and uses Section 3.5
+bounds. Only `ssh-ed25519` and `sk-ssh-ed25519` policy entries are supported.
+Require `require_remote_audit_ack = false` and retain mandatory collector
+configuration validation. SIGHUP does not reload this profile.
+
+Both signed and unsigned requests must use `one_time`, `stdio`, `null` or
+`sha256` stdin, `allow_interpreted_script = false`, an empty
+`caller_env_allowlist` and empty `caller_env`. Same-UID execution is rejected
+even if the general configuration opts into it. Other unsupported profile
+values fail with `POLICY_VIOLATION`; malformed shapes retain their existing
+protocol errors. No setting or signed warrant can enable a deferred feature.
+
+**Broker trust and bytes:** Use a distinct root:root `0600` `SOCK_STREAM`
+socket in a trusted root-owned directory. Authenticate `SO_PEERCRED.uid == 0`
+before parsing either peer's messages; invalid credentials close only that
+connection. The approver also verifies the socket and parent ownership/modes.
+Only one root approver connection and one outstanding approval are permitted.
+Each broker frame is a four-byte big-endian length followed by one exact JCS
+document of `1..=524288` bytes, with no ancillary descriptors. Enforce the
+five-second cumulative frame/send deadlines independently of human waiting.
+
+An approval request has exactly `exec_id` (UUIDv7), `signer_id` (configured ID),
+and `csr_payload` (the complete canonical CSR string, at most 65536 decoded
+UTF-8 bytes). A response has exactly either `status: "approved"`, `exec_id`,
+`dsse_envelope`, or `status: "rejected"`, `exec_id`, `reason` (1–1024 UTF-8
+bytes obeying Section 3.3). Apply strict duplicate/unknown-field, depth, schema
+and canonical-encoding checks. An approved response contains exactly one
+signature from the selected signer and a payload byte-for-byte equal to the
+retained CSR. Derive DSSE PAE from those payload bytes, then sign PAE using
+Section 3.4 SSHSIG; neither signing bare JSON nor signing a displayed digest
+is equivalent. A root peer's confirmation is not itself authorization.
+
+**Admission and deadlines:** After static profile/policy checks, reserve the
+single approval slot before starting unsigned snapshots. Busy requests receive
+`RESOURCE_EXHAUSTED`, without an unbounded waiting queue. Snapshot completion
+still competes with the accept-based deadline under Section 1.3.1. At successful
+handoff to `AUTHORIZING`, start a separate immutable `120000 ms` monotonic
+deadline covering broker delivery, human confirmation and signing. This is
+not the hook timeout and progress never resets it. Verify that deadline when
+accepting the response, even if its timer callback has not run. A verified
+response handed to local authorization disarms it; final warrant expiry and
+cancellation checks remain mandatory. Approval never refreshes the grant's
+signed validity window.
+
+If no authenticated approver is connected at handoff, send `TIMEOUT_CSR`
+immediately with the completed canonical CSR. Explicit refusal sends
+`REJECTED`; broker disconnect, malformed response or approval timeout sends
+`TIMEOUT_CSR`. Signature/policy failures use the normal authorization denial.
+These pre-commit outcomes cannot consume a grant or spawn. A requester
+disconnect cancels without a wire reply. On cancellation, timeout or broker
+protocol fault, close the broker connection to invalidate the outstanding
+prompt; do not reuse it for another request. Ignore late completions and bind
+all results to execution ID, connection identity and captured policy. Release
+the approval slot on resolution/cancellation, but retain worker, FD and RAM
+reservations until actual cleanup. An idle approver may reconnect for future
+requests; reconnecting never reissues an old prompt automatically.
+
+**Root interaction:** The approver requires effective UID 0 and a verified
+controlling TTY, with prompts and key passphrase/FIDO interactions on that
+TTY rather than broker stdin. Its root-controlled signer configuration and
+explicit key/agent selection must match the requested signer ID, public key,
+algorithm, namespace and UP/UV policy. Never choose an arbitrary agent key
+or take an identity-file path from the request. Display every CSR field,
+execution ID and selected key fingerprint before confirmation; render argv
+as indexed escaped strings, environment as individual exact key/value pairs,
+and include groups, capabilities, umask, script permission, host/requester/
+target identities, input/executable digests, mode, grant and validity. Do not
+truncate away fields and then permit approval. Confirm with `[y/N]`: only
+explicit `y` or `yes` signs; blank input, EOF or TTY loss denies. No shell
+command is assembled from request data. Any signing helper has bounded output
+and is terminated/reaped on broker loss, timeout or local cancellation.
+
+Verification must cover real terminal output through the Section 2.3 relay,
+OpenSSH signing interoperability, complete sanitized display, no approver,
+busy admission, wrong key/PAE/namespace, refusal/EOF, slow signing, expired
+warrants, stale/duplicate replies, reconnect and disconnect at every boundary.
+The local-profile tests and reproduction commands are indexed in
+`IMPLEMENTATION_NOTES.md`. They supplement the applicable Section 8 cases;
+passing local-profile tests does not establish full v1.0 conformance.
+
+---
+
 ## 7. Hash-Chained Ratcheting Audit Log & Crash Recovery
 
 ### 7.1 Provisioning (`sigrundctl init-host`)
@@ -918,6 +1211,7 @@ if ((stv.f_flag & req) != req)
 ```json
 {
   "key_hex": "<64-char-hex-K_1>",
+  "initial_key_hex": "<64-char-hex-K_0>",
   "last_record_sha256": "<64-char-hex-SHA256-of-record-0-jcs-bytes>",
   "remote_acked_seq": 0,
   "seq": 1
@@ -941,6 +1235,70 @@ To write event `seq = i` ($i \ge 1$) using current state $S = (\text{seq} = i, K
 3. Compute $K_{i+1} = \text{SHA-256}(K_i \parallel \text{"sigrun-ratchet-v1"})$ and `record_i_sha256 = hex(SHA256(record_i_bytes))`.
 4. Write `{ "key_hex": "<K_{i+1}>", "last_record_sha256": "<record_i_sha256>", "remote_acked_seq": S.remote_acked_seq, "seq": i + 1 }` to `/var/lib/sigrund/audit_ratchet.state.tmp` (`0600 root:root`), call `fsync(tmp_fd)`, close `tmp_fd`, call `rename("audit_ratchet.state.tmp", "audit_ratchet.state")`, and call `fsync(var_lib_dir_fd)`.
 5. Zero $K_i$ in memory (`explicit_bzero`).
+
+The state file also carries `initial_key_hex`, the protected 64-character
+hexadecimal encoding of $K_0$, unchanged for the lifetime of the host. It is
+needed to verify the genesis record and replay the ratchet during startup
+recovery. It is never used as a request-time signing key and remains covered
+by the state file's `0600` ownership and permission requirements.
+
+**Security limit:** Retaining `initial_key_hex` permits derivation of every
+past and future ratchet key. This format therefore provides no forward-secure
+audit authenticity after compromise of the host's state or UID 0. Zeroing a
+working key does not remove the retained seed. Local checks detect corruption
+and inconsistent edits while the protected state remains trustworthy; an
+attacker controlling both log and state can rewrite a self-consistent history
+or roll both back. Collector checkpoints protect history already committed
+outside the host according to Sections 1.1 and 4.4; an unreplicated suffix
+has no such protection. Verification anchors contain secret HMAC material
+and must be handled as secrets. A future forward-secure format would require
+removing the locally recoverable seed and redesigning verification/migration;
+that property must not be claimed for this format or the local-only MVP.
+
+If the record and log `fsync()` succeed but any temporary-state creation,
+state write, rename, or directory `fsync()` fails, the in-memory writer is
+poisoned immediately. It must reject every later append until a startup-style
+verified reconciliation has established whether the log is synchronized or
+one record ahead and has published a matching state file. Reusing the old
+sequence and ratchet key after a durable log write is forbidden.
+
+### 7.2.1 Audit Storage Pressure and Authorization Admission
+
+Before listening and before each new consumption transaction, the bounded
+durable executor checks log length and free space on the pinned log and state
+filesystems, including the SQLite/WAL filesystem if different. Use checked
+`fstatvfs` available-byte arithmetic; failed checks stop authorization. If log
+length is at or above `audit_log_high_water_bytes` or any filesystem has fewer
+than `audit_min_free_bytes` available, stop requester admission and do not
+begin new consumption or spawn reservations. Reconcile operations already
+reserved; the ownership and cancellation rules still apply. Recheck before
+spawn admission when authorization was delayed by a remote round trip.
+Also refresh the pressure gate before every audit append, including rejection
+and diagnostic records, so a stream of denied requests closes admission at the
+threshold without waiting for a successful authorization. Threshold crossings
+still allow already-owned records to be persisted as described below. A failed
+capacity query is a fatal storage-health error and initiates shutdown.
+Checks and filesystem operations never run on the event loop.
+
+The high-water mark is an admission threshold, not a truncation limit or a
+promise that all remaining audit writes will fit. Pending rejection records,
+already-reserved commits and job outcomes may append beyond it. Do not create
+one new record for every connection refused under pressure; use Section
+1.3.2's bounded aggregation. Space can disappear after a successful check:
+ENOSPC/EIO during a durable operation follows the existing transaction and
+ratchet failure rules and triggers Section 2.4.1 shutdown. Never retry an
+uncertain consumption, drop an `AUTH_COMMIT` to keep serving, truncate valid
+history, reset the consumption database, or authorize without durable audit.
+
+Resume only after operator remediation and verified startup recovery (restart
+is required after this pressure gate closes). Expand storage or move the
+complete protected state/log set through a controlled offline procedure;
+raising the high-water threshold requires sufficient free space. This version
+defines no safe history pruning/rotation protocol: replication acknowledgement
+does not by itself permit deleting a log prefix. Deployment instructions must
+include capacity monitoring and recovery steps preserving host identity, all
+consumption state and complete authenticated history. Admission windows bound
+write rate but cannot bound lifetime log/database growth.
 
 ### 7.3 Startup Crash-Recovery & Integrity Gate
 
@@ -1115,3 +1473,52 @@ Each case runs in a fresh isolated daemon state with test signing keys and actua
 <br>2. Only canonical lowercase UUIDv7 and bounded UID/GID/timestamp/integer values pass; overflow is rejected without allocation, commit, or spawn.<br>
 
 <br>3. Verified denials map to `EXPIRED_OR_NOT_YET_VALID`, `REVOKED`, and `REPLAY_DETECTED` respectively, append the post-commit abort, and never spawn. Corrupt receipts fail as `REMOTE_AUDIT_FAILED` without cursor advancement. Rollback failure stops accepting requests and fails closed without ratcheting. |
+
+### 8.2.1 Required Pre-Execution Regression Subcases
+
+These extend the existing V rows; they are not optional roadmap-only tests.
+The local MVP runs the job/local-audit portions before claiming completion;
+hook, reload and remote subcases remain requirements for their owning features.
+
+| Existing cases | Additional deterministic fixture | Required observation |
+| --- | --- | --- |
+| V-07, V-13, V-19 | Gate WAL/audit fsync while unrelated requests expire, are refused, have no approver or exhaust workers. Keep sockets writable and receive decisions before releasing the gate. Repeat disconnects across admission windows. | Pre-commit replies obey their phase/send deadlines; no second decision on audit completion; retained audit/worker/FD/RAM charges stay bounded and release exactly once. Reservation outcomes remain reconciled. |
+| V-19 | Exhaust per-UID and global admission windows with many UIDs; cross a window boundary with pinned audits, lower quotas on reload, attempt restart-only changes and invalid/overflowing limits. | Exact configured counts, bounded UID table, preserved reload debt and retained ownership; excess admission closes before parsing or receiving rights; no per-attempt durable rejection flood. |
+| V-09, V-18, V-19 | Cross log high water and each distinct filesystem's free-space floor; inject failed capacity checks, ENOSPC and EIO before/after commit. | Admission stops, uncertain transactions are not retried, committed records are not skipped, poison rules and shutdown apply. Verified restart after remediation preserves host identity, history and consumption. |
+| V-06, V-08, V-11 | Inject unshare and every initial FD duplication/remap failure, including EMFILE and closed descriptors 0–4; place a writable sentinel at inherited FD 4 (FD 3 for hooks). | Only the actual sync pipe receives error bytes; unrelated sentinel contents remain unchanged; missing/partial evidence never yields readiness or exec. |
+| V-08, V-10 | Gate publication after clone returns, let that child and a registered primary exit concurrently, then cancel or start shutdown before releasing the gate. | The registration barrier prevents untracked-primary status theft; registered primaries remain serviceable; both exact statuses are delivered once and cancelled children are torn down without readiness. |
+| V-08, V-10, V-17 | SIGINT/SIGTERM and fatal-storage shutdown before/after commit and clone reservations, during running work and blocked cleanup; force daemon death and exercise supervisor escalation/restart in a real delegated service. | No new reservations/readiness after shutdown; ownership and instance lock persist through reconciliation; whole-service cleanup and orphan recovery precede restart admission, with no invented prior-instance exit status or containment claim. |
+
+### 8.3 Implementation Status and Release Gate
+
+This specification is the target runtime contract. Current implementation scope,
+operator instructions, module-based test coverage and deferred features are
+maintained in `IMPLEMENTATION_NOTES.md`. The implemented local profile supports
+one-time SSH warrants, root-TTY approval, stdio execution and null/hashed stdin;
+it does not establish complete v1.0 conformance. Namespace-only fixtures do not
+substitute for real delegated-host execution tests.
+
+The following integrations are required before claiming v1.0 conformance:
+
+1. `sigrund` still must complete policy reload with aggregate generation
+   quotas, hooks, collector replication/ACK and PTY transfer, plus scripts,
+   reusable grants and the remaining signature adapters. The local stdio
+   execution, central reaper and shutdown paths are integrated.
+2. `sigrun` must complete server PTY transfer, window relaying, and PTY terminal
+   cleanup/validation. The stdio descriptor contract, signed/unsigned request
+   construction, separate status output, deadlines, signal forwarding and
+   actual child result relaying are integrated.
+3. `sigrund-collector` must implement authenticated TLS transport, exact
+   HTTP/DSSE framing, contiguous batch verification, host binding,
+   deduplication, durable cursor advancement, and the denial mappings in
+   Section 4.4.
+4. `sigrundctl` must complete provisioning and operator workflows, including
+   the anchor-output contract and safe administrative revocation operations.
+5. V-01 through V-19 must run in isolated Linux fixtures with deterministic
+   gates for cancellation, commit/spawn reservations, crash recovery, and
+   descriptor transfer. Unit tests, `cargo test`, and Clippy alone do not
+   satisfy this matrix.
+
+An implementation may claim a row of the matrix only when the end-to-end
+observable behavior in that row passes. A helper unit test may support a row,
+but cannot waive a missing daemon, client, collector, or operator integration.

@@ -1,0 +1,50 @@
+name: Prepare Linux tests
+description: Install test tools and enable mapped user namespaces on a disposable hosted VM.
+runs:
+  using: composite
+  steps:
+    - name: Install Linux test dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          build-essential pkg-config uidmap util-linux openssh-client \
+          python3 python3-gi strace dbus
+    - name: Prepare unprivileged namespace fixtures
+      shell: bash
+      run: |
+        for key in kernel.apparmor_restrict_unprivileged_userns kernel.apparmor_restrict_unprivileged_unconfined; do
+          if sudo sysctl "$key" >/dev/null 2>&1; then
+            sudo sysctl -w "$key=0"
+          fi
+        done
+        if sudo sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+        fi
+        sudo /usr/bin/python3 - "$(id -un)" <<'PY'
+        import pwd
+        import sys
+        from pathlib import Path
+
+        account = pwd.getpwnam(sys.argv[1])
+        assert account.pw_uid != 0, 'ordinary tests must run as an unprivileged user'
+        for name in ('subuid', 'subgid'):
+            path = Path('/etc') / name
+            text = path.read_text() if path.exists() else ''
+            entries = [line.split(':') for line in text.splitlines() if line and not line.startswith('#')]
+            if any(owner in (account.pw_name, str(account.pw_uid)) and int(count) >= 65536
+                   for owner, start, count in entries):
+                continue
+            start = 1_000_000
+            ranges = sorted((int(first), int(first) + int(count)) for _, first, count in entries)
+            for first, end in ranges:
+                if start + 65536 <= first:
+                    break
+                if start < end:
+                    start = end
+            with path.open('a') as output:
+                if text and not text.endswith('\n'):
+                    output.write('\n')
+                output.write(f'{account.pw_name}:{start}:65536\n')
+        PY
+        unshare --user --map-auto --map-root-user true
