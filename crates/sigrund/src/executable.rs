@@ -5,10 +5,10 @@ use crate::{
 };
 use sigrund_core::{
     config::DaemonConfig,
-    executable::{ExecutableTrust, TrustModel},
+    executable::{CapabilitySets, ExecutableTrust, TrustModel},
     protocol::RequestedExecutionContext,
     snapshot::SnapshotDigest,
-    warrant::Command,
+    warrant::{Command, ExecutionContext},
 };
 use std::{
     fs::File,
@@ -25,6 +25,7 @@ pub struct Executable {
     sealed: Option<SealedSnapshot>,
     pub digest: SnapshotDigest,
     pub trust: Option<ExecutableTrust>,
+    pub post_exec_capabilities: Option<CapabilitySets>,
 }
 impl From<SealedSnapshot> for Executable {
     fn from(sealed: SealedSnapshot) -> Self {
@@ -33,6 +34,7 @@ impl From<SealedSnapshot> for Executable {
             sealed: Some(sealed),
             source: None,
             trust: None,
+            post_exec_capabilities: None,
         }
     }
 }
@@ -71,7 +73,7 @@ impl Executable {
     pub fn needs_checkpoint(&self) -> bool {
         self.trust.is_some()
     }
-    pub fn verify_direct(&self, context: &RequestedExecutionContext) -> io::Result<()> {
+    pub fn verify_direct(&self, context: &ExecutionContext) -> io::Result<()> {
         let source = self
             .source
             .as_ref()
@@ -81,7 +83,13 @@ impl Executable {
             .as_ref()
             .ok_or_else(|| invalid("missing executable evidence"))?;
         let metadata = source.metadata()?;
-        if !direct_eligible(source, &metadata, context)? {
+        let observed_profile = direct_profile(
+            source,
+            &metadata,
+            &context.requested(),
+            context.post_exec_capabilities.is_some(),
+        )?;
+        if observed_profile.as_ref() != Some(&context.expected_capabilities()) {
             return Err(invalid("direct executable is no longer eligible"));
         }
         let observed = match trust {
@@ -102,7 +110,7 @@ impl Executable {
         Ok(())
     }
     /// Called off-loop with the tracee stopped before its first user instruction.
-    pub fn verify_exec(&self, pid: i32, context: &RequestedExecutionContext) -> io::Result<()> {
+    pub fn verify_exec(&self, pid: i32, context: &ExecutionContext) -> io::Result<()> {
         self.verify_direct(context)?;
         let actual = std::fs::metadata(format!("/proc/{pid}/exe"))?;
         let source = self
@@ -149,20 +157,20 @@ impl Executable {
         if groups != context.supplementary_gids {
             return Err(invalid("exec changed supplementary groups"));
         }
-        let expected = context
-            .capabilities
-            .iter()
-            .try_fold(0u64, |bits, name| {
-                crate::authorization::capability_number(name).map(|n| bits | (1u64 << n))
-            })
-            .ok_or_else(|| invalid("invalid capabilities"))?;
-        for name in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:", "CapBnd:"] {
+        let expected = context.expected_capabilities();
+        for (name, set) in [
+            ("CapInh:", &expected.inheritable),
+            ("CapPrm:", &expected.permitted),
+            ("CapEff:", &expected.effective),
+            ("CapAmb:", &expected.ambient),
+            ("CapBnd:", &expected.bounding),
+        ] {
             let bits = u64::from_str_radix(
                 field(name).ok_or_else(|| invalid("missing capabilities"))?,
                 16,
             )
             .map_err(|_| invalid("invalid process capabilities"))?;
-            if bits != expected {
+            if bits != capability_bits(set)? {
                 return Err(invalid("exec changed capabilities"));
             }
         }
@@ -177,6 +185,7 @@ pub struct Selection<'a> {
     pub signed: Option<&'a Command>,
     pub context: &'a RequestedExecutionContext,
     pub trace_available: bool,
+    pub allow_file_capabilities: bool,
 }
 
 pub fn prepare(
@@ -205,9 +214,18 @@ pub fn prepare(
         if *model == TrustModel::DigestMemfd {
             return snapshot::executable(source, budget, uid, config, check).map(Into::into);
         }
-        if !selection.trace_available || !direct_eligible(&source, &metadata, selection.context)? {
+        if !selection.trace_available {
             continue;
         }
+        let Some(profile) = direct_profile(
+            &source,
+            &metadata,
+            selection.context,
+            selection.allow_file_capabilities,
+        )?
+        else {
+            continue;
+        };
         let trust = match model {
             TrustModel::FsVerity => verity(&source)?,
             TrustModel::Ctime
@@ -232,8 +250,11 @@ pub fn prepare(
                     sha256: String::new(),
                 },
                 trust: Some(trust),
+                post_exec_capabilities: selection.allow_file_capabilities.then_some(profile),
             };
-            executable.verify_direct(selection.context)?;
+            let mut context: ExecutionContext = selection.context.clone().into();
+            context.post_exec_capabilities = executable.post_exec_capabilities.clone();
+            executable.verify_direct(&context)?;
             return Ok(executable);
         }
     }
@@ -259,17 +280,18 @@ fn no_xattr(source: &File, name: &std::ffi::CStr) -> io::Result<bool> {
         _ => Err(error),
     }
 }
-fn direct_eligible(
+fn direct_profile(
     source: &File,
     m: &std::fs::Metadata,
     c: &RequestedExecutionContext,
-) -> io::Result<bool> {
+    allow_file_capabilities: bool,
+) -> io::Result<Option<CapabilitySets>> {
     let mut mount: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatvfs(source.as_raw_fd(), &mut mount) } < 0 {
         return Err(io::Error::last_os_error());
     }
     if m.mode() & 0o6000 != 0 || mount.f_flag & libc::ST_NOEXEC != 0 {
-        return Ok(false);
+        return Ok(None);
     }
     // The setup stub sets SECBIT_NOROOT and grants only requested
     // capabilities, so UID 0 does not imply DAC override.
@@ -280,9 +302,145 @@ fn direct_eligible(
     } else {
         m.mode() & 0o001 != 0
     };
-    Ok(execute
-        && no_xattr(source, c"security.capability")?
-        && no_xattr(source, c"system.posix_acl_access")?)
+    if !execute || !no_xattr(source, c"system.posix_acl_access")? {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 24];
+    let count = unsafe {
+        libc::fgetxattr(
+            source.as_raw_fd(),
+            c"security.capability".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENODATA | libc::EOPNOTSUPP) => {
+                Ok(Some(CapabilitySets::ordinary(&c.capabilities)))
+            }
+            Some(libc::ERANGE) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    if !allow_file_capabilities
+        || mount.f_flag & libc::ST_NOSUID != 0
+        || !host_capability_mount(source)?
+    {
+        return Ok(None);
+    }
+    file_capability_profile(&bytes[..count as usize], &c.capabilities)
+}
+
+fn capability_bits(names: &[String]) -> io::Result<u64> {
+    names.iter().try_fold(0, |bits, name| {
+        crate::authorization::capability_number(name)
+            .map(|n| bits | (1u64 << n))
+            .ok_or_else(|| invalid("unknown capability"))
+    })
+}
+fn file_capability_profile(
+    bytes: &[u8],
+    authority: &[String],
+) -> io::Result<Option<CapabilitySets>> {
+    // v2 host-namespace file capabilities: two little-endian 32-bit words.
+    if bytes.len() != 20 {
+        return Ok(None);
+    }
+    let word = |n| u32::from_le_bytes(bytes[n..n + 4].try_into().unwrap());
+    let flags = word(0);
+    if flags & !1 != 0x0200_0000 {
+        return Ok(None);
+    }
+    let permitted = u64::from(word(4)) | (u64::from(word(12)) << 32);
+    let inheritable = u64::from(word(8)) | (u64::from(word(16)) << 32);
+    let ceiling = capability_bits(authority)?;
+    if (permitted | inheritable) & !ceiling != 0 {
+        return Ok(None);
+    }
+    let mut profile = CapabilitySets::ordinary(authority);
+    profile.permitted = authority
+        .iter()
+        .filter(|name| {
+            let bit = 1u64
+                << crate::authorization::capability_number(name).expect("validated capability");
+            (permitted | inheritable) & bit != 0
+        })
+        .cloned()
+        .collect();
+    profile.effective = if flags & 1 != 0 {
+        profile.permitted.clone()
+    } else {
+        vec![]
+    };
+    profile.ambient.clear();
+    Ok(Some(profile))
+}
+fn host_capability_mount(source: &File) -> io::Result<bool> {
+    use std::io::Read;
+    let mut map = String::new();
+    File::open("/proc/self/uid_map")?
+        .take(4097)
+        .read_to_string(&mut map)?;
+    if map.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"] {
+        return Ok(false);
+    }
+    // Establish that the retained mount is not idmapped. Older kernels lacking
+    // these queries keep the ordinary direct models but decline file caps.
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::statx(
+            source.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            0x4000,
+            &mut stat,
+        )
+    } < 0
+    {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM) => Ok(false),
+            _ => Err(error),
+        };
+    }
+    if stat.stx_mask & 0x4000 == 0 {
+        return Ok(false);
+    }
+    #[repr(C)]
+    struct Request {
+        size: u32,
+        spare: u32,
+        id: u64,
+        mask: u64,
+    }
+    let request = Request {
+        size: 24,
+        spare: 0,
+        id: stat.stx_mnt_id,
+        mask: 2,
+    };
+    let mut mount = [0u64; 64];
+    // __NR_statmount on the supported x86_64 and aarch64 Linux ABIs.
+    const SYS_STATMOUNT: libc::c_long = 457;
+    if unsafe {
+        libc::syscall(
+            SYS_STATMOUNT,
+            &request,
+            mount.as_mut_ptr(),
+            std::mem::size_of_val(&mount),
+            0,
+        )
+    } < 0
+    {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM) => Ok(false),
+            _ => Err(error),
+        };
+    }
+    Ok(mount[1] & 2 != 0 && mount[8] & 0x0010_0000 == 0)
 }
 fn ctime_eligible(source: &File, m: &std::fs::Metadata) -> io::Result<bool> {
     Ok(m.is_file()
@@ -293,7 +451,6 @@ fn ctime_eligible(source: &File, m: &std::fs::Metadata) -> io::Result<bool> {
             filesystem(source)?,
             0xef53 | 0xf2f52010 | 0x9123683e | 0x58465342 | 0x01021994
         )
-        && no_xattr(source, c"security.capability")?
         && no_xattr(source, c"system.posix_acl_access")?)
 }
 fn ctime(m: &std::fs::Metadata) -> ExecutableTrust {
@@ -339,4 +496,53 @@ fn verity(source: &File) -> io::Result<Option<ExecutableTrust>> {
             .map(|b| format!("{b:02x}"))
             .collect(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn file_caps_are_explicit_authority_with_exact_kernel_sets() {
+        let authority = vec!["CAP_CHOWN".into(), "CAP_NET_BIND_SERVICE".into()];
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&0x0200_0001u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(1u32 << 10).to_le_bytes());
+        let profile = file_capability_profile(&bytes, &authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.permitted, ["CAP_NET_BIND_SERVICE"]);
+        assert_eq!(profile.effective, profile.permitted);
+        assert!(profile.ambient.is_empty());
+        assert_eq!(profile.inheritable, authority);
+        assert_eq!(profile.bounding, authority);
+        assert!(profile.valid(&authority));
+        bytes[0] = 0;
+        assert!(
+            file_capability_profile(&bytes, &authority)
+                .unwrap()
+                .unwrap()
+                .effective
+                .is_empty()
+        );
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            file_capability_profile(&bytes, &authority)
+                .unwrap()
+                .unwrap()
+                .permitted,
+            authority
+        );
+        assert!(file_capability_profile(&bytes, &[]).unwrap().is_none());
+        bytes[3] = 3;
+        assert!(
+            file_capability_profile(&bytes, &authority)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            file_capability_profile(&bytes[..19], &authority)
+                .unwrap()
+                .is_none()
+        );
+    }
 }

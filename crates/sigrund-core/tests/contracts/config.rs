@@ -126,7 +126,7 @@ fn profile_restrictions_apply_to_signed_and_unsigned_requests() {
         }
         let mut hello = unsigned();
         hello.requested_command = Some(warrant.command.requested());
-        hello.requested_execution_context = Some(warrant.execution_context.clone());
+        hello.requested_execution_context = Some(warrant.execution_context.requested());
         hello.requested_policy.as_mut().unwrap().mode = warrant.policy.mode.clone();
         hello.validate_request().unwrap();
         assert!(

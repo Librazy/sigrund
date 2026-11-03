@@ -115,6 +115,7 @@ pub(crate) fn check_unsigned_policy(
                 now,
             },
             SnapshotDigests {
+                post_exec_capabilities: None,
                 executable_sha256: Some("0".repeat(64)),
                 executable_trust: None,
                 stdin_sha256: request
@@ -241,15 +242,19 @@ pub(crate) fn prepare(
     request.check()?;
     let source_identity = FileIdentity::read(&source)?;
     request.check()?;
+    let execution_context = signed
+        .as_ref()
+        .map(|(w, _)| w.warrant().execution_context.requested())
+        .or_else(|| request.hello.requested_execution_context.clone())
+        .expect("execution context");
     let executable = crate::executable::prepare(
         source,
         crate::executable::Selection {
             signed: signed.as_ref().map(|(w, _)| &w.warrant().command),
-            context: signed
+            context: &execution_context,
+            allow_file_capabilities: signed
                 .as_ref()
-                .map(|(w, _)| &w.warrant().execution_context)
-                .or(request.hello.requested_execution_context.as_ref())
-                .expect("execution context"),
+                .is_none_or(|(w, _)| w.warrant().version == "1.2"),
             trace_available: crate::execution::trace_available(),
         },
         budget,
@@ -297,6 +302,8 @@ pub(crate) fn prepare(
         if !snapshots
             .executable
             .matches_command(&warrant.warrant().command)
+            || snapshots.executable.post_exec_capabilities
+                != warrant.warrant().execution_context.post_exec_capabilities
         {
             return Err(fail(
                 "EXECUTABLE_MUTATED_OR_TOO_LARGE",
@@ -331,6 +338,7 @@ pub(crate) fn prepare(
                 now,
             },
             SnapshotDigests {
+                post_exec_capabilities: snapshots.executable.post_exec_capabilities.clone(),
                 executable_sha256: snapshots.executable.sha256(),
                 executable_trust: snapshots.executable.trust.clone(),
                 stdin_sha256: stdin_digest,

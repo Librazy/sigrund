@@ -190,6 +190,16 @@ impl Execution {
                         } else {
                             self.reaper.detached(job.pid.expect("tracee"));
                             job.exec_verified = true;
+                            job.fields["observed_post_exec_capabilities"] = serde_json::to_value(
+                                owner
+                                    .job
+                                    .authorized
+                                    .warrant
+                                    .warrant()
+                                    .execution_context
+                                    .expected_capabilities(),
+                            )
+                            .map_err(|e| invalid(e.to_string()))?;
                         }
                         job.owner = Some(*owner);
                     }

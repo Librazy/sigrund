@@ -280,3 +280,54 @@ fn csr_checks_captured_ttl_timestamp_arithmetic_and_stdin_bindings() {
     digests.stdin_sha256 = Some("11".repeat(32));
     assert!(Csr::from_unsigned(&hello, identity(1000), digests, 900).is_ok());
 }
+
+#[test]
+fn direct_v12_binds_exact_capability_sets_without_changing_legacy_bytes() {
+    use sigrund_core::executable::{CapabilitySets, ExecutableTrust};
+    let mut w = fixture();
+    w.version = "1.2".into();
+    w.command.executable_sha256 = None;
+    w.command.executable_trust = Some(ExecutableTrust::FsVerity {
+        algorithm: "sha256".into(),
+        digest: "12".repeat(32),
+    });
+    w.execution_context.capabilities = vec!["CAP_NET_BIND_SERVICE".into()];
+    let mut sets = CapabilitySets::ordinary(&w.execution_context.capabilities);
+    sets.ambient.clear();
+    w.execution_context.post_exec_capabilities = Some(sets);
+    let csr = Csr::new(w.clone()).unwrap();
+    let envelope = signed(w.clone());
+    csr.bind_envelope(&envelope).unwrap();
+    for field in [
+        "permitted",
+        "effective",
+        "inheritable",
+        "ambient",
+        "bounding",
+    ] {
+        let mut value = serde_json::to_value(&w).unwrap();
+        value["execution_context"]["post_exec_capabilities"][field] = json!(["CAP_SYS_ADMIN"]);
+        assert!(
+            parse_value(&value).is_err(),
+            "accepted unauthorized {field}"
+        );
+        value["execution_context"]["post_exec_capabilities"][field] = json!([]);
+        if let Ok(changed) = parse_value(&value)
+            && changed.warrant() != &w
+        {
+            assert!(
+                csr.bind_envelope(&signed(changed.warrant().clone()))
+                    .is_err()
+            );
+        }
+    }
+    w.execution_context.post_exec_capabilities = None;
+    assert!(Csr::new(w.clone()).is_err());
+    w.version = "1.1".into();
+    assert!(Csr::new(w.clone()).is_ok());
+    w.execution_context.post_exec_capabilities = Some(CapabilitySets::ordinary(&[]));
+    assert!(Csr::new(w).is_err());
+    let mut hello = serde_json::to_value(unsigned()).unwrap();
+    hello["requested_execution_context"]["post_exec_capabilities"] = json!({});
+    assert!(parse_strict::<ClientHello>(&serde_json::to_vec(&hello).unwrap()).is_err());
+}

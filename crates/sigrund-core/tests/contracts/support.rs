@@ -40,6 +40,7 @@ pub(super) fn identity(now: i64) -> CsrIdentity {
 }
 pub(super) fn snapshots() -> SnapshotDigests {
     SnapshotDigests {
+        post_exec_capabilities: None,
         executable_sha256: Some("00".repeat(32)),
         executable_trust: None,
         stdin_sha256: None,

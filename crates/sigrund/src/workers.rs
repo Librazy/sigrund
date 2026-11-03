@@ -746,6 +746,7 @@ mod tests {
                 now: 1,
             },
             SnapshotDigests {
+                post_exec_capabilities: None,
                 executable_sha256: request
                     .request()
                     .snapshots

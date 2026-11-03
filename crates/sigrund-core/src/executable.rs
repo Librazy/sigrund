@@ -74,3 +74,45 @@ impl ExecutableTrust {
         }
     }
 }
+
+/// Exact capability state approved for the first user instruction.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilitySets {
+    pub permitted: Vec<String>,
+    pub effective: Vec<String>,
+    pub inheritable: Vec<String>,
+    pub ambient: Vec<String>,
+    pub bounding: Vec<String>,
+}
+impl CapabilitySets {
+    pub fn ordinary(authority: &[String]) -> Self {
+        Self {
+            permitted: authority.to_vec(),
+            effective: authority.to_vec(),
+            inheritable: authority.to_vec(),
+            ambient: authority.to_vec(),
+            bounding: authority.to_vec(),
+        }
+    }
+    pub fn valid(&self, authority: &[String]) -> bool {
+        let sets = [
+            &self.permitted,
+            &self.effective,
+            &self.inheritable,
+            &self.ambient,
+            &self.bounding,
+        ];
+        sets.iter().all(|set| {
+            set.len() <= 64
+                && set.windows(2).all(|w| w[0] < w[1])
+                && set.iter().all(|c| authority.contains(c))
+        }) && self.bounding == authority
+            && self.inheritable == authority
+            && self.effective.iter().all(|c| self.permitted.contains(c))
+            && self
+                .ambient
+                .iter()
+                .all(|c| self.permitted.contains(c) && self.inheritable.contains(c))
+    }
+}

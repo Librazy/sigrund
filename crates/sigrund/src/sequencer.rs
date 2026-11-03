@@ -406,6 +406,8 @@ fn authorize(
         "target_uid":w.execution_context.target_uid,"target_gid":w.execution_context.target_gid,
         "executable_sha256":w.command.executable_sha256,
         "executable_trust":w.command.executable_trust,
+        "capability_authority":w.execution_context.capabilities,
+        "post_exec_capabilities":w.execution_context.expected_capabilities(),
         "stdin_sha256":w.command.stdin_sha256,
         "tty_mode":w.command.tty_mode,"environment_entries":verified.envp.len()});
     if result == AuthorizationResult::Allowed {

@@ -46,8 +46,52 @@ impl Command {
     }
 }
 
-/// The CSR and signed execution context have exactly the same field set.
-pub type ExecutionContext = RequestedExecutionContext;
+/// Signed context includes daemon-derived state, absent from unsigned input.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionContext {
+    pub capabilities: Vec<String>,
+    pub env_exact: std::collections::BTreeMap<String, String>,
+    pub caller_env_allowlist: Vec<String>,
+    pub supplementary_gids: Vec<u32>,
+    pub target_gid: u32,
+    pub target_uid: u32,
+    pub umask: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_exec_capabilities: Option<crate::executable::CapabilitySets>,
+}
+impl From<RequestedExecutionContext> for ExecutionContext {
+    fn from(context: RequestedExecutionContext) -> Self {
+        Self {
+            capabilities: context.capabilities,
+            env_exact: context.env_exact,
+            caller_env_allowlist: context.caller_env_allowlist,
+            supplementary_gids: context.supplementary_gids,
+            target_gid: context.target_gid,
+            target_uid: context.target_uid,
+            umask: context.umask,
+            post_exec_capabilities: None,
+        }
+    }
+}
+impl ExecutionContext {
+    pub fn requested(&self) -> RequestedExecutionContext {
+        RequestedExecutionContext {
+            capabilities: self.capabilities.clone(),
+            env_exact: self.env_exact.clone(),
+            caller_env_allowlist: self.caller_env_allowlist.clone(),
+            supplementary_gids: self.supplementary_gids.clone(),
+            target_gid: self.target_gid,
+            target_uid: self.target_uid,
+            umask: self.umask,
+        }
+    }
+    pub fn expected_capabilities(&self) -> crate::executable::CapabilitySets {
+        self.post_exec_capabilities
+            .clone()
+            .unwrap_or_else(|| crate::executable::CapabilitySets::ordinary(&self.capabilities))
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -92,8 +136,20 @@ impl Warrant {
             &self.command.executable_sha256,
             &self.command.executable_trust,
         ) {
-            ("1.0", Some(digest), None) => valid_digest(digest),
-            ("1.1", None, Some(trust)) => trust.valid(),
+            ("1.0", Some(digest), None) => {
+                valid_digest(digest) && self.execution_context.post_exec_capabilities.is_none()
+            }
+            ("1.1", None, Some(trust)) => {
+                trust.valid() && self.execution_context.post_exec_capabilities.is_none()
+            }
+            ("1.2", None, Some(trust)) => {
+                trust.valid()
+                    && self
+                        .execution_context
+                        .post_exec_capabilities
+                        .as_ref()
+                        .is_some_and(|sets| sets.valid(&self.execution_context.capabilities))
+            }
             _ => false,
         };
         if !executable_valid
@@ -115,7 +171,7 @@ impl Warrant {
         }
         validate_unsigned_request(
             &self.command.requested(),
-            &self.execution_context,
+            &self.execution_context.requested(),
             &RequestedPolicy {
                 mode: self.policy.mode.clone(),
                 ttl_secs: 0,
@@ -182,6 +238,7 @@ pub struct CsrIdentity {
 }
 
 pub struct SnapshotDigests {
+    pub post_exec_capabilities: Option<crate::executable::CapabilitySets>,
     pub executable_sha256: Option<String>,
     pub executable_trust: Option<crate::executable::ExecutableTrust>,
     pub stdin_sha256: Option<String>,
@@ -235,11 +292,19 @@ impl Csr {
                     .ok_or_else(|| invalid("timestamp overflow"))?,
             )
         };
-        let version = if snapshots.executable_trust.is_some() {
+        let version = if snapshots.post_exec_capabilities.is_some() {
+            "1.2"
+        } else if snapshots.executable_trust.is_some() {
             "1.1"
         } else {
             "1.0"
         };
+        let mut execution_context: ExecutionContext = hello
+            .requested_execution_context
+            .clone()
+            .expect("validated unsigned request")
+            .into();
+        execution_context.post_exec_capabilities = snapshots.post_exec_capabilities;
         Self::new(Warrant {
             command: Command {
                 allow_interpreted_script: command.allow_interpreted_script,
@@ -252,10 +317,7 @@ impl Csr {
                 stdin_sha256: snapshots.stdin_sha256,
                 tty_mode: command.tty_mode.clone(),
             },
-            execution_context: hello
-                .requested_execution_context
-                .clone()
-                .expect("validated unsigned request"),
+            execution_context,
             grant_id: identity.grant_id,
             host_id: identity.host_id,
             policy: GrantPolicy {

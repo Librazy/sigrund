@@ -70,6 +70,7 @@ fn selection_limits_and_cross_thread_exec_checkpoint() {
             signed: None,
             context: &context(),
             trace_available: false,
+            allow_file_capabilities: false,
         },
         &budget,
         1001,
@@ -89,7 +90,8 @@ fn selection_limits_and_cross_thread_exec_checkpoint() {
             executable::Selection {
                 signed: None,
                 context: &context(),
-                trace_available: false
+                trace_available: false,
+                allow_file_capabilities: false,
             },
             &budget,
             1001,
@@ -105,7 +107,8 @@ fn selection_limits_and_cross_thread_exec_checkpoint() {
             executable::Selection {
                 signed: None,
                 context: &context(),
-                trace_available: false
+                trace_available: false,
+                allow_file_capabilities: false,
             },
             &budget,
             1001,
@@ -293,6 +296,7 @@ fn ctime_namespace_fixture() {
             signed: None,
             context: &context(),
             trace_available: true,
+            allow_file_capabilities: false,
         },
         &budget,
         1001,
@@ -304,7 +308,7 @@ fn ctime_namespace_fixture() {
     assert_eq!(prepared.digest.bytes, 67_108_865);
     assert_eq!(prepared.sha256(), None);
     assert_eq!(budget.usage(1001), (0, 0));
-    prepared.verify_direct(&context()).unwrap();
+    prepared.verify_direct(&context().into()).unwrap();
     cfg.executable_trust_models = vec![TrustModel::DigestMemfd, TrustModel::Ctime];
     assert!(
         executable::prepare(
@@ -312,7 +316,8 @@ fn ctime_namespace_fixture() {
             executable::Selection {
                 signed: None,
                 context: &context(),
-                trace_available: true
+                trace_available: true,
+                allow_file_capabilities: false,
             },
             &budget,
             1001,
@@ -328,7 +333,8 @@ fn ctime_namespace_fixture() {
             executable::Selection {
                 signed: None,
                 context: &context(),
-                trace_available: false
+                trace_available: false,
+                allow_file_capabilities: false,
             },
             &budget,
             1001,
@@ -338,14 +344,15 @@ fn ctime_namespace_fixture() {
         .is_err()
     );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
-    assert!(prepared.verify_direct(&context()).is_err());
+    assert!(prepared.verify_direct(&context().into()).is_err());
     assert!(
         executable::prepare(
             File::open(&path).unwrap(),
             executable::Selection {
                 signed: None,
                 context: &context(),
-                trace_available: true
+                trace_available: true,
+                allow_file_capabilities: false,
             },
             &budget,
             1001,
@@ -361,7 +368,7 @@ fn ctime_namespace_fixture() {
         .unwrap()
         .set_len(100)
         .unwrap();
-    assert!(prepared.verify_direct(&context()).is_err());
+    assert!(prepared.verify_direct(&context().into()).is_err());
     assert_eq!(budget.usage(1001), (0, 0));
 
     // noexec must force fallback before approval, for the same otherwise
@@ -387,6 +394,7 @@ fn ctime_namespace_fixture() {
                 signed: None,
                 context: &context(),
                 trace_available: true,
+                allow_file_capabilities: false,
             },
             &budget,
             1001,

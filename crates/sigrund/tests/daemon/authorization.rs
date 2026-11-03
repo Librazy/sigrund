@@ -64,6 +64,7 @@ fn warrant(f: &Fixture, uid: u32) -> Warrant {
             now: now(),
         },
         SnapshotDigests {
+            post_exec_capabilities: None,
             executable_sha256: Some(sha256_hex(&fs::read(&f.executable).unwrap())),
             executable_trust: None,
             stdin_sha256: None,

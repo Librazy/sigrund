@@ -242,7 +242,7 @@ impl ClientHello {
             }
             validate_unsigned_request(
                 &warrant.warrant().command.requested(),
-                &warrant.warrant().execution_context,
+                &warrant.warrant().execution_context.requested(),
                 &RequestedPolicy {
                     mode: warrant.warrant().policy.mode.clone(),
                     ttl_secs: 0,
