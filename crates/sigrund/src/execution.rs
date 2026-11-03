@@ -49,6 +49,7 @@ pub struct PreparedChild {
     argv: Vec<CString>,
     envp: Vec<CString>,
     cwd: CString,
+    direct_path: Option<CString>,
     groups: Vec<u32>,
     uid: u32,
     gid: u32,
@@ -74,6 +75,7 @@ struct ChildSpec {
     groups: *const u32,
     groups_len: usize,
     cwd: *const libc::c_char,
+    direct_path: *const libc::c_char,
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
     mountinfo: *mut u8,
@@ -126,6 +128,17 @@ impl PreparedChild {
             envp,
             cwd: CString::new(warrant.command.cwd.as_str())
                 .map_err(|_| io::Error::other("NUL in cwd"))?,
+            direct_path: if warrant.command.executable_trust.is_some()
+                && warrant.execution_context.expected_capabilities().ambient
+                    != warrant.execution_context.capabilities
+            {
+                Some(
+                    CString::new(warrant.command.executable_path.as_str())
+                        .map_err(|_| io::Error::other("NUL in executable path"))?,
+                )
+            } else {
+                None
+            },
             groups: warrant.execution_context.supplementary_gids.clone(),
             uid: warrant.execution_context.target_uid,
             gid: warrant.execution_context.target_gid,
@@ -180,6 +193,10 @@ impl PreparedChild {
             groups: self.groups.as_ptr(),
             groups_len: self.groups.len(),
             cwd: self.cwd.as_ptr(),
+            direct_path: self
+                .direct_path
+                .as_ref()
+                .map_or(std::ptr::null(), |p| p.as_ptr()),
             argv: argv.as_ptr(),
             envp: envp.as_ptr(),
             mountinfo: self.mountinfo.as_mut_ptr(),
@@ -336,6 +353,7 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
             argv: vec![CString::new("/usr/bin/true").unwrap()],
             envp: vec![],
             cwd: CString::new("/").unwrap(),
+            direct_path: None,
             groups: vec![],
             uid: 0,
             gid: 0,
@@ -358,7 +376,7 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
         let gate = child.gate.take().expect("probe gate");
         let tracing = attach_checkpoint(child.pid, &gate).is_ok();
         if !tracing {
-            // Unsupported tracing only disables the ctime model. The ordinary
+            // Unsupported tracing disables the direct models. The ordinary
             // mandatory startup exec probe must still pass independently.
             let _ = unsafe { libc::write(gate.as_raw_fd(), b"x".as_ptr().cast(), 1) };
         }
@@ -385,7 +403,13 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
                         return Err(io::Error::other("unexpected startup trace stop"));
                     }
                     release_checkpoint(child.pid)?;
-                    TRACE_AVAILABLE.store(true, std::sync::atomic::Ordering::Release);
+                    let status = std::fs::read_to_string("/proc/self/status")?;
+                    let can_inspect = status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("CapEff:"))
+                        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                        .is_some_and(|bits| bits & (1 << 19) != 0);
+                    TRACE_AVAILABLE.store(can_inspect, std::sync::atomic::Ordering::Release);
                     break;
                 }
                 let mut poll = libc::pollfd {
