@@ -9,7 +9,7 @@ runs:
         sudo apt-get update
         sudo apt-get install --yes --no-install-recommends \
           build-essential pkg-config uidmap util-linux openssh-client \
-          python3 python3-gi strace dbus
+          python3 python3-gi strace dbus e2fsprogs fsverity
     - name: Prepare unprivileged namespace fixtures
       shell: bash
       run: |

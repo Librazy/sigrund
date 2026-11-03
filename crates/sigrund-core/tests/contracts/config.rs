@@ -1,6 +1,32 @@
 use super::support::*;
 
 #[test]
+fn executable_models_are_ordered_nonempty_and_captured() {
+    use sigrund_core::executable::{TrustModel, default_models};
+    let mut cfg = config("").unwrap();
+    assert_eq!(cfg.executable_trust_models, default_models());
+    cfg.executable_trust_models = vec![TrustModel::DigestMemfd, TrustModel::Ctime];
+    cfg.validate().unwrap();
+    let store = sigrund_core::config::PolicyStore::new(cfg.clone());
+    let captured = store.capture();
+    cfg.executable_trust_models = vec![TrustModel::FsVerity];
+    store.reload(cfg.clone()).unwrap();
+    assert_eq!(
+        captured.executable_trust_models,
+        vec![TrustModel::DigestMemfd, TrustModel::Ctime]
+    );
+    assert_eq!(
+        store.capture().executable_trust_models,
+        vec![TrustModel::FsVerity]
+    );
+    cfg.executable_trust_models.clear();
+    assert!(cfg.validate().is_err());
+    cfg.executable_trust_models = vec![TrustModel::Ctime; 2];
+    assert!(cfg.validate().is_err());
+    assert!(serde_json::from_str::<TrustModel>("\"unknown\"").is_err());
+}
+
+#[test]
 fn mvp_profile_is_opt_in_and_rejects_expansion_at_load_and_reload() {
     assert!(config("").unwrap().mvp.is_none());
     let cfg = config("[mvp]").unwrap();

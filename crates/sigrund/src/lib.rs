@@ -5,6 +5,7 @@ mod cgroup;
 pub mod cli;
 pub mod client;
 pub mod daemon;
+pub mod executable;
 pub mod execution;
 mod jobs;
 pub mod linux;

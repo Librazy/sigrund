@@ -20,6 +20,8 @@ const MAX_COLLECTOR_TIMEOUT_MS: u32 = 3_000;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
+    #[serde(default = "crate::executable::default_models")]
+    pub executable_trust_models: Vec<crate::executable::TrustModel>,
     /// Presence opts into the roadmap's restricted first executable slice.
     #[serde(default)]
     pub mvp: Option<MvpProfile>,
@@ -273,6 +275,7 @@ impl PolicyStore {
 
 #[derive(Clone, Debug)]
 pub struct CapturedPolicy {
+    pub executable_trust_models: Vec<crate::executable::TrustModel>,
     pub generation: u64,
     pub mvp: Option<MvpProfile>,
     pub max_active_hooks_per_uid: u32,
@@ -299,6 +302,7 @@ impl PolicyGeneration {
     pub fn capture(&self) -> CapturedPolicy {
         let c = &self.config;
         CapturedPolicy {
+            executable_trust_models: c.executable_trust_models.clone(),
             generation: self.number,
             mvp: c.mvp.clone(),
             max_active_hooks_per_uid: c.max_active_hooks_per_uid,
@@ -552,6 +556,18 @@ impl DaemonConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.executable_trust_models.is_empty()
+            || self
+                .executable_trust_models
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.executable_trust_models.len()
+        {
+            return Err(CoreError::Config(
+                "empty or duplicate executable trust models".into(),
+            ));
+        }
         if let Some(profile) = &self.mvp {
             profile.validate()?;
             if self.require_remote_audit_ack {
@@ -866,6 +882,7 @@ mod tests {
 
     fn valid() -> DaemonConfig {
         DaemonConfig {
+            executable_trust_models: crate::executable::default_models(),
             mvp: None,
             allow_same_uid_elevation: false,
             require_remote_audit_ack: false,

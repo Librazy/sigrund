@@ -37,6 +37,8 @@ struct Active {
     limit: usize,
     pid: Option<i32>,
     spawn_reserved: bool,
+    checkpoint: bool,
+    exec_verified: bool,
     sync: Option<OwnedFd>,
     deadline: Option<Instant>,
     handshake: Handshake,
@@ -107,6 +109,8 @@ impl Execution {
             cleaned: None,
             pid: None,
             spawn_reserved: false,
+            checkpoint: false,
+            exec_verified: false,
             sync: None,
             deadline: None,
             handshake: Handshake::default(),
@@ -140,7 +144,7 @@ impl Execution {
     fn dispatch(&mut self, token: u64, task: Task) -> io::Result<()> {
         if let Err(task) = self.supervisor.send(task) {
             let owner = match *task {
-                Task::Spawn(owner) | Task::Cleanup(owner) => owner,
+                Task::Spawn(owner) | Task::Cleanup(owner) | Task::VerifyExec(owner, _) => owner,
                 Task::Prepare(_) => unreachable!(),
             };
             self.jobs.get_mut(&token).unwrap().owner = Some(owner);
@@ -154,6 +158,40 @@ impl Execution {
         for event in self.supervisor.drain() {
             let result = (|| -> io::Result<()> {
                 match event {
+                    SpawnOutcome::ExecVerified { owner, result } => {
+                        let token = owner.job.token;
+                        let job = self.jobs.get_mut(&token).expect("exec checkpoint owner");
+                        job.task = false;
+                        let result = result
+                            .and_then(|()| crate::jobs::eligible(&owner.job))
+                            .and_then(|()| {
+                                if job.failure.is_some()
+                                    || Instant::now() >= job.deadline.expect("exec deadline")
+                                    || !job.lifecycle.transition(Phase::Running, Phase::Releasing)
+                                {
+                                    return Err(invalid("exec checkpoint cancelled or expired"));
+                                }
+                                let result = if job.lifecycle.cancelled.load(Ordering::Acquire) {
+                                    Err(invalid("exec checkpoint cancelled before detach"))
+                                } else {
+                                    crate::execution::release_checkpoint(job.pid.expect("tracee"))
+                                };
+                                assert!(job.lifecycle.transition(Phase::Releasing, Phase::Running));
+                                if job.lifecycle.cancelled.load(Ordering::Acquire) {
+                                    job.lifecycle.cancel();
+                                }
+                                result
+                            });
+                        if let Err(error) = result {
+                            job.failure = Some(format!("exec checkpoint failed: {error}"));
+                            if job.outcome.is_some() {
+                                job.outcome = Some(SyncOutcome::SpawnFailed);
+                            }
+                        } else {
+                            job.exec_verified = true;
+                        }
+                        job.owner = Some(*owner);
+                    }
                     SpawnOutcome::Prepared { owner, failure } => {
                         let token = owner.job.token;
                         let job = self.jobs.get_mut(&token).expect("prepared owner");
@@ -168,7 +206,7 @@ impl Execution {
                         job.task = false;
                         job.owner = Some(*owner);
                         match child {
-                            Ok(child) => {
+                            Ok(mut child) => {
                                 let pid = child.pid;
                                 // Register before releasing the barrier, even during shutdown.
                                 assert!(
@@ -176,6 +214,17 @@ impl Execution {
                                         .complete(token, Some((pid, child.pidfd)))
                                         .is_ok()
                                 );
+                                job.checkpoint = child.gate.is_some();
+                                if let Some(gate) = child.gate.take() {
+                                    match crate::execution::attach_checkpoint(pid, &gate) {
+                                        Ok(()) => self.reaper.traced(pid),
+                                        Err(error) => {
+                                            job.failure = Some(format!(
+                                                "exec checkpoint attach failed: {error}"
+                                            ))
+                                        }
+                                    }
+                                }
                                 job.pid = Some(pid);
                                 job.deadline = Some(child.deadline);
                                 job.sync = Some(child.sync);
@@ -359,6 +408,31 @@ impl Execution {
                 job.exit = Some(exit);
             }
         }
+        for stop in self.reaper.take_stops() {
+            let Some(token) = stop.token else { continue };
+            let task = {
+                let job = self.jobs.get_mut(&token).expect("registered tracee");
+                if job.checkpoint
+                    && !job.exec_verified
+                    && !job.task
+                    && stop.code == libc::CLD_TRAPPED
+                    && stop.status == (libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8))
+                {
+                    job.owner
+                        .take()
+                        .map(|owner| Task::VerifyExec(owner, stop.pid))
+                } else {
+                    job.failure = Some("unexpected ptrace stop".into());
+                    if job.outcome.is_some() {
+                        job.outcome = Some(SyncOutcome::SpawnFailed);
+                    }
+                    None
+                }
+            };
+            if let Some(task) = task {
+                self.dispatch(token, task)?;
+            }
+        }
         let tokens: Vec<_> = self.jobs.keys().copied().collect();
         for token in tokens {
             let job = self.jobs.get_mut(&token).unwrap();
@@ -373,7 +447,11 @@ impl Execution {
                 if outcome != SyncOutcome::ReadyToExec {
                     job.failure = Some(format!("child setup failed: {outcome:?}"));
                 }
-                job.outcome = Some(outcome);
+                job.outcome = Some(if job.failure.is_some() {
+                    SyncOutcome::SpawnFailed
+                } else {
+                    outcome
+                });
             }
             if job
                 .control_deadline
@@ -382,6 +460,17 @@ impl Execution {
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
                 job.lifecycle.cancel();
+            }
+            if job.checkpoint
+                && !job.exec_verified
+                && job
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                job.failure = Some("exec checkpoint timed out".into());
+                if job.outcome.is_some() {
+                    job.outcome = Some(SyncOutcome::SpawnFailed);
+                }
             }
             let cancelled = job.lifecycle.cancelled.load(Ordering::Acquire);
             let failed = job.failure.is_some()
@@ -393,10 +482,16 @@ impl Execution {
                 && !job.ready_audited
                 && !self.poisoned
                 && job.outcome == Some(SyncOutcome::ReadyToExec)
+                && (!job.checkpoint || job.exec_verified)
             {
                 let mut fields = job.fields.clone();
                 fields["child_pid"] = job.pid.into();
-                fields["exec_outcome"] = "unknown".into();
+                fields["exec_outcome"] = if job.exec_verified {
+                    "exec_event_observed"
+                } else {
+                    "unknown"
+                }
+                .into();
                 self.durable
                     .try_send(sequencer::Work::Execution {
                         token,

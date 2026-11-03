@@ -1,3 +1,7 @@
+# Ordered executable trust models. Omit a model to disable it.
+# Only digest_memfd uses max_executable_bytes and executable snapshot RAM.
+executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]
+
 allow_same_uid_elevation = false
 require_remote_audit_ack = false
 csr_allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]

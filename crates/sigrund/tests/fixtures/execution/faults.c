@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -40,6 +41,16 @@ static void gate(long pid) {
     char byte;
     do{n=real_call(SYS_read,release_fd,&byte,1);}while(n<0&&errno==EINTR);
 }
+/* Hold the real coordinator immediately before detach, after exec validation.
+ * This is test-only: killing it must trigger EXITKILL before target entry. */
+long ptrace(enum __ptrace_request request, ...) {
+    va_list ap;va_start(ap,request);
+    pid_t pid=va_arg(ap,pid_t);
+    void *address=va_arg(ap,void *),*data=va_arg(ap,void *);
+    va_end(ap);
+    if(request==PTRACE_DETACH&&!strcmp(mode,"exec-detach")&&take_arm())gate(pid);
+    return real_call(SYS_ptrace,request,pid,address,data);
+}
 long syscall(long number,...) {
     va_list ap;va_start(ap,number);
     long args[6];for(unsigned i=0;i<6;++i)args[i]=va_arg(ap,long);va_end(ap);
@@ -49,7 +60,7 @@ long syscall(long number,...) {
         int saved=errno;
         if(result>0&&!strcmp(mode,"clone-after")&&take_arm())gate(result);
         if(result>0&&parent_gate_mode())active=1;
-        if(result==0&&strcmp(mode,"clone-after")&&!parent_gate_mode())active=take_arm();
+        if(result==0&&strcmp(mode,"clone-after")&&strcmp(mode,"exec-detach")&&!parent_gate_mode())active=take_arm();
         errno=saved;return result;
     }
     if(active) {

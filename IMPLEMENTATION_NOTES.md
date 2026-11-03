@@ -10,7 +10,7 @@ and acceptance artifacts remain in Git history.
 An unprivileged requester runs `sigrun`; a foreground root approver reviews the
 complete request on its own controlling TTY and signs with an explicitly chosen
 SSH key. The daemon verifies the signature and policy, consumes the one-time
-grant, persists local audit, executes sealed input snapshots, and returns
+grant, persists local audit, executes the retained executable and sealed finite stdin, and returns
 separate stdout/stderr and the primary child's exit status. Pre-signed warrants
 use the same authorization and execution gates without an online approver.
 
@@ -69,7 +69,7 @@ worker/RAM/audit reservation until its owner actually finishes cleanup. Sockets
 are unregistered from epoll before retirement, including when a worker retains
 a duplicate. Unmappable peer credentials reject only that connection.
 
-Executable and stdin snapshots share the same bounded preparation path for
+Executable preparation and stdin snapshots share the same bounded worker path for
 signed and unsigned requests. Root pinning permits mount crossings; executable
 resolution beneath a pinned root uses stricter `openat2` restrictions. Final
 authorization rechecks retained root identity, sealed bytes, policy, validity and
@@ -102,6 +102,40 @@ of state with no partial tail. Failed state publication poisons the writer until
 verified recovery. Retaining `initial_key_hex` enables history verification but
 provides neither forward secrecy after root/state compromise nor protection
 against whole-state rollback without an external checkpoint.
+
+## Executable trust selection
+
+`executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]` selects enabled
+models in order. Set `["digest_memfd"]` to retain the previous snapshot-only
+behavior. Selection happens before approval; signed evidence never falls back
+to another model. Older 1.0 digest warrants retain their canonical bytes.
+
+Verity files bind their kernel-measured SHA-256/SHA-512 verity descriptor digest.
+Root-managed local files may instead bind device/inode/size/nanosecond ctime and
+stop at `PTRACE_EVENT_EXEC` for a final check before user code. Both direct paths
+retain and execute the source FD, avoid executable snapshot RAM and can exceed
+`max_executable_bytes` and the old 64 MiB ceiling. Hashing/memfd copies still obey
+both size and RAM bounds; hashed stdin is unchanged. Unknown, remote, overlay
+and FUSE filesystems do not qualify for ctime. See normative Section 2.2.2 for
+filesystem, permission, signed-evidence and tracing requirements.
+
+Direct CSR/warrants use version 1.1, `executable_sha256: null` and a typed
+`executable_trust` field. Ctime grants bind the approval-time version, so package
+updates/replacements require approval again. Ctime assumes trusted root
+maintenance and timestamp semantics; it does not authenticate dependencies or
+provide cryptographic content identity. Script/same-UID restrictions still apply.
+
+The coordinator owns ptrace attachment/detachment, while workers perform final
+metadata checks and own the source descriptors. Exec stops are distinct from
+exits in the Central Reaper. A private startup gate prevents exec before trace
+attachment; cancellation is reconciled around an atomic release reservation.
+One-time consumption remains durable before spawn, including when the later
+checkpoint rejects. `EXEC_READY_TO_EXEC` reports `exec_event_observed` only after
+ctime validation; untraced execution keeps the prior `unknown` outcome.
+
+The privileged `scripts/verify-trust.py` acceptance gate tests real ext4 verity,
+both digest algorithms, >64 MiB direct ELF execution, root/service capabilities,
+unsafe-file fallback and deterministic mutation before exec.
 
 ## Operator lab
 

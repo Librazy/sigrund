@@ -102,7 +102,7 @@ def unprivileged():
 
 
 class Fixture:
-    def __init__(self, parent, binaries):
+    def __init__(self, parent, binaries, models=None):
         self.parent = parent
         self.binaries = binaries
         self.directory = tempfile.TemporaryDirectory(prefix='sigrund-runtime-')
@@ -132,6 +132,9 @@ class Fixture:
             (root / name).chmod(0o755)
         roots = json.dumps(sorted(['/usr/bin', str(root)]))
         config = (REPO / 'config/sigrund.toml.example').read_text()
+        # Existing fixtures explicitly exercise the legacy sealed-byte contract.
+        config = config.replace('executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]',
+                                'executable_trust_models = ' + json.dumps(models if models is not None else ['digest_memfd']))
         config = config.replace('["/usr/bin", "/usr/sbin"]', roots)
         config = config.replace('<strict-padded-base64-32-byte-ed25519-key>', base64.b64encode(bytes(32)).decode())
         config = config.replace('shutdown_grace_ms = 10000', 'shutdown_grace_ms = 500')
@@ -183,7 +186,7 @@ class Fixture:
 
     def signed(self, command, args=(), uid=65534, target_uid=33,
                capabilities=(), env_exact=None, input_bytes=None,
-               supplementary_gids=(33,)):
+               supplementary_gids=(33,), executable_trust=None):
         genesis = json.loads(self.log.read_text().splitlines()[0])
         payload = canonical({
             'version': '1.0', 'grant_id': uuid7(), 'host_id': genesis['host_id'],
@@ -199,6 +202,15 @@ class Fixture:
                                   'caller_env_allowlist': [], 'umask': 0o027},
             'policy': {'mode': 'one_time', 'not_before': int(time.time()) - 1, 'not_after': int(time.time()) + 120},
         })
+        if executable_trust is not None:
+            value = json.loads(payload)
+            value['version'] = '1.1'
+            value['command']['executable_sha256'] = None
+            value['command']['executable_trust'] = executable_trust
+            payload = canonical(value)
+        return self.sign_payload(payload)
+
+    def sign_payload(self, payload):
         kind = b'application/vnd.sigrun.warrant.v1+json'
         pae = b'DSSEv1 ' + str(len(kind)).encode() + b' ' + kind + b' ' + str(len(payload)).encode() + b' ' + payload
         signed = subprocess.run(['ssh-keygen', '-Y', 'sign', '-n', 'sigrun.warrant.v1', '-O', 'hashalg=sha512', '-f', str(self.key)], input=pae, capture_output=True, check=True).stdout

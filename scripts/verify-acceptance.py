@@ -316,6 +316,11 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
         run([sys.executable, lab, 'prepare', '--directory', base, '--binaries', binaries, '--requester', requester,
              '--supervisor-unit', supervisor_unit],
             capture_output=True)
+        # This case deliberately tests retained snapshot bytes after mutation.
+        config_path = base / 'config.toml'
+        config_path.write_text(config_path.read_text().replace(
+            'executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]',
+            'executable_trust_models = ["digest_memfd"]'))
         manifest = json.loads((base / 'lab.json').read_text())
         tools = base / 'bin'
         runtime = Path(manifest['runtime'])
@@ -484,6 +489,8 @@ def inside(args):
             ('platform', [sys.executable, REPO / 'scripts/verify-platform.py', args.platform_binary, '--cgroup-parent', parent]),
             ('runtime', [sys.executable, REPO / 'scripts/verify-runtime.py', '--cgroup-parent', parent,
                          '--binaries', args.binaries, '--systemd']),
+            ('trust', [sys.executable, REPO / 'scripts/verify-trust.py', '--cgroup-parent', parent,
+                       '--binaries', args.binaries, '--artifacts', args.artifacts / 'trust']),
             ('failures', [sys.executable, REPO / 'scripts/verify-execution.py', '--cgroup-parent', parent,
                           '--binaries', args.binaries, '--artifacts', args.artifacts / 'execution',
                           '--strace', strace]),

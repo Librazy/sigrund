@@ -32,6 +32,7 @@ struct child_spec {
     size_t mountinfo_capacity;
     uint32_t *group_check;
     int isolated;
+    int gate_read, gate_write, checkpoint;
 };
 struct setup_frame { uint32_t step; int32_t error; };
 _Static_assert(sizeof(struct setup_frame) == 8, "sync ABI");
@@ -135,6 +136,14 @@ static void lock_mounts(const struct child_spec *spec, int sync) {
 
 static void run_child(const struct child_spec *s) {
     int sync = s->sync;
+    if (s->checkpoint) {
+        syscall(SYS_close, s->gate_write);
+        char byte;
+        long count;
+        do { count = syscall(SYS_read, s->gate_read, &byte, 1); } while (count < 0 && errno == EINTR);
+        if (count != 1 || byte != 'x') die(sync, 1, ECANCELED);
+        syscall(SYS_close, s->gate_read);
+    }
     CHECK(1, syscall(SYS_unshare, CLONE_FILES));
     int tmp_sync = syscall(SYS_fcntl, sync, F_DUPFD_CLOEXEC, 5);
     CHECK(1, tmp_sync);

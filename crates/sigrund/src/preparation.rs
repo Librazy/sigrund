@@ -115,7 +115,8 @@ pub(crate) fn check_unsigned_policy(
                 now,
             },
             SnapshotDigests {
-                executable_sha256: "0".repeat(64),
+                executable_sha256: Some("0".repeat(64)),
+                executable_trust: None,
                 stdin_sha256: request
                     .hello
                     .requested_command
@@ -240,8 +241,17 @@ pub(crate) fn prepare(
     request.check()?;
     let source_identity = FileIdentity::read(&source)?;
     request.check()?;
-    let executable = snapshot::executable(
+    let executable = crate::executable::prepare(
         source,
+        crate::executable::Selection {
+            signed: signed.as_ref().map(|(w, _)| &w.warrant().command),
+            context: signed
+                .as_ref()
+                .map(|(w, _)| &w.warrant().execution_context)
+                .or(request.hello.requested_execution_context.as_ref())
+                .expect("execution context"),
+            trace_available: crate::execution::trace_available(),
+        },
         budget,
         request.requester_uid,
         &request.policy,
@@ -284,17 +294,13 @@ pub(crate) fn prepare(
     let snapshots = request.snapshots.as_ref().expect("snapshot owner");
     let stdin_digest = snapshots.stdin.as_ref().map(|s| s.digest.sha256.clone());
     let document = if let Some((warrant, signer_ids)) = signed {
-        if !bool::from(
-            warrant
-                .warrant()
-                .command
-                .executable_sha256
-                .as_bytes()
-                .ct_eq(snapshots.executable.digest.sha256.as_bytes()),
-        ) {
+        if !snapshots
+            .executable
+            .matches_command(&warrant.warrant().command)
+        {
             return Err(fail(
                 "EXECUTABLE_MUTATED_OR_TOO_LARGE",
-                "signed executable digest differs",
+                "signed executable evidence differs",
             ));
         }
         let stdin_matches = match (&warrant.warrant().command.stdin_sha256, &stdin_digest) {
@@ -325,7 +331,8 @@ pub(crate) fn prepare(
                 now,
             },
             SnapshotDigests {
-                executable_sha256: snapshots.executable.digest.sha256.clone(),
+                executable_sha256: snapshots.executable.sha256(),
+                executable_trust: snapshots.executable.trust.clone(),
                 stdin_sha256: stdin_digest,
             },
             request.policy.max_ttl_secs,
@@ -719,7 +726,7 @@ mod tests {
                     .ino()
             );
             let snapshots = request.snapshots.as_ref().unwrap();
-            for snapshot in [Some(&snapshots.executable), snapshots.stdin.as_ref()]
+            for snapshot in [snapshots.executable.sealed(), snapshots.stdin.as_ref()]
                 .into_iter()
                 .flatten()
             {
@@ -738,7 +745,7 @@ mod tests {
             assert_eq!(bytes, original);
             assert_eq!(
                 csr.warrant().command.executable_sha256,
-                sigrund_core::crypto::sha256_hex(&bytes)
+                Some(sigrund_core::crypto::sha256_hex(&bytes))
             );
             std::fs::write(&source, &original).unwrap();
             drop(request);
@@ -806,7 +813,7 @@ mod tests {
                         panic!()
                     };
                     let mut changed = warrant.warrant().clone();
-                    changed.command.executable_sha256 = "0".repeat(64);
+                    changed.command.executable_sha256 = Some("0".repeat(64));
                     *warrant = CanonicalWarrant::new(changed).unwrap();
                     request.snapshots.as_mut().unwrap().executable.digest.sha256 = "0".repeat(64);
                 }
@@ -862,7 +869,7 @@ mod tests {
                 w.command.stdin_policy = "sha256".into();
                 w.command.stdin_sha256 = Some("0".repeat(64));
             } else {
-                w.command.executable_sha256 = "0".repeat(64);
+                w.command.executable_sha256 = Some("0".repeat(64));
             }
             let w = CanonicalWarrant::new(w).unwrap();
             let mut request = fixture.request(

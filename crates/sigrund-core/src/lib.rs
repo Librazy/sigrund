@@ -6,6 +6,7 @@ pub mod approval;
 pub mod audit;
 pub mod config;
 pub mod crypto;
+pub mod executable;
 pub mod framing;
 pub mod json;
 pub mod lifecycle;

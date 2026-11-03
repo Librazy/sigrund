@@ -22,6 +22,7 @@ pub(crate) enum Task {
     Prepare(CommittedJob),
     Spawn(PreparedJob),
     Cleanup(PreparedJob),
+    VerifyExec(PreparedJob, i32),
 }
 pub(crate) enum SpawnOutcome {
     Prepared {
@@ -33,6 +34,10 @@ pub(crate) enum SpawnOutcome {
         child: io::Result<ChildProcess>,
     },
     Cleaned(Box<CommittedJob>),
+    ExecVerified {
+        owner: Box<PreparedJob>,
+        result: io::Result<()>,
+    },
     Signal {
         token: u64,
         signal: i32,
@@ -105,6 +110,27 @@ impl JobSupervisor {
                             let task = tasks.lock().expect("job receiver").recv();
                             let Ok(task) = task else { break };
                             match task {
+                                Task::VerifyExec(owner, pid) => {
+                                    let request = owner.job.lease.request();
+                                    let result = request
+                                        .snapshots
+                                        .as_ref()
+                                        .expect("executable owner")
+                                        .executable
+                                        .verify_exec(
+                                            pid,
+                                            &owner
+                                                .job
+                                                .authorized
+                                                .warrant
+                                                .warrant()
+                                                .execution_context,
+                                        );
+                                    notifier.send(SpawnOutcome::ExecVerified {
+                                        owner: Box::new(owner),
+                                        result,
+                                    });
+                                }
                                 Task::Prepare(job) => {
                                     let (cgroup, message) = operation(layout.as_ref(), &job);
                                     let failure = (!message.is_empty()).then_some(message);
@@ -189,7 +215,7 @@ fn wake_coordinator(fd: RawFd) {
         }
     }
 }
-fn eligible(job: &CommittedJob) -> io::Result<()> {
+pub(crate) fn eligible(job: &CommittedJob) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     if job.lifecycle.cancelled.load(Ordering::Acquire)
         || !crate::sequencer::connection_live(job.control)
@@ -234,7 +260,7 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<ChildProcess> {
         return Err(io::Error::other("missing output rights"));
     }
     eligible(&owner.job)?;
-    command.spawn(
+    command.spawn_checkpoint(
         owner.cgroup.as_ref().expect("prepared cgroup").fd(),
         [
             input,
@@ -242,6 +268,7 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<ChildProcess> {
             request.rights[n - 1].as_raw_fd(),
             snapshot.executable.as_fd().as_raw_fd(),
         ],
+        snapshot.executable.needs_checkpoint(),
     )
 }
 pub(crate) fn prepare_job(

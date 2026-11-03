@@ -23,7 +23,10 @@ pub struct Command {
     pub argv: Vec<String>,
     pub cwd: String,
     pub executable_path: String,
-    pub executable_sha256: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub executable_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_trust: Option<crate::executable::ExecutableTrust>,
     pub stdin_policy: String,
     #[serde(deserialize_with = "required_nullable")]
     pub stdin_sha256: Option<String>,
@@ -84,11 +87,19 @@ impl Warrant {
             .host_id
             .strip_prefix("sigrun-host:sha256:")
             .is_some_and(valid_digest);
-        if self.version != "1.0"
+        let executable_valid = match (
+            self.version.as_str(),
+            &self.command.executable_sha256,
+            &self.command.executable_trust,
+        ) {
+            ("1.0", Some(digest), None) => valid_digest(digest),
+            ("1.1", None, Some(trust)) => trust.valid(),
+            _ => false,
+        };
+        if !executable_valid
             || !valid_host
             || self.requester_uid == u32::MAX
             || self.requester_gid == u32::MAX
-            || !valid_digest(&self.command.executable_sha256)
         {
             return Err(invalid(
                 "invalid warrant identity, version, or executable digest",
@@ -171,7 +182,8 @@ pub struct CsrIdentity {
 }
 
 pub struct SnapshotDigests {
-    pub executable_sha256: String,
+    pub executable_sha256: Option<String>,
+    pub executable_trust: Option<crate::executable::ExecutableTrust>,
     pub stdin_sha256: Option<String>,
 }
 
@@ -223,6 +235,11 @@ impl Csr {
                     .ok_or_else(|| invalid("timestamp overflow"))?,
             )
         };
+        let version = if snapshots.executable_trust.is_some() {
+            "1.1"
+        } else {
+            "1.0"
+        };
         Self::new(Warrant {
             command: Command {
                 allow_interpreted_script: command.allow_interpreted_script,
@@ -230,6 +247,7 @@ impl Csr {
                 cwd: command.cwd.clone(),
                 executable_path: command.executable_path.clone(),
                 executable_sha256: snapshots.executable_sha256,
+                executable_trust: snapshots.executable_trust,
                 stdin_policy: command.stdin_policy.clone(),
                 stdin_sha256: snapshots.stdin_sha256,
                 tty_mode: command.tty_mode.clone(),
@@ -247,7 +265,7 @@ impl Csr {
             },
             requester_uid: identity.requester_uid,
             requester_gid: identity.requester_gid,
-            version: "1.0".into(),
+            version: version.into(),
         })
     }
 

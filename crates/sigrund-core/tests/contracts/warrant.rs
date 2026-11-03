@@ -1,6 +1,70 @@
 use super::support::*;
 
 #[test]
+fn direct_executable_evidence_is_versioned_canonical_and_signed() {
+    use sigrund_core::executable::ExecutableTrust;
+    let ctime = ExecutableTrust::Ctime {
+        device: u64::MAX.to_string(),
+        inode: u64::MAX.to_string(),
+        size: "67108865".into(),
+        ctime_sec: 1000,
+        ctime_nsec: 999_999_999,
+    };
+    for evidence in [
+        ctime,
+        ExecutableTrust::FsVerity {
+            algorithm: "sha256".into(),
+            digest: "ab".repeat(32),
+        },
+        ExecutableTrust::FsVerity {
+            algorithm: "sha512".into(),
+            digest: "cd".repeat(64),
+        },
+    ] {
+        let mut w = fixture();
+        w.version = "1.1".into();
+        w.command.executable_sha256 = None;
+        w.command.executable_trust = Some(evidence.clone());
+        let canonical = CanonicalWarrant::new(w.clone()).unwrap();
+        assert_eq!(
+            CanonicalWarrant::parse(canonical.as_bytes()).unwrap(),
+            canonical
+        );
+        let csr = Csr::new(w.clone()).unwrap();
+        assert_eq!(csr.bind_envelope(&signed(w.clone())).unwrap(), canonical);
+        let mut changed = w.clone();
+        changed.command.executable_trust = Some(ExecutableTrust::FsVerity {
+            algorithm: "sha256".into(),
+            digest: "ef".repeat(32),
+        });
+        assert!(csr.bind_envelope(&signed(changed)).is_err());
+        w.command.executable_sha256 = Some("00".repeat(32));
+        assert!(CanonicalWarrant::new(w.clone()).is_err());
+        w.command.executable_sha256 = None;
+        w.version = "1.0".into();
+        assert!(CanonicalWarrant::new(w).is_err());
+    }
+    for value in [
+        json!({"model":"ctime","device":"01","inode":"1","size":"1","ctime_sec":1000,"ctime_nsec":0}),
+        json!({"model":"ctime","device":"1","inode":"0","size":"1","ctime_sec":1000,"ctime_nsec":0}),
+        json!({"model":"ctime","device":"1","inode":"1","size":"0","ctime_sec":1000,"ctime_nsec":0}),
+        json!({"model":"ctime","device":"1","inode":"1","size":"1","ctime_sec":1000,"ctime_nsec":1000000000}),
+        json!({"model":"fs_verity","algorithm":"sha256","digest":"AB".repeat(32)}),
+        json!({"model":"fs_verity","algorithm":"sha512","digest":"ab".repeat(32)}),
+        json!({"model":"fs_verity","algorithm":"sha1","digest":"ab".repeat(20)}),
+    ] {
+        let evidence: ExecutableTrust = serde_json::from_value(value).unwrap();
+        assert!(!evidence.valid());
+    }
+    assert!(
+        serde_json::from_value::<ExecutableTrust>(
+            json!({"model":"fs_verity","algorithm":"sha256","digest":"ab".repeat(32),"extra":true})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn canonical_documents_round_trip_against_golden_bytes() {
     let warrant = CanonicalWarrant::new(fixture()).unwrap();
     assert_eq!(warrant.as_bytes(), GOLDEN);

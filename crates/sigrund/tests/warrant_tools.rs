@@ -21,7 +21,8 @@ fn csr() -> Csr {
             now: 1000,
         },
         SnapshotDigests {
-            executable_sha256: "0".repeat(64),
+            executable_sha256: Some("0".repeat(64)),
+            executable_trust: None,
             stdin_sha256: None,
         },
         3600,

@@ -42,7 +42,7 @@ pub(crate) struct ValidatedRequest {
     pub cancelled: Arc<AtomicBool>,
 }
 pub(crate) struct MeasuredSnapshots {
-    pub executable: crate::snapshot::SealedSnapshot,
+    pub executable: crate::executable::Executable,
     pub stdin: Option<crate::snapshot::SealedSnapshot>,
 }
 impl ValidatedRequest {
@@ -53,7 +53,8 @@ impl ValidatedRequest {
             return Err(io::ErrorKind::Interrupted.into());
         }
         if self.snapshots.as_ref().is_some_and(|snapshots| {
-            snapshots.executable.digest.bytes > self.policy.max_executable_bytes
+            (snapshots.executable.sealed().is_some()
+                && snapshots.executable.digest.bytes > self.policy.max_executable_bytes)
                 || snapshots
                     .stdin
                     .as_ref()
@@ -628,7 +629,8 @@ mod tests {
                     request.requester_uid,
                     &request.policy,
                     || request.check(),
-                )?,
+                )?
+                .into(),
                 stdin: None,
             });
             sent.send((std::thread::current().id(), request.rights[0].as_raw_fd()))
@@ -726,7 +728,8 @@ mod tests {
                     1001,
                     &request.policy,
                     || request.check(),
-                )?,
+                )?
+                .into(),
                 stdin: None,
             });
             Ok(())
@@ -751,7 +754,9 @@ mod tests {
                     .executable
                     .digest
                     .sha256
-                    .clone(),
+                    .clone()
+                    .into(),
+                executable_trust: None,
                 stdin_sha256: None,
             },
             3600,

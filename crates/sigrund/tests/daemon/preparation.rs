@@ -78,7 +78,7 @@ pub(super) fn verify_preparation_requests() {
         );
         assert_eq!(
             w.command.executable_sha256,
-            sha256_hex(&fs::read(&fixture.executable).unwrap())
+            Some(sha256_hex(&fs::read(&fixture.executable).unwrap()))
         );
         assert_eq!(w.command.stdin_sha256, input.map(sha256_hex));
         assert_eq!(w.policy.not_after.unwrap() - w.policy.not_before, 60);
