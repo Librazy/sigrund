@@ -319,7 +319,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
         # This case deliberately tests retained snapshot bytes after mutation.
         config_path = base / 'config.toml'
         config_path.write_text(config_path.read_text().replace(
-            'executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]',
+            'executable_trust_models = ["fs_verity", "ctime", "digest_direct", "digest_memfd"]',
             'executable_trust_models = ["digest_memfd"]'))
         manifest = json.loads((base / 'lab.json').read_text())
         tools = base / 'bin'

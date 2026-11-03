@@ -181,7 +181,7 @@ live-job and cleanup ownership survive loss of the client connection.
 allow_same_uid_elevation = false       # bool
 require_remote_audit_ack = false       # bool
 csr_allowed_executable_dirs = ["/usr/bin", "/usr/sbin"] # sorted absolute paths
-executable_trust_models = ["fs_verity", "ctime", "digest_memfd"] # ordered, unique, nonempty
+executable_trust_models = ["fs_verity", "ctime", "digest_direct", "digest_memfd"] # ordered, unique, nonempty
 
 # Hook identity and quotas
 sigrun_hook_uid = 65534                 # uint32, != UINT32_MAX
@@ -200,6 +200,8 @@ max_io_workers_per_uid = 2              # positive uint32
 snapshot_ram_global_bytes = 536870912   # positive uint64
 snapshot_ram_per_uid_bytes = 134217728  # positive uint64
 max_executable_bytes = 67108864         # positive uint64
+max_direct_digest_bytes = 268435456     # positive uint64, <= 1073741824
+direct_digest_timeout_ms = 5000        # positive uint32, <= 30000
 max_stdin_bytes = 16777216              # positive uint64
 request_deadline_ms = 5000              # positive uint32
 request_admissions_global = 256        # uint32, 1..=4096 per admission_window_secs
@@ -408,105 +410,148 @@ Both request modes must complete the common phase below. Unsigned requests do no
 5. **Handoff and Cleanup:** Both modes hand completed results to the coordinator through Section 1.3.1's CAS, within the original accept-based deadline. No database consumption or job spawn is allowed before successful handoff and the full authorization gate. On cancellation/error, each owning worker closes its sources/memfds when it actually returns; snapshot quota remains pinned until then. The executable is executed only via the retained sealed `exec_memfd`, not by reopening its path.
 
 
-### 2.2.2 Configurable Executable Trust Models (v1.1)
+### 2.2.2 Configurable Executable Trust Models (v1.2)
 
-This section supersedes executable-only requirements elsewhere that assume all
-executables are copied, sealed and identified by `executable_sha256`. Existing
-v1.0 digest warrants and all hashed-stdin requirements retain their semantics.
+This section supersedes executable-only requirements that assume every executable
+is copied into a sealed memfd. Hashed stdin and legacy v1.0 bytes are unchanged.
 
-**Selection and configuration.** `executable_trust_models` is an ordered,
-nonempty list of unique values from `fs_verity`, `ctime`, `digest_memfd`, defaulting
-to that order. Omitted models are disabled, including the fallback. Capture the
-list with the request policy. For unsigned requests, select the first applicable
-model before building the CSR. Unsupported features, filesystems and incompatible
-file permissions permit trying the next enabled model. I/O errors, changed
-observations or invalid evidence reject; they do not trigger a weaker model.
-Signed warrants require their specific model to be enabled and applicable;
-never substitute another model, reopen a path or recopy after approval.
+**Selection.** `executable_trust_models` is an ordered, nonempty, unique list,
+defaulting to `["fs_verity", "ctime", "digest_direct", "digest_memfd"]`. Capture
+this policy with each admitted request. Unsigned requests select the first
+eligible enabled model before approval. Missing kernel support, unsupported
+filesystems/metadata and candidate size limits allow selection of the next
+model. I/O errors and changed observations reject. Signed requests require their
+specific model to remain enabled and eligible; never downgrade or resnapshot.
 
-**Common ownership.** Resolve sources using the existing pinned-root `openat2`
-algorithm and hold the same source FD through direct execution. Sources must be
-positive-size regular ELF files. Direct paths accept only sources executable by
-the target's ordinary UID/GID/group permissions (including UID 0 under
-`SECBIT_NOROOT`), without setuid/setgid bits,
-file capabilities or extended access ACLs, and require an executable source
-mount (no `ST_NOEXEC`). Ineligible direct sources may use the
-memfd path before approval. All source metadata, fixed-size header reads, verity
-ioctls and final closes run off-loop with the existing worker/owner bounds.
-Direct sources do not reserve executable snapshot RAM and are exempt from both
-`max_executable_bytes` and its 64 MiB hard ceiling. These limits still apply to
-all digest+memfd copies. Job memory limits and all stdin/admission quotas remain.
-Scripts and same-UID elevation remain unavailable in the implemented MVP profile.
+**Common direct eligibility.** Resolve a positive-size regular ELF through the
+pinned-root `openat2` algorithm and retain that source FD through cleanup.
+Require ordinary target UID/GID/supplementary-group execute permission, including
+UID 0 under `SECBIT_NOROOT`, no setuid/setgid bits or extended access ACL, and an
+executable source mount (`!ST_NOEXEC`). All direct models require the probed
+ptrace checkpoint and the daemon's effective `CAP_SYS_PTRACE` for inspection
+after child credential changes. Unsupported sources can use enabled memfd fallback before
+approval. Source inspection, fixed-buffer hashing, verity ioctls and descriptor
+cleanup run on reserved workers. Direct execution preserves the source inode
+and normal `/proc/self/exe` behavior; this does not promise an unchanged pathname
+after rename/unlink or integrity of the loader, shared libraries or other inputs.
 
-**fs-verity.** On kernel ext-family, F2FS or Btrfs filesystems, require a successful
-`FS_IOC_MEASURE_VERITY` on the retained source. `ENODATA`, `ENOTTY` and
-`EOPNOTSUPP` mean this candidate is unavailable. Authenticate the returned
-algorithm and digest in the CSR/warrant and remeasure at the authorization gate.
-Support SHA-256 (32 bytes) and SHA-512 (64 bytes). Do not confuse this descriptor
-measurement with SHA-256 of the file byte stream, and do not enable verity on
-behalf of a requester. Execute the same verity FD directly. Kernel verity
-immutability/verified paging supplies content stability without a ptrace stop.
+| Model | Signed executable evidence | Before durable consumption | At exec stop |
+| --- | --- | --- | --- |
+| `fs_verity` | Kernel verity algorithm and descriptor measurement | Remeasure and recheck eligibility/expected credentials | Same inode, verity measurement, eligibility and exact credentials |
+| `ctime` | Device, inode, size, ctime seconds and nanoseconds | Same version and root-managed eligibility | Same version, inode, eligibility and exact credentials |
+| `digest_direct` | Full-file SHA-256 | Recheck eligibility; rehash if the internal version fingerprint changed | Same inode, mandatory full-file hash, eligibility and exact credentials |
+| `digest_memfd` | Existing non-null `executable_sha256` | Verify sealed snapshot and existing bounds | Existing untraced exec path |
 
-**ctime.** This model trusts root's management of local system files; timestamps
-are change indicators, not cryptographic content identifiers. Require root
-ownership, no group/other write permission and no special execution metadata.
-Only kernel ext-family, F2FS, Btrfs, XFS and tmpfs sources are eligible. Other
-filesystems, including overlay, remote and FUSE filesystems, use another enabled
-model. Sign the source's device, inode, size, `ctime_sec` and `ctime_nsec` at
-approval. File replacement or updates require new approval. Check the same
-metadata before consumption and again at an exec-event checkpoint, including
-root ownership/permission restrictions. This does not assert timestamp uniqueness
-against malicious privileged writers or protect shared libraries/configuration.
+Ownership, mode, raw capability xattrs, ACLs and mount attributes are not separate
+signed fields. They are re-read when determining eligibility and the resulting
+credential profile. Ctime's signed version implicitly rejects changes to those
+inode attributes. Every direct model repeats eligibility before consumption and
+at the checkpoint, because fs-verity alone does not protect execution metadata.
 
-**Wire binding and compatibility.** v1.0 requires its existing non-null
-`command.executable_sha256` and omits `command.executable_trust`. Its canonical
-bytes and digest+memfd verification remain unchanged. New direct warrants use
-`version: "1.1"`, require `executable_sha256: null`, and carry exactly one tagged
-`executable_trust` value:
+**fs-verity.** Admit ext-family, F2FS and Btrfs with successful
+`FS_IOC_MEASURE_VERITY`. `ENODATA`, `ENOTTY`, `EOPNOTSUPP` mean unavailable.
+Support SHA-256/32-byte and SHA-512/64-byte measurements. Sign the kernel's verity
+descriptor digest, not a hash of the file byte stream. Never enable verity on
+behalf of a requester. Kernel verified paging supplies immutable content;
+the checkpoint still checks mutable metadata and the credential transition.
+
+**ctime.** Trust root maintenance and local timestamp semantics. Require root
+ownership, no group/other write permissions and the common execution-metadata
+checks. Admit only ext-family, F2FS, Btrfs, XFS and tmpfs. Sign device, inode and
+size as canonical unsigned decimal strings (inode/size positive, size at most
+`i64::MAX`), and ctime as nonnegative bounded seconds plus nanoseconds below one
+billion. Updates require fresh approval. This is a version check, not a content
+signature or protection against malicious privileged timestamp manipulation.
+
+**digest_direct.** Admit only ext-family, F2FS, Btrfs, XFS and tmpfs, whose Linux
+executable write exclusion makes a full hash at the exec stop authoritative.
+Remote, FUSE, overlay and unknown filesystems are ineligible. Hash the retained
+source with a buffer of at most 64 KiB; never allocate an executable snapshot.
+Sign the full-file SHA-256. An internal dev/inode/size/ctime fingerprint permits
+skipping unchanged pre-consumption rehashes; it is not signed and never replaces
+the mandatory post-exec hash. Reject mutation during hashing. Kernel exec fails
+with an outstanding writer; the stopped loaded inode cannot be ordinarily
+modified before release. Privileged kernel/filesystem bypass is out of scope.
+
+`max_direct_digest_bytes` defaults to 256 MiB, maximum 1 GiB;
+`direct_digest_timeout_ms` defaults to 5000, maximum 30000. These bounds are
+independent of memfd's `max_executable_bytes` (maximum 64 MiB). Verity and ctime
+have neither hashing limit nor executable snapshot RAM charge. Stdin retains its
+existing size/RAM limits. Initial source eligibility and stdin preparation use
+the original request deadline. The coordinator then CAS-transitions
+`SNAPSHOTTING -> HASHING`, assigns a once-only hash deadline, and resumes the
+same reserved worker. Completion transitions to `AUTHORIZING`; stale phase
+timeouts cannot cancel a later phase. Conditional final-authorization rehashing
+also has a fixed hashing deadline. The two-second spawn/setup deadline is never
+extended while waiting for exec. A timely digest_direct exec event starts a
+separate fixed verification deadline; other models retain the spawn deadline.
+Check cancellation/deadlines between chunks and after the final chunk. Individual
+kernel I/O calls are not preemptible; admission, worker, descriptor and job
+reservations remain owned until actual completion/cleanup, even after timeout.
+
+**Capability authority and signed execution profiles.** Unsigned requests supply
+only authority ceiling `capabilities = C`. The daemon derives and signs v1.2
+`execution_context.post_exec_capabilities`, containing sorted unique named
+`permitted`, `effective`, `inheritable`, `ambient`, and `bounding` sets. The
+ordinary ELF profile has all five sets equal to C. Keep pre-exec sets equal to C,
+`no_new_privs` and locked securebits. Never repair credentials after exec.
+
+Initially support only exact Linux v2 host-user-namespace file-capability xattrs
+on positively identified non-idmapped, non-nosuid mounts. Unsupported revisions,
+namespaces, unknown mount metadata and malformed xattrs are ineligible. Both
+file permitted and inheritable masks must be subsets of explicit C and the
+signer's ceiling. Linux suppresses file capabilities when the execution FD's
+mount belongs to the parent's namespace. For a capability-bearing transition,
+the syscall-only child setup opens a symlink-free alias of the approved absolute
+path in its private mount namespace, compares its device/inode against the
+retained source FD, and executes only that identical inode. The original FD
+stays pinned by the parent. Replacement or an unavailable alias fails closed;
+there is no approval for alternate bytes or fallback. At exec the loaded inode
+and exact resulting sets must still match. For such files derive `I = B = C`, `A = empty`,
+`P = (fP & C) | (fI & C)`, and `E = P` when the file effective flag is set,
+otherwise `E = empty`. Unsupported file-capability semantics can use memfd,
+which intentionally strips those attributes. Legacy direct warrants exclude
+file capabilities and retain their implicit ordinary profile.
+
+**Wire compatibility.** v1.0 keeps its existing canonical byte format, non-null
+`command.executable_sha256`, no trust evidence and no profile. Legacy v1.1
+verity/ctime warrants keep their canonical bytes and implicit ordinary profile.
+New direct warrants use v1.2, `executable_sha256: null`, exactly one typed
+`executable_trust`, and the required exact capability profile. Examples:
 
 ```json
 {"model":"fs_verity","algorithm":"sha256","digest":"<64 lowercase hex digits>"}
-```
-
-```json
 {"model":"ctime","device":"2049","inode":"12345","size":"67108865","ctime_sec":1800000000,"ctime_nsec":123456789}
+{"model":"digest_direct","sha256":"<64 lowercase hex digits>"}
 ```
 
-Device, inode and size use canonical unsigned decimal strings (no sign or leading
-zeros), because their full 64-bit ranges may exceed JCS's exact integer range.
-Inode and size are positive; size is at most `i64::MAX`; timestamps use the
-existing nonnegative timestamp bound and nanoseconds are below one billion.
-Unknown fields/models/algorithms, invalid lengths and mixed digest/direct
-representations reject. SHA-512 uses 128 lowercase hex digits. DSSE payload type
-and SSH namespace remain in the v1 family. CSR response binding covers every new
-field. Approval displays all evidence, and audit records include the selected
-model/evidence, with a null byte-stream digest for direct execution.
+Reject unknown fields, invalid measurements/digests, mixed representations,
+profiles exceeding C, and digest_direct evidence in legacy versions. Requested
+and signed contexts are distinct types; clients cannot submit a derived profile
+as unsigned input. DSSE payload type and SSH namespace stay in the v1 family.
+Approval and audit include evidence, authority and the approved profile; successful
+checkpoint audit includes the profile observed by exact comparison.
 
-**Exec checkpoint and cancellation.** Probe ptrace support before exposing
-listeners; if unavailable, ctime is unavailable during model selection. A ctime
-child initially waits on a private pipe. The coordinator registers its PID/pidfd,
-uses `PTRACE_SEIZE` with `PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL`, and releases the
-pipe. This establishes the coordinator as tracer even when another thread cloned
-the child. The Central Reaper retains stopped children and reports exec events
-separately from exits. Sync-pipe EOF alone never releases a ctime child.
+**Checkpoint and cancellation.** Before any child exec, the coordinator attaches
+using `PTRACE_SEIZE` and `PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL`, registers the
+PID/pidfd and releases a private startup pipe. This works when another thread
+clones the child. The Central Reaper reports exec stops separately from exits;
+sync-pipe EOF alone cannot release a direct child. At `PTRACE_EVENT_EXEC`, no
+loader/target user instruction has run. A bounded worker verifies the loaded
+`/proc/<pid>/exe` identity, model evidence, eligibility, all four UID and GID
+values, supplementary groups, all five capability sets and `NoNewPrivs = 1`.
 
-At `PTRACE_EVENT_EXEC`, the kernel has installed the ELF mappings and denied
-ordinary writes to the main executable, but no target/interpreter user code has
-run. A bounded worker checks the actual `/proc/<pid>/exe` inode against the held
-source, signed metadata and resulting credentials/capabilities. The coordinator
-checks cancellation, connection, warrant expiry and the original two-second
-spawn deadline, CAS-reserves `RUNNING -> RELEASING`, then detaches and reconciles
-`RELEASING -> RUNNING`. Cancellation during release is pending until the result
-is known, followed by teardown; it cannot claim the target never ran. Failures,
-unexpected stops, timeout and disconnect kill/clean up without release. Tracer
-death before detach kills the tracee. Metadata worker and FD reservations remain
-owned through actual cleanup. A ctime readiness audit records
-`exec_outcome: "exec_event_observed"`; legacy/untraced readiness remains
-`exec_outcome: "unknown"`.
-
-Consumption and durable authorization still precede clone. A post-commit
-checkpoint failure consumes a one-time warrant and records execution failure;
-there is no refund, model retry or resnapshot.
+Before detach the coordinator checks cancellation, connection, warrant expiry
+and the applicable verification deadline, reserves `RUNNING -> RELEASING`, then
+detaches and reconciles `RELEASING -> RUNNING`. Clear the reaper's tracing
+registration after successful detach so ordinary later suspension still works.
+Cancellation during release is pending until detach's result is known. Any
+failure, unexpected stop, timeout or disconnect kills/cleans up without release;
+tracer death before detach kills the child. Readiness is audited only after
+verification and release as `exec_event_observed`. Memfd retains `unknown`.
+Consumption precedes clone: post-commit failures consume a one-time warrant,
+with no refund, fallback or retry. LSM domain binding and dependency integrity
+remain outside this model.
 
 ### 2.3 `tty_mode` and `stdin_policy` Compatibility Matrix
 

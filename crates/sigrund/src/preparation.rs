@@ -86,6 +86,15 @@ pub(crate) struct Prepared {
     pub null_stdin: Option<OwnedFd>,
 }
 
+/// Retained preparation state handed back before the coordinator starts hashing.
+pub(crate) struct Pending {
+    signed: Option<(CanonicalWarrant, Vec<String>)>,
+    root_path: PathBuf,
+    root_identity: FileIdentity,
+    source_identity: FileIdentity,
+    null_stdin: Option<OwnedFd>,
+}
+
 pub(crate) fn check_unsigned_policy(
     request: &mut ValidatedRequest,
     context: &Context,
@@ -296,6 +305,50 @@ pub(crate) fn prepare(
         Some(file.into())
     };
     request.check()?;
+    request.pending_preparation = Some(Pending {
+        signed,
+        root_path: selected.root,
+        root_identity,
+        source_identity,
+        null_stdin,
+    });
+    if request
+        .snapshots
+        .as_ref()
+        .expect("snapshot owner")
+        .executable
+        .needs_digest()
+    {
+        return Ok(());
+    }
+    finish_document(request, context, gid)
+}
+
+pub(crate) fn hash_and_finish(
+    request: &mut ValidatedRequest,
+    context: &Context,
+    gid: u32,
+) -> io::Result<()> {
+    request.check()?;
+    let mut snapshots = request.snapshots.take().expect("snapshot owner");
+    let result = snapshots.executable.finish_digest(|| request.check());
+    request.snapshots = Some(snapshots);
+    result.map_err(|e| snapshot_error(e, "EXECUTABLE_MUTATED_OR_TOO_LARGE"))?;
+    finish_document(request, context, gid)
+}
+
+fn finish_document(request: &mut ValidatedRequest, context: &Context, gid: u32) -> io::Result<()> {
+    request.check()?;
+    let Pending {
+        signed,
+        root_path,
+        root_identity,
+        source_identity,
+        null_stdin,
+    } = request
+        .pending_preparation
+        .take()
+        .expect("pending preparation");
     let snapshots = request.snapshots.as_ref().expect("snapshot owner");
     let stdin_digest = snapshots.stdin.as_ref().map(|s| s.digest.sha256.clone());
     let document = if let Some((warrant, signer_ids)) = signed {
@@ -355,7 +408,7 @@ pub(crate) fn prepare(
     };
     request.prepared = Some(Prepared {
         document,
-        root_path: selected.root,
+        root_path,
         root_identity,
         source_identity,
         null_stdin,
@@ -681,6 +734,7 @@ mod tests {
                 snapshots: None,
                 unsigned_policy_checked: false,
                 prepared: None,
+                pending_preparation: None,
                 policy: self.config.clone(),
                 requester_uid: 1001,
                 deadline: Instant::now() + Duration::from_secs(5),

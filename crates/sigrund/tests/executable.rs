@@ -371,6 +371,62 @@ fn ctime_namespace_fixture() {
     assert!(prepared.verify_direct(&context().into()).is_err());
     assert_eq!(budget.usage(1001), (0, 0));
 
+    // Writable local sources use bounded direct hashing without snapshot RAM.
+    cfg.executable_trust_models = vec![TrustModel::DigestDirect, TrustModel::DigestMemfd];
+    cfg.max_executable_bytes = 4;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let direct = |cfg: &DaemonConfig| {
+        executable::prepare(
+            File::open(&path).unwrap(),
+            executable::Selection {
+                signed: None,
+                context: &context(),
+                trace_available: true,
+                allow_file_capabilities: true,
+            },
+            &budget,
+            1001,
+            cfg,
+            || Ok(()),
+        )
+    };
+    let mut hashed = direct(&cfg).unwrap();
+    assert_eq!(hashed.model(), TrustModel::DigestDirect);
+    assert!(hashed.needs_digest());
+    let mut signed_context: sigrund_core::warrant::ExecutionContext = context().into();
+    signed_context.post_exec_capabilities = hashed.post_exec_capabilities.clone();
+    assert!(hashed.verify_direct(&signed_context).is_err());
+    hashed.finish_digest(|| Ok(())).unwrap();
+    assert!(!hashed.needs_digest());
+    hashed.verify_direct(&signed_context).unwrap();
+    assert_eq!(budget.usage(1001), (0, 0));
+    // Changing metadata alone allows rehashing the same approved bytes.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    hashed.verify_direct(&signed_context).unwrap();
+    use std::os::unix::fs::FileExt;
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all_at(b"X", 99)
+        .unwrap();
+    assert!(hashed.verify_direct(&signed_context).is_err());
+    cfg.max_direct_digest_bytes = 99;
+    assert!(direct(&cfg).is_err());
+    cfg.max_executable_bytes = 1024;
+    cfg.snapshot_ram_per_uid_bytes = 1024;
+    cfg.snapshot_ram_global_bytes = 1024;
+    assert_eq!(direct(&cfg).unwrap().model(), TrustModel::DigestMemfd);
+    cfg.max_direct_digest_bytes = 1024;
+    let mut cancelled = direct(&cfg).unwrap();
+    assert!(
+        cancelled
+            .finish_digest(|| Err(std::io::ErrorKind::Interrupted.into()))
+            .is_err()
+    );
+    assert!(cancelled.needs_digest());
+    assert_eq!(budget.usage(1001), (0, 0));
+
     // noexec must force fallback before approval, for the same otherwise
     // ctime-eligible inode. The sealed copy must remain executable.
     let code = dir.path().join("noexec.c");

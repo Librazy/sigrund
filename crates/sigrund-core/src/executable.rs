@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum TrustModel {
     FsVerity,
     Ctime,
+    DigestDirect,
     DigestMemfd,
 }
 
@@ -13,6 +14,7 @@ pub fn default_models() -> Vec<TrustModel> {
     vec![
         TrustModel::FsVerity,
         TrustModel::Ctime,
+        TrustModel::DigestDirect,
         TrustModel::DigestMemfd,
     ]
 }
@@ -20,6 +22,9 @@ pub fn default_models() -> Vec<TrustModel> {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "model", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutableTrust {
+    DigestDirect {
+        sha256: String,
+    },
     FsVerity {
         algorithm: String,
         digest: String,
@@ -36,6 +41,7 @@ pub enum ExecutableTrust {
 impl ExecutableTrust {
     pub fn model(&self) -> TrustModel {
         match self {
+            Self::DigestDirect { .. } => TrustModel::DigestDirect,
             Self::FsVerity { .. } => TrustModel::FsVerity,
             Self::Ctime { .. } => TrustModel::Ctime,
         }
@@ -47,6 +53,12 @@ impl ExecutableTrust {
             (n.to_string() == text).then_some(n)
         }
         match self {
+            Self::DigestDirect { sha256 } => {
+                sha256.len() == 64
+                    && sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }
             Self::FsVerity { algorithm, digest } => {
                 let length = match algorithm.as_str() {
                     "sha256" => 64,

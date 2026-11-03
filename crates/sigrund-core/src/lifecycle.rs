@@ -14,6 +14,7 @@ pub enum Phase {
     Cancelled = 7,
     Failed = 8,
     Releasing = 9,
+    Hashing = 10,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +54,7 @@ impl Lifecycle {
             6 => Phase::Running,
             7 => Phase::Cancelled,
             9 => Phase::Releasing,
+            10 => Phase::Hashing,
             _ => Phase::Failed,
         };
         let decision = match ((word >> 8) & 0xff) as u8 {
@@ -90,6 +92,8 @@ impl Lifecycle {
         if !matches!(
             (from, to),
             (Phase::Snapshotting, Phase::Authorizing)
+                | (Phase::Snapshotting, Phase::Hashing)
+                | (Phase::Hashing, Phase::Authorizing)
                 | (Phase::Authorizing, Phase::Committing)
                 | (Phase::Committing, Phase::Committed)
                 | (Phase::Committed, Phase::Spawning)
@@ -272,6 +276,20 @@ impl Default for Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashing_has_one_handoff_and_rejects_stale_snapshot_timeouts() {
+        let lifecycle = Lifecycle::new();
+        assert!(lifecycle.transition(Phase::Snapshotting, Phase::Hashing));
+        assert!(!lifecycle.transition(Phase::Snapshotting, Phase::Hashing));
+        assert!(!lifecycle.claim_terminal(Phase::Snapshotting, Decision::Timeout));
+        assert!(lifecycle.transition(Phase::Hashing, Phase::Authorizing));
+        assert!(!lifecycle.claim_terminal(Phase::Hashing, Decision::Timeout));
+        let cancelled = Lifecycle::new();
+        assert!(cancelled.transition(Phase::Snapshotting, Phase::Hashing));
+        assert!(cancelled.cancel());
+        assert!(!cancelled.transition(Phase::Hashing, Phase::Authorizing));
+    }
 
     #[test]
     fn only_one_terminal_winner() {

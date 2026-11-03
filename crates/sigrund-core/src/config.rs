@@ -58,6 +58,10 @@ pub struct DaemonConfig {
     pub snapshot_ram_per_uid_bytes: u64,
     #[serde(default = "default_executable")]
     pub max_executable_bytes: u64,
+    #[serde(default = "default_direct_digest_bytes")]
+    pub max_direct_digest_bytes: u64,
+    #[serde(default = "default_direct_digest_timeout")]
+    pub direct_digest_timeout_ms: u32,
     #[serde(default = "default_stdin")]
     pub max_stdin_bytes: u64,
     #[serde(default = "default_request_deadline")]
@@ -290,6 +294,8 @@ pub struct CapturedPolicy {
     pub snapshot_ram_global_bytes: u64,
     pub snapshot_ram_per_uid_bytes: u64,
     pub max_executable_bytes: u64,
+    pub max_direct_digest_bytes: u64,
+    pub direct_digest_timeout_ms: u32,
     pub max_stdin_bytes: u64,
     pub request_deadline_ms: u32,
     pub job_memory_max_bytes: u64,
@@ -317,6 +323,8 @@ impl PolicyGeneration {
             snapshot_ram_global_bytes: c.snapshot_ram_global_bytes,
             snapshot_ram_per_uid_bytes: c.snapshot_ram_per_uid_bytes,
             max_executable_bytes: c.max_executable_bytes,
+            max_direct_digest_bytes: c.max_direct_digest_bytes,
+            direct_digest_timeout_ms: c.direct_digest_timeout_ms,
             max_stdin_bytes: c.max_stdin_bytes,
             request_deadline_ms: c.request_deadline_ms,
             job_memory_max_bytes: c.job_memory_max_bytes,
@@ -625,7 +633,10 @@ impl DaemonConfig {
                 "invalid admission, audit storage or shutdown bounds".into(),
             ));
         }
-        if self.max_executable_bytes == 0
+        if self.max_direct_digest_bytes == 0
+            || self.max_direct_digest_bytes > 1_073_741_824
+            || !(1..=30_000).contains(&self.direct_digest_timeout_ms)
+            || self.max_executable_bytes == 0
             || self.max_executable_bytes > 67_108_864
             || self.max_stdin_bytes == 0
             || self.max_stdin_bytes > 16_777_216
@@ -876,6 +887,13 @@ fn default_audit_free() -> u64 {
     67_108_864
 }
 
+fn default_direct_digest_bytes() -> u64 {
+    268_435_456
+}
+fn default_direct_digest_timeout() -> u32 {
+    5_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,6 +922,8 @@ mod tests {
             snapshot_ram_global_bytes: 536_870_912,
             snapshot_ram_per_uid_bytes: 134_217_728,
             max_executable_bytes: 67_108_864,
+            max_direct_digest_bytes: default_direct_digest_bytes(),
+            direct_digest_timeout_ms: default_direct_digest_timeout(),
             max_stdin_bytes: 16_777_216,
             request_deadline_ms: 5_000,
             request_admissions_global: 256,

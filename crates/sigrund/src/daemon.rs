@@ -468,11 +468,35 @@ impl Connection {
             if !lease.matches_admission(self.peer.uid, &self.policy) {
                 return Err(invalid("request admission mismatch"));
             }
+            if lease.request().pending_preparation.is_some() {
+                if !self
+                    .lifecycle
+                    .transition(Phase::Snapshotting, Phase::Hashing)
+                {
+                    return Err(invalid("stale hash handoff"));
+                }
+                let deadline =
+                    now + Duration::from_millis(u64::from(self.policy.direct_digest_timeout_ms));
+                self.request_deadline = Some(deadline);
+                let mut lease = result.expect("eligible direct source");
+                lease.begin_hashing(deadline);
+                let context = context.clone();
+                let gid = self.peer.gid;
+                lease.continue_on_worker(move |request| {
+                    preparation::hash_and_finish(request, &context, gid)
+                });
+                return Ok(());
+            }
             if let Some(prepared) = lease.prepared() {
                 if self.approval_csr.is_none()
-                    && !self
-                        .lifecycle
-                        .transition(Phase::Snapshotting, Phase::Authorizing)
+                    && !self.lifecycle.transition(
+                        if self.lifecycle.state().0 == Phase::Hashing {
+                            Phase::Hashing
+                        } else {
+                            Phase::Snapshotting
+                        },
+                        Phase::Authorizing,
+                    )
                 {
                     return Err(invalid("stale snapshot handoff"));
                 }

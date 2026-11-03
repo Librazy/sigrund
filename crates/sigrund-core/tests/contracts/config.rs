@@ -185,3 +185,27 @@ fn approval_signer_selection_is_explicit_bounded_and_unambiguous() {
         assert!(profile.validate().is_err());
     }
 }
+
+#[test]
+fn direct_digest_limits_are_independent_bounded_and_captured() {
+    let mut cfg = config("").unwrap();
+    assert_eq!(cfg.max_direct_digest_bytes, 268_435_456);
+    assert_eq!(cfg.direct_digest_timeout_ms, 5000);
+    cfg.max_executable_bytes = 1;
+    cfg.max_direct_digest_bytes = 1_073_741_824;
+    cfg.direct_digest_timeout_ms = 30_000;
+    cfg.validate().unwrap();
+    let store = sigrund_core::config::PolicyStore::new(cfg.clone());
+    let captured = store.capture();
+    assert_eq!(captured.max_direct_digest_bytes, 1_073_741_824);
+    assert_eq!(captured.direct_digest_timeout_ms, 30_000);
+    for limit in [0, 1_073_741_825] {
+        cfg.max_direct_digest_bytes = limit;
+        assert!(cfg.validate().is_err());
+    }
+    cfg.max_direct_digest_bytes = 1;
+    for timeout in [0, 30_001] {
+        cfg.direct_digest_timeout_ms = timeout;
+        assert!(cfg.validate().is_err());
+    }
+}

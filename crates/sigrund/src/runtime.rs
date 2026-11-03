@@ -41,6 +41,7 @@ struct Active {
     exec_verified: bool,
     sync: Option<OwnedFd>,
     deadline: Option<Instant>,
+    verification_deadline: Option<Instant>,
     handshake: Handshake,
     outcome: Option<SyncOutcome>,
     exit: Option<ChildExit>,
@@ -113,6 +114,7 @@ impl Execution {
             exec_verified: false,
             sync: None,
             deadline: None,
+            verification_deadline: None,
             handshake: Handshake::default(),
             outcome: None,
             exit: None,
@@ -144,7 +146,7 @@ impl Execution {
     fn dispatch(&mut self, token: u64, task: Task) -> io::Result<()> {
         if let Err(task) = self.supervisor.send(task) {
             let owner = match *task {
-                Task::Spawn(owner) | Task::Cleanup(owner) | Task::VerifyExec(owner, _) => owner,
+                Task::Spawn(owner) | Task::Cleanup(owner) | Task::VerifyExec(owner, _, _) => owner,
                 Task::Prepare(_) => unreachable!(),
             };
             self.jobs.get_mut(&token).unwrap().owner = Some(owner);
@@ -166,7 +168,10 @@ impl Execution {
                             .and_then(|()| crate::jobs::eligible(&owner.job))
                             .and_then(|()| {
                                 if job.failure.is_some()
-                                    || Instant::now() >= job.deadline.expect("exec deadline")
+                                    || Instant::now()
+                                        >= job
+                                            .verification_deadline
+                                            .expect("exec verification deadline")
                                     || !job.lifecycle.transition(Phase::Running, Phase::Releasing)
                                 {
                                     return Err(invalid("exec checkpoint cancelled or expired"));
@@ -426,12 +431,30 @@ impl Execution {
                 if job.checkpoint
                     && !job.exec_verified
                     && !job.task
+                    && Instant::now() < job.deadline.expect("spawn deadline")
                     && stop.code == libc::CLD_TRAPPED
                     && stop.status == (libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8))
                 {
-                    job.owner
-                        .take()
-                        .map(|owner| Task::VerifyExec(owner, stop.pid))
+                    job.owner.take().map(|owner| {
+                        let request = owner.job.lease.request();
+                        let deadline = if request
+                            .snapshots
+                            .as_ref()
+                            .expect("source")
+                            .executable
+                            .model()
+                            == sigrund_core::executable::TrustModel::DigestDirect
+                        {
+                            Instant::now()
+                                + std::time::Duration::from_millis(u64::from(
+                                    request.policy.direct_digest_timeout_ms,
+                                ))
+                        } else {
+                            job.deadline.expect("spawn deadline")
+                        };
+                        job.verification_deadline = Some(deadline);
+                        Task::VerifyExec(owner, stop.pid, deadline)
+                    })
                 } else {
                     job.failure = Some("unexpected ptrace stop".into());
                     if job.outcome.is_some() {
@@ -475,7 +498,8 @@ impl Execution {
             if job.checkpoint
                 && !job.exec_verified
                 && job
-                    .deadline
+                    .verification_deadline
+                    .or(job.deadline)
                     .is_some_and(|deadline| Instant::now() >= deadline)
             {
                 job.failure = Some("exec checkpoint timed out".into());

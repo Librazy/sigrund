@@ -130,7 +130,17 @@ pub(crate) fn verify(
             || request.check(),
         )
     } else {
-        snapshots.executable.verify_direct(&w.execution_context)
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(u64::from(request.policy.direct_digest_timeout_ms));
+        snapshots
+            .executable
+            .verify_direct_checked(&w.execution_context, || {
+                request.check()?;
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                Ok(())
+            })
     }
     .map_err(|_| {
         Denial::new(

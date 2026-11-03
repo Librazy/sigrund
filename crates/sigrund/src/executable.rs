@@ -26,6 +26,9 @@ pub struct Executable {
     pub digest: SnapshotDigest,
     pub trust: Option<ExecutableTrust>,
     pub post_exec_capabilities: Option<CapabilitySets>,
+    // Internal version fingerprint is never part of digest_direct signing.
+    hash_version: Option<ExecutableTrust>,
+    direct_digest_limit: u64,
 }
 impl From<SealedSnapshot> for Executable {
     fn from(sealed: SealedSnapshot) -> Self {
@@ -35,6 +38,8 @@ impl From<SealedSnapshot> for Executable {
             source: None,
             trust: None,
             post_exec_capabilities: None,
+            hash_version: None,
+            direct_digest_limit: 0,
         }
     }
 }
@@ -73,7 +78,41 @@ impl Executable {
     pub fn needs_checkpoint(&self) -> bool {
         self.trust.is_some()
     }
+    pub fn needs_digest(&self) -> bool {
+        self.model() == TrustModel::DigestDirect && self.hash_version.is_none()
+    }
+    /// Separate worker phase, after source eligibility and stdin preparation.
+    pub fn finish_digest(&mut self, check: impl Fn() -> io::Result<()>) -> io::Result<()> {
+        if !self.needs_digest() {
+            return Err(invalid("unexpected executable hash phase"));
+        }
+        let source = self.source.as_ref().expect("direct source");
+        let version = ctime(&source.metadata()?);
+        let sha256 = hash_source(source, self.direct_digest_limit, &check)?;
+        if ctime(&source.metadata()?) != version {
+            return Err(invalid("executable changed during hashing"));
+        }
+        self.trust = Some(ExecutableTrust::DigestDirect { sha256 });
+        self.hash_version = Some(version);
+        check()
+    }
     pub fn verify_direct(&self, context: &ExecutionContext) -> io::Result<()> {
+        self.verify_direct_checked(context, || Ok(()))
+    }
+    pub fn verify_direct_checked(
+        &self,
+        context: &ExecutionContext,
+        check: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.verify_evidence(context, false, &check)
+    }
+    fn verify_evidence(
+        &self,
+        context: &ExecutionContext,
+        force_hash: bool,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        check()?;
         let source = self
             .source
             .as_ref()
@@ -93,6 +132,21 @@ impl Executable {
             return Err(invalid("direct executable is no longer eligible"));
         }
         let observed = match trust {
+            ExecutableTrust::DigestDirect { .. } => {
+                if !local_filesystem(source)? || self.hash_version.is_none() {
+                    return Err(invalid("unverified direct digest source"));
+                }
+                let version = ctime(&metadata);
+                if !force_hash && self.hash_version.as_ref() == Some(&version) {
+                    trust.clone()
+                } else {
+                    let sha256 = hash_source(source, self.direct_digest_limit, check)?;
+                    if ctime(&source.metadata()?) != version {
+                        return Err(invalid("executable changed during verification"));
+                    }
+                    ExecutableTrust::DigestDirect { sha256 }
+                }
+            }
             ExecutableTrust::FsVerity { .. } => {
                 verity(source)?.ok_or_else(|| invalid("verity no longer available"))?
             }
@@ -107,11 +161,19 @@ impl Executable {
         if &observed != trust {
             return Err(invalid("executable evidence changed"));
         }
-        Ok(())
+        check()
     }
     /// Called off-loop with the tracee stopped before its first user instruction.
     pub fn verify_exec(&self, pid: i32, context: &ExecutionContext) -> io::Result<()> {
-        self.verify_direct(context)?;
+        self.verify_exec_checked(pid, context, || Ok(()))
+    }
+    pub fn verify_exec_checked(
+        &self,
+        pid: i32,
+        context: &ExecutionContext,
+        check: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.verify_evidence(context, true, &check)?;
         let actual = std::fs::metadata(format!("/proc/{pid}/exe"))?;
         let source = self
             .source
@@ -170,8 +232,11 @@ impl Executable {
                 16,
             )
             .map_err(|_| invalid("invalid process capabilities"))?;
-            if bits != capability_bits(set)? {
-                return Err(invalid("exec changed capabilities"));
+            let expected = capability_bits(set)?;
+            if bits != expected {
+                return Err(invalid(format!(
+                    "exec changed {name} expected {expected:016x}, observed {bits:016x}"
+                )));
             }
         }
         if field("NoNewPrivs:") != Some("1") {
@@ -228,6 +293,15 @@ pub fn prepare(
         };
         let trust = match model {
             TrustModel::FsVerity => verity(&source)?,
+            TrustModel::DigestDirect if local_filesystem(&source)? => {
+                if metadata.len() > config.max_direct_digest_bytes {
+                    // An unsigned request can still select the enabled memfd fallback.
+                    continue;
+                }
+                Some(ExecutableTrust::DigestDirect {
+                    sha256: String::new(),
+                })
+            }
             TrustModel::Ctime
                 if selection.trace_available && ctime_eligible(&source, &metadata)? =>
             {
@@ -251,14 +325,49 @@ pub fn prepare(
                 },
                 trust: Some(trust),
                 post_exec_capabilities: selection.allow_file_capabilities.then_some(profile),
+                hash_version: None,
+                direct_digest_limit: config.max_direct_digest_bytes,
             };
             let mut context: ExecutionContext = selection.context.clone().into();
             context.post_exec_capabilities = executable.post_exec_capabilities.clone();
-            executable.verify_direct(&context)?;
+            if !executable.needs_digest() {
+                executable.verify_direct(&context)?;
+            }
             return Ok(executable);
         }
     }
     Err(invalid("no enabled executable trust model applies"))
+}
+
+/// Only local filesystems with Linux executable write exclusion are admitted.
+fn local_filesystem(source: &File) -> io::Result<bool> {
+    Ok(matches!(
+        filesystem(source)?,
+        0xef53 | 0xf2f52010 | 0x9123683e | 0x58465342 | 0x01021994
+    ))
+}
+fn hash_source(
+    source: &File,
+    maximum: u64,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let size = source.metadata()?.len();
+    if size == 0 || size > maximum {
+        return Err(invalid("direct digest size limit exceeded"));
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    let mut offset = 0;
+    while offset < size {
+        check()?;
+        let count = ((size - offset) as usize).min(buffer.len());
+        source.read_exact_at(&mut buffer[..count], offset)?;
+        hash.update(&buffer[..count]);
+        offset += count as u64;
+    }
+    check()?;
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn filesystem(source: &File) -> io::Result<u64> {
@@ -501,6 +610,24 @@ fn verity(source: &File) -> io::Result<Option<ExecutableTrust>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hashing_checks_cancellation_between_bounded_chunks_and_after_eof() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(131073).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = hash_source(&file, 131073, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 4 {
+                Err(io::ErrorKind::TimedOut.into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls.get(), 4);
+        assert!(hash_source(&file, 131072, &|| Ok(())).is_err());
+    }
+
     #[test]
     fn file_caps_are_explicit_authority_with_exact_kernel_sets() {
         let authority = vec!["CAP_CHOWN".into(), "CAP_NET_BIND_SERVICE".into()];

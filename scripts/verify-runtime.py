@@ -133,7 +133,7 @@ class Fixture:
         roots = json.dumps(sorted(['/usr/bin', str(root)]))
         config = (REPO / 'config/sigrund.toml.example').read_text()
         # Existing fixtures explicitly exercise the legacy sealed-byte contract.
-        config = config.replace('executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]',
+        config = config.replace('executable_trust_models = ["fs_verity", "ctime", "digest_direct", "digest_memfd"]',
                                 'executable_trust_models = ' + json.dumps(models if models is not None else ['digest_memfd']))
         config = config.replace('["/usr/bin", "/usr/sbin"]', roots)
         config = config.replace('<strict-padded-base64-32-byte-ed25519-key>', base64.b64encode(bytes(32)).decode())

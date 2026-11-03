@@ -105,37 +105,47 @@ against whole-state rollback without an external checkpoint.
 
 ## Executable trust selection
 
-`executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]` selects enabled
-models in order. Set `["digest_memfd"]` to retain the previous snapshot-only
-behavior. Selection happens before approval; signed evidence never falls back
-to another model. Older 1.0 digest warrants retain their canonical bytes.
+`executable_trust_models` defaults to `["fs_verity", "ctime", "digest_direct",
+"digest_memfd"]`. Selection precedes approval; a signed warrant never switches
+models. Set `["digest_memfd"]` for snapshot-only operation.
 
-Verity files bind their kernel-measured SHA-256/SHA-512 verity descriptor digest.
-Root-managed local files may instead bind device/inode/size/nanosecond ctime and
-stop at `PTRACE_EVENT_EXEC` for a final check before user code. Both direct paths
-retain and execute the source FD, avoid executable snapshot RAM and can exceed
-`max_executable_bytes` and the old 64 MiB ceiling. Hashing/memfd copies still obey
-both size and RAM bounds; hashed stdin is unchanged. Unknown, remote, overlay
-and FUSE filesystems do not qualify for ctime. See normative Section 2.2.2 for
-filesystem, permission, signed-evidence and tracing requirements.
+Verity binds a kernel-measured descriptor digest. Ctime binds the version of an
+eligible root-managed local ELF. Digest_direct signs a full-file SHA-256 and
+executes the retained source, then hashes again at `PTRACE_EVENT_EXEC` before any
+loader/target instruction. All direct models revalidate execution metadata and
+exact credentials at authorization and at the exec stop. Supported direct files
+preserve `/proc/self/exe` identity and ordinary host v2 file-capability semantics
+within the requested authority ceiling. File-capability transitions use an
+inode-checked alias in the child's private mount namespace; an unavailable or
+replaced path fails closed while the original FD stays pinned. Set-ID files, extended ACLs and noexec
+mounts require fallback; unknown/namespaced/idmapped file capabilities do too.
 
-Direct CSR/warrants use version 1.1, `executable_sha256: null` and a typed
-`executable_trust` field. Ctime grants bind the approval-time version, so package
-updates/replacements require approval again. Ctime assumes trusted root
-maintenance and timestamp semantics; it does not authenticate dependencies or
-provide cryptographic content identity. Script/same-UID restrictions still apply.
+New direct warrants are v1.2 and sign all five expected post-exec capability
+sets, in addition to the authority ceiling. Unsigned contexts cannot specify
+those derived sets. Legacy v1.0 memfd and v1.1 direct bytes remain valid with
+unchanged implicit profiles; legacy requests never acquire new file-capability
+semantics. See normative Section 2.2.2 for the evidence and credential table.
 
-The coordinator owns ptrace attachment/detachment, while workers perform final
-metadata checks and own the source descriptors. Exec stops are distinct from
-exits in the Central Reaper. A private startup gate prevents exec before trace
-attachment; cancellation is reconciled around an atomic release reservation.
-One-time consumption remains durable before spawn, including when the later
-checkpoint rejects. `EXEC_READY_TO_EXEC` reports `exec_event_observed` only after
-ctime validation; untraced execution keeps the prior `unknown` outcome.
+Direct execution uses no executable snapshot RAM. Verity/ctime may exceed both
+size limits. Digest_direct uses a fixed 64 KiB buffer and its own
+`max_direct_digest_bytes` (256 MiB default, 1 GiB ceiling) and
+`direct_digest_timeout_ms` (5000 default, 30000 ceiling). Original request/setup
+deadlines remain enforced; the coordinator owns the subsequent hashing and
+post-exec verification deadlines. Cancellation is checked between chunks, while
+reservations remain held until actual worker completion. Memfd and hashed stdin
+retain their existing size/RAM limits. Memfd strips file capabilities and exposes
+an execute-only anonymous `/proc/self/exe`; programs relying on reading their
+original executable may require an eligible direct model.
 
-The privileged `scripts/verify-trust.py` acceptance gate tests real ext4 verity,
-both digest algorithms, >64 MiB direct ELF execution, root/service capabilities,
-unsafe-file fallback and deterministic mutation before exec.
+Ctime trusts root maintenance/timestamps; digest_direct requires a supported
+local filesystem's executable write exclusion. None authenticate the dynamic
+loader, libraries, configuration or an LSM transition. Post-commit verification
+failure consumes a one-time warrant without refund. Tracer death before release
+kills the tracee. Successful detach clears tracing state for later SIGSTOP.
+
+The privileged `scripts/verify-trust.py` gates cover ext4 verity (SHA-256/512),
+large direct ELFs, digest mutation, file-capability profiles, `/proc/self/exe`,
+metadata changes during online approval, noexec fallback and tracer death.
 
 ## Operator lab
 

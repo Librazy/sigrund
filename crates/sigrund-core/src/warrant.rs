@@ -140,7 +140,12 @@ impl Warrant {
                 valid_digest(digest) && self.execution_context.post_exec_capabilities.is_none()
             }
             ("1.1", None, Some(trust)) => {
-                trust.valid() && self.execution_context.post_exec_capabilities.is_none()
+                trust.valid()
+                    && !matches!(
+                        trust,
+                        crate::executable::ExecutableTrust::DigestDirect { .. }
+                    )
+                    && self.execution_context.post_exec_capabilities.is_none()
             }
             ("1.2", None, Some(trust)) => {
                 trust.valid()

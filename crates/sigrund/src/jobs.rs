@@ -22,7 +22,7 @@ pub(crate) enum Task {
     Prepare(CommittedJob),
     Spawn(PreparedJob),
     Cleanup(PreparedJob),
-    VerifyExec(PreparedJob, i32),
+    VerifyExec(PreparedJob, i32, std::time::Instant),
 }
 pub(crate) enum SpawnOutcome {
     Prepared {
@@ -110,14 +110,14 @@ impl JobSupervisor {
                             let task = tasks.lock().expect("job receiver").recv();
                             let Ok(task) = task else { break };
                             match task {
-                                Task::VerifyExec(owner, pid) => {
+                                Task::VerifyExec(owner, pid, deadline) => {
                                     let request = owner.job.lease.request();
                                     let result = request
                                         .snapshots
                                         .as_ref()
                                         .expect("executable owner")
                                         .executable
-                                        .verify_exec(
+                                        .verify_exec_checked(
                                             pid,
                                             &owner
                                                 .job
@@ -125,6 +125,21 @@ impl JobSupervisor {
                                                 .warrant
                                                 .warrant()
                                                 .execution_context,
+                                            || {
+                                                request.check()?;
+                                                if owner
+                                                    .job
+                                                    .lifecycle
+                                                    .cancelled
+                                                    .load(std::sync::atomic::Ordering::Acquire)
+                                                {
+                                                    return Err(io::ErrorKind::Interrupted.into());
+                                                }
+                                                if std::time::Instant::now() >= deadline {
+                                                    return Err(io::ErrorKind::TimedOut.into());
+                                                }
+                                                Ok(())
+                                            },
                                         );
                                     notifier.send(SpawnOutcome::ExecVerified {
                                         owner: Box::new(owner),

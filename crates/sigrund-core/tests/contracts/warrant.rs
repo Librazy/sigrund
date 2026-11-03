@@ -331,3 +331,30 @@ fn direct_v12_binds_exact_capability_sets_without_changing_legacy_bytes() {
     hello["requested_execution_context"]["post_exec_capabilities"] = json!({});
     assert!(parse_strict::<ClientHello>(&serde_json::to_vec(&hello).unwrap()).is_err());
 }
+
+#[test]
+fn digest_direct_requires_v12_and_binds_full_file_digest() {
+    use sigrund_core::executable::{CapabilitySets, ExecutableTrust};
+    let mut w = fixture();
+    w.version = "1.2".into();
+    w.command.executable_sha256 = None;
+    w.command.executable_trust = Some(ExecutableTrust::DigestDirect {
+        sha256: "ab".repeat(32),
+    });
+    w.execution_context.post_exec_capabilities = Some(CapabilitySets::ordinary(&[]));
+    let csr = Csr::new(w.clone()).unwrap();
+    csr.bind_envelope(&signed(w.clone())).unwrap();
+    w.command.executable_trust = Some(ExecutableTrust::DigestDirect {
+        sha256: "cd".repeat(32),
+    });
+    assert!(csr.bind_envelope(&signed(w.clone())).is_err());
+    w.version = "1.1".into();
+    w.execution_context.post_exec_capabilities = None;
+    assert!(Csr::new(w.clone()).is_err());
+    w.version = "1.2".into();
+    w.execution_context.post_exec_capabilities = Some(CapabilitySets::ordinary(&[]));
+    for digest in ["AB".repeat(32), "ab".repeat(31), "gg".repeat(32)] {
+        w.command.executable_trust = Some(ExecutableTrust::DigestDirect { sha256: digest });
+        assert!(Csr::new(w.clone()).is_err());
+    }
+}

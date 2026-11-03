@@ -2,6 +2,8 @@
 """Real filesystem/execution trust gates inside the delegated acceptance service."""
 import argparse
 import errno
+import hashlib
+import socket
 import json
 import os
 from pathlib import Path
@@ -16,7 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 SHARED = runpy.run_path(str(Path(__file__).with_name('verify-runtime.py')))
 Fixture, Gate = SHARED['Fixture'], SHARED['Gate']
 canonical, wait_for, unprivileged = SHARED['canonical'], SHARED['wait_for'], SHARED['unprivileged']
-DEFAULT_MODELS = ['fs_verity', 'ctime', 'digest_memfd']
+DEFAULT_MODELS = ['fs_verity', 'ctime', 'digest_direct', 'digest_memfd']
 
 
 def request(f, *, warrant=None, command=None, target=0, args=(), capabilities=()):
@@ -114,7 +116,7 @@ def ctime_gate(parent, binaries):
         f.launch()
         for target, caps in [(0, ()), (33, ()), (33, ('CAP_NET_BIND_SERVICE',))]:
             payload, value = csr(f, native, target=target, capabilities=caps)
-            assert value['version'] == '1.1' and value['command']['executable_sha256'] is None
+            assert value['version'] == '1.2' and value['command']['executable_sha256'] is None
             trust = value['command']['executable_trust']
             assert trust['model'] == 'ctime' and int(trust['size']) == 67_108_865, trust
             records = approved(f, payload, f'{target}\n'.encode())
@@ -163,7 +165,7 @@ def ctime_gate(parent, binaries):
         unsafe = program(f, 'unsafe', large=False)
         unsafe.chmod(0o777)
         payload, value = csr(f, unsafe)
-        assert value['version'] == '1.0' and 'executable_trust' not in value['command']
+        assert value['version'] == '1.2' and value['command']['executable_trust']['model'] == 'digest_direct'
         approved(f, payload, b'0\n')
         # UID 0 is capability-stripped and must satisfy its owner execute bit.
         owner_noexec = program(f, 'owner-noexec', large=False)
@@ -219,6 +221,174 @@ def mutation_gate(parent, binaries):
         if gate:
             gate.close()
         cleanup(f)
+
+
+def digest_direct_gate(parent, binaries):
+    f = Fixture(parent, binaries, ['digest_direct', 'digest_memfd'])
+    gate = child = output = None
+    try:
+        native = program(f)
+        native.chmod(0o777)
+        os.chown(native, 65534, 65534)
+        configure(f)
+        gate = Gate(f, 'clone-after')
+        payload, value = csr(f, native, target=33)
+        assert value['version'] == '1.2'
+        with native.open('rb') as source:
+            digest = hashlib.file_digest(source, 'sha256').hexdigest()
+        assert value['command']['executable_trust'] == {'model': 'digest_direct', 'sha256': digest}
+        assert value['command']['executable_sha256'] is None
+        approved(f, payload, b'33\n')
+        # A metadata-only change is accepted after revalidation and rehashing.
+        payload, _ = csr(f, native)
+        native.chmod(0o755)
+        approved(f, payload, b'0\n')
+        # Content mutation after durable consumption is caught at the exec stop.
+        marker = f.base / 'digest-must-not-run'
+        payload, _ = csr(f, native, args=(marker,))
+        path, _ = f.sign_payload(payload)
+        gate.arm()
+        child, output = request(f, warrant=path)
+        gate.arrive()
+        with native.open('r+b') as writer:
+            writer.seek(-1, os.SEEK_END)
+            writer.write(b'X')
+        gate.unblock()
+        code, out, err, events = finish(child, output)
+        child = output = None
+        assert code == 255 and not out and events[0]['status'] == 'SPAWN_FAILED', (code, out, err, events)
+        assert not marker.exists()
+        wait_for(f.empty, 'digest mismatch cleanup')
+        # The failed post-commit checkpoint consumed the one-time grant.
+        with native.open('r+b') as writer:
+            writer.seek(-1, os.SEEK_END)
+            writer.write(b'\0')
+        denied(f, payload, 'REPLAY_DETECTED')
+        # Independent direct size bounds reject before signing; a small source
+        # can still use memfd if only that candidate fits its configured bound.
+        f.stop()
+        config = f.base / 'config'
+        config.write_text(config.read_text().replace('max_direct_digest_bytes = 268435456', 'max_direct_digest_bytes = 4'))
+        f.launch()
+        small = program(f, 'small', large=False)
+        payload, value = csr(f, small)
+        assert value['version'] == '1.0'
+        approved(f, payload, b'0\n')
+        code, out, err, events = finish(*request(f, command=native))
+        assert code == 255 and not out and events[0]['status'] == 'EXECUTABLE_MUTATED_OR_TOO_LARGE', (code, out, err, events)
+        f.stop()
+    finally:
+        if child and child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)
+        if output:
+            output.close()
+        if gate:
+            gate.close()
+        cleanup(f)
+
+
+def file_capabilities_gate(parent, binaries):
+    f = Fixture(parent, binaries, ['digest_direct', 'digest_memfd'])
+    mounted = False
+    gate = child = output = None
+    try:
+        # The service's /tmp may itself be nosuid. Use an owned mount whose
+        # capability semantics satisfy the direct model's eligibility rule.
+        subprocess.run(['mount', '-t', 'tmpfs', '-o', 'nodev,mode=0755', 'tmpfs', str(f.commands)], check=True)
+        mounted = True
+        source = f.base / 'self.c'
+        source.write_text('#include <sys/stat.h>\n#include <stdio.h>\n#include <unistd.h>\n'
+                          'int main(void){struct stat s;FILE*f=fopen("/proc/self/exe","rb");'
+                          'if(!f||fgetc(f)!=127||stat("/proc/self/exe",&s))return 91;'
+                          'printf("%llu\\n",(unsigned long long)s.st_ino);return 0;}\n')
+        native = f.commands / 'self'
+        subprocess.run(['cc', '-O2', str(source), '-o', str(native)], check=True)
+        native.chmod(0o755)
+        configure(f)
+        f.launch()
+        cap = 'CAP_NET_BIND_SERVICE'
+        for flags in [None, 'p', 'ep', 'i', 'eip']:
+            if flags is not None:
+                subprocess.run(['setcap', 'cap_net_bind_service=' + flags, str(native)], check=True)
+            payload, value = csr(f, native, target=33, capabilities=(cap,))
+            assert value['command'].get('executable_trust', {}).get('model') == 'digest_direct', (flags, value)
+            expected = value['execution_context']['post_exec_capabilities']
+            assert expected['bounding'] == expected['inheritable'] == [cap], expected
+            assert expected['ambient'] == ([cap] if flags is None else []), expected
+            assert expected['permitted'] == [cap], expected
+            assert expected['effective'] == ([cap] if flags is None or 'e' in flags else []), expected
+            records = approved(f, payload, f'{native.stat().st_ino}\n'.encode())
+            assert records[1]['observed_post_exec_capabilities'] == expected, records
+        # The child namespace alias may not substitute a different inode.
+        f.stop()
+        gate = Gate(f, 'clone-after')
+        payload, _ = csr(f, native, target=33, capabilities=(cap,))
+        path, _ = f.sign_payload(payload)
+        gate.arm()
+        child, output = request(f, warrant=path)
+        gate.arrive()
+        replacement = program(f, 'replacement', large=False)
+        os.replace(replacement, native)
+        gate.unblock()
+        code, out, err, events = finish(child, output)
+        child = output = None
+        assert code == 255 and not out and events[0]['status'] == 'SPAWN_FAILED', (code, out, err, events)
+        wait_for(f.empty, 'file capability alias replacement cleanup')
+        subprocess.run(['setcap', 'cap_net_bind_service=ep', str(native)], check=True)
+        # Capabilities outside explicitly requested authority must use memfd.
+        payload, value = csr(f, native, target=33)
+        assert value['version'] == '1.0', value
+        # The snapshot strips file capabilities, preserving the legacy contract.
+        subprocess.run(['setcap', '-r', str(native)], check=True)
+        f.stop()
+    finally:
+        if child and child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)
+        if output:
+            output.close()
+        if gate:
+            gate.close()
+        cleanup(f, mounted)
+
+
+def metadata_approval_gate(f, native):
+    """Mutate verity's unprotected metadata while its CSR awaits approval."""
+    config = f.base / 'config'
+    config.write_text(config.read_text() + '\napproval_signer_id = "' + SHARED['SIGNER'] + '"\n')
+    f.launch()
+    for change, restore, caps in [
+        (lambda: native.chmod(0o644), lambda: native.chmod(0o755), ()),
+        (lambda: subprocess.run(['setcap', 'cap_net_bind_service=ep', str(native)], check=True),
+         lambda: subprocess.run(['setcap', '-r', str(native)], check=True), ('CAP_NET_BIND_SERVICE',)),
+    ]:
+        with socket.socket(socket.AF_UNIX) as broker:
+            broker.settimeout(6)
+            before = f.diagnostics.read_text().count('"broker":true')
+            broker.connect(str(f.approval))
+            wait_for(lambda: f.diagnostics.read_text().count('"broker":true') > before, 'metadata broker registered')
+            child, output = request(f, command=native, target=33, capabilities=caps)
+            def exact(n):
+                result = b''
+                while len(result) < n:
+                    data = broker.recv(n - len(result))
+                    assert data, 'approval EOF'
+                    result += data
+                return result
+            length = struct.unpack('>I', exact(4))[0]
+            approval = json.loads(exact(length))
+            change()
+            _, envelope = f.sign_payload(approval['csr_payload'].encode())
+            response = canonical({'status': 'approved', 'exec_id': approval['exec_id'], 'dsse_envelope': envelope})
+            broker.sendall(struct.pack('>I', len(response)) + response)
+            code, out, err, events = finish(child, output)
+            assert code == 255 and not out and events[0]['status'] == 'EXECUTABLE_MUTATED_OR_TOO_LARGE', (code, out, err, events)
+            restore()
+            # Rejection happened before consumption: the same signed grant is
+            # still redeemable after restoring an eligible credential transition.
+            approved(f, approval['csr_payload'].encode(), b'33\n')
+    f.stop()
 
 
 def noexec_gate(parent, binaries):
@@ -315,7 +485,7 @@ def verity_gate(parent, binaries):
             evidence = value['command']['executable_trust']
             measured = subprocess.check_output(['fsverity', 'measure', str(native)], text=True).split()[0]
             assert evidence == {'model': 'fs_verity', 'algorithm': algorithm, 'digest': measured.split(':')[1]}, evidence
-            assert value['version'] == '1.1' and value['command']['executable_sha256'] is None
+            assert value['version'] == '1.2' and value['command']['executable_sha256'] is None
             approved(f, payload, b'0\n')
             payload, value = csr(f, native)
             value['command']['executable_trust']['digest'] = '00' * (32 if algorithm == 'sha256' else 64)
@@ -338,6 +508,7 @@ def verity_gate(parent, binaries):
         assert value['command']['executable_trust']['model'] == 'fs_verity'
         approved(f, payload, b'0\n')
         f.stop()
+        metadata_approval_gate(f, small)
     finally:
         cleanup(f, mounted)
 
@@ -352,7 +523,7 @@ def main():
         parser.error('run in the dedicated root acceptance service')
     args.artifacts.mkdir(parents=True, exist_ok=True)
     results = []
-    for name, gate in [('ctime', ctime_gate), ('mutation', mutation_gate), ('noexec', noexec_gate), ('tracer-death', tracer_death_gate), ('fs-verity', verity_gate)]:
+    for name, gate in [('digest-direct', digest_direct_gate), ('file-capabilities', file_capabilities_gate), ('ctime', ctime_gate), ('mutation', mutation_gate), ('noexec', noexec_gate), ('tracer-death', tracer_death_gate), ('fs-verity', verity_gate)]:
         gate(args.cgroup_parent, args.binaries)
         results.append({'gate': name, 'result': 'passed'})
         print(json.dumps(results[-1]), flush=True)

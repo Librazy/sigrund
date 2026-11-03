@@ -1,6 +1,6 @@
 # Ordered executable trust models. Omit a model to disable it.
 # Only digest_memfd uses max_executable_bytes and executable snapshot RAM.
-executable_trust_models = ["fs_verity", "ctime", "digest_memfd"]
+executable_trust_models = ["fs_verity", "ctime", "digest_direct", "digest_memfd"]
 
 allow_same_uid_elevation = false
 require_remote_audit_ack = false
@@ -21,6 +21,9 @@ max_io_workers_per_uid = 2
 snapshot_ram_global_bytes = 536870912
 snapshot_ram_per_uid_bytes = 134217728
 max_executable_bytes = 67108864
+# Direct hashing uses a fixed 64 KiB buffer, without snapshot RAM.
+max_direct_digest_bytes = 268435456
+direct_digest_timeout_ms = 5000
 max_stdin_bytes = 16777216
 request_deadline_ms = 5000
 request_admissions_global = 256
