@@ -347,7 +347,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
             return any('SOCKET_ADMITTED' in line and '"broker":true' in line for line in records.splitlines())
         wait_for(broker_attached, 'approver broker registration')
         # The acceptance script owns only these new terminals and disposable key.
-        for index, (answer, target, stdin_bytes) in enumerate(((b'\n', 0, None), (b'yes\n', 0, None),
+        for index, (answer, target, stdin_bytes) in enumerate(((b'no\n', 0, None), (b'yes\n', 0, None),
                                                             (b'yes\n', 33, b'\x00reviewed\xff\n'))):
             rm, rs = pty.openpty()
             masters.extend([rm, rs])
@@ -369,7 +369,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
                 child.stdin.close()
                 prompt = b''
                 deadline = time.monotonic() + 8
-                while b'Approve and sign? [y/N] ' not in prompt:
+                while b'Approve and sign? [y/yes/n/no] ' not in prompt:
                     assert time.monotonic() < deadline and child.poll() is None, prompt
                     if select.select([master], [], [], 0.1)[0]:
                         prompt += os.read(master, 8192)
@@ -388,7 +388,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
                     terminal += os.read(rm, 65536)
                 status.seek(0)
                 events = [json.loads(line) for line in status]
-            if answer == b'\n':
+            if answer == b'no\n':
                 assert child.returncode == 255 and events[0]['status'] == 'REJECTED', (terminal, events)
             else:
                 assert child.returncode == 0 and events[-1] == {'exit_code': 0, 'signal': None}, (terminal, events)
@@ -416,7 +416,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
         (directory / 'audit.jsonl').write_bytes((base / 'log/audit.jsonl').read_bytes())
         (directory / 'daemon.service').write_bytes((base / 'daemon.service').read_bytes())
         evidence.passed('operator-workflow', requester_uid=account.pw_uid, root_uid=0, service_uid=33,
-                        requester_tty=True, root_tty=True, blank_confirmation='REJECTED',
+                        requester_tty=True, root_tty=True, explicit_refusal='REJECTED',
                         hashed_stdin=True, packaged_and_foreground=True, group=group, daemon_pid=main_pid)
     finally:
         if child and child.poll() is None:

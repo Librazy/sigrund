@@ -130,6 +130,10 @@ fn namespace_fixture() {
             .lines()
             .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
     });
+    // Extra Enter presses used to launch the watcher must not answer a future
+    // prompt. Wait for their echo so they are definitely in the TTY queue.
+    terminal.write_all(b"\n\n").unwrap();
+    tty_until(&mut terminal, b"\r\n\r\n");
     // A non-root requester drives the real client/snapshot/TTY/signature path.
     let before = fixture.diagnostic_count();
     let mut command = Command::new(fixture.directory.path().join("sigrun"));
@@ -241,6 +245,18 @@ fn namespace_fixture() {
     );
     assert_eq!(decision(&mut invalid_policy).status, "POLICY_VIOLATION");
     drop(invalid_policy);
+    // Empty, invalid and overlong lines reprompt without rejecting or signing.
+    // A valid answer queued behind an invalid line must also be discarded.
+    for answer in [
+        b"\n".as_slice(),
+        b"maybe\n",
+        b"y                 \n",
+        b"\nyes\n",
+    ] {
+        terminal.write_all(answer).unwrap();
+        prompt(&mut terminal);
+        assert!(child.try_wait().unwrap().is_none());
+    }
     terminal.write_all(b"yes\n").unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(
@@ -260,8 +276,8 @@ fn namespace_fixture() {
         approver.0.try_wait().unwrap().is_none(),
         "approver should remain connected for subsequent requests"
     );
-    // Blank and explicit no are default-deny and reuse the same idle broker.
-    for answer in [b"\n".as_slice(), b"no\n", b"\x04"] {
+    // Explicit refusal and EOF deny and reuse the same idle broker.
+    for answer in [b"n\n".as_slice(), b"no\n", b"\x04"] {
         let before = fixture.diagnostic_count();
         let mut socket = fixture.admitted_client();
         send_hello(&mut socket, &fixture.executable);
@@ -277,14 +293,29 @@ fn namespace_fixture() {
         drop(socket);
         fixture.wait_for_cleanup(before);
     }
-    // Requester cancellation invalidates the prompt and stops the watcher.
+    // Requester cancellation invalidates the prompt, discards its unfinished
+    // answer, and reconnects the same watcher for a fresh request.
     let before = fixture.diagnostic_count();
     let mut socket = fixture.admitted_client();
     send_hello(&mut socket, &fixture.executable);
     prompt(&mut terminal);
+    terminal.write_all(b"y").unwrap();
+    tty_until(&mut terminal, b"y");
     drop(socket);
-    wait_for(|| approver.0.try_wait().unwrap().is_some());
+    wait_for_reconnect(&fixture, before, &mut approver);
     fixture.wait_for_cleanup(before);
+    let before = fixture.diagnostic_count();
+    let mut socket = fixture.admitted_client();
+    send_hello(&mut socket, &fixture.executable);
+    prompt(&mut terminal);
+    terminal.write_all(b"\n").unwrap();
+    prompt(&mut terminal);
+    terminal.write_all(b"no\n").unwrap();
+    assert_eq!(decision(&mut socket).status, "REJECTED");
+    drop(socket);
+    fixture.wait_for_cleanup(before);
+    // Stop this watcher before fixtures that deliberately attach other brokers.
+    drop(approver);
     broker_failures_and_reconnect(&fixture, &identity);
     operator_failures_and_expiry(&fixture, &identity);
     wrong_operator_identity(&fixture);
@@ -327,6 +358,16 @@ fn namespace_fixture() {
 
 fn launch_approver(fixture: &Fixture, identity: &Path) -> (File, DaemonChild) {
     launch_approver_with(fixture, identity, |_| {})
+}
+fn wait_for_reconnect(fixture: &Fixture, before: usize, approver: &mut DaemonChild) {
+    wait_for(|| {
+        assert!(approver.0.try_wait().unwrap().is_none(), "watcher exited");
+        fs::read_to_string(&fixture.diagnostics)
+            .unwrap()
+            .lines()
+            .skip(before)
+            .any(|line| line.contains("SOCKET_ADMITTED") && line.contains("\"broker\":true"))
+    });
 }
 fn launch_approver_with(
     fixture: &Fixture,
@@ -392,8 +433,8 @@ fn prompt(terminal: &mut File) -> String {
             r => panic!("TTY read failed {r:?}: {}", String::from_utf8_lossy(&bytes)),
         }
         bytes
-            .windows(b"Approve and sign? [y/N] ".len())
-            .any(|w| w == b"Approve and sign? [y/N] ")
+            .windows(b"Approve and sign? [y/yes/n/no] ".len())
+            .any(|w| w == b"Approve and sign? [y/yes/n/no] ")
     });
     String::from_utf8(bytes).unwrap()
 }
@@ -704,15 +745,16 @@ fn slow_signing_cancellation(fixture: &Fixture, identity: &Path) {
         .unwrap();
     assert!(Path::new(&format!("/proc/{helper}")).exists());
     // This closes the daemon broker, which the approver must notice while its
-    // child is blocked in agent I/O, then kill and reap before exiting itself.
+    // child is blocked in agent I/O, then kill and reap before reconnecting.
     drop(client);
-    wait_for(|| approver.0.try_wait().unwrap().is_some());
+    wait_for_reconnect(fixture, before, &mut approver);
     assert!(
         !Path::new(&format!("/proc/{helper}")).exists(),
         "signing helper survived cancellation"
     );
     drop(accepted);
     fixture.wait_for_cleanup(before);
+    drop(approver);
 }
 
 fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
@@ -814,8 +856,9 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
         send_hello(&mut client, &fixture.executable);
         prompt(&mut terminal);
         drop(client);
-        wait_for(|| approver.0.try_wait().unwrap().is_some());
+        wait_for_reconnect(fixture, before, &mut approver);
         fixture.wait_for_cleanup(before);
+        drop(approver);
     }
     agent.0.kill().unwrap();
     agent.0.wait().unwrap();
@@ -899,7 +942,8 @@ fn assert_tty_attributes_restored(terminal: &File, original: &libc::termios) {
 fn encrypted_signing_cancellation_restores_terminal(fixture: &Fixture, identity: &Path) {
     // The preceding encrypted-key test leaves this identity encrypted. Stop
     // OpenSSH while it has changed the real controlling terminal for a secret
-    // read, then inspect the same PTY after the approver and helper are gone.
+    // read, then inspect the same PTY after the helper is gone. Broker loss
+    // reconnects the watcher; an explicit local signal still exits it.
     for local_signal in [false, true] {
         let admission = fixture.diagnostic_count();
         let (mut terminal, mut approver) = launch_approver_with(fixture, identity, |command| {
@@ -944,12 +988,19 @@ fn encrypted_signing_cancellation_restores_terminal(fixture: &Fixture, identity:
             assert_eq!(decision(&mut client).status, "TIMEOUT_CSR");
         }
         drop(client);
-        wait_for(|| approver.0.try_wait().unwrap().is_some());
+        if local_signal {
+            wait_for(|| approver.0.try_wait().unwrap().is_some());
+        } else {
+            wait_for_reconnect(fixture, before, &mut approver);
+        }
         assert!(
             !Path::new(&format!("/proc/{helper}")).exists(),
             "signing helper survived"
         );
         assert_tty_attributes_restored(&terminal, &original);
         fixture.wait_for_cleanup(before);
+        if !local_signal {
+            drop(approver);
+        }
     }
 }

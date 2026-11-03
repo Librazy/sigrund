@@ -143,7 +143,72 @@ pub fn run(args: &ApprovalArgs) -> io::Result<u8> {
         return Err(io::Error::last_os_error());
     }
     let signals = Signals::new()?;
-    let socket = connect_broker(&args.socket, &signals)?;
+    let mut socket = connect_broker(&args.socket, &signals)?;
+    loop {
+        let error = match watch_broker(&tty, &identity_file, &signers, &public, &socket, &signals) {
+            Ok(()) => return Ok(0),
+            Err(error) if recoverable_connection_error(&error) => error,
+            Err(error) => return Err(error),
+        };
+        // A timed-out or cancelled exchange is never reused. The daemon must
+        // retire it before a fresh connection can receive another request.
+        let _ = socket.shutdown(std::net::Shutdown::Both);
+        drop(socket);
+        discard_confirmation_input(&tty)?;
+        eprintln!("\nsigrund-approve: approval connection ended ({error}); waiting to reconnect");
+        socket = reconnect_broker(&args.socket, &signals, &tty)?;
+    }
+}
+
+fn recoverable_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+fn reconnect_broker(path: &Path, signals: &Signals, tty: &File) -> io::Result<UnixStream> {
+    loop {
+        if signals.next()?.is_some() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        // Do not spin if the daemon has not yet retired the old connection or
+        // is restarting. Polling also keeps local cancellation responsive.
+        let mut events = [
+            event(signals.fd.as_raw_fd(), libc::POLLIN),
+            event(tty.as_raw_fd(), 0),
+        ];
+        poll(&mut events, None)?;
+        if events[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other("operator terminal lost"));
+        }
+        if signals.next()?.is_some() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        match connect_broker(path, signals) {
+            Ok(socket) => return Ok(socket),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn watch_broker(
+    tty: &File,
+    identity_file: &File,
+    signers: &SignerPolicyFile,
+    public: &PublicKey,
+    socket: &UnixStream,
+    signals: &Signals,
+) -> io::Result<()> {
     loop {
         let mut reader = ApprovalReader::default();
         let request = loop {
@@ -173,12 +238,12 @@ pub fn run(args: &ApprovalArgs) -> io::Result<u8> {
             return Err(invalid("explicit identity does not match requested signer"));
         }
         let response = approve(
-            &tty,
-            &identity_file,
+            tty,
+            identity_file,
             signer,
             &request,
-            &socket,
-            &signals,
+            socket,
+            signals,
             deadline,
         )?;
         let mut writer = FrameWriter::approval(
@@ -186,7 +251,7 @@ pub fn run(args: &ApprovalArgs) -> io::Result<u8> {
             Instant::now(),
         )?;
         loop {
-            check(&socket, &signals, deadline)?;
+            check(socket, signals, deadline)?;
             if writer.write(socket.as_raw_fd(), Instant::now())? {
                 break;
             }
@@ -331,6 +396,16 @@ fn valid_now(csr: &Csr) -> bool {
             && csr.warrant().policy.not_after.is_some_and(|end| now <= end)
     })
 }
+
+fn discard_confirmation_input(tty: &File) -> io::Result<()> {
+    // Drop complete lines and unfinished canonical input (for example a lone
+    // 'y' left by a cancelled request). Pre-prompt input is not confirmation.
+    if unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn approve(
     tty: &File,
     identity: &File,
@@ -355,43 +430,10 @@ fn approve(
     if !valid_now(&csr) {
         return Ok(refused("warrant expired or not yet valid"));
     }
-    write_tty(tty, b"Approve and sign? [y/N] ", socket, signals, deadline)?;
-    let mut input = tty;
-    let mut answer = Vec::new();
-    loop {
-        check(socket, signals, deadline)?;
-        let mut byte = [0];
-        match input.read(&mut byte) {
-            Ok(0) => return Ok(refused("operator terminal EOF")),
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                answer.push(byte[0]);
-                if answer.len() > 16 {
-                    return Err(invalid("confirmation exceeds length limit"));
-                }
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                poll(
-                    &mut [
-                        event(tty.as_raw_fd(), libc::POLLIN),
-                        event(socket.as_raw_fd(), libc::POLLIN),
-                        event(signals.fd.as_raw_fd(), libc::POLLIN),
-                    ],
-                    Some(deadline),
-                )?
-            }
-            Err(_) => return Ok(refused("operator terminal lost")),
-        }
-    }
-    if answer != b"y" && answer != b"yes" {
-        return Ok(refused("operator refused approval"));
+    match confirm(tty, socket, signals, deadline)? {
+        Some(true) => {}
+        Some(false) => return Ok(refused("operator refused approval")),
+        None => return Ok(refused("operator terminal EOF")),
     }
     if !valid_now(&csr) {
         return Ok(refused("warrant expired while awaiting confirmation"));
@@ -420,6 +462,75 @@ fn approve(
         exec_id: request.exec_id.clone(),
         dsse_envelope: envelope,
     })
+}
+
+fn confirm(
+    tty: &File,
+    socket: &UnixStream,
+    signals: &Signals,
+    deadline: Instant,
+) -> io::Result<Option<bool>> {
+    let mut input = tty;
+    let mut answer = Vec::with_capacity(16);
+    let mut oversized = false;
+    write_tty(
+        tty,
+        b"Approve and sign? [y/yes/n/no] ",
+        socket,
+        signals,
+        deadline,
+    )?;
+    discard_confirmation_input(tty)?;
+    loop {
+        check(socket, signals, deadline)?;
+        let mut byte = [0];
+        match input.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    if !oversized {
+                        match answer.as_slice() {
+                            b"y" | b"yes" => return Ok(Some(true)),
+                            b"n" | b"no" => return Ok(Some(false)),
+                            _ => {}
+                        }
+                    }
+                    write_tty(
+                        tty,
+                        b"Enter y or yes to approve, n or no to reject.\nApprove and sign? [y/yes/n/no] ",
+                        socket,
+                        signals,
+                        deadline,
+                    )?;
+                    discard_confirmation_input(tty)?;
+                    answer.clear();
+                    oversized = false;
+                } else if answer.len() < 16 {
+                    answer.push(byte[0]);
+                } else {
+                    // Drain the rest of an overlong line with bounded memory;
+                    // its prefix must never be treated as a valid answer.
+                    oversized = true;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                poll(
+                    &mut [
+                        event(tty.as_raw_fd(), libc::POLLIN),
+                        event(socket.as_raw_fd(), libc::POLLIN),
+                        event(signals.fd.as_raw_fd(), libc::POLLIN),
+                    ],
+                    Some(deadline),
+                )?
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Every leaf and empty container is rendered; indexed argv and escaped key
@@ -726,6 +837,129 @@ mod tests {
         signer.public_key = fs::read_to_string(path.with_extension("pub")).unwrap();
         signer.require_user_presence = false;
         (File::open(path).unwrap(), signer)
+    }
+
+    fn read_prompt(terminal: &mut File) {
+        nonblocking(terminal.as_raw_fd()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut text = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "confirmation prompt did not arrive"
+            );
+            let mut bytes = [0; 4096];
+            match terminal.read(&mut bytes) {
+                Ok(0) => panic!("terminal closed before confirmation prompt"),
+                Ok(n) => text.extend_from_slice(&bytes[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    poll(
+                        &mut [event(terminal.as_raw_fd(), libc::POLLIN)],
+                        Some(deadline),
+                    )
+                    .unwrap();
+                }
+                Err(error) => panic!("confirmation terminal: {error}"),
+            }
+            if text.ends_with(b"Approve and sign? [y/yes/n/no] ") {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn confirmation_discards_typeahead_and_reprompts_until_an_explicit_answer() {
+        let (mut master, tty) = terminal();
+        nonblocking(tty.as_raw_fd()).unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let signals = Signals::new().unwrap();
+        // A queued affirmative answer must not authorize the coming request.
+        master.write_all(b"yes\n\n").unwrap();
+        for (answer, expected) in [
+            (b"y\n".as_slice(), true),
+            (b"yes\n", true),
+            (b"n\n", false),
+            (b"no\n", false),
+        ] {
+            std::thread::scope(|scope| {
+                let operator = scope.spawn(|| {
+                    read_prompt(&mut master);
+                    for invalid in [
+                        b"\n".as_slice(),
+                        b"wat\n",
+                        b"y                 \n",
+                        b"\nyes\n",
+                    ] {
+                        master.write_all(invalid).unwrap();
+                        read_prompt(&mut master);
+                    }
+                    master.write_all(answer).unwrap();
+                });
+                assert_eq!(
+                    confirm(
+                        &tty,
+                        &socket,
+                        &signals,
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                    .unwrap(),
+                    Some(expected)
+                );
+                operator.join().unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn confirmation_without_enter_expires_and_partial_input_is_discarded() {
+        let (mut master, tty) = terminal();
+        nonblocking(tty.as_raw_fd()).unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let signals = Signals::new().unwrap();
+        std::thread::scope(|scope| {
+            let operator = scope.spawn(|| {
+                read_prompt(&mut master);
+                master.write_all(b"\n").unwrap();
+                read_prompt(&mut master);
+                master.write_all(b"y").unwrap();
+            });
+            let error = confirm(
+                &tty,
+                &socket,
+                &signals,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(recoverable_connection_error(&error));
+            operator.join().unwrap();
+        });
+        discard_confirmation_input(&tty).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tty.try_clone().unwrap().read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Enter on the next request must not complete the old partial 'y'.
+        std::thread::scope(|scope| {
+            let operator = scope.spawn(|| {
+                read_prompt(&mut master);
+                master.write_all(b"\n").unwrap();
+                read_prompt(&mut master);
+                master.write_all(b"no\n").unwrap();
+            });
+            assert_eq!(
+                confirm(
+                    &tty,
+                    &socket,
+                    &signals,
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .unwrap(),
+                Some(false)
+            );
+            operator.join().unwrap();
+        });
     }
 
     #[test]

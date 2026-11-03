@@ -1317,8 +1317,14 @@ protocol fault, close the broker connection to invalidate the outstanding
 prompt; do not reuse it for another request. Ignore late completions and bind
 all results to execution ID, connection identity and captured policy. Release
 the approval slot on resolution/cancellation, but retain worker, FD and RAM
-reservations until actual cleanup. An idle approver may reconnect for future
-requests; reconnecting never reissues an old prompt automatically.
+reservations until actual cleanup. The foreground approver reconnects after
+timeout or broker disconnect for future requests; reconnecting never reissues
+an old prompt automatically. Shut down the old connection, terminate/reap any
+signing helper and restore terminal settings before reconnecting. Discard
+unfinished TTY input, retry transient missing/refused sockets with bounded
+polling, and revalidate socket/parent ownership and peer credentials on every
+connection. Local cancellation, TTY loss, malformed protocol or failed trust
+checks stop the approver rather than retrying those failures.
 
 **Root interaction:** The approver requires effective UID 0 and a verified
 controlling TTY, with prompts and key passphrase/FIDO interactions on that
@@ -1330,8 +1336,13 @@ execution ID and selected key fingerprint before confirmation; render argv
 as indexed escaped strings, environment as individual exact key/value pairs,
 and include groups, capabilities, umask, script permission, host/requester/
 target identities, input/executable digests, mode, grant and validity. Do not
-truncate away fields and then permit approval. Confirm with `[y/N]`: only
-explicit `y` or `yes` signs; blank input, EOF or TTY loss denies. No shell
+truncate away fields and then permit approval. Confirm with `[y/yes/n/no]`:
+only explicit `y` or `yes` followed by Enter signs; `n` or `no` followed by
+Enter rejects. Flush pending terminal input immediately after displaying
+each prompt so typeahead cannot confirm or reject a new request. Blank,
+invalid and overlong answers reprompt without extending the original
+approval deadline; bound answer storage and drain overlong lines without
+accepting a valid prefix. EOF or TTY loss cannot approve. No shell
 command is assembled from request data. Any signing helper has bounded output
 and is terminated/reaped on broker loss, timeout or local cancellation.
 
@@ -1339,6 +1350,9 @@ Verification must cover real terminal output through the Section 2.3 relay,
 OpenSSH signing interoperability, complete sanitized display, no approver,
 busy admission, wrong key/PAE/namespace, refusal/EOF, slow signing, expired
 warrants, stale/duplicate replies, reconnect and disconnect at every boundary.
+Cover buffered Enter/affirmative input before a prompt, repeated invalid
+answers, input without Enter, timeout recovery, and unfinished confirmation
+from a cancelled request never carrying into the next one.
 The local-profile tests and reproduction commands are indexed in
 `IMPLEMENTATION_NOTES.md`. They supplement the applicable Section 8 cases;
 passing local-profile tests does not establish full v1.0 conformance.

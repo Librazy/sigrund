@@ -241,7 +241,7 @@ def root_tty_workflow(parent, binaries, evidence):
                                           cwd='/', stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 prompt = b''
                 deadline = time.monotonic() + 6
-                while b'Approve and sign? [y/N] ' not in prompt:
+                while b'Approve and sign? [y/yes/n/no] ' not in prompt:
                     assert time.monotonic() < deadline, prompt
                     assert select.select([master], [], [], 0.1)[0] or approver.poll() is None
                     if select.select([master], [], [], 0)[0]:
