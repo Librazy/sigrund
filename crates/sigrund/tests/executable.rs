@@ -304,7 +304,7 @@ fn ctime_namespace_fixture() {
     assert_eq!(prepared.digest.bytes, 67_108_865);
     assert_eq!(prepared.sha256(), None);
     assert_eq!(budget.usage(1001), (0, 0));
-    prepared.verify_direct().unwrap();
+    prepared.verify_direct(&context()).unwrap();
     cfg.executable_trust_models = vec![TrustModel::DigestMemfd, TrustModel::Ctime];
     assert!(
         executable::prepare(
@@ -338,7 +338,7 @@ fn ctime_namespace_fixture() {
         .is_err()
     );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
-    assert!(prepared.verify_direct().is_err());
+    assert!(prepared.verify_direct(&context()).is_err());
     assert!(
         executable::prepare(
             File::open(&path).unwrap(),
@@ -361,7 +361,7 @@ fn ctime_namespace_fixture() {
         .unwrap()
         .set_len(100)
         .unwrap();
-    assert!(prepared.verify_direct().is_err());
+    assert!(prepared.verify_direct(&context()).is_err());
     assert_eq!(budget.usage(1001), (0, 0));
 
     // noexec must force fallback before approval, for the same otherwise

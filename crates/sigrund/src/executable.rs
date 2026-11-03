@@ -69,9 +69,9 @@ impl Executable {
         self.sealed.as_ref()
     }
     pub fn needs_checkpoint(&self) -> bool {
-        self.model() == TrustModel::Ctime
+        self.trust.is_some()
     }
-    pub fn verify_direct(&self) -> io::Result<()> {
+    pub fn verify_direct(&self, context: &RequestedExecutionContext) -> io::Result<()> {
         let source = self
             .source
             .as_ref()
@@ -80,6 +80,10 @@ impl Executable {
             .trust
             .as_ref()
             .ok_or_else(|| invalid("missing executable evidence"))?;
+        let metadata = source.metadata()?;
+        if !direct_eligible(source, &metadata, context)? {
+            return Err(invalid("direct executable is no longer eligible"));
+        }
         let observed = match trust {
             ExecutableTrust::FsVerity { .. } => {
                 verity(source)?.ok_or_else(|| invalid("verity no longer available"))?
@@ -99,7 +103,7 @@ impl Executable {
     }
     /// Called off-loop with the tracee stopped before its first user instruction.
     pub fn verify_exec(&self, pid: i32, context: &RequestedExecutionContext) -> io::Result<()> {
-        self.verify_direct()?;
+        self.verify_direct(context)?;
         let actual = std::fs::metadata(format!("/proc/{pid}/exe"))?;
         let source = self
             .source
@@ -135,6 +139,15 @@ impl Executable {
             if ids != vec![expected; 4] {
                 return Err(invalid("exec changed credentials"));
             }
+        }
+        let groups = field("Groups:")
+            .ok_or_else(|| invalid("missing supplementary groups"))?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid("invalid supplementary groups"))?;
+        if groups != context.supplementary_gids {
+            return Err(invalid("exec changed supplementary groups"));
         }
         let expected = context
             .capabilities
@@ -192,7 +205,7 @@ pub fn prepare(
         if *model == TrustModel::DigestMemfd {
             return snapshot::executable(source, budget, uid, config, check).map(Into::into);
         }
-        if !direct_eligible(&source, &metadata, selection.context)? {
+        if !selection.trace_available || !direct_eligible(&source, &metadata, selection.context)? {
             continue;
         }
         let trust = match model {
@@ -220,7 +233,7 @@ pub fn prepare(
                 },
                 trust: Some(trust),
             };
-            executable.verify_direct()?;
+            executable.verify_direct(selection.context)?;
             return Ok(executable);
         }
     }

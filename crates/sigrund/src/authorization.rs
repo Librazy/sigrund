@@ -130,7 +130,7 @@ pub(crate) fn verify(
             || request.check(),
         )
     } else {
-        snapshots.executable.verify_direct()
+        snapshots.executable.verify_direct(&w.execution_context)
     }
     .map_err(|_| {
         Denial::new(
