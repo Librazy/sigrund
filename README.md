@@ -93,6 +93,9 @@ echo "$?"
 
 Review the displayed request on root's terminal and enter `yes`. The requester
 receives `0` from `id -u` and exit status `0`. Status JSON goes to its own file.
+Confirmation requires Enter: `y`/`yes` approves and `n`/`no` rejects. Empty or
+invalid answers reprompt until the original approval deadline. After timeout
+or connection loss, the approver reconnects to watch for future requests.
 Commands use absolute executable paths and exact arguments, without shell
 evaluation or PATH lookup. Stdin defaults to null; `--stdin sha256` binds finite
 piped or redirected input.

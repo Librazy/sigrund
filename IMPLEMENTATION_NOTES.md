@@ -36,7 +36,12 @@ Authorization denial defaults to exit 255, protocol/disconnect failure to 254,
 and usage errors to 64; successful execution returns the child's status.
 
 Root approves only with `y` or `yes` after every CSR field and the selected key
-fingerprint are displayed with escaped arguments. The root-owned identity may
+fingerprint are displayed with escaped arguments. Confirmation requires Enter;
+`n` or `no` rejects. Pending TTY input is discarded after each prompt. Blank,
+invalid and overlong answers reprompt within the original 120-second deadline.
+Timeout or broker disconnect aborts that exchange and reconnects the watcher
+for future requests, discarding unfinished confirmation. Local signals, TTY
+loss and trust/protocol failures still stop it. The root-owned identity may
 be a private key or a public key backed by root's SSH agent. Signing uses
 OpenSSH SSHSIG over DSSE PAE, with namespace `sigrun.warrant.v1` and SHA-512.
 Passphrases stay on the verified TTY; askpass is disabled, and terminal settings
