@@ -4,6 +4,7 @@
 #include <grp.h>
 #include <linux/capability.h>
 #include <linux/mount.h>
+#include <linux/openat2.h>
 #include <linux/sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -12,6 +13,7 @@
 #include <sys/prctl.h>
 #include <sys/mount.h>
 #include <sys/statvfs.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -26,12 +28,14 @@ struct child_spec {
     const uint32_t *groups;
     size_t groups_len;
     const char *cwd;
+    const char *direct_path;
     const char *const *argv;
     const char *const *envp;
     char *mountinfo;
     size_t mountinfo_capacity;
     uint32_t *group_check;
     int isolated;
+    int gate_read, gate_write, checkpoint;
 };
 struct setup_frame { uint32_t step; int32_t error; };
 _Static_assert(sizeof(struct setup_frame) == 8, "sync ABI");
@@ -135,6 +139,14 @@ static void lock_mounts(const struct child_spec *spec, int sync) {
 
 static void run_child(const struct child_spec *s) {
     int sync = s->sync;
+    if (s->checkpoint) {
+        syscall(SYS_close, s->gate_write);
+        char byte;
+        long count;
+        do { count = syscall(SYS_read, s->gate_read, &byte, 1); } while (count < 0 && errno == EINTR);
+        if (count != 1 || byte != 'x') die(sync, 1, ECANCELED);
+        syscall(SYS_close, s->gate_read);
+    }
     CHECK(1, syscall(SYS_unshare, CLONE_FILES));
     int tmp_sync = syscall(SYS_fcntl, sync, F_DUPFD_CLOEXEC, 5);
     CHECK(1, tmp_sync);
@@ -151,6 +163,25 @@ static void run_child(const struct child_spec *s) {
     sync = 4;
     CHECK(1, syscall(SYS_close_range, 5U, ~0U, 0U));
     if (s->isolated) lock_mounts(s, sync);
+    if (s->direct_path && s->isolated) {
+        /* mnt_may_suid() suppresses file capabilities for an FD whose mount
+         * belongs to the parent's namespace. Open an alias in this namespace,
+         * accepting only the exact inode still pinned by FD 3 and the parent.
+         * Path replacement/symlinks cannot select different executable bytes. */
+        struct open_how how = {
+            .flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+            .resolve = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+        };
+        int alias = syscall(SYS_openat2, AT_FDCWD, s->direct_path, &how, sizeof(how));
+        CHECK(1, alias);
+        struct stat pinned, candidate;
+        CHECK(1, syscall(SYS_fstat, 3, &pinned));
+        CHECK(1, syscall(SYS_fstat, alias, &candidate));
+        ASSERT(1, S_ISREG(candidate.st_mode) && pinned.st_dev == candidate.st_dev &&
+                  pinned.st_ino == candidate.st_ino);
+        CHECK(1, syscall(SYS_dup3, alias, 3, O_CLOEXEC));
+        CHECK(1, syscall(SYS_close, alias));
+    }
     struct sigaction action = { .sa_handler = SIG_DFL };
     sigemptyset(&action.sa_mask);
     for (int sig = 1; sig < NSIG; ++sig) {

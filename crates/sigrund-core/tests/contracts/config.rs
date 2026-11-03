@@ -1,6 +1,32 @@
 use super::support::*;
 
 #[test]
+fn executable_models_are_ordered_nonempty_and_captured() {
+    use sigrund_core::executable::{TrustModel, default_models};
+    let mut cfg = config("").unwrap();
+    assert_eq!(cfg.executable_trust_models, default_models());
+    cfg.executable_trust_models = vec![TrustModel::DigestMemfd, TrustModel::Ctime];
+    cfg.validate().unwrap();
+    let store = sigrund_core::config::PolicyStore::new(cfg.clone());
+    let captured = store.capture();
+    cfg.executable_trust_models = vec![TrustModel::FsVerity];
+    store.reload(cfg.clone()).unwrap();
+    assert_eq!(
+        captured.executable_trust_models,
+        vec![TrustModel::DigestMemfd, TrustModel::Ctime]
+    );
+    assert_eq!(
+        store.capture().executable_trust_models,
+        vec![TrustModel::FsVerity]
+    );
+    cfg.executable_trust_models.clear();
+    assert!(cfg.validate().is_err());
+    cfg.executable_trust_models = vec![TrustModel::Ctime; 2];
+    assert!(cfg.validate().is_err());
+    assert!(serde_json::from_str::<TrustModel>("\"unknown\"").is_err());
+}
+
+#[test]
 fn mvp_profile_is_opt_in_and_rejects_expansion_at_load_and_reload() {
     assert!(config("").unwrap().mvp.is_none());
     let cfg = config("[mvp]").unwrap();
@@ -100,7 +126,7 @@ fn profile_restrictions_apply_to_signed_and_unsigned_requests() {
         }
         let mut hello = unsigned();
         hello.requested_command = Some(warrant.command.requested());
-        hello.requested_execution_context = Some(warrant.execution_context.clone());
+        hello.requested_execution_context = Some(warrant.execution_context.requested());
         hello.requested_policy.as_mut().unwrap().mode = warrant.policy.mode.clone();
         hello.validate_request().unwrap();
         assert!(
@@ -157,5 +183,29 @@ fn approval_signer_selection_is_explicit_bounded_and_unambiguous() {
             ..MvpProfile::default()
         };
         assert!(profile.validate().is_err());
+    }
+}
+
+#[test]
+fn direct_digest_limits_are_independent_bounded_and_captured() {
+    let mut cfg = config("").unwrap();
+    assert_eq!(cfg.max_direct_digest_bytes, 268_435_456);
+    assert_eq!(cfg.direct_digest_timeout_ms, 5000);
+    cfg.max_executable_bytes = 1;
+    cfg.max_direct_digest_bytes = 1_073_741_824;
+    cfg.direct_digest_timeout_ms = 30_000;
+    cfg.validate().unwrap();
+    let store = sigrund_core::config::PolicyStore::new(cfg.clone());
+    let captured = store.capture();
+    assert_eq!(captured.max_direct_digest_bytes, 1_073_741_824);
+    assert_eq!(captured.direct_digest_timeout_ms, 30_000);
+    for limit in [0, 1_073_741_825] {
+        cfg.max_direct_digest_bytes = limit;
+        assert!(cfg.validate().is_err());
+    }
+    cfg.max_direct_digest_bytes = 1;
+    for timeout in [0, 30_001] {
+        cfg.direct_digest_timeout_ms = timeout;
+        assert!(cfg.validate().is_err());
     }
 }

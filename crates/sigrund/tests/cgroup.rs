@@ -102,7 +102,9 @@ fn delegated_platform_gate() {
                     now: 1,
                 },
                 SnapshotDigests {
-                    executable_sha256: "0".repeat(64),
+                    post_exec_capabilities: None,
+                    executable_sha256: Some("0".repeat(64)),
+                    executable_trust: None,
                     stdin_sha256: None,
                 },
                 3600,

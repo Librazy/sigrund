@@ -34,9 +34,20 @@ pub struct Reaper {
     pending: Option<u64>,
     needs_sweep: bool,
     primaries: HashMap<libc::pid_t, (u64, OwnedFd)>,
+    traced: std::collections::HashSet<libc::pid_t>,
+    stops: Vec<ChildExit>,
 }
 
 impl Reaper {
+    pub fn traced(&mut self, pid: libc::pid_t) {
+        self.traced.insert(pid);
+    }
+    pub fn detached(&mut self, pid: libc::pid_t) {
+        self.traced.remove(&pid);
+    }
+    pub fn take_stops(&mut self) -> Vec<ChildExit> {
+        std::mem::take(&mut self.stops)
+    }
     pub fn reserve(&mut self, token: u64) -> bool {
         if self.pending.is_some() || self.needs_sweep {
             return false;
@@ -76,8 +87,21 @@ impl Reaper {
         let pids: Vec<_> = self.primaries.keys().copied().collect();
         for pid in pids {
             let (token, pidfd) = &self.primaries[&pid];
-            match wait(libc::P_PIDFD, pidfd.as_raw_fd() as u32) {
+            match wait(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as u32,
+                self.traced.contains(&pid),
+            ) {
                 Ok(Some(info)) => {
+                    if matches!(info.si_code, libc::CLD_TRAPPED | libc::CLD_STOPPED) {
+                        self.stops.push(ChildExit {
+                            pid,
+                            token: Some(*token),
+                            code: info.si_code,
+                            status: unsafe { info.si_status() },
+                        });
+                        continue;
+                    }
                     exits.push(ChildExit {
                         pid,
                         token: Some(*token),
@@ -85,6 +109,7 @@ impl Reaper {
                         status: unsafe { info.si_status() },
                     });
                     self.primaries.remove(&pid);
+                    self.traced.remove(&pid);
                 }
                 Ok(None) => (),
                 Err(error) => return Err(ReapError { exits, error }),
@@ -97,10 +122,23 @@ impl Reaper {
         // closed until a later dispatch finishes the remaining deferred work.
         self.needs_sweep = true;
         for _ in 0..256 {
-            match wait(libc::P_ALL, 0) {
+            match wait(libc::P_ALL, 0, false) {
                 Ok(Some(info)) => {
                     let pid = unsafe { info.si_pid() };
+                    // ptrace stops can be returned by P_ALL even without
+                    // WSTOPPED. An exec event may arrive between the pidfd
+                    // pass and this sweep: never retire its live owner.
+                    if matches!(info.si_code, libc::CLD_TRAPPED | libc::CLD_STOPPED) {
+                        self.stops.push(ChildExit {
+                            pid,
+                            token: self.primaries.get(&pid).map(|(token, _)| *token),
+                            code: info.si_code,
+                            status: unsafe { info.si_status() },
+                        });
+                        continue;
+                    }
                     let token = self.primaries.remove(&pid).map(|(token, _)| token);
+                    self.traced.remove(&pid);
                     exits.push(ChildExit {
                         pid,
                         token,
@@ -134,10 +172,28 @@ impl Reaper {
         self.needs_sweep
     }
 }
-fn wait(kind: libc::idtype_t, id: libc::id_t) -> io::Result<Option<libc::siginfo_t>> {
+fn wait(
+    kind: libc::idtype_t,
+    id: libc::id_t,
+    stopped: bool,
+) -> io::Result<Option<libc::siginfo_t>> {
     loop {
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        if unsafe { libc::waitid(kind, id, &mut info, libc::WEXITED | libc::WNOHANG) } == 0 {
+        if unsafe {
+            libc::waitid(
+                kind,
+                id,
+                &mut info,
+                libc::WEXITED
+                    | libc::WNOHANG
+                    | if stopped {
+                        libc::WSTOPPED | libc::__WALL
+                    } else {
+                        0
+                    },
+            )
+        } == 0
+        {
             return Ok((unsafe { info.si_pid() } != 0).then_some(info));
         }
         let error = io::Error::last_os_error();

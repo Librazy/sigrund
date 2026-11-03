@@ -64,7 +64,9 @@ fn warrant(f: &Fixture, uid: u32) -> Warrant {
             now: now(),
         },
         SnapshotDigests {
-            executable_sha256: sha256_hex(&fs::read(&f.executable).unwrap()),
+            post_exec_capabilities: None,
+            executable_sha256: Some(sha256_hex(&fs::read(&f.executable).unwrap())),
+            executable_trust: None,
             stdin_sha256: None,
         },
         3600,
@@ -206,7 +208,7 @@ fn namespace_fixture() {
             "capability" => w.execution_context.capabilities = vec!["CAP_SYS_ADMIN".into()],
             "groups" => w.execution_context.supplementary_gids = vec![77],
             "same_uid" => w.execution_context.target_uid = 0,
-            "digest" => w.command.executable_sha256 = "0".repeat(64),
+            "digest" => w.command.executable_sha256 = Some("0".repeat(64)),
             "expired" => {
                 w.policy.not_before = now() - 100;
                 w.policy.not_after = Some(now() - 1);

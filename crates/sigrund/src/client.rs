@@ -698,7 +698,9 @@ mod signed_input_tests {
                 now: 1000,
             },
             SnapshotDigests {
-                executable_sha256: "2".repeat(64),
+                post_exec_capabilities: None,
+                executable_sha256: Some("2".repeat(64)),
+                executable_trust: None,
                 stdin_sha256: hashed_stdin.then(|| "3".repeat(64)),
             },
             3600,

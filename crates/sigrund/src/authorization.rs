@@ -113,17 +113,39 @@ pub(crate) fn verify(
         return Err(policy());
     }
     let snapshots = request.snapshots.as_ref().ok_or_else(policy)?;
-    verify_snapshot(
-        &snapshots.executable,
-        &w.command.executable_sha256,
-        request.policy.max_executable_bytes,
-        true,
-        || request.check(),
-    )
+    if !request
+        .policy
+        .executable_trust_models
+        .contains(&snapshots.executable.model())
+        || !snapshots.executable.matches_command(&w.command)
+    {
+        return Err(policy());
+    }
+    if let Some(sealed) = snapshots.executable.sealed() {
+        verify_snapshot(
+            sealed,
+            w.command.executable_sha256.as_deref().ok_or_else(policy)?,
+            request.policy.max_executable_bytes,
+            true,
+            || request.check(),
+        )
+    } else {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(u64::from(request.policy.direct_digest_timeout_ms));
+        snapshots
+            .executable
+            .verify_direct_checked(&w.execution_context, || {
+                request.check()?;
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                Ok(())
+            })
+    }
     .map_err(|_| {
         Denial::new(
             "EXECUTABLE_MUTATED_OR_TOO_LARGE",
-            "executable snapshot verification failed",
+            "executable evidence verification failed",
         )
     })?;
     match (

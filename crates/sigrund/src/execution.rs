@@ -12,6 +12,36 @@ use std::{
     time::{Duration, Instant},
 };
 
+static TRACE_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn trace_available() -> bool {
+    TRACE_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Called by the coordinator (which consequently owns the ptrace relation).
+pub fn attach_checkpoint(pid: i32, gate: &OwnedFd) -> io::Result<()> {
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_SEIZE,
+            pid,
+            0usize,
+            (libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_EXITKILL) as usize,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::write(gate.as_raw_fd(), b"x".as_ptr().cast(), 1) } != 1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+pub fn release_checkpoint(pid: i32) -> io::Result<()> {
+    if unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0usize, 0usize) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Exact parent-owned storage used by the C-only clone/exec transition.
 /// Pointer tables are built immediately before dispatch and remain live until
 /// clone returns; the child receives independent copies (no CLONE_VM/FILES).
@@ -19,6 +49,7 @@ pub struct PreparedChild {
     argv: Vec<CString>,
     envp: Vec<CString>,
     cwd: CString,
+    direct_path: Option<CString>,
     groups: Vec<u32>,
     uid: u32,
     gid: u32,
@@ -44,12 +75,16 @@ struct ChildSpec {
     groups: *const u32,
     groups_len: usize,
     cwd: *const libc::c_char,
+    direct_path: *const libc::c_char,
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
     mountinfo: *mut u8,
     mountinfo_capacity: usize,
     group_check: *mut u32,
     isolated: i32,
+    gate_read: i32,
+    gate_write: i32,
+    checkpoint: i32,
 }
 unsafe extern "C" {
     fn sigrund_spawn(spec: *const ChildSpec, cgroup: i32, pidfd: *mut i32) -> i32;
@@ -61,6 +96,7 @@ pub struct ChildProcess {
     pub pidfd: OwnedFd,
     pub sync: OwnedFd,
     pub deadline: Instant,
+    pub gate: Option<OwnedFd>,
 }
 
 impl PreparedChild {
@@ -92,6 +128,17 @@ impl PreparedChild {
             envp,
             cwd: CString::new(warrant.command.cwd.as_str())
                 .map_err(|_| io::Error::other("NUL in cwd"))?,
+            direct_path: if warrant.command.executable_trust.is_some()
+                && warrant.execution_context.expected_capabilities().ambient
+                    != warrant.execution_context.capabilities
+            {
+                Some(
+                    CString::new(warrant.command.executable_path.as_str())
+                        .map_err(|_| io::Error::other("NUL in executable path"))?,
+                )
+            } else {
+                None
+            },
             groups: warrant.execution_context.supplementary_gids.clone(),
             uid: warrant.execution_context.target_uid,
             gid: warrant.execution_context.target_gid,
@@ -109,11 +156,25 @@ impl PreparedChild {
     /// checks and after establishing the coordinator's registration barrier.
     /// Startup probes instead run before admission, with no concurrent reaper.
     pub fn spawn(&mut self, cgroup_fd: RawFd, fds: [RawFd; 4]) -> io::Result<ChildProcess> {
-        self.spawn_inner(cgroup_fd, fds)
+        self.spawn_checkpoint(cgroup_fd, fds, false)
     }
 
-    fn spawn_inner(&mut self, cgroup_fd: RawFd, fds: [RawFd; 4]) -> io::Result<ChildProcess> {
+    pub fn spawn_checkpoint(
+        &mut self,
+        cgroup_fd: RawFd,
+        fds: [RawFd; 4],
+        checkpoint: bool,
+    ) -> io::Result<ChildProcess> {
         let (sync, writer) = sync_pipe()?;
+        let gate = if checkpoint {
+            let mut fds = [-1; 2];
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+        } else {
+            None
+        };
         let mut argv: Vec<_> = self.argv.iter().map(|v| v.as_ptr()).collect();
         argv.push(std::ptr::null());
         let mut envp: Vec<_> = self.envp.iter().map(|v| v.as_ptr()).collect();
@@ -132,12 +193,19 @@ impl PreparedChild {
             groups: self.groups.as_ptr(),
             groups_len: self.groups.len(),
             cwd: self.cwd.as_ptr(),
+            direct_path: self
+                .direct_path
+                .as_ref()
+                .map_or(std::ptr::null(), |p| p.as_ptr()),
             argv: argv.as_ptr(),
             envp: envp.as_ptr(),
             mountinfo: self.mountinfo.as_mut_ptr(),
             mountinfo_capacity: self.mountinfo.len(),
             group_check: self.group_check.as_mut_ptr(),
             isolated: i32::from(self.capabilities & (1 << 21) == 0),
+            gate_read: gate.as_ref().map_or(-1, |g| g.0.as_raw_fd()),
+            gate_write: gate.as_ref().map_or(-1, |g| g.1.as_raw_fd()),
+            checkpoint: i32::from(checkpoint),
         };
         let mut pidfd = -1;
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -154,6 +222,7 @@ impl PreparedChild {
             pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
             sync,
             deadline,
+            gate: gate.map(|(_, writer)| writer),
         })
     }
 }
@@ -251,6 +320,7 @@ pub fn classify_sync(bytes: &[u8], eof: bool) -> SyncOutcome {
 /// The child always exits inside its new namespaces; parent mounts are never
 /// modified and no weaker-flags fallback exists.
 pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
+    TRACE_AVAILABLE.store(false, std::sync::atomic::Ordering::Release);
     let id = sigrund_core::crypto::new_uuidv7().to_string();
     let cgroup = layout.create_job(&id, 67_108_864, 0, 32)?;
     // Exercise execveat and the complete credential path, not just namespace
@@ -283,6 +353,7 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
             argv: vec![CString::new("/usr/bin/true").unwrap()],
             envp: vec![],
             cwd: CString::new("/").unwrap(),
+            direct_path: None,
             groups: vec![],
             uid: 0,
             gid: 0,
@@ -292,7 +363,7 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
             mountinfo: vec![0; 1_048_576],
             group_check: vec![],
         };
-        let child = command.spawn(
+        let mut child = command.spawn_checkpoint(
             cgroup.fd(),
             [
                 null.as_raw_fd(),
@@ -300,7 +371,57 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
                 null.as_raw_fd(),
                 executable.as_raw_fd(),
             ],
+            true,
         )?;
+        let gate = child.gate.take().expect("probe gate");
+        let tracing = attach_checkpoint(child.pid, &gate).is_ok();
+        if !tracing {
+            // Unsupported tracing disables the direct models. The ordinary
+            // mandatory startup exec probe must still pass independently.
+            let _ = unsafe { libc::write(gate.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        }
+        drop(gate);
+        if tracing {
+            loop {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        child.pidfd.as_raw_fd() as u32,
+                        &mut info,
+                        libc::WSTOPPED | libc::WNOHANG | libc::__WALL,
+                    )
+                };
+                if result < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if unsafe { info.si_pid() } != 0 {
+                    if info.si_code != libc::CLD_TRAPPED
+                        || unsafe { info.si_status() }
+                            != (libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8))
+                    {
+                        return Err(io::Error::other("unexpected startup trace stop"));
+                    }
+                    release_checkpoint(child.pid)?;
+                    let status = std::fs::read_to_string("/proc/self/status")?;
+                    let can_inspect = status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("CapEff:"))
+                        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                        .is_some_and(|bits| bits & (1 << 19) != 0);
+                    TRACE_AVAILABLE.store(can_inspect, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+                let mut poll = libc::pollfd {
+                    fd: child.pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut poll, 1, 5) } > 0 || Instant::now() >= child.deadline {
+                    break;
+                }
+            }
+        }
         let mut handshake = Handshake::default();
         let outcome = loop {
             if let Some(outcome) =

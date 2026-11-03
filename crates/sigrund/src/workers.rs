@@ -34,6 +34,7 @@ pub(crate) struct ValidatedRequest {
     pub rights: Vec<OwnedFd>,
     pub snapshots: Option<MeasuredSnapshots>,
     pub prepared: Option<crate::preparation::Prepared>,
+    pub pending_preparation: Option<crate::preparation::Pending>,
     pub unsigned_policy_checked: bool,
     pub policy: Arc<DaemonConfig>,
     pub requester_uid: u32,
@@ -42,7 +43,7 @@ pub(crate) struct ValidatedRequest {
     pub cancelled: Arc<AtomicBool>,
 }
 pub(crate) struct MeasuredSnapshots {
-    pub executable: crate::snapshot::SealedSnapshot,
+    pub executable: crate::executable::Executable,
     pub stdin: Option<crate::snapshot::SealedSnapshot>,
 }
 impl ValidatedRequest {
@@ -53,7 +54,11 @@ impl ValidatedRequest {
             return Err(io::ErrorKind::Interrupted.into());
         }
         if self.snapshots.as_ref().is_some_and(|snapshots| {
-            snapshots.executable.digest.bytes > self.policy.max_executable_bytes
+            (snapshots.executable.sealed().is_some()
+                && snapshots.executable.digest.bytes > self.policy.max_executable_bytes)
+                || (snapshots.executable.model()
+                    == sigrund_core::executable::TrustModel::DigestDirect
+                    && snapshots.executable.digest.bytes > self.policy.max_direct_digest_bytes)
                 || snapshots
                     .stdin
                     .as_ref()
@@ -90,6 +95,11 @@ impl RequestLease {
     }
     pub fn request(&self) -> &ValidatedRequest {
         self.request.as_ref().expect("live lease")
+    }
+    pub fn begin_hashing(&mut self, deadline: Instant) {
+        let request = self.request.as_mut().expect("live lease");
+        request.deadline = deadline;
+        request.deadline_active = true;
     }
     pub fn begin_authorization(&mut self) {
         self.request.as_mut().expect("live lease").deadline_active = false;
@@ -269,6 +279,7 @@ fn read_request(
         rights: frame.rights,
         snapshots: None,
         prepared: None,
+        pending_preparation: None,
         unsigned_policy_checked: false,
         policy,
         requester_uid: uid,
@@ -628,7 +639,8 @@ mod tests {
                     request.requester_uid,
                     &request.policy,
                     || request.check(),
-                )?,
+                )?
+                .into(),
                 stdin: None,
             });
             sent.send((std::thread::current().id(), request.rights[0].as_raw_fd()))
@@ -673,6 +685,57 @@ mod tests {
         assert!(seen.try_recv().is_err());
         assert_eq!(budget.usage(1001), (0, 0));
     }
+    #[test]
+    fn expired_hashing_worker_retains_admission_until_actual_completion() {
+        let policy = config();
+        let mut workers = IoWorkers::new(&policy).unwrap();
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let disposal = crate::socket_disposal::SocketDisposal::new().unwrap();
+        let receiver = disposal.reserve().unwrap().socket(receiver.into());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let original = Instant::now() + Duration::from_secs(5);
+        let handle = workers
+            .submit(10, 1001, &receiver, policy.clone(), false, original)
+            .unwrap();
+        send(&mut sender, file.as_raw_fd());
+        let mut request = lease(next(&mut workers));
+        let deadline = Instant::now() + Duration::from_millis(20);
+        request.begin_hashing(deadline);
+        let (entered, seen) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        request.continue_on_worker(move |request| {
+            assert_eq!(request.deadline, deadline);
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            request.check()
+        });
+        seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(workers.reservations.len(), 1);
+        assert!(
+            workers
+                .submit(11, 1001, &receiver, policy, false, original)
+                .is_err()
+        );
+        release.send(()).unwrap();
+        match next(&mut workers) {
+            Completion::Validated { result, .. } => {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut)
+            }
+            _ => panic!("unexpected completion"),
+        }
+        if !workers.reservations.is_empty() {
+            assert!(matches!(next(&mut workers), Completion::Released { .. }));
+        }
+        assert!(workers.reservations.is_empty());
+        drop(handle);
+    }
+
     #[test]
     fn committed_handoff_retains_snapshot_signer_policy_and_quota_on_blocked_stage() {
         use crate::{
@@ -726,7 +789,8 @@ mod tests {
                     1001,
                     &request.policy,
                     || request.check(),
-                )?,
+                )?
+                .into(),
                 stdin: None,
             });
             Ok(())
@@ -743,6 +807,7 @@ mod tests {
                 now: 1,
             },
             SnapshotDigests {
+                post_exec_capabilities: None,
                 executable_sha256: request
                     .request()
                     .snapshots
@@ -751,7 +816,9 @@ mod tests {
                     .executable
                     .digest
                     .sha256
-                    .clone(),
+                    .clone()
+                    .into(),
+                executable_trust: None,
                 stdin_sha256: None,
             },
             3600,

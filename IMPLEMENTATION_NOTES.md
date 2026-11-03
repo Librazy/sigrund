@@ -10,7 +10,7 @@ and acceptance artifacts remain in Git history.
 An unprivileged requester runs `sigrun`; a foreground root approver reviews the
 complete request on its own controlling TTY and signs with an explicitly chosen
 SSH key. The daemon verifies the signature and policy, consumes the one-time
-grant, persists local audit, executes sealed input snapshots, and returns
+grant, persists local audit, executes the retained executable and sealed finite stdin, and returns
 separate stdout/stderr and the primary child's exit status. Pre-signed warrants
 use the same authorization and execution gates without an online approver.
 
@@ -69,7 +69,7 @@ worker/RAM/audit reservation until its owner actually finishes cleanup. Sockets
 are unregistered from epoll before retirement, including when a worker retains
 a duplicate. Unmappable peer credentials reject only that connection.
 
-Executable and stdin snapshots share the same bounded preparation path for
+Executable preparation and stdin snapshots share the same bounded worker path for
 signed and unsigned requests. Root pinning permits mount crossings; executable
 resolution beneath a pinned root uses stricter `openat2` restrictions. Final
 authorization rechecks retained root identity, sealed bytes, policy, validity and
@@ -102,6 +102,50 @@ of state with no partial tail. Failed state publication poisons the writer until
 verified recovery. Retaining `initial_key_hex` enables history verification but
 provides neither forward secrecy after root/state compromise nor protection
 against whole-state rollback without an external checkpoint.
+
+## Executable trust selection
+
+`executable_trust_models` defaults to `["fs_verity", "ctime", "digest_direct",
+"digest_memfd"]`. Selection precedes approval; a signed warrant never switches
+models. Set `["digest_memfd"]` for snapshot-only operation.
+
+Verity binds a kernel-measured descriptor digest. Ctime binds the version of an
+eligible root-managed local ELF. Digest_direct signs a full-file SHA-256 and
+executes the retained source, then hashes again at `PTRACE_EVENT_EXEC` before any
+loader/target instruction. All direct models revalidate execution metadata and
+exact credentials at authorization and at the exec stop. Supported direct files
+preserve `/proc/self/exe` identity and ordinary host v2 file-capability semantics
+within the requested authority ceiling. File-capability transitions use an
+inode-checked alias in the child's private mount namespace; an unavailable or
+replaced path fails closed while the original FD stays pinned. Set-ID files, extended ACLs and noexec
+mounts require fallback; unknown/namespaced/idmapped file capabilities do too.
+
+New direct warrants are v1.2 and sign all five expected post-exec capability
+sets, in addition to the authority ceiling. Unsigned contexts cannot specify
+those derived sets. Legacy v1.0 memfd and v1.1 direct bytes remain valid with
+unchanged implicit profiles; legacy requests never acquire new file-capability
+semantics. See normative Section 2.2.2 for the evidence and credential table.
+
+Direct execution uses no executable snapshot RAM. Verity/ctime may exceed both
+size limits. Digest_direct uses a fixed 64 KiB buffer and its own
+`max_direct_digest_bytes` (256 MiB default, 1 GiB ceiling) and
+`direct_digest_timeout_ms` (5000 default, 30000 ceiling). Original request/setup
+deadlines remain enforced; the coordinator owns the subsequent hashing and
+post-exec verification deadlines. Cancellation is checked between chunks, while
+reservations remain held until actual worker completion. Memfd and hashed stdin
+retain their existing size/RAM limits. Memfd strips file capabilities and exposes
+an execute-only anonymous `/proc/self/exe`; programs relying on reading their
+original executable may require an eligible direct model.
+
+Ctime trusts root maintenance/timestamps; digest_direct requires a supported
+local filesystem's executable write exclusion. None authenticate the dynamic
+loader, libraries, configuration or an LSM transition. Post-commit verification
+failure consumes a one-time warrant without refund. Tracer death before release
+kills the tracee. Successful detach clears tracing state for later SIGSTOP.
+
+The privileged `scripts/verify-trust.py` gates cover ext4 verity (SHA-256/512),
+large direct ELFs, digest mutation, file-capability profiles, `/proc/self/exe`,
+metadata changes during online approval, noexec fallback and tracer death.
 
 ## Operator lab
 

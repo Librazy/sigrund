@@ -153,3 +153,12 @@ runs formatting, Clippy, workspace tests and privileged acceptance on disposable
 Ubuntu VMs. Acceptance exercises actual approval/execution, replay denial,
 cancellation, recovery and service shutdown; ordinary unit tests alone do not
 validate those kernel and service-manager boundaries.
+
+Executable trust models are configurable with `executable_trust_models`, defaulting
+to `["fs_verity", "ctime", "digest_direct", "digest_memfd"]`. Direct models
+execute retained source FDs and verify evidence and credentials at an exec stop,
+preserving `/proc/self/exe` and eligible file capabilities. Digest_direct uses
+bounded streaming SHA-256 with independent size/time limits; verity and ctime
+avoid executable hashing. Other files use digest+sealed memfd. Set
+`["digest_memfd"]` for snapshot-only operation; see the executable trust section
+in [implementation notes](IMPLEMENTATION_NOTES.md) for guarantees and compatibility.

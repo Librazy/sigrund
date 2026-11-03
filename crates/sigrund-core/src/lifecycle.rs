@@ -13,6 +13,8 @@ pub enum Phase {
     Running = 6,
     Cancelled = 7,
     Failed = 8,
+    Releasing = 9,
+    Hashing = 10,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +53,8 @@ impl Lifecycle {
             5 => Phase::Spawning,
             6 => Phase::Running,
             7 => Phase::Cancelled,
+            9 => Phase::Releasing,
+            10 => Phase::Hashing,
             _ => Phase::Failed,
         };
         let decision = match ((word >> 8) & 0xff) as u8 {
@@ -88,10 +92,14 @@ impl Lifecycle {
         if !matches!(
             (from, to),
             (Phase::Snapshotting, Phase::Authorizing)
+                | (Phase::Snapshotting, Phase::Hashing)
+                | (Phase::Hashing, Phase::Authorizing)
                 | (Phase::Authorizing, Phase::Committing)
                 | (Phase::Committing, Phase::Committed)
                 | (Phase::Committed, Phase::Spawning)
                 | (Phase::Spawning, Phase::Running)
+                | (Phase::Running, Phase::Releasing)
+                | (Phase::Releasing, Phase::Running)
         ) {
             return false;
         }
@@ -104,7 +112,7 @@ impl Lifecycle {
             // The executor must finish recording the result of a reserved
             // operation even when cancellation became pending during it.
             if current & CANCELLATION_PENDING != 0
-                && !matches!(from, Phase::Committing | Phase::Spawning)
+                && !matches!(from, Phase::Committing | Phase::Spawning | Phase::Releasing)
             {
                 return false;
             }
@@ -139,7 +147,10 @@ impl Lifecycle {
         if decision == Decision::Undecided || matches!(phase, Phase::Cancelled | Phase::Failed) {
             return false;
         }
-        if matches!(phase, Phase::Committing | Phase::Spawning) {
+        if matches!(
+            phase,
+            Phase::Committing | Phase::Spawning | Phase::Releasing
+        ) {
             if matches!(decision, Decision::Timeout | Decision::NoReply) {
                 // A phase-specific timeout must not cancel a later phase if
                 // completion wins while this callback is waiting to run.
@@ -221,7 +232,10 @@ impl Lifecycle {
             if matches!(phase, Phase::Cancelled | Phase::Failed) {
                 return false;
             }
-            let reserved = matches!(phase, Phase::Committing | Phase::Spawning);
+            let reserved = matches!(
+                phase,
+                Phase::Committing | Phase::Spawning | Phase::Releasing
+            );
             let next = if reserved {
                 current | CANCELLATION_PENDING
             } else {
@@ -264,6 +278,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hashing_has_one_handoff_and_rejects_stale_snapshot_timeouts() {
+        let lifecycle = Lifecycle::new();
+        assert!(lifecycle.transition(Phase::Snapshotting, Phase::Hashing));
+        assert!(!lifecycle.transition(Phase::Snapshotting, Phase::Hashing));
+        assert!(!lifecycle.claim_terminal(Phase::Snapshotting, Decision::Timeout));
+        assert!(lifecycle.transition(Phase::Hashing, Phase::Authorizing));
+        assert!(!lifecycle.claim_terminal(Phase::Hashing, Decision::Timeout));
+        let cancelled = Lifecycle::new();
+        assert!(cancelled.transition(Phase::Snapshotting, Phase::Hashing));
+        assert!(cancelled.cancel());
+        assert!(!cancelled.transition(Phase::Hashing, Phase::Authorizing));
+    }
+
+    #[test]
     fn only_one_terminal_winner() {
         let lifecycle = Lifecycle::new();
         assert!(lifecycle.claim_terminal(Phase::Snapshotting, Decision::Timeout));
@@ -304,6 +332,20 @@ mod tests {
             assert!(lifecycle.cancel());
             assert_eq!(lifecycle.state(), (Phase::Cancelled, Decision::NoReply));
         }
+    }
+
+    #[test]
+    fn exec_release_reservation_reconciles_cancellation() {
+        let lifecycle = Lifecycle::new();
+        advance_to(&lifecycle, Phase::Running);
+        assert!(lifecycle.transition(Phase::Running, Phase::Releasing));
+        assert!(!lifecycle.cancel());
+        assert!(!lifecycle.publish_ready());
+        assert_eq!(lifecycle.state().0, Phase::Releasing);
+        assert!(lifecycle.transition(Phase::Releasing, Phase::Running));
+        assert!(!lifecycle.publish_ready());
+        assert!(lifecycle.cancel());
+        assert_eq!(lifecycle.state().0, Phase::Cancelled);
     }
 
     #[test]

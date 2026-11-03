@@ -468,11 +468,35 @@ impl Connection {
             if !lease.matches_admission(self.peer.uid, &self.policy) {
                 return Err(invalid("request admission mismatch"));
             }
+            if lease.request().pending_preparation.is_some() {
+                if !self
+                    .lifecycle
+                    .transition(Phase::Snapshotting, Phase::Hashing)
+                {
+                    return Err(invalid("stale hash handoff"));
+                }
+                let deadline =
+                    now + Duration::from_millis(u64::from(self.policy.direct_digest_timeout_ms));
+                self.request_deadline = Some(deadline);
+                let mut lease = result.expect("eligible direct source");
+                lease.begin_hashing(deadline);
+                let context = context.clone();
+                let gid = self.peer.gid;
+                lease.continue_on_worker(move |request| {
+                    preparation::hash_and_finish(request, &context, gid)
+                });
+                return Ok(());
+            }
             if let Some(prepared) = lease.prepared() {
                 if self.approval_csr.is_none()
-                    && !self
-                        .lifecycle
-                        .transition(Phase::Snapshotting, Phase::Authorizing)
+                    && !self.lifecycle.transition(
+                        if self.lifecycle.state().0 == Phase::Hashing {
+                            Phase::Hashing
+                        } else {
+                            Phase::Snapshotting
+                        },
+                        Phase::Authorizing,
+                    )
                 {
                     return Err(invalid("stale snapshot handoff"));
                 }
@@ -480,6 +504,7 @@ impl Connection {
                 let _ = log.try_send(serde_json::json!({"event":"SNAPSHOTS_PREPARED", "exec_id":self.exec_id,
                     "root_path":prepared.root_path,"root_device":prepared.root_identity.device,"root_inode":prepared.root_identity.inode,
                     "source_device":prepared.source_identity.device,"source_inode":prepared.source_identity.inode,
+                    "executable_trust_model":lease.request().snapshots.as_ref().map(|s| s.executable.model()),
                     "null_stdin":prepared.null_stdin.is_some()}).to_string());
                 match &prepared.document {
                     Document::Unsigned(csr) => {
@@ -968,7 +993,9 @@ impl ForegroundDaemon {
         drop(logger);
         let _ = log.try_send(
             serde_json::json!({"event":"DAEMON_READY", "host_id":context.host_id,
-            "profile":"local-approval", "local_audit_forward_secure":false})
+            "profile":"local-approval", "local_audit_forward_secure":false,
+            "executable_trust_models":self.config.executable_trust_models,
+            "ctime_checkpoint_available":crate::execution::trace_available()})
             .to_string(),
         );
         let mut connections: HashMap<u64, Connection> = HashMap::new();
@@ -1619,7 +1646,9 @@ mod approval_tests {
                 now: 1000,
             },
             SnapshotDigests {
-                executable_sha256: "0".repeat(64),
+                post_exec_capabilities: None,
+                executable_sha256: Some("0".repeat(64)),
+                executable_trust: None,
                 stdin_sha256: None,
             },
             3600,
