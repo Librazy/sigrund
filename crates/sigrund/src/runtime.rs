@@ -188,6 +188,7 @@ impl Execution {
                                 job.outcome = Some(SyncOutcome::SpawnFailed);
                             }
                         } else {
+                            self.reaper.detached(job.pid.expect("tracee"));
                             job.exec_verified = true;
                         }
                         job.owner = Some(*owner);

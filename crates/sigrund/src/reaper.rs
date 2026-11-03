@@ -42,6 +42,9 @@ impl Reaper {
     pub fn traced(&mut self, pid: libc::pid_t) {
         self.traced.insert(pid);
     }
+    pub fn detached(&mut self, pid: libc::pid_t) {
+        self.traced.remove(&pid);
+    }
     pub fn take_stops(&mut self) -> Vec<ChildExit> {
         std::mem::take(&mut self.stops)
     }

@@ -72,11 +72,12 @@ def denied(f, payload, status='EXECUTABLE_MUTATED_OR_TOO_LARGE'):
     wait_for(f.empty, 'rejected trust job cleanup')
 
 
-def program(f, name='native', large=True):
+def program(f, name='native', large=True, pause=False):
     source = f.base / 'native.c'
-    source.write_text('#include <unistd.h>\n#include <stdio.h>\n#include <fcntl.h>\n'
+    source.write_text('#include <unistd.h>\n#include <stdio.h>\n#include <fcntl.h>\n#include <signal.h>\n'
                       'int main(int argc,char**argv){if(argc>1){int f=open(argv[1],O_WRONLY|O_CREAT,0600);'
-                      'if(f<0)return 91;close(f);}printf("%u\\n",(unsigned)geteuid());return 0;}\n')
+                      'if(f<0)return 91;close(f);}' + ('raise(SIGSTOP);' if pause else '') +
+                      'printf("%u\\n",(unsigned)geteuid());return 0;}\n')
     path = f.commands / name
     subprocess.run(['cc', '-O2', str(source), '-o', str(path)], check=True)
     if large:
@@ -119,6 +120,32 @@ def ctime_gate(parent, binaries):
             records = approved(f, payload, f'{target}\n'.encode())
             assert records[1]['exec_outcome'] == 'exec_event_observed', records
             assert records[0]['executable_trust'] == trust, records
+        # A detached ctime job may suspend normally and resume without being
+        # mistaken for an unexpected ptrace stop by the coordinator.
+        suspend = program(f, 'suspend', large=False, pause=True)
+        marker = f.base / 'suspended'
+        payload, value = csr(f, suspend, args=(marker,))
+        assert value['command']['executable_trust']['model'] == 'ctime'
+        path, _ = f.sign_payload(payload)
+        child, output = request(f, warrant=path)
+        try:
+            wait_for(marker.exists, 'suspend program entry')
+            pids = [int(pid) for group in (f.group / 'jobs').glob('job-*/cgroup.procs')
+                    for pid in group.read_text().split()]
+            assert len(pids) == 1, pids
+            status = Path(f'/proc/{pids[0]}/status')
+            wait_for(lambda: '\nState:\tT (stopped)\n' in status.read_text(), 'ordinary SIGSTOP')
+            time.sleep(0.15)  # Let the coordinator poll the stopped child.
+            assert child.poll() is None and status.exists(), f.diagnostics.read_text()
+            os.kill(pids[0], signal.SIGCONT)
+            code, stdout, stderr, events = finish(child, output)
+            assert code == 0 and stdout == b'0\n', (code, stdout, stderr, events)
+            wait_for(f.empty, 'resumed ctime job cleanup')
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)
+            output.close()
         # A signed legacy digest may not silently use either direct model.
         old, _ = f.signed(native)
         code, out, _, events = finish(*request(f, warrant=old))

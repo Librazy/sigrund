@@ -50,7 +50,7 @@ fn selection_limits_and_cross_thread_exec_checkpoint() {
     let code = dir.path().join("probe.c");
     std::fs::write(
         &code,
-        "#include <unistd.h>\nint main(void){return write(1,\"target-entered\",14)==14?0:1;}\n",
+        "#include <unistd.h>\n#include <signal.h>\nint main(void){raise(SIGSTOP);return write(1,\"target-entered\",14)==14?0:1;}\n",
     )
     .unwrap();
     assert!(
@@ -194,6 +194,34 @@ fn selection_limits_and_cross_thread_exec_checkpoint() {
         .unwrap_err();
     assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
     execution::release_checkpoint(pid).unwrap();
+    reaper.detached(pid);
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as u32,
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        if unsafe { info.si_pid() } != 0 {
+            assert_eq!(info.si_code, libc::CLD_STOPPED);
+            assert_eq!(unsafe { info.si_status() }, libc::SIGSTOP);
+            break;
+        }
+        assert!(Instant::now() < deadline, "normal suspension missing");
+        std::thread::yield_now();
+    }
+    // After detach ordinary suspension must neither retire the child nor
+    // produce a ptrace stop for the coordinator to reject.
+    assert!(reaper.poll().unwrap().is_empty());
+    assert!(reaper.take_stops().is_empty());
+    assert!(reaper.registered_fd(pid).is_some());
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
     loop {
         let exits = reaper.poll().unwrap();
         if !exits.is_empty() {
