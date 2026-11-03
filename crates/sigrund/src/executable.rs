@@ -258,9 +258,9 @@ fn direct_eligible(
     if m.mode() & 0o6000 != 0 || mount.f_flag & libc::ST_NOEXEC != 0 {
         return Ok(false);
     }
-    let execute = if c.target_uid == 0 {
-        m.mode() & 0o111 != 0
-    } else if c.target_uid == m.uid() {
+    // The setup stub sets SECBIT_NOROOT and grants only requested
+    // capabilities, so UID 0 does not imply DAC override.
+    let execute = if c.target_uid == m.uid() {
         m.mode() & 0o100 != 0
     } else if c.target_gid == m.gid() || c.supplementary_gids.contains(&m.gid()) {
         m.mode() & 0o010 != 0

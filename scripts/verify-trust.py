@@ -165,6 +165,12 @@ def ctime_gate(parent, binaries):
         payload, value = csr(f, unsafe)
         assert value['version'] == '1.0' and 'executable_trust' not in value['command']
         approved(f, payload, b'0\n')
+        # UID 0 is capability-stripped and must satisfy its owner execute bit.
+        owner_noexec = program(f, 'owner-noexec', large=False)
+        owner_noexec.chmod(0o655)
+        payload, value = csr(f, owner_noexec)
+        assert value['version'] == '1.0' and 'executable_trust' not in value['command']
+        approved(f, payload, b'0\n')
         # Removing a model rejects outstanding warrants instead of downgrading.
         payload, _ = csr(f, native)
         f.stop()
@@ -319,6 +325,17 @@ def verity_gate(parent, binaries):
         f.launch()
         payload, value = csr(f, small)
         assert value['version'] == '1.0' and 'executable_trust' not in value['command']
+        approved(f, payload, b'0\n')
+        f.stop()
+        subprocess.run(['mount', '-o', 'remount,exec', str(f.commands)], check=True)
+        small.chmod(0o655)
+        f.launch()
+        payload, value = csr(f, small)
+        assert value['version'] == '1.0' and 'executable_trust' not in value['command']
+        approved(f, payload, b'0\n')
+        small.chmod(0o755)
+        payload, value = csr(f, small)
+        assert value['command']['executable_trust']['model'] == 'fs_verity'
         approved(f, payload, b'0\n')
         f.stop()
     finally:

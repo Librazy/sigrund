@@ -395,6 +395,24 @@ fn ctime_namespace_fixture() {
         )
     };
     assert_eq!(select(&cfg).unwrap().model(), TrustModel::Ctime);
+    // UID 0 with no capabilities uses the owner permission class, even if
+    // group and other execute bits are set. Select the working snapshot path.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o655)).unwrap();
+    let fallback = select(&cfg).unwrap();
+    assert_eq!(fallback.model(), TrustModel::DigestMemfd);
+    assert_eq!(
+        std::process::Command::new(format!("/proc/self/fd/{}", fallback.as_fd().as_raw_fd()))
+            .status()
+            .unwrap()
+            .code(),
+        Some(42)
+    );
+    drop(fallback);
+    let mut direct_only = cfg.clone();
+    direct_only.executable_trust_models = vec![TrustModel::Ctime];
+    assert!(select(&direct_only).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(select(&cfg).unwrap().model(), TrustModel::Ctime);
     assert_eq!(
         unsafe {
             libc::mount(

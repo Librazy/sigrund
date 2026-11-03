@@ -427,7 +427,8 @@ never substitute another model, reopen a path or recopy after approval.
 **Common ownership.** Resolve sources using the existing pinned-root `openat2`
 algorithm and hold the same source FD through direct execution. Sources must be
 positive-size regular ELF files. Direct paths accept only sources executable by
-the target's ordinary UID/GID/group permissions, without setuid/setgid bits,
+the target's ordinary UID/GID/group permissions (including UID 0 under
+`SECBIT_NOROOT`), without setuid/setgid bits,
 file capabilities or extended access ACLs, and require an executable source
 mount (no `ST_NOEXEC`). Ineligible direct sources may use the
 memfd path before approval. All source metadata, fixed-size header reads, verity
