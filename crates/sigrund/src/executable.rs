@@ -251,7 +251,11 @@ fn direct_eligible(
     m: &std::fs::Metadata,
     c: &RequestedExecutionContext,
 ) -> io::Result<bool> {
-    if m.mode() & 0o6000 != 0 {
+    let mut mount: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(source.as_raw_fd(), &mut mount) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if m.mode() & 0o6000 != 0 || mount.f_flag & libc::ST_NOEXEC != 0 {
         return Ok(false);
     }
     let execute = if c.target_uid == 0 {

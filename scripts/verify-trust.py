@@ -215,6 +215,30 @@ def mutation_gate(parent, binaries):
         cleanup(f)
 
 
+def noexec_gate(parent, binaries):
+    f = Fixture(parent, binaries, DEFAULT_MODELS)
+    mounted = False
+    try:
+        subprocess.run(['mount', '-t', 'tmpfs', '-o', 'nosuid,nodev,mode=0755', 'tmpfs', str(f.commands)], check=True)
+        mounted = True
+        native = program(f, large=False)
+        configure(f)
+        f.launch()
+        payload, value = csr(f, native)
+        assert value['command']['executable_trust']['model'] == 'ctime'
+        f.stop()
+        subprocess.run(['mount', '-o', 'remount,noexec,nosuid,nodev', str(f.commands)], check=True)
+        f.launch()
+        # Previously signed direct evidence cannot be executed or downgraded.
+        denied(f, payload)
+        payload, value = csr(f, native)
+        assert value['version'] == '1.0' and 'executable_trust' not in value['command']
+        approved(f, payload, b'0\n')
+        f.stop()
+    finally:
+        cleanup(f, mounted)
+
+
 def tracer_death_gate(parent, binaries):
     f = Fixture(parent, binaries, DEFAULT_MODELS)
     gate = child = output = None
@@ -275,6 +299,8 @@ def verity_gate(parent, binaries):
                 assert error.errno == errno.EPERM, error
             else:
                 raise AssertionError('verity file accepted a writer')
+        small = program(f, 'small', large=False)
+        subprocess.run(['fsverity', 'enable', str(small)], check=True)
         configure(f)
         f.launch()
         for algorithm in ['sha256', 'sha512']:
@@ -288,6 +314,12 @@ def verity_gate(parent, binaries):
             payload, value = csr(f, native)
             value['command']['executable_trust']['digest'] = '00' * (32 if algorithm == 'sha256' else 64)
             denied(f, canonical(value))
+        f.stop()
+        subprocess.run(['mount', '-o', 'remount,noexec', str(f.commands)], check=True)
+        f.launch()
+        payload, value = csr(f, small)
+        assert value['version'] == '1.0' and 'executable_trust' not in value['command']
+        approved(f, payload, b'0\n')
         f.stop()
     finally:
         cleanup(f, mounted)
@@ -303,7 +335,7 @@ def main():
         parser.error('run in the dedicated root acceptance service')
     args.artifacts.mkdir(parents=True, exist_ok=True)
     results = []
-    for name, gate in [('ctime', ctime_gate), ('mutation', mutation_gate), ('tracer-death', tracer_death_gate), ('fs-verity', verity_gate)]:
+    for name, gate in [('ctime', ctime_gate), ('mutation', mutation_gate), ('noexec', noexec_gate), ('tracer-death', tracer_death_gate), ('fs-verity', verity_gate)]:
         gate(args.cgroup_parent, args.binaries)
         results.append({'gate': name, 'result': 'passed'})
         print(json.dumps(results[-1]), flush=True)

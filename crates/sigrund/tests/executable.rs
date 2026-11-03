@@ -7,8 +7,8 @@ use std::{
     fs::File,
     io::Write,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::fs::PermissionsExt,
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
     },
     time::{Duration, Instant},
 };
@@ -239,7 +239,7 @@ fn selection_limits_and_cross_thread_exec_checkpoint() {
     let run = std::process::Command::new("timeout")
         .arg("20s")
         .arg("unshare")
-        .args(["--user", "--map-auto", "--map-root-user"])
+        .args(["--user", "--map-auto", "--map-root-user", "--mount"])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--ignored",
@@ -258,14 +258,28 @@ fn selection_limits_and_cross_thread_exec_checkpoint() {
 }
 
 #[test]
-#[ignore = "invoked in a root-mapped namespace"]
+#[ignore = "invoked in a root-mapped mount namespace"]
 fn ctime_namespace_fixture() {
     let mut cfg = config();
     cfg.max_executable_bytes = 4;
     cfg.snapshot_ram_per_uid_bytes = 4;
     cfg.snapshot_ram_global_bytes = 4;
     let budget = SnapshotBudget::default();
-    let dir = tempfile::tempdir_in("/dev/shm").unwrap();
+    // Mount our own executable tmpfs: the system /dev/shm may be noexec.
+    let dir = tempfile::tempdir().unwrap();
+    let mountpoint = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                mountpoint.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
     let path = dir.path().join("large-elf");
     let mut file = File::create(&path).unwrap();
     file.write_all(b"\x7fELF").unwrap();
@@ -349,4 +363,75 @@ fn ctime_namespace_fixture() {
         .unwrap();
     assert!(prepared.verify_direct().is_err());
     assert_eq!(budget.usage(1001), (0, 0));
+
+    // noexec must force fallback before approval, for the same otherwise
+    // ctime-eligible inode. The sealed copy must remain executable.
+    let code = dir.path().join("noexec.c");
+    let path = dir.path().join("noexec-elf");
+    std::fs::write(&code, "int main(void){return 42;}\n").unwrap();
+    assert!(
+        std::process::Command::new("cc")
+            .arg(&code)
+            .arg("-o")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    cfg = config();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let select = |cfg: &DaemonConfig| {
+        executable::prepare(
+            File::open(&path).unwrap(),
+            executable::Selection {
+                signed: None,
+                context: &context(),
+                trace_available: true,
+            },
+            &budget,
+            1001,
+            cfg,
+            || Ok(()),
+        )
+    };
+    assert_eq!(select(&cfg).unwrap().model(), TrustModel::Ctime);
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                mountpoint.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REMOUNT | libc::MS_NOEXEC | libc::MS_NOSUID | libc::MS_NODEV,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        std::process::Command::new(&path)
+            .status()
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EACCES)
+    );
+    let fallback = select(&cfg).unwrap();
+    assert_eq!(fallback.model(), TrustModel::DigestMemfd);
+    assert_eq!(
+        std::process::Command::new(format!("/proc/self/fd/{}", fallback.as_fd().as_raw_fd()))
+            .status()
+            .unwrap()
+            .code(),
+        Some(42)
+    );
+    drop(fallback);
+    cfg.max_executable_bytes = 4;
+    assert!(select(&cfg).is_err());
+    cfg = config();
+    cfg.executable_trust_models = vec![TrustModel::Ctime];
+    assert!(select(&cfg).is_err());
+    assert_eq!(budget.usage(1001), (0, 0));
+    assert_eq!(
+        unsafe { libc::umount2(mountpoint.as_ptr(), libc::MNT_DETACH) },
+        0
+    );
 }

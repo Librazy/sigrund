@@ -428,7 +428,8 @@ never substitute another model, reopen a path or recopy after approval.
 algorithm and hold the same source FD through direct execution. Sources must be
 positive-size regular ELF files. Direct paths accept only sources executable by
 the target's ordinary UID/GID/group permissions, without setuid/setgid bits,
-file capabilities or extended access ACLs. Ineligible direct sources may use the
+file capabilities or extended access ACLs, and require an executable source
+mount (no `ST_NOEXEC`). Ineligible direct sources may use the
 memfd path before approval. All source metadata, fixed-size header reads, verity
 ioctls and final closes run off-loop with the existing worker/owner bounds.
 Direct sources do not reserve executable snapshot RAM and are exempt from both
