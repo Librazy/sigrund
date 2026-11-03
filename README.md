@@ -7,16 +7,27 @@ a root operator reviews it on their own terminal and signs it with an SSH key.
 The daemon verifies the signature and policy, records the authorization,
 executes the command, and returns its output and exit status to the requester.
 
-The implemented MVP supports local interactive approval and offline, pre-signed
-one-time warrants. The broader [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-includes features that are not yet implemented; see [current scope](#current-scope).
+The implemented **v1** MVP supports local interactive approval and offline,
+pre-signed one-time warrants. The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
+now defines the **v2 target**, which is not implemented. V2 introduces
+client-generated full CSRs, private daemon expansion of thin CSRs, and confidential
+authorization outcomes. Thin requests receive only approval or a fixed-deadline
+timeout; their expanded evidence and rejection reasons remain private. Full
+requests additionally permit an explicit rejection after requester-access validation.
 
-## How it works
+V2 retains all four executable trust models and separates durable authorization
+from execution readiness/results. It deliberately breaks old protocol, warrant,
+signature and state formats, with fresh provisioning rather than migration.
+The current binaries do **not** provide these v2 confidentiality guarantees.
+Commands, packages and workflows below describe the current v1 implementation;
+see [implementation status](IMPLEMENTATION_NOTES.md#v2-target-and-implementation-gap).
+
+## How the current implementation works
 
 1. `sigrun` submits the executable, arguments, target credentials and input policy
    over a local Unix socket.
-2. `sigrund` captures sealed executable/input snapshots and prepares the exact
-   request for approval.
+2. `sigrund` selects executable trust evidence, retaining a source FD or sealed
+   snapshot, seals finite input, and prepares the exact request for approval.
 3. `sigrund-approve`, running as root on a controlling TTY, displays the request
    and signs it with the selected SSH identity after confirmation.
 4. `sigrund` checks signature, policy, expiry and revocation, consumes the one-time

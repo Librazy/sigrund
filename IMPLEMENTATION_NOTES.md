@@ -1,9 +1,43 @@
 # sigrun/sigrund implementation notes
 
 The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-is normative. These notes describe the implemented local approval profile,
-operator workflow, test layout and remaining scope. Historical milestone reports
-and acceptance artifacts remain in Git history.
+is the normative **v2 target**. These notes describe the **currently implemented
+v1 runtime**, its runnable operator workflow and tests. V2 is not implemented;
+existing behavior and acceptance results must not be presented as v2 conformance.
+Historical milestone reports and acceptance artifacts remain in Git history.
+
+## V2 target and implementation gap
+
+The specification now requires client-generated full CSRs, a bounded public
+preparation-context endpoint, requester-credential access validation, and private
+daemon expansion of thin CSRs. Signed provenance and canonical intent bind the
+origin, evidence and exact post-exec capability profile across all four trust
+models. Thin expansion is online-only; offline signing uses client-full CSRs.
+
+Thin requests expose only APPROVED or TIMEOUT, with rejection and preparation
+failures hidden until a configurable admission-based deadline. Full CSRs may also
+receive explicit REJECTED after validation. No authorization response returns a
+CSR or detailed reason. APPROVED follows durable authorization and precedes
+execution; readiness and execution results are separate frames. V2 also revises
+hook confidentiality, collector/audit provenance, and late-commit reconciliation.
+
+None of those workflow changes is implemented by this documentation update.
+Current v1 still performs privileged executable preparation before approval and
+returns evidence through TIMEOUT_CSR. It can disclose file existence and metadata
+within configured executable roots. The helper/access and response restrictions
+in v2 must be implemented and tested before claiming that issue resolved.
+
+V2 requires matching new clients, daemon, approver and collector, v2 signature
+domains, and explicitly fresh database/audit state. Old formats fail closed;
+there is no migration or automatic state deletion. The v2-only CLI contracts
+`--full-only`, `--export-csr`, and direct CSR-file PAE preparation described in
+the spec are not supported by current binaries. The recipes below intentionally
+remain v1 recipes and must be replaced when the runtime changes.
+
+The spec's V-01–V-20 matrix is a new acceptance contract. Existing suites cover
+parts of the older runtime; no v2 matrix row is claimed complete here. Hooks,
+PTY, remote collector/ACK, reload, reusable grants and other deferred features
+retain their deferred status despite updated normative contracts.
 
 ## Supported workflow and limits
 
@@ -203,7 +237,7 @@ Approval prints the target UID and returns the child's status. A service-user
 request can add `--target-uid 33 --target-gid 33`; `--stdin sha256` binds piped
 or redirected input. Keep status in its own file and inspect it separately.
 
-For offline signing, stop the approver and capture a fresh `TIMEOUT_CSR` using
+For **current v1 offline signing**, stop the approver and capture a fresh `TIMEOUT_CSR` using
 the requester invocation above. As root, extract and review the exact CSR, sign
 its PAE, and package the envelope:
 
@@ -318,18 +352,19 @@ installation/upgrade/removal tests validate packaging; they do not replace the
 native privileged execution gates. Packages never provision or automatically
 start the daemon, and preserve operator state on removal.
 
-The local workflow covers applicable portions of V-01–V-11, V-13–V-15 and
-V-17–V-19. Full rows remain incomplete wherever they include deferred features;
-V-12/PTY and V-16/hooks are outside this profile. Full v1.0 conformance requires:
+Existing local acceptance covers parts of the historical v1 verification matrix,
+whose original definitions remain in Git history. The normative spec now uses
+a revised v2 matrix; those case numbers must not be used as current pass claims.
+In addition to the v2 workflow changes listed above, the broader target requires:
 
 - PTY transfer, window relaying, terminal cleanup and unrestricted input.
-- Hook execution/fallback and strict deadline/output integration.
+- Trusted hook execution and strict deadline/output/confidentiality integration.
 - Remote TLS collector service, replication/ACK, receipts, durable cursors,
   provisioning anchors and external rollback/checkpoint protection. The
   collector binary currently supplies validation diagnostics only.
 - Policy reload with aggregate generation quotas, scripts/reusable grants,
   OpenPGP/Sigstore adapters and safe administrative revocation tooling.
-- Complete V-01–V-19 end-to-end cases for those integrations and real hardware
+- Complete applicable v2 V-01–V-20 end-to-end cases and real hardware
   signing acceptance before claiming physical security-key support.
 
 Interpreter artifact binding and selectable host/container execution domains
