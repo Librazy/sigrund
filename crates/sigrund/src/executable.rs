@@ -29,6 +29,7 @@ pub struct Executable {
     // Internal version fingerprint is never part of digest_direct signing.
     hash_version: Option<ExecutableTrust>,
     direct_digest_limit: u64,
+    admin_trusted_composefs_mount: Option<u64>,
 }
 impl From<SealedSnapshot> for Executable {
     fn from(sealed: SealedSnapshot) -> Self {
@@ -42,6 +43,7 @@ impl From<SealedSnapshot> for Executable {
             post_exec_capabilities: None,
             hash_version: None,
             direct_digest_limit: 0,
+            admin_trusted_composefs_mount: None,
         }
     }
 }
@@ -55,6 +57,9 @@ impl AsFd for Executable {
     }
 }
 impl Executable {
+    pub fn admin_trusted_composefs(&self) -> bool {
+        self.admin_trusted_composefs_mount.is_some()
+    }
     pub fn matches_command(&self, command: &Command) -> bool {
         command.executable_sha256.is_none() && command.executable_trust == self.trust
     }
@@ -128,11 +133,19 @@ impl Executable {
         let observed = match trust {
             ExecutableTrust::DigestMemfd { .. } => return Err(invalid("not a direct executable")),
             ExecutableTrust::DigestDirect { .. } => {
-                if !local_filesystem(source)? || self.hash_version.is_none() {
+                let eligible = if let Some(id) = self.admin_trusted_composefs_mount {
+                    crate::composefs::eligible(source, &[id])?
+                } else {
+                    local_filesystem(source)?
+                };
+                if !eligible || self.hash_version.is_none() {
                     return Err(invalid("unverified direct digest source"));
                 }
                 let version = ctime(&metadata);
-                if !force_hash && self.hash_version.as_ref() == Some(&version) {
+                if !force_hash
+                    && !self.admin_trusted_composefs()
+                    && self.hash_version.as_ref() == Some(&version)
+                {
                     trust.clone()
                 } else {
                     let sha256 = hash_source(source, self.direct_digest_limit, check)?;
@@ -278,6 +291,11 @@ pub fn prepare(
             &selection,
             config.max_executable_bytes,
             config.max_direct_digest_bytes,
+            if config.digest_direct.allow_admin_trusted_composefs {
+                &config.admin_trusted_composefs_mounts
+            } else {
+                &[]
+            },
         )?
         else {
             continue;
@@ -296,6 +314,12 @@ pub fn prepare(
             if magic != *b"\x7fELF" {
                 return Err(invalid("direct executable is not ELF"));
             }
+            let admin_trusted_composefs_mount =
+                if *model == TrustModel::DigestDirect && !local_filesystem(&source)? {
+                    Some(crate::composefs::mount_id(&source)?)
+                } else {
+                    None
+                };
             let executable = Executable {
                 source: Some(source),
                 sealed: None,
@@ -307,6 +331,7 @@ pub fn prepare(
                 post_exec_capabilities: Some(profile),
                 hash_version: None,
                 direct_digest_limit: config.max_direct_digest_bytes,
+                admin_trusted_composefs_mount,
             };
             let mut context: ExecutionContext = selection.context.clone().into();
             context.post_exec_capabilities = executable.post_exec_capabilities.clone();
@@ -328,6 +353,7 @@ fn inspect_model(
     selection: &Selection<'_>,
     max_memfd: u64,
     max_direct: u64,
+    composefs_mounts: &[u64],
 ) -> io::Result<Option<(ExecutableTrust, CapabilitySets)>> {
     if model == TrustModel::DigestMemfd {
         return Ok((metadata.len() <= max_memfd).then(|| {
@@ -354,7 +380,11 @@ fn inspect_model(
     let trust = match model {
         TrustModel::FsVerity => verity(source)?,
         TrustModel::Ctime if ctime_eligible(source, metadata)? => Some(ctime(metadata)),
-        TrustModel::DigestDirect if local_filesystem(source)? && metadata.len() <= max_direct => {
+        TrustModel::DigestDirect
+            if metadata.len() <= max_direct
+                && (local_filesystem(source)?
+                    || crate::composefs::eligible(source, composefs_mounts)?) =>
+        {
             Some(ExecutableTrust::DigestDirect {
                 sha256: String::new(),
             })
@@ -396,6 +426,7 @@ pub(crate) fn client_evidence(
             &selection,
             public.limits.max_executable_bytes,
             public.limits.max_direct_digest_bytes,
+            &public.features.admin_trusted_composefs_mounts,
         )?
         else {
             continue;
@@ -689,6 +720,138 @@ fn verity(source: &File) -> io::Result<Option<ExecutableTrust>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires real root in a private mount namespace"]
+    fn composefs_rehash_detects_data_changes_hidden_by_metacopy() {
+        use std::{fs, path::PathBuf, process::Command};
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        assert_ne!(
+            fs::metadata("/proc/self/ns/mnt").unwrap().ino(),
+            fs::metadata("/proc/1/ns/mnt").unwrap().ino(),
+            "run under unshare --mount --propagation private"
+        );
+        let base = tempfile::tempdir().unwrap();
+        for dir in ["metadata", "data", "merged"] {
+            fs::create_dir(base.path().join(dir)).unwrap();
+        }
+        let metadata_path = base.path().join("metadata/id");
+        let data_path = base.path().join("data/id");
+        fs::copy("/usr/bin/id", &metadata_path).unwrap();
+        fs::copy("/usr/bin/id", &data_path).unwrap();
+        let metadata = File::open(&metadata_path).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    metadata.as_raw_fd(),
+                    c"trusted.overlay.metacopy".as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    metadata.as_raw_fd(),
+                    c"trusted.overlay.redirect".as_ptr(),
+                    b"/id".as_ptr().cast(),
+                    3,
+                    0,
+                )
+            },
+            0
+        );
+        let mount = base.path().join("merged");
+        assert!(
+            Command::new("mount")
+                .args(["-t", "overlay", "composefs", "-o"])
+                .arg(format!(
+                    "ro,metacopy=on,redirect_dir=on,lowerdir={}::{}",
+                    base.path().join("metadata").display(),
+                    base.path().join("data").display()
+                ))
+                .arg(&mount)
+                .status()
+                .unwrap()
+                .success()
+        );
+        struct Mounted(PathBuf);
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                let _ = Command::new("umount").arg(&self.0).status();
+            }
+        }
+        let _mounted = Mounted(mount.clone());
+        let source = File::open(mount.join("id")).unwrap();
+        let id = crate::composefs::mount_id(&source).unwrap();
+        let text = include_str!("../../../config/sigrund.toml.example").replace(
+            "<strict-padded-base64-32-byte-ed25519-key>",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        );
+        let mut config = DaemonConfig::from_toml(text.as_bytes()).unwrap();
+        config.executable_trust_models = vec![TrustModel::DigestDirect, TrustModel::DigestMemfd];
+        config.admin_trusted_composefs_mounts = vec![id];
+        let context = RequestedExecutionContext {
+            capabilities: vec![],
+            env_exact: Default::default(),
+            caller_env_allowlist: vec![],
+            supplementary_gids: vec![],
+            target_uid: 1000,
+            target_gid: 1000,
+            umask: 0o077,
+        };
+        let make = |cfg: &DaemonConfig| {
+            prepare(
+                source.try_clone().unwrap(),
+                Selection {
+                    signed: None,
+                    context: &context,
+                    trace_available: true,
+                    allow_file_capabilities: false,
+                },
+                &SnapshotBudget::default(),
+                1000,
+                cfg,
+                || Ok(()),
+            )
+            .unwrap()
+        };
+        let mut executable = make(&config);
+        assert_eq!(executable.model(), TrustModel::DigestDirect);
+        assert!(executable.admin_trusted_composefs());
+        executable.finish_digest(|| Ok(())).unwrap();
+        let execution: ExecutionContext = context.clone().into();
+        executable.verify_direct(&execution).unwrap();
+        let version = ctime(&source.metadata().unwrap());
+        let backing = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data_path)
+            .unwrap();
+        let offset = backing.metadata().unwrap().len() - 1;
+        let mut original = [0];
+        backing.read_exact_at(&mut original, offset).unwrap();
+        backing.write_all_at(&[original[0] ^ 1], offset).unwrap();
+        assert_eq!(
+            ctime(&source.metadata().unwrap()),
+            version,
+            "metacopy metadata must conceal the mutation"
+        );
+        assert!(
+            executable
+                .verify_direct(&execution)
+                .unwrap_err()
+                .to_string()
+                .contains("evidence changed")
+        );
+        backing.write_all_at(&original, offset).unwrap();
+        executable.verify_direct(&execution).unwrap();
+        config.digest_direct.allow_admin_trusted_composefs = false;
+        assert_eq!(make(&config).model(), TrustModel::DigestMemfd);
+    }
     #[test]
     fn hashing_checks_cancellation_between_bounded_chunks_and_after_eof() {
         let file = tempfile::tempfile().unwrap();

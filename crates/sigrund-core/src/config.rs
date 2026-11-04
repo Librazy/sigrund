@@ -20,6 +20,11 @@ const MAX_COLLECTOR_TIMEOUT_MS: u32 = 3_000;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
+    #[serde(default)]
+    pub digest_direct: DigestDirectConfig,
+    /// Derived from daemon-side startup inspection, never accepted from TOML.
+    #[serde(skip)]
+    pub admin_trusted_composefs_mounts: Vec<u64>,
     #[serde(default = "crate::executable::default_models")]
     pub executable_trust_models: Vec<crate::executable::TrustModel>,
     /// Presence opts into the roadmap's restricted first executable slice.
@@ -104,6 +109,20 @@ pub struct DaemonConfig {
     pub max_onetime_window_secs: u64,
     #[serde(default = "default_ttl")]
     pub max_ttl_secs: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DigestDirectConfig {
+    pub allow_admin_trusted_composefs: bool,
+}
+
+impl Default for DigestDirectConfig {
+    fn default() -> Self {
+        Self {
+            allow_admin_trusted_composefs: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -281,6 +300,7 @@ impl PolicyStore {
 
 #[derive(Clone, Debug)]
 pub struct CapturedPolicy {
+    pub allow_admin_trusted_composefs: bool,
     pub executable_trust_models: Vec<crate::executable::TrustModel>,
     pub generation: u64,
     pub mvp: Option<MvpProfile>,
@@ -311,6 +331,7 @@ impl PolicyGeneration {
     pub fn capture(&self) -> CapturedPolicy {
         let c = &self.config;
         CapturedPolicy {
+            allow_admin_trusted_composefs: c.digest_direct.allow_admin_trusted_composefs,
             executable_trust_models: c.executable_trust_models.clone(),
             generation: self.number,
             mvp: c.mvp.clone(),
@@ -909,6 +930,8 @@ mod tests {
 
     fn valid() -> DaemonConfig {
         DaemonConfig {
+            digest_direct: DigestDirectConfig::default(),
+            admin_trusted_composefs_mounts: vec![],
             executable_trust_models: crate::executable::default_models(),
             mvp: None,
             allow_same_uid_elevation: false,

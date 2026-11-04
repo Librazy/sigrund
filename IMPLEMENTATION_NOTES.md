@@ -98,6 +98,46 @@ or imports. Jobs execute in the daemon's configured domain; requester namespaces
 are not followed automatically. Cross-container/host routing is unimplemented.
 See [interpreter and execution-domain design notes](docs/INTERPRETERS_AND_EXECUTION_DOMAINS.md).
 
+### Deferred namespace-aware executable evidence
+
+Namespace-aware workflows are not implemented. The requester-access helper
+resolves paths in the daemon's mount namespace using authenticated requester
+credentials; jobs execute in that daemon's domain. Neither follows the
+requester's namespace set. The private mount namespace used for child isolation
+and namespace-root test fixtures do not establish container routing or
+cross-namespace workflow support.
+
+A known ComposeFS limitation occurs when a client sees a cloned mount tree,
+such as `systemd` `PrivateMounts=` or a container exposing the host socket.
+Public context advertises the daemon-enrolled mount ID. A different mount ID
+on the client's executable cannot qualify against that enrollment, so local
+evidence selection can choose `digest_memfd` while daemon-local selection chooses
+`digest_direct`. Unsigned `full_csr` preparation independently chooses the
+daemon's preferred eligible model and rejects evidence that differs from the
+client's CSR before approval. Local full-CSR preparation can succeed in this
+case, so the client's fallback on local preparation errors does not trigger a
+thin request. Cross-namespace snapshot fallback is therefore not guaranteed.
+
+Run the requester in the daemon's execution domain (for example, use host
+execution for a host daemon). For a recognized ComposeFS root, setting
+`[digest_direct].allow_admin_trusted_composefs = false` removes this ComposeFS
+selection difference; `executable_trust_models = ["digest_memfd"]` explicitly
+selects snapshots on both sides. These settings do not implement namespace
+routing or reconcile different executable bytes, credentials or cwd paths.
+
+The namespace-aware implementation must resolve this limitation as part of its
+destination contract. It must bind executable and cwd resolution, requester
+identity and evidence to the verified destination, then reconcile unsigned
+full-CSR model selection there. Any deliberate thin fallback must preserve
+intent and approval provenance; `--full-only` and CSR export must never silently
+request privileged expansion. Already signed warrants must retain their signed
+model and bytes, with no downgrade on a mismatch. Acceptance must cover cloned
+ComposeFS mount trees, `PrivateMounts=`, supported container routes, identical
+paths with different destination bytes, default/full-only/export/thin requests,
+and signed-request rejection without consumption or model switching. This work
+is deferred to namespace-aware workflows; the current evidence checks continue
+to fail closed.
+
 ## Code ownership and security boundaries
 
 | Area | Responsibility |
@@ -157,6 +197,45 @@ against whole-state rollback without an external checkpoint.
 "digest_memfd"]`. Selection precedes approval; a signed warrant never switches
 models. Set `["digest_memfd"]` for snapshot-only operation.
 
+`[digest_direct].allow_admin_trusted_composefs` defaults to `true`; set it to
+`false` to exclude ComposeFS from direct execution. Existing executable-root
+allowlists still apply. At startup the daemon recognizes only the host's booted,
+read-only OSTree ComposeFS root, with one metadata lower and one data-only
+`/sysroot/ostree/repo/objects` layer, no upper/workdir/userxattr, and known mount
+options. Legacy `lowerdir=metadata::data` and newer `lowerdir+=...,datadir+=...`
+representations are supported. Discovery requires the initial UID mapping and
+PID 1's user/mount namespaces. The metadata lower mount is detached by OSTree;
+its displayed path cannot be reopened. This model trusts the administrator's
+boot-created metadata, rather than claiming to measure or authenticate it.
+
+Before enrollment, the daemon checks every data-store ancestor and scans the
+store without following symlinks or crossing mounts. Directories and regular
+objects must be root-owned, without group/other write permissions or extended
+access/default ACLs, on supported local storage. Symlink objects are not data
+sources: OverlayFS data-only lookup rejects symlinks. Inspection is bounded to
+250,000 entries, eight levels, ten seconds and a 4 MiB mount table. Unsupported,
+inaccessible, unprotected or over-budget arrangements remain ineligible; the
+daemon can still serve snapshot requests. The enrolled root and data-store FDs
+remain pinned for the daemon's lifetime. Restart to reevaluate a changed layout.
+
+Clients learn the qualified mount ID through public context; the daemon derives
+its own enrollment and independently checks each retained executable. Mount IDs
+are matched to descriptors, not path prefixes or client assertions. ComposeFS
+executables must remain read-only and root-owned with ordinary metadata and no
+file capabilities. Each request records `admin_trusted_composefs` in the audit;
+online approvals display the administrator-maintenance assumption. The signed
+model remains `digest_direct` with a full-file SHA-256. Preparation,
+pre-consumption and exec-stop checks always hash the entire file; overlay ctime
+never authorizes a cached hash. Existing inode, access and credential checks
+remain in force.
+
+Administrators must preserve backing-object protection and never modify active
+objects in place, including through another writable mount or a privileged job.
+The startup scan does not continuously police administrators or their updates.
+This extension supplies no kernel write exclusion and no protection against a
+privileged writer changing executable pages after the final hash. A read-only
+view alone is insufficient. `ctime` and `fs_verity` eligibility are unchanged.
+
 Verity binds a kernel-measured descriptor digest. Ctime binds the version of an
 eligible root-managed local ELF. Digest_direct signs a full-file SHA-256 and
 executes the retained source, then hashes again at `PTRACE_EVENT_EXEC` before any
@@ -184,8 +263,9 @@ retain their existing size/RAM limits. Memfd strips file capabilities and expose
 an execute-only anonymous `/proc/self/exe`; programs relying on reading their
 original executable may require an eligible direct model.
 
-Ctime trusts root maintenance/timestamps; digest_direct requires a supported
-local filesystem's executable write exclusion. None authenticate the dynamic
+Ctime trusts root maintenance/timestamps; digest_direct uses either a supported
+local filesystem's executable write exclusion or the explicitly documented
+administrator-maintained ComposeFS contract above. None authenticate the dynamic
 loader, libraries, configuration or an LSM transition. Post-commit verification
 failure consumes a one-time warrant without refund. Tracer death before release
 kills the tracee. Successful detach clears tracing state for later SIGSTOP.
@@ -193,6 +273,16 @@ kills the tracee. Successful detach clears tracing state for later SIGSTOP.
 The privileged `scripts/verify-trust.py` gates cover ext4 verity (SHA-256/512),
 large direct ELFs, digest mutation, file-capability profiles, `/proc/self/exe`,
 metadata changes during online approval, noexec fallback and tracer death.
+ComposeFS also has two ignored privileged Rust fixtures: run
+`composefs::tests::privileged_store_protection_and_bounds` and
+`executable::tests::composefs_rehash_detects_data_changes_hidden_by_metacopy`
+from the library test binary as root under
+`unshare --mount --propagation private`, with `--ignored --exact`.
+The latter changes backing bytes while retaining identical metacopy timestamps
+and verifies that pre-consumption hashing detects the change. A native OSTree
+ComposeFS guest additionally exercises real enrollment, client-full and online
+approval, opt-out, backing-store rejection and no downgrade after signing.
+
 
 ## Operator lab
 

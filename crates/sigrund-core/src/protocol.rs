@@ -483,6 +483,12 @@ pub struct ContextLimits {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextFeatures {
+    /// Mount IDs qualified by the daemon in its execution namespace. A client
+    /// mount-ID mismatch cannot qualify ComposeFS direct evidence; differing
+    /// full-CSR evidence is rejected, without guaranteed thin/snapshot fallback.
+    /// Namespace-aware evidence negotiation is deferred; see IMPLEMENTATION_NOTES.md.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admin_trusted_composefs_mounts: Vec<u64>,
     pub direct_exec_checkpoint: bool,
     pub host_file_capabilities: bool,
     pub tty_modes: Vec<String>,

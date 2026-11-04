@@ -62,3 +62,9 @@ max_ttl_secs = 31536000
 # pty_enabled = false
 # max_active_approval_requests = 1
 # approval_signer_id = "mandator-alice-yubikey"
+
+# Defaults to true. Only recognized, administrator-maintained OSTree ComposeFS
+# roots qualify. Active backing objects must remain protected and unchanged.
+# Set false to retain sealed snapshots for ComposeFS executables.
+# [digest_direct]
+# allow_admin_trusted_composefs = false

@@ -179,3 +179,20 @@ bounded streaming SHA-256 with independent size/time limits; verity and ctime
 avoid executable hashing. Other files use digest+sealed memfd. Set
 `["digest_memfd"]` for snapshot-only operation; see the executable trust section
 in [implementation notes](IMPLEMENTATION_NOTES.md) for guarantees and compatibility.
+
+Recognized OSTree ComposeFS roots use `digest_direct` by default after daemon
+startup checks the administrator-protected backing object store. This trusts
+administrators to preserve object protection and never modify active objects in
+place; it does not provide fs-verity or executable write exclusion. Writable
+`usroverlay`, unrecognized overlays and failed eligibility checks retain snapshot
+fallback. To opt out:
+
+```toml
+[digest_direct]
+allow_admin_trusted_composefs = false
+```
+
+The initial adapter supports the booted OSTree ComposeFS root in the host mount
+namespace with its data-only store at `/sysroot/ostree/repo/objects`. It does not
+assume every read-only overlay is ComposeFS. Client, daemon and approver versions
+must match for the new public-context and approval fields.

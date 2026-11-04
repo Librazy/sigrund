@@ -446,6 +446,7 @@ fn authorize(
         "target_uid":w.execution_context.target_uid,"target_gid":w.execution_context.target_gid,
         "executable_sha256":w.command.executable_sha256,
         "executable_trust":w.command.executable_trust,
+        "admin_trusted_composefs":request.snapshots.as_ref().is_some_and(|s| s.executable.admin_trusted_composefs()),
         "capability_authority":w.execution_context.capabilities,
         "post_exec_capabilities":w.execution_context.expected_capabilities(),
         "stdin_sha256":w.command.stdin_sha256,

@@ -87,6 +87,7 @@ pub struct StartupResources {
     pub roots: Vec<fs::File>,
     pub(crate) storage: crate::storage::StoragePressure,
     pub(crate) execution: Option<CgroupLayout>,
+    pub(crate) composefs: Option<crate::composefs::Enrollment>,
     _collector_files: Vec<fs::File>,
     _lock: fs::File,
 }
@@ -278,6 +279,7 @@ impl StartupResources {
         Ok(Self {
             storage,
             execution: None,
+            composefs: None,
             host_id,
             audit,
             store,

@@ -481,6 +481,8 @@ fn public_context(
         || result.policy_generation == 0
         || result.executable_trust_models.is_empty()
         || result.executable_trust_models.len() > 4
+        || result.features.admin_trusted_composefs_mounts.len() > 1
+        || result.features.admin_trusted_composefs_mounts.contains(&0)
         || result
             .executable_trust_models
             .iter()
