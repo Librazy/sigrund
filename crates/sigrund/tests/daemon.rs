@@ -43,6 +43,37 @@ fn read_diagnostic_events(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn daemon_ready(path: &Path) -> bool {
+    read_diagnostic_events(path)
+        .iter()
+        .any(|event| event["event"] == "DAEMON_READY")
+}
+
+#[test]
+fn daemon_readiness_requires_complete_matching_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("diagnostics.jsonl");
+    let record = "{\"event\":\"DAEMON_READY\",\"detail\":\"λ\"}\n";
+    let split_utf8 = record.find('λ').unwrap() + 1;
+    fs::write(&path, &record.as_bytes()[..split_utf8]).unwrap();
+    assert!(!daemon_ready(&path));
+
+    fs::write(
+        &path,
+        b"{\"event\":\"OTHER\",\"detail\":\"DAEMON_READY\"}\n",
+    )
+    .unwrap();
+    assert!(!daemon_ready(&path));
+    let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+    for byte in record.bytes() {
+        writer.write_all(&[byte]).unwrap();
+        assert_eq!(daemon_ready(&path), byte == b'\n');
+    }
+    // An unfinished later record must not hide an already completed ready event.
+    writer.write_all(b"{\"detail\":\"\xce").unwrap();
+    assert!(daemon_ready(&path));
+}
+
 #[test]
 fn diagnostic_reader_waits_for_complete_records() {
     let directory = tempfile::tempdir().unwrap();
@@ -352,11 +383,9 @@ impl Fixture {
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
                 "daemon exited: {}",
-                fs::read_to_string(&self.diagnostics).unwrap()
+                String::from_utf8_lossy(&fs::read(&self.diagnostics).unwrap())
             );
-            fs::read_to_string(&self.diagnostics)
-                .unwrap()
-                .contains("DAEMON_READY")
+            daemon_ready(&self.diagnostics)
         });
         daemon
     }

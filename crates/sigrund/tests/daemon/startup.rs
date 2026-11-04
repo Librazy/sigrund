@@ -211,11 +211,9 @@ pub(super) fn verify_audit_directory_replacement() {
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
                 "{}",
-                fs::read_to_string(&fixture.diagnostics).unwrap()
+                String::from_utf8_lossy(&fs::read(&fixture.diagnostics).unwrap())
             );
-            fs::read_to_string(&fixture.diagnostics)
-                .unwrap()
-                .contains("DAEMON_READY")
+            daemon_ready(&fixture.diagnostics)
         });
         fixture.peer(65534, "client");
         daemon.stop();
