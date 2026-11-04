@@ -101,14 +101,13 @@ fn root_mount(line: &str) -> Option<u64> {
                     if data.replace(value).is_some() {
                         return None;
                     }
-                } else if let Some(value) = option.strip_prefix("lowerdir=") {
+                } else {
+                    // Reject rw, upperdir, workdir, userxattr and unknown options.
+                    let value = option.strip_prefix("lowerdir=")?;
                     let (l, d) = value.split_once("::")?;
                     if lower.replace(l).is_some() || data.replace(d).is_some() {
                         return None;
                     }
-                } else {
-                    // Includes rw, upperdir, workdir, userxattr and unknown options.
-                    return None;
                 }
             }
         }
