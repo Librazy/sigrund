@@ -19,12 +19,13 @@ SHARED = runpy.run_path(str(Path(__file__).with_name('verify-runtime.py')))
 Gate = SHARED['Gate']
 canonical, wait_for, unprivileged = SHARED['canonical'], SHARED['wait_for'], SHARED['unprivileged']
 DEFAULT_MODELS = ['fs_verity', 'ctime', 'digest_direct', 'digest_memfd']
+SNAPSHOT_MAX_BYTES = 1_048_576
 
 
 class Fixture(SHARED['Fixture']):
     def __init__(self, parent, binaries, models=None):
-        # Large direct-digest fixtures exercise the independent five-second
-        # hashing budget; the confidentiality fixture's 2.5s deadline is shorter.
+        # Allow the independent five-second direct hashing budget within the
+        # authorization deadline; the confidentiality fixture uses only 2.5s.
         super().__init__(parent, binaries, models, authorization_timeout_ms=8000)
         config = self.base / 'config'
         # Repeated offline exports intentionally cross the production context
@@ -86,7 +87,7 @@ def denied(f, payload, status='EXECUTABLE_MUTATED_OR_TOO_LARGE'):
     wait_for(f.empty, 'rejected trust job cleanup')
 
 
-def program(f, name='native', large=True, pause=False):
+def program(f, name='native', size=67_108_865, pause=False):
     source = f.base / 'native.c'
     source.write_text('#include <unistd.h>\n#include <stdio.h>\n#include <fcntl.h>\n#include <signal.h>\n'
                       'int main(int argc,char**argv){if(argc>1){int f=open(argv[1],O_WRONLY|O_CREAT,0600);'
@@ -94,16 +95,20 @@ def program(f, name='native', large=True, pause=False):
                       'printf("%u\\n",(unsigned)geteuid());return 0;}\n')
     path = f.commands / name
     subprocess.run(['cc', '-O2', str(source), '-o', str(path)], check=True)
-    if large:
+    if size is not None:
+        assert path.stat().st_size <= size, ('compiled ELF exceeds requested fixture size', path, size)
         with path.open('r+b') as output:
-            output.truncate(67_108_865)
+            output.truncate(size)
     path.chmod(0o755)
     return path
 
 
 def configure(f, models=None):
     path = f.base / 'config'
-    text = path.read_text().replace('max_executable_bytes = 67108864', 'max_executable_bytes = 65536')
+    # Native ARM64 ELFs can exceed 64 KiB even before padding. Keep ordinary
+    # fallback programs within the snapshot limit on every tested architecture.
+    text = path.read_text().replace('max_executable_bytes = 67108864',
+                                    f'max_executable_bytes = {SNAPSHOT_MAX_BYTES}')
     if models is not None:
         text = text.replace('executable_trust_models = ' + json.dumps(DEFAULT_MODELS),
                             'executable_trust_models = ' + json.dumps(models))
@@ -136,7 +141,7 @@ def ctime_gate(parent, binaries):
             assert records[0]['executable_trust'] == trust, records
         # A detached ctime job may suspend normally and resume without being
         # mistaken for an unexpected ptrace stop by the coordinator.
-        suspend = program(f, 'suspend', large=False, pause=True)
+        suspend = program(f, 'suspend', size=None, pause=True)
         marker = f.base / 'suspended'
         payload, value = csr(f, suspend, args=(marker,))
         assert value['command']['executable_trust']['model'] == 'ctime'
@@ -174,13 +179,13 @@ def ctime_gate(parent, binaries):
             denied(f, payload, 'SPAWN_FAILED')
         assert not marker.exists()
         # Unsafe permissions fall through to the original snapshot path.
-        unsafe = program(f, 'unsafe', large=False)
+        unsafe = program(f, 'unsafe', size=None)
         unsafe.chmod(0o777)
         payload, value = csr(f, unsafe)
         assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_direct'
         approved(f, payload, b'0\n')
         # UID 0 is capability-stripped and must satisfy its owner execute bit.
-        owner_noexec = program(f, 'owner-noexec', large=False)
+        owner_noexec = program(f, 'owner-noexec', size=None)
         owner_noexec.chmod(0o655)
         payload, value = csr(f, owner_noexec)
         assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
@@ -239,7 +244,9 @@ def digest_direct_gate(parent, binaries):
     f = Fixture(parent, binaries, ['digest_direct', 'digest_memfd'])
     gate = child = output = None
     try:
-        native = program(f)
+        # Exceed the configured snapshot bound without turning this model
+        # selection test into a debug-build SHA-256 throughput requirement.
+        native = program(f, size=SNAPSHOT_MAX_BYTES + 1)
         native.chmod(0o777)
         os.chown(native, 65534, 65534)
         configure(f)
@@ -282,7 +289,7 @@ def digest_direct_gate(parent, binaries):
         config = f.base / 'config'
         config.write_text(config.read_text().replace('max_direct_digest_bytes = 268435456', 'max_direct_digest_bytes = 4'))
         f.launch()
-        small = program(f, 'small', large=False)
+        small = program(f, 'small', size=None)
         payload, value = csr(f, small)
         assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
         approved(f, payload, b'0\n')
@@ -340,7 +347,7 @@ def file_capabilities_gate(parent, binaries):
         gate.arm()
         child, output = request(f, warrant=path)
         gate.arrive()
-        replacement = program(f, 'replacement', large=False)
+        replacement = program(f, 'replacement', size=None)
         os.replace(replacement, native)
         gate.unblock()
         code, out, err, events = finish(child, output)
@@ -409,7 +416,7 @@ def noexec_gate(parent, binaries):
     try:
         subprocess.run(['mount', '-t', 'tmpfs', '-o', 'nosuid,nodev,mode=0755', 'tmpfs', str(f.commands)], check=True)
         mounted = True
-        native = program(f, large=False)
+        native = program(f, size=None)
         configure(f)
         f.launch()
         payload, value = csr(f, native)
@@ -487,7 +494,7 @@ def verity_gate(parent, binaries):
                 assert error.errno == errno.EPERM, error
             else:
                 raise AssertionError('verity file accepted a writer')
-        small = program(f, 'small', large=False)
+        small = program(f, 'small', size=None)
         subprocess.run(['fsverity', 'enable', str(small)], check=True)
         configure(f)
         f.launch()
