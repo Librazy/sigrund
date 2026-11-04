@@ -98,6 +98,46 @@ or imports. Jobs execute in the daemon's configured domain; requester namespaces
 are not followed automatically. Cross-container/host routing is unimplemented.
 See [interpreter and execution-domain design notes](docs/INTERPRETERS_AND_EXECUTION_DOMAINS.md).
 
+### Deferred namespace-aware executable evidence
+
+Namespace-aware workflows are not implemented. The requester-access helper
+resolves paths in the daemon's mount namespace using authenticated requester
+credentials; jobs execute in that daemon's domain. Neither follows the
+requester's namespace set. The private mount namespace used for child isolation
+and namespace-root test fixtures do not establish container routing or
+cross-namespace workflow support.
+
+A known ComposeFS limitation occurs when a client sees a cloned mount tree,
+such as `systemd` `PrivateMounts=` or a container exposing the host socket.
+Public context advertises the daemon-enrolled mount ID. A different mount ID
+on the client's executable cannot qualify against that enrollment, so local
+evidence selection can choose `digest_memfd` while daemon-local selection chooses
+`digest_direct`. Unsigned `full_csr` preparation independently chooses the
+daemon's preferred eligible model and rejects evidence that differs from the
+client's CSR before approval. Local full-CSR preparation can succeed in this
+case, so the client's fallback on local preparation errors does not trigger a
+thin request. Cross-namespace snapshot fallback is therefore not guaranteed.
+
+Run the requester in the daemon's execution domain (for example, use host
+execution for a host daemon). For a recognized ComposeFS root, setting
+`[digest_direct].allow_admin_trusted_composefs = false` removes this ComposeFS
+selection difference; `executable_trust_models = ["digest_memfd"]` explicitly
+selects snapshots on both sides. These settings do not implement namespace
+routing or reconcile different executable bytes, credentials or cwd paths.
+
+The namespace-aware implementation must resolve this limitation as part of its
+destination contract. It must bind executable and cwd resolution, requester
+identity and evidence to the verified destination, then reconcile unsigned
+full-CSR model selection there. Any deliberate thin fallback must preserve
+intent and approval provenance; `--full-only` and CSR export must never silently
+request privileged expansion. Already signed warrants must retain their signed
+model and bytes, with no downgrade on a mismatch. Acceptance must cover cloned
+ComposeFS mount trees, `PrivateMounts=`, supported container routes, identical
+paths with different destination bytes, default/full-only/export/thin requests,
+and signed-request rejection without consumption or model switching. This work
+is deferred to namespace-aware workflows; the current evidence checks continue
+to fail closed.
+
 ## Code ownership and security boundaries
 
 | Area | Responsibility |
