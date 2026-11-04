@@ -230,23 +230,10 @@ impl StartupResources {
                 Err(error) => return Err(error),
             }
         }
-        let store = StateStore::open_in_directory(state_directory.try_clone()?)
-            .map_err(|e| invalid(format!("database startup failed: {e}")))?;
-        state_directory.sync_all()?;
-        let storage = crate::storage::StoragePressure::new(
-            log_file.try_clone()?,
-            vec![log_directory, state_directory.try_clone()?],
-        );
-        let audit = AuditLog::from_verified_files(
-            log_file,
-            state_file,
-            state_directory.try_clone()?,
-            state_name,
-            Some(&host_id),
-        )
-        .map_err(|e| invalid(format!("audit recovery failed: {e}")))?;
-        // All state entry access stays relative to the checked directory,
-        // including stale temporary cleanup and future state publication.
+        // Recovery may publish secret ratchet state through this temporary
+        // pathname. Validate and unlink any stale inode before recovery can
+        // reuse it, keeping all access relative to the checked directory.
+        // Version checks and the exclusive instance lock must precede cleanup.
         match openat2_file(
             state_directory.as_raw_fd(),
             Path::new("audit_ratchet.state.tmp"),
@@ -268,6 +255,21 @@ impl StartupResources {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        let store = StateStore::open_in_directory(state_directory.try_clone()?)
+            .map_err(|e| invalid(format!("database startup failed: {e}")))?;
+        state_directory.sync_all()?;
+        let storage = crate::storage::StoragePressure::new(
+            log_file.try_clone()?,
+            vec![log_directory, state_directory.try_clone()?],
+        );
+        let audit = AuditLog::from_verified_files(
+            log_file,
+            state_file,
+            state_directory.try_clone()?,
+            state_name,
+            Some(&host_id),
+        )
+        .map_err(|e| invalid(format!("audit recovery failed: {e}")))?;
         if !storage.check(config)? {
             return Err(invalid(
                 "audit storage pressure; remediation and restart required",

@@ -111,6 +111,40 @@ pub(super) fn verify_provisioning_permissions() {
     }
 }
 
+fn append_recovery_tail(fixture: &Fixture, recovery: &str) -> serde_json::Value {
+    let state_path = fixture.state.join("audit_ratchet.state");
+    let state_bytes = fs::read(&state_path).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&state_bytes).unwrap();
+    let genesis: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&fixture.log)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut log = OpenOptions::new().append(true).open(&fixture.log).unwrap();
+    if recovery == "partial" {
+        log.write_all(b"partial").unwrap();
+    } else {
+        let mut key = [0; 32];
+        let hex = state["key_hex"].as_str().unwrap();
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        let mut record = serde_json::json!({"schema_version":2,"event_type":"TEST_CRASH_WINDOW",
+            "host_id":genesis["host_id"],"seq":state["seq"],
+            "prev_record_sha256":state["last_record_sha256"]});
+        record["entry_hmac"] = entry_hmac(&key, &serde_json::to_vec(&record).unwrap()).into();
+        log.write_all(&serde_json::to_vec(&record).unwrap())
+            .unwrap();
+        log.write_all(b"\n").unwrap();
+    }
+    log.sync_all().unwrap();
+    drop(log);
+    genesis
+}
+
 // Pause startup after audit-file verification, then replace both directory
 // pathnames. Recovery must use the already checked descriptors, including
 // publication of the advanced state and its authenticated recovery record.
@@ -118,35 +152,7 @@ pub(super) fn verify_audit_directory_replacement() {
     for recovery in ["partial", "forward"] {
         let fixture = Fixture::new();
         let state_path = fixture.state.join("audit_ratchet.state");
-        let state_bytes = fs::read(&state_path).unwrap();
-        let state: serde_json::Value = serde_json::from_slice(&state_bytes).unwrap();
-        let genesis: serde_json::Value = serde_json::from_str(
-            fs::read_to_string(&fixture.log)
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        let mut log = OpenOptions::new().append(true).open(&fixture.log).unwrap();
-        if recovery == "partial" {
-            log.write_all(b"partial").unwrap();
-        } else {
-            let mut key = [0; 32];
-            let hex = state["key_hex"].as_str().unwrap();
-            for (index, byte) in key.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
-            }
-            let mut record = serde_json::json!({"schema_version":2,"event_type":"TEST_CRASH_WINDOW",
-                "host_id":genesis["host_id"],"seq":state["seq"],
-                "prev_record_sha256":state["last_record_sha256"]});
-            record["entry_hmac"] = entry_hmac(&key, &serde_json::to_vec(&record).unwrap()).into();
-            log.write_all(&serde_json::to_vec(&record).unwrap())
-                .unwrap();
-            log.write_all(b"\n").unwrap();
-        }
-        log.sync_all().unwrap();
-        drop(log);
+        let genesis = append_recovery_tail(&fixture, recovery);
         let interposer = fixture.directory.path().join("startup_gate.so");
         assert!(
             Command::new("cc")
@@ -234,5 +240,99 @@ pub(super) fn verify_audit_directory_replacement() {
         )
         .unwrap();
         assert_eq!(audit.state().seq, if recovery == "partial" { 3 } else { 4 });
+    }
+}
+
+#[test]
+fn stale_audit_temporary_gate() {
+    let _gate = NAMESPACE_GATE.lock().unwrap();
+    let output = Command::new("unshare")
+        .args(["--user", "--map-auto", "--map-root-user"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "startup::stale_audit_temporary_namespace_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SIGRUND_STARTUP_NAMESPACE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "invoked by the startup namespace gate"]
+fn stale_audit_temporary_namespace_fixture() {
+    assert_eq!(std::env::var("SIGRUND_STARTUP_NAMESPACE").unwrap(), "1");
+    for recovery in ["partial", "forward"] {
+        for (uid, gid, mode) in [(65534, 0, 0o600), (0, 65534, 0o600), (0, 0, 0o644)] {
+            let fixture = Fixture::new();
+            append_recovery_tail(&fixture, recovery);
+            let state_path = fixture.state.join("audit_ratchet.state");
+            let temporary = fixture.state.join("audit_ratchet.state.tmp");
+            fs::write(&temporary, b"untrusted stale temporary sentinel").unwrap();
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(mode)).unwrap();
+            std::os::unix::fs::chown(&temporary, Some(uid), Some(gid)).unwrap();
+            let retained = File::open(&temporary).unwrap();
+            let metadata = retained.metadata().unwrap();
+            let state_before = fs::read(&state_path).unwrap();
+            let log_before = fs::read(&fixture.log).unwrap();
+            let config =
+                sigrund_core::config::DaemonConfig::from_toml(&fs::read(&fixture.config).unwrap())
+                    .unwrap();
+            let result =
+                sigrund::startup::StartupResources::prepare(&config, &fixture.state, &fixture.log);
+            let error = match result {
+                Ok(_) => {
+                    panic!("{recovery}: accepted stale audit temporary file {uid}:{gid} {mode:o}")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(fs::read(&state_path).unwrap(), state_before);
+            assert_eq!(fs::read(&fixture.log).unwrap(), log_before);
+            assert_eq!(
+                fs::read(&temporary).unwrap(),
+                b"untrusted stale temporary sentinel"
+            );
+            let mut bytes = Vec::new();
+            (&retained).read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"untrusted stale temporary sentinel");
+            let after = fs::metadata(&temporary).unwrap();
+            assert_eq!(
+                (after.ino(), after.uid(), after.gid(), after.mode()),
+                (
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.mode()
+                )
+            );
+        }
+        // Even a trusted stale inode must be unlinked before recovery writes
+        // secret state: an already open descriptor must retain only its sentinel.
+        let fixture = Fixture::new();
+        append_recovery_tail(&fixture, recovery);
+        let temporary = fixture.state.join("audit_ratchet.state.tmp");
+        fs::write(&temporary, b"trusted stale temporary sentinel").unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut retained = File::open(&temporary).unwrap();
+        fixture.launch().stop();
+        let mut bytes = Vec::new();
+        retained.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"trusted stale temporary sentinel");
+        assert!(!temporary.exists());
+        let state = fs::metadata(fixture.state.join("audit_ratchet.state")).unwrap();
+        assert_eq!(
+            (state.uid(), state.gid(), state.mode() & 0o777),
+            (0, 0, 0o600)
+        );
+        assert_ne!(state.ino(), retained.metadata().unwrap().ino());
     }
 }
