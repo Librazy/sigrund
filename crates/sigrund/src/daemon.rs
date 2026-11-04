@@ -355,6 +355,20 @@ impl Connection {
         self.respond(status, message, None, now)
     }
 
+    fn timeout_after_commit(&mut self, epoll: RawFd, now: Instant) -> io::Result<()> {
+        self.reject("REQUEST_TIMEOUT", "authorization delivery expired", now)?;
+        // A completion can beat the expiry sweep. Authorization had disabled
+        // writes, so arm the queued decision before its send deadline takes over.
+        register(
+            epoll,
+            libc::EPOLL_CTL_MOD,
+            self.fd.as_raw_fd(),
+            self.token,
+            self.output.is_some(),
+            false,
+        )
+    }
+
     fn respond(
         &mut self,
         status: &str,
@@ -1262,11 +1276,7 @@ impl ForegroundDaemon {
                                                 records:vec![("AUTH_ABORTED_POST_COMMIT",fields)],
                                                 limit:c.policy.audit_record_max_bytes as usize, owner:None})
                                                 .map_err(|_|invalid("reserved reconciliation capacity unavailable"))?;
-                                            c.reject(
-                                                "REQUEST_TIMEOUT",
-                                                "authorization delivery expired",
-                                                now,
-                                            )?;
+                                            c.timeout_after_commit(epoll.as_raw_fd(), now)?;
                                         }
                                     } else {
                                         abort_delivery(job, &sequencer.sender());
@@ -1874,7 +1884,7 @@ mod approval_tests {
         let (log, _logs) = sync_channel(16);
         let mut workers = IoWorkers::new(&config).unwrap();
         let disposal = SocketDisposal::new().unwrap();
-        for completion_first in [true, false] {
+        for case in ["validation", "timer", "commit"] {
             let (socket, mut peer) = UnixStream::pair().unwrap();
             socket.set_nonblocking(true).unwrap();
             let fd = disposal.reserve().unwrap().socket(socket.into());
@@ -1922,7 +1932,44 @@ mod approval_tests {
                 approval_reusable: false,
             };
             let now = deadline + Duration::from_millis(1);
-            if completion_first {
+            if case == "commit" {
+                assert!(
+                    connection
+                        .lifecycle
+                        .transition(Phase::Authorizing, Phase::Committing)
+                );
+                assert!(
+                    connection
+                        .lifecycle
+                        .transition(Phase::Committing, Phase::Committed)
+                );
+                connection.lifecycle.silence();
+                let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+                assert!(raw >= 0);
+                let epoll = unsafe { OwnedFd::from_raw_fd(raw) };
+                register(
+                    epoll.as_raw_fd(),
+                    libc::EPOLL_CTL_ADD,
+                    connection.fd.as_raw_fd(),
+                    42,
+                    false,
+                    false,
+                )
+                .unwrap();
+                let mut event: libc::epoll_event = unsafe { zeroed() };
+                assert_eq!(
+                    unsafe { libc::epoll_wait(epoll.as_raw_fd(), &mut event, 1, 0) },
+                    0
+                );
+                connection
+                    .timeout_after_commit(epoll.as_raw_fd(), now)
+                    .unwrap();
+                assert_eq!(
+                    unsafe { libc::epoll_wait(epoll.as_raw_fd(), &mut event, 1, 100) },
+                    1
+                );
+                assert_ne!(event.events & libc::EPOLLOUT as u32, 0);
+            } else if case == "validation" {
                 connection
                     .finish_validation(
                         Err(invalid("late result")),
