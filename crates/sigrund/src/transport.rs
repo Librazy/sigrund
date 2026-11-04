@@ -67,7 +67,8 @@ pub fn peer_groups(fd: RawFd) -> io::Result<Vec<u32>> {
     {
         return Err(io::Error::last_os_error());
     }
-    if length as usize % size_of::<u32>() != 0 || length as usize > groups.len() * size_of::<u32>()
+    if !(length as usize).is_multiple_of(size_of::<u32>())
+        || length as usize > groups.len() * size_of::<u32>()
     {
         return Err(invalid("invalid SO_PEERGROUPS"));
     }

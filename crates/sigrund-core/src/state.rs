@@ -347,7 +347,7 @@ fn hex_digest(text: &str) -> Result<[u8; 32]> {
         return Err(CoreError::Value("invalid intent digest".into()));
     }
     let mut bytes = [0; 32];
-    for (i, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
     }
     Ok(bytes)
