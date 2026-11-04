@@ -93,53 +93,62 @@ impl ChildExit {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Decision {
-    pub csr_payload: Option<String>,
     pub exec_id: String,
-    pub message: String,
     pub status: String,
 }
-
 impl Decision {
     pub fn validate(&self) -> Result<()> {
-        const STATUSES: &[&str] = &[
-            "READY_TO_EXEC",
-            "REJECTED",
-            "TIMEOUT_CSR",
-            "INVALID_REQUEST",
-            "INVALID_TTY_STDIN_COMBINATION",
-            "POLICY_VIOLATION",
-            "EXPIRED_OR_NOT_YET_VALID",
-            "REVOKED",
-            "REPLAY_DETECTED",
-            "EXECUTABLE_MUTATED_OR_TOO_LARGE",
-            "STDIN_HASH_MISMATCH",
-            "REMOTE_AUDIT_FAILED",
-            "REQUEST_TIMEOUT",
-            "RESOURCE_EXHAUSTED",
-            "SPAWN_FAILED",
-        ];
-        if !STATUSES.contains(&self.status.as_str()) || self.message.len() > 4096 {
-            return Err(CoreError::Protocol(
-                "invalid authorization decision bounds".into(),
-            ));
-        }
         validate_uuidv7(&self.exec_id)?;
-        if self.status == "TIMEOUT_CSR" {
-            if self
-                .csr_payload
-                .as_ref()
-                .is_none_or(|payload| payload.len() > 65_536)
-            {
-                return Err(CoreError::Protocol(
-                    "TIMEOUT_CSR requires bounded csr_payload".into(),
-                ));
-            }
-        } else if self.csr_payload.is_some() {
-            return Err(CoreError::Protocol(
-                "csr_payload is only valid for TIMEOUT_CSR".into(),
-            ));
+        if !matches!(self.status.as_str(), "APPROVED" | "REJECTED" | "TIMEOUT") {
+            return Err(CoreError::Protocol("invalid authorization status".into()));
         }
         Ok(())
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecReady {
+    pub exec_id: String,
+    pub exec_outcome: String,
+}
+impl ExecReady {
+    pub fn validate(&self) -> Result<()> {
+        validate_uuidv7(&self.exec_id)?;
+        if !matches!(
+            self.exec_outcome.as_str(),
+            "unknown" | "exec_event_observed"
+        ) {
+            return Err(CoreError::Protocol("invalid exec outcome".into()));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecResult {
+    pub exec_id: String,
+    pub status: String,
+    #[serde(deserialize_with = "crate::warrant::required_nullable")]
+    pub exit_code: Option<u8>,
+    #[serde(deserialize_with = "crate::warrant::required_nullable")]
+    pub signal: Option<u8>,
+}
+impl ExecResult {
+    pub fn validate(&self) -> Result<()> {
+        validate_uuidv7(&self.exec_id)?;
+        match self.status.as_str() {
+            "EXITED" => ChildExit {
+                exit_code: self.exit_code,
+                signal: self.signal,
+            }
+            .validate(),
+            "SETUP_FAILED" | "EXEC_FAILED" | "CANCELLED"
+                if self.exit_code.is_none() && self.signal.is_none() =>
+            {
+                Ok(())
+            }
+            _ => Err(CoreError::Protocol("invalid execution result".into())),
+        }
     }
 }
 
@@ -189,112 +198,301 @@ pub struct RequestedPolicy {
     pub ttl_secs: u64,
 }
 
+/// Immutable execution intent, excluding all measured evidence.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct Intent {
+    pub command: RequestedCommand,
+    pub execution_context: RequestedExecutionContext,
+    pub policy: RequestedPolicy,
+    pub caller_env: BTreeMap<String, String>,
+}
+impl Intent {
+    pub fn validate(&self) -> Result<()> {
+        validate_unsigned_request(
+            &self.command,
+            &self.execution_context,
+            &self.policy,
+            &self.caller_env,
+        )?;
+        if self.policy.mode == "permanent" && self.policy.ttl_secs != 0 {
+            return Err(CoreError::Protocol(
+                "permanent intent requires zero TTL".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn sha256(&self) -> Result<String> {
+        self.validate()?;
+        Ok(crate::crypto::sha256_hex(&crate::json::canonical_bytes(
+            self,
+        )?))
+    }
+}
+
+/// Normalized internal request. Only WireHello is serialized on the public socket.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(try_from = "WireHello", into = "WireHello")]
 pub struct ClientHello {
     pub caller_env: BTreeMap<String, String>,
     pub mode: String,
     pub tty_mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csr_payload: Option<String>,
     pub dsse_envelope: Option<DsseEnvelope>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_command: Option<RequestedCommand>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_execution_context: Option<RequestedExecutionContext>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_policy: Option<RequestedPolicy>,
 }
-
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "mode", deny_unknown_fields)]
+enum WireHello {
+    #[serde(rename = "thin_csr")]
+    Thin {
+        version: String,
+        tty_mode: String,
+        caller_env: BTreeMap<String, String>,
+        intent: Box<Intent>,
+    },
+    #[serde(rename = "full_csr")]
+    Full {
+        version: String,
+        tty_mode: String,
+        caller_env: BTreeMap<String, String>,
+        csr_payload: String,
+    },
+    #[serde(rename = "signed")]
+    Signed {
+        version: String,
+        tty_mode: String,
+        caller_env: BTreeMap<String, String>,
+        dsse_envelope: DsseEnvelope,
+    },
+}
+impl TryFrom<WireHello> for ClientHello {
+    type Error = CoreError;
+    fn try_from(wire: WireHello) -> Result<Self> {
+        let (version, mut hello) = match wire {
+            WireHello::Thin {
+                version,
+                tty_mode,
+                caller_env,
+                intent,
+            } => {
+                if caller_env != intent.caller_env {
+                    return Err(CoreError::Protocol("caller environment mismatch".into()));
+                }
+                (
+                    version,
+                    Self {
+                        caller_env,
+                        tty_mode,
+                        mode: "thin_csr".into(),
+                        csr_payload: None,
+                        dsse_envelope: None,
+                        requested_command: Some(intent.command),
+                        requested_execution_context: Some(intent.execution_context),
+                        requested_policy: Some(intent.policy),
+                    },
+                )
+            }
+            WireHello::Full {
+                version,
+                tty_mode,
+                caller_env,
+                csr_payload,
+            } => (
+                version,
+                Self {
+                    caller_env,
+                    tty_mode,
+                    mode: "full_csr".into(),
+                    csr_payload: Some(csr_payload),
+                    dsse_envelope: None,
+                    requested_command: None,
+                    requested_execution_context: None,
+                    requested_policy: None,
+                },
+            ),
+            WireHello::Signed {
+                version,
+                tty_mode,
+                caller_env,
+                dsse_envelope,
+            } => (
+                version,
+                Self {
+                    caller_env,
+                    tty_mode,
+                    mode: "signed".into(),
+                    csr_payload: None,
+                    dsse_envelope: Some(dsse_envelope),
+                    requested_command: None,
+                    requested_execution_context: None,
+                    requested_policy: None,
+                },
+            ),
+        };
+        if version != "2.0" {
+            return Err(CoreError::Protocol("unsupported wire version".into()));
+        }
+        if let Some(payload) = &hello.csr_payload {
+            let csr = crate::warrant::Csr::parse(payload.as_bytes())?;
+            let intent = csr.warrant().intent()?;
+            hello.requested_command = Some(intent.command);
+            hello.requested_execution_context = Some(intent.execution_context);
+            hello.requested_policy = Some(intent.policy);
+        }
+        hello.validate_shape()?;
+        Ok(hello)
+    }
+}
+impl From<ClientHello> for WireHello {
+    fn from(hello: ClientHello) -> Self {
+        let version = "2.0".into();
+        if let Some(dsse_envelope) = hello.dsse_envelope {
+            Self::Signed {
+                version,
+                tty_mode: hello.tty_mode,
+                caller_env: hello.caller_env,
+                dsse_envelope,
+            }
+        } else if let Some(csr_payload) = hello.csr_payload {
+            Self::Full {
+                version,
+                tty_mode: hello.tty_mode,
+                caller_env: hello.caller_env,
+                csr_payload,
+            }
+        } else {
+            let intent = hello.intent().expect("validated thin request");
+            Self::Thin {
+                version,
+                tty_mode: hello.tty_mode,
+                caller_env: hello.caller_env,
+                intent: Box::new(intent),
+            }
+        }
+    }
+}
 impl ClientHello {
-    /// Entry point for an untrusted hello body. Wire bounds apply to the
-    /// original JSON bytes, including whitespace and alternative escapes.
+    pub fn intent(&self) -> Result<Intent> {
+        if let Some(envelope) = &self.dsse_envelope {
+            return envelope.warrant()?.warrant().intent();
+        }
+        if let Some(payload) = &self.csr_payload {
+            return crate::warrant::Csr::parse(payload.as_bytes())?
+                .warrant()
+                .intent();
+        }
+        let intent = Intent {
+            command: self
+                .requested_command
+                .clone()
+                .ok_or_else(|| CoreError::Protocol("missing command".into()))?,
+            execution_context: self
+                .requested_execution_context
+                .clone()
+                .ok_or_else(|| CoreError::Protocol("missing context".into()))?,
+            policy: self
+                .requested_policy
+                .clone()
+                .ok_or_else(|| CoreError::Protocol("missing policy".into()))?,
+            caller_env: self.caller_env.clone(),
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
     pub fn parse_request(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > 196_608 {
+        if bytes.len() > 524_288 {
             return Err(CoreError::Protocol(
                 "CLIENT_HELLO exceeds frame ceiling".into(),
             ));
         }
         let hello: Self = parse_strict(bytes)?;
-        if hello.mode == "unsigned_csr_request" && bytes.len() > 65_536 {
-            return Err(CoreError::Protocol(
-                "unsigned request exceeds 65536 bytes".into(),
-            ));
-        }
         hello.validate_request()?;
         Ok(hello)
     }
-
-    /// Full privilege-independent validation. Signature verification, peer and
-    /// policy ceilings, and retained snapshot checks follow in authorization.
     pub fn validate_request(&self) -> Result<()> {
-        let bytes = serde_json::to_vec(self).map_err(|error| CoreError::Json(error.to_string()))?;
-        if bytes.len() > 196_608 || self.mode == "unsigned_csr_request" && bytes.len() > 65_536 {
+        self.validate_shape()?;
+        let bytes = serde_json::to_vec(self).map_err(|e| CoreError::Json(e.to_string()))?;
+        if bytes.len() > 524_288 {
             return Err(CoreError::Protocol(
-                "CLIENT_HELLO exceeds request size limit".into(),
+                "CLIENT_HELLO exceeds frame ceiling".into(),
             ));
         }
-        crate::json::preflight_with_string_limits(&bytes, 8, &Self::string_limit)?;
-        self.validate_shape()?;
-        if let Some(envelope) = &self.dsse_envelope {
-            let warrant = envelope.warrant()?;
-            if warrant.warrant().command.tty_mode != self.tty_mode {
-                return Err(CoreError::Protocol("signed tty_mode fields differ".into()));
-            }
-            validate_unsigned_request(
-                &warrant.warrant().command.requested(),
-                &warrant.warrant().execution_context.requested(),
-                &RequestedPolicy {
-                    mode: warrant.warrant().policy.mode.clone(),
-                    ttl_secs: 0,
-                },
-                &self.caller_env,
-            )?;
-        }
-        Ok(())
+        crate::json::preflight_with_string_limits(&bytes, 8, &Self::string_limit)
     }
-
     pub fn validate_shape(&self) -> Result<()> {
-        if !matches!(self.tty_mode.as_str(), "stdio" | "pty") {
-            return Err(CoreError::Protocol("invalid tty_mode".into()));
+        let intent = self.intent()?;
+        if self.tty_mode != intent.command.tty_mode || self.caller_env != intent.caller_env {
+            return Err(CoreError::Protocol("hello intent mismatch".into()));
         }
         match self.mode.as_str() {
+            "thin_csr" if self.dsse_envelope.is_none() && self.csr_payload.is_none() => (),
+            "full_csr" if self.dsse_envelope.is_none() && self.csr_payload.is_some() => {
+                let csr =
+                    crate::warrant::Csr::parse(self.csr_payload.as_ref().unwrap().as_bytes())?;
+                csr.warrant().require_client_full()?;
+            }
             "signed"
                 if self.dsse_envelope.is_some()
+                    && self.csr_payload.is_none()
                     && self.requested_command.is_none()
                     && self.requested_execution_context.is_none()
                     && self.requested_policy.is_none() =>
             {
-                let envelope = self.dsse_envelope.as_ref().unwrap();
-                envelope.validate()?;
+                self.dsse_envelope
+                    .as_ref()
+                    .unwrap()
+                    .warrant()?
+                    .warrant()
+                    .require_client_full()?;
             }
-            "unsigned_csr_request"
-                if self.dsse_envelope.is_none()
-                    && self.requested_command.is_some()
-                    && self.requested_execution_context.is_some()
-                    && self.requested_policy.is_some() =>
-            {
-                let command = self.requested_command.as_ref().unwrap();
-                if command.tty_mode != self.tty_mode {
-                    return Err(CoreError::Protocol(
-                        "unsigned tty_mode fields differ".into(),
-                    ));
-                }
-                validate_unsigned_request(
-                    command,
-                    self.requested_execution_context.as_ref().unwrap(),
-                    self.requested_policy.as_ref().unwrap(),
-                    &self.caller_env,
-                )?;
-            }
-            _ => {
-                return Err(CoreError::Protocol(
-                    "CLIENT_HELLO mode fields are inconsistent".into(),
-                ));
-            }
+            _ => return Err(CoreError::Protocol("inconsistent request mode".into())),
         }
         Ok(())
     }
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextQuery {
+    pub version: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicContext {
+    pub version: String,
+    pub host_id: String,
+    pub policy_generation: u64,
+    pub executable_trust_models: Vec<crate::executable::TrustModel>,
+    pub limits: ContextLimits,
+    pub features: ContextFeatures,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLimits {
+    pub max_executable_bytes: u64,
+    pub max_direct_digest_bytes: u64,
+    pub direct_digest_timeout_ms: u32,
+    pub max_stdin_bytes: u64,
+    pub max_ttl_secs: u64,
+    pub max_onetime_window_secs: u64,
+    pub authorization_timeout_ms: u32,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextFeatures {
+    pub direct_exec_checkpoint: bool,
+    pub host_file_capabilities: bool,
+    pub tty_modes: Vec<String>,
+    pub stdin_policies: Vec<String>,
+    pub grant_modes: Vec<String>,
+}
+impl ProtocolSchema for ContextQuery {}
+impl ProtocolSchema for PublicContext {}
+impl ProtocolSchema for ExecReady {}
+impl ProtocolSchema for ExecResult {}
 
 pub(crate) fn validate_unsigned_request(
     command: &RequestedCommand,
@@ -516,6 +714,10 @@ fn valid_capability(capability: &str) -> bool {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetAuth {
+    pub request_origin: String,
+    pub intent_sha256: String,
+    #[serde(deserialize_with = "crate::warrant::required_nullable")]
+    pub approval_exec_id: Option<String>,
     pub auth_commit_seq: u64,
     pub exec_id: String,
     pub grant_id: String,
@@ -586,6 +788,15 @@ impl RemoteAuditBatchRequest {
                 .first_seq
                 .checked_add(offset as u64)
                 .ok_or_else(|| CoreError::Protocol("audit sequence overflow".into()))?;
+            if value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(2)
+            {
+                return Err(CoreError::Protocol(
+                    "collector requires v2 audit records".into(),
+                ));
+            }
             if seq != expected_seq
                 || value.get("host_id").and_then(serde_json::Value::as_str)
                     != Some(self.host_id.as_str())
@@ -613,6 +824,21 @@ impl RemoteAuditBatchRequest {
                 ));
             }
             for (field, target_value) in [
+                (
+                    "request_origin",
+                    serde_json::Value::String(target.request_origin.clone()),
+                ),
+                (
+                    "intent_sha256",
+                    serde_json::Value::String(target.intent_sha256.clone()),
+                ),
+                (
+                    "approval_exec_id",
+                    target
+                        .approval_exec_id
+                        .clone()
+                        .map_or(serde_json::Value::Null, serde_json::Value::String),
+                ),
                 ("exec_id", serde_json::Value::String(target.exec_id.clone())),
                 (
                     "grant_id",
@@ -662,6 +888,21 @@ impl RemoteAuditBatchRequest {
                 ));
             }
             validate_uuidv7(&target.exec_id)?;
+            if !crate::warrant::valid_digest(&target.intent_sha256)
+                || !(matches!(
+                    (
+                        target.request_origin.as_str(),
+                        target.approval_exec_id.as_deref()
+                    ),
+                    ("client_full", None)
+                ) || (target.request_origin == "daemon_expanded_thin"
+                    && target.approval_exec_id.as_deref() == Some(target.exec_id.as_str())
+                    && target.policy_mode == "one_time"))
+            {
+                return Err(CoreError::Protocol(
+                    "invalid collector target provenance".into(),
+                ));
+            }
             validate_uuidv7(&target.grant_id)?;
             if target.payload_sha256.len() != 64
                 || !target
@@ -713,6 +954,7 @@ impl ProtocolSchema for ClientHello {
     fn string_limit(path: &[String]) -> usize {
         let path: Vec<_> = path.iter().map(String::as_str).collect();
         match path.as_slice() {
+            ["csr_payload"] => 65_536,
             ["dsse_envelope", "payload"] => 87_384,
             ["dsse_envelope", "signatures", "*", "sig"] => 32_768,
             ["dsse_envelope", "signatures", "*", "keyid"] => 128,
@@ -733,15 +975,7 @@ impl ProtocolSchema for DsseEnvelope {
     }
 }
 
-impl ProtocolSchema for Decision {
-    fn string_limit(path: &[String]) -> usize {
-        if path.len() == 1 && path[0] == "csr_payload" {
-            65_536
-        } else {
-            4096
-        }
-    }
-}
+impl ProtocolSchema for Decision {}
 
 impl ProtocolSchema for RemoteAuditBatchRequest {
     fn string_limit(path: &[String]) -> usize {
@@ -870,10 +1104,10 @@ mod tests {
     #[test]
     fn hello_accepts_outer_envelope_limits_and_rejects_oversized_fields() {
         let mut hello = serde_json::json!({
-            "mode": "signed", "tty_mode": "stdio", "caller_env": {},
+            "version":"2.0", "mode": "signed", "tty_mode": "stdio", "caller_env": {},
             "dsse_envelope": {
                 "payloadType": WARRANT_PAYLOAD_TYPE,
-                "payload": STANDARD.encode(vec![0; 65_536]),
+                "payload": STANDARD.encode(include_bytes!("../tests/fixtures/v2-warrant.json")),
                 "signatures": [{"keyid": "k".repeat(128), "sig": STANDARD.encode(vec![0; 24_576])}],
             },
         });
@@ -897,29 +1131,9 @@ mod tests {
 
     #[test]
     fn unsigned_hello_accepts_absolute_executable_and_root_cwd() {
-        let hello = serde_json::json!({
-            "caller_env": {},
-            "mode": "unsigned_csr_request",
-            "requested_command": {
-                "allow_interpreted_script": false,
-                "argv": ["/usr/bin/probe"],
-                "cwd": "/",
-                "executable_path": "/usr/bin/probe",
-                "stdin_policy": "null",
-                "tty_mode": "stdio"
-            },
-            "requested_execution_context": {
-                "capabilities": [],
-                "env_exact": {},
-                "caller_env_allowlist": [],
-                "supplementary_gids": [],
-                "target_gid": 0,
-                "target_uid": 0,
-                "umask": 63
-            },
-            "requested_policy": {"mode": "one_time", "ttl_secs": 900},
-            "tty_mode": "stdio"
-        });
+        let w = crate::warrant::Csr::parse(include_bytes!("../tests/fixtures/v2-warrant.json"))
+            .unwrap();
+        let hello = serde_json::json!({"version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent": w.warrant().intent().unwrap()});
         parse_strict::<ClientHello>(&serde_json::to_vec(&hello).unwrap())
             .unwrap()
             .validate_shape()
@@ -936,6 +1150,7 @@ mod tests {
         let grant_id = "0192d8f4-9a00-7000-8000-112233445566";
         let digest = "00".repeat(32);
         let record = serde_json::json!({
+            "schema_version":2,"request_origin":"client_full","intent_sha256":digest,"approval_exec_id":null,
             "event_type": "AUTH_COMMIT",
             "exec_id": exec_id,
             "grant_id": grant_id,
@@ -948,6 +1163,9 @@ mod tests {
             "signer_id": "signer"
         });
         let target = TargetAuth {
+            request_origin: "client_full".into(),
+            intent_sha256: digest.clone(),
+            approval_exec_id: None,
             auth_commit_seq: 1,
             exec_id: exec_id.into(),
             grant_id: grant_id.into(),
@@ -970,21 +1188,18 @@ mod tests {
 
     #[test]
     fn decision_csr_and_batch_records_have_their_own_string_limits() {
-        let mut decision = serde_json::json!({
-            "csr_payload": "x".repeat(65_536), "message": "x".repeat(4096),
-            "status": "TIMEOUT_CSR", "exec_id": "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
-        });
+        let decision = serde_json::json!({"status":"TIMEOUT", "exec_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f"});
         parse_strict::<Decision>(&serde_json::to_vec(&decision).unwrap())
             .unwrap()
             .validate()
             .unwrap();
-        decision["csr_payload"] = "x".repeat(65_537).into();
-        assert!(parse_strict::<Decision>(&serde_json::to_vec(&decision).unwrap()).is_err());
-        decision["csr_payload"] = "{}".into();
-        decision["message"] = "x".repeat(4097).into();
-        assert!(parse_strict::<Decision>(&serde_json::to_vec(&decision).unwrap()).is_err());
+        for key in ["csr_payload", "message", "reason"] {
+            let mut invalid = decision.clone();
+            invalid[key] = "private".into();
+            assert!(parse_strict::<Decision>(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
         let prefix = "{\"data\":\"";
-        let suffix = "\",\"host_id\":\"host\",\"seq\":1}";
+        let suffix = "\",\"host_id\":\"host\",\"schema_version\":2,\"seq\":1}";
         let record = format!(
             "{prefix}{}{suffix}",
             "x".repeat(65_536 - prefix.len() - suffix.len())

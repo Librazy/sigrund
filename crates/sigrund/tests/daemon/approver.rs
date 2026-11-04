@@ -4,7 +4,7 @@ use super::*;
 use std::os::fd::FromRawFd;
 
 impl Fixture {
-    fn admitted_client(&self) -> UnixStream {
+    pub(super) fn admitted_client(&self) -> UnixStream {
         let mut candidate = None;
         let mut before = 0;
         wait_for(|| {
@@ -106,21 +106,13 @@ fn namespace_fixture() {
             ),
     )
     .unwrap();
-    fs::write(
-        &fixture.config,
-        format!(
-            "{}\napproval_signer_id = \"mandator-alice-yubikey\"\n",
-            fs::read_to_string(&fixture.config).unwrap()
-        ),
-    )
-    .unwrap();
     let daemon = fixture.launch();
     let initial_log = fs::read(&fixture.log).unwrap();
-    // No approver: completed canonical CSR is returned immediately.
+    // No approver: the request remains silent until the authorization deadline.
     let before = fixture.diagnostic_count();
     let mut socket = fixture.admitted_client();
     send_hello(&mut socket, &fixture.executable);
-    assert_eq!(decision(&mut socket).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut socket).status, "TIMEOUT");
     drop(socket);
     fixture.wait_for_cleanup(before);
     let (mut terminal, mut approver) = launch_approver(&fixture, &identity);
@@ -134,6 +126,7 @@ fn namespace_fixture() {
     // prompt. Wait for their echo so they are definitely in the TTY queue.
     terminal.write_all(b"\n\n").unwrap();
     tty_until(&mut terminal, b"\r\n\r\n");
+    fs::set_permissions(&fixture.executable, fs::Permissions::from_mode(0o000)).unwrap();
     // A non-root requester drives the real client/snapshot/TTY/signature path.
     let before = fixture.diagnostic_count();
     let mut command = Command::new(fixture.directory.path().join("sigrun"));
@@ -192,7 +185,10 @@ fn namespace_fixture() {
         "stdin_policy",
         "stdin_sha256",
         "executable_path",
-        "executable_sha256",
+        "executable_trust",
+        "request_origin",
+        "intent_sha256",
+        "approval_exec_id",
         "host_id",
         "grant_id",
         "not_before",
@@ -228,12 +224,10 @@ fn namespace_fixture() {
             .executable
             .with_file_name("missing-busy-snapshot-source"),
     );
-    assert_eq!(decision(&mut busy).status, "RESOURCE_EXHAUSTED");
-    drop(busy);
     let mut invalid_policy = fixture.admitted_client();
     let mut invalid_hello: serde_json::Value =
         serde_json::from_slice(&hello(&fixture.executable)).unwrap();
-    invalid_hello["requested_execution_context"]["target_uid"] = 77.into();
+    invalid_hello["intent"]["execution_context"]["target_uid"] = 77.into();
     send_rights(
         &invalid_policy,
         &encode_frame(
@@ -243,8 +237,6 @@ fn namespace_fixture() {
         .unwrap(),
         2,
     );
-    assert_eq!(decision(&mut invalid_policy).status, "POLICY_VIOLATION");
-    drop(invalid_policy);
     // Empty, invalid and overlong lines reprompt without rejecting or signing.
     // A valid answer queued behind an invalid line must also be discarded.
     for answer in [
@@ -261,16 +253,14 @@ fn namespace_fixture() {
     let output = child.wait_with_output().unwrap();
     assert_eq!(
         output.status.code(),
-        Some(255),
+        Some(254),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("execution is disabled by --authorization-only"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(decision(&mut busy).status, "TIMEOUT");
+    drop(busy);
+    assert_eq!(decision(&mut invalid_policy).status, "TIMEOUT");
+    drop(invalid_policy);
     fixture.wait_for_cleanup(before);
     assert!(
         approver.0.try_wait().unwrap().is_none(),
@@ -284,12 +274,7 @@ fn namespace_fixture() {
         prompt(&mut terminal);
         terminal.write_all(answer).unwrap();
         let response = decision(&mut socket);
-        assert_eq!(response.status, "REJECTED");
-        assert!(
-            response
-                .message
-                .contains(if answer == b"\x04" { "EOF" } else { "refused" })
-        );
+        assert_eq!(response.status, "TIMEOUT");
         drop(socket);
         fixture.wait_for_cleanup(before);
     }
@@ -311,7 +296,7 @@ fn namespace_fixture() {
     terminal.write_all(b"\n").unwrap();
     prompt(&mut terminal);
     terminal.write_all(b"no\n").unwrap();
-    assert_eq!(decision(&mut socket).status, "REJECTED");
+    assert_eq!(decision(&mut socket).status, "TIMEOUT");
     drop(socket);
     fixture.wait_for_cleanup(before);
     // Stop this watcher before fixtures that deliberately attach other brokers.
@@ -485,7 +470,7 @@ fn revocation_after_approval_request(fixture: &Fixture, identity: &Path) {
         .unwrap();
     let response = signed_response(&approval, identity, |_| {});
     broker_send(&mut broker, &response);
-    assert_eq!(decision(&mut client).status, "REVOKED");
+    assert_eq!(decision(&mut client).status, "TIMEOUT");
     drop(client);
     fixture.wait_for_cleanup(before);
     drop(broker);
@@ -504,7 +489,7 @@ fn signed_response(
             "-Y",
             "sign",
             "-n",
-            "sigrun.warrant.v1",
+            "sigrun.warrant.v2",
             "-O",
             "hashalg=sha512",
             "-f",
@@ -539,7 +524,10 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
     // retained CSR field. A valid signature cannot replace the original CSR.
     for field in [
         "argv",
-        "executable_sha256",
+        "executable_trust",
+        "request_origin",
+        "intent_sha256",
+        "approval_exec_id",
         "target_uid",
         "grant_id",
         "exec_id",
@@ -555,7 +543,7 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
         if field == "expired" {
             let mut hello: serde_json::Value =
                 serde_json::from_slice(&hello(&fixture.executable)).unwrap();
-            hello["requested_policy"]["ttl_secs"] = 1.into();
+            hello["intent"]["policy"]["ttl_secs"] = 1.into();
             send_rights(
                 &client,
                 &encode_frame(FrameType::ClientHello, &serde_json::to_vec(&hello).unwrap())
@@ -577,7 +565,12 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
             }
             let mut response = signed_response(&request, identity, |w| match field {
                 "argv" => w["command"]["argv"][0] = "changed".into(),
-                "executable_sha256" => w["command"]["executable_sha256"] = "f".repeat(64).into(),
+                "executable_trust" => {
+                    w["command"]["executable_trust"]["sha256"] = "f".repeat(64).into()
+                }
+                "request_origin" => w["request_origin"] = "client_full".into(),
+                "intent_sha256" => w["intent_sha256"] = "0".repeat(64).into(),
+                "approval_exec_id" => w["approval_exec_id"] = new_uuidv7().to_string().into(),
                 "target_uid" => w["execution_context"]["target_uid"] = 0.into(),
                 "grant_id" => w["grant_id"] = new_uuidv7().to_string().into(),
                 _ => {}
@@ -596,22 +589,7 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
             broker_send(&mut broker, &response);
         }
         let response = decision(&mut client);
-        assert_eq!(
-            response.status,
-            match field {
-                "malformed" | "disconnect" => "TIMEOUT_CSR",
-                "expired" => "EXPIRED_OR_NOT_YET_VALID",
-                _ => "POLICY_VIOLATION",
-            },
-            "{field}: {}",
-            response.message
-        );
-        if response.status == "TIMEOUT_CSR" {
-            assert_eq!(
-                response.csr_payload.as_deref(),
-                Some(request.csr_payload.as_str())
-            );
-        }
+        assert_eq!(response.status, "TIMEOUT", "{field}");
         expect_closed(&mut broker);
         drop(client);
         fixture.wait_for_cleanup(before);
@@ -625,11 +603,7 @@ fn broker_failures_and_reconnect(fixture: &Fixture, identity: &Path) {
     let request = broker_request(&mut broker);
     let response = signed_response(&request, identity, |_| {});
     broker_send(&mut broker, &response);
-    assert!(
-        decision(&mut client)
-            .message
-            .contains("disabled by --authorization-only")
-    );
+    assert_eq!(decision(&mut client).status, "APPROVED");
     drop(client);
     fixture.wait_for_cleanup(before);
     broker_send(&mut broker, &response);
@@ -672,7 +646,7 @@ fn operator_failures_and_expiry(fixture: &Fixture, identity: &Path) {
     let before = fixture.diagnostic_count();
     let mut client = fixture.admitted_client();
     let mut hello: serde_json::Value = serde_json::from_slice(&hello(&fixture.executable)).unwrap();
-    hello["requested_policy"]["ttl_secs"] = 1.into();
+    hello["intent"]["policy"]["ttl_secs"] = 1.into();
     send_rights(
         &client,
         &encode_frame(FrameType::ClientHello, &serde_json::to_vec(&hello).unwrap()).unwrap(),
@@ -682,8 +656,8 @@ fn operator_failures_and_expiry(fixture: &Fixture, identity: &Path) {
     thread::sleep(Duration::from_secs(2));
     terminal.write_all(b"yes\n").unwrap();
     let expired = decision(&mut client);
-    assert_eq!(expired.status, "REJECTED");
-    assert!(expired.message.contains("expired"));
+    assert_eq!(expired.status, "TIMEOUT");
+
     drop(client);
     fixture.wait_for_cleanup(before);
     // Losing the root's TTY invalidates an outstanding prompt.
@@ -692,7 +666,7 @@ fn operator_failures_and_expiry(fixture: &Fixture, identity: &Path) {
     send_hello(&mut client, &fixture.executable);
     prompt(&mut terminal);
     drop(terminal);
-    assert_eq!(decision(&mut client).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut client).status, "TIMEOUT");
     drop(client);
     wait_for(|| approver.0.try_wait().unwrap().is_some());
     fixture.wait_for_cleanup(before);
@@ -840,11 +814,7 @@ fn successful_agent_and_encrypted_identity(fixture: &Fixture, identity: &Path) {
             assert!(text.contains("Enter passphrase"));
             terminal.write_all(b"approver-test\n").unwrap();
         }
-        assert!(
-            decision(&mut client)
-                .message
-                .contains("disabled by --authorization-only")
-        );
+        assert_eq!(decision(&mut client).status, "APPROVED");
         assert!(
             !askpass_marker.exists(),
             "askpass must never receive a signing passphrase request"
@@ -906,7 +876,7 @@ fn wrong_operator_identity(fixture: &Fixture) {
     let before = fixture.diagnostic_count();
     let mut client = fixture.admitted_client();
     send_hello(&mut client, &fixture.executable);
-    assert_eq!(decision(&mut client).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut client).status, "TIMEOUT");
     drop(client);
     wait_for(|| approver.0.try_wait().unwrap().is_some());
     assert!(
@@ -985,7 +955,7 @@ fn encrypted_signing_cancellation_restores_terminal(fixture: &Fixture, identity:
                 unsafe { libc::kill(approver.0.id() as _, libc::SIGTERM) },
                 0
             );
-            assert_eq!(decision(&mut client).status, "TIMEOUT_CSR");
+            assert_eq!(decision(&mut client).status, "TIMEOUT");
         }
         drop(client);
         if local_signal {

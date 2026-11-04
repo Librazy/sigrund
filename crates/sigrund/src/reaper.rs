@@ -9,6 +9,22 @@ use std::{
     os::fd::{AsRawFd, OwnedFd},
 };
 
+// A fresh-exec access helper is waited by its reserved I/O task. Prevent P_ALL
+// from stealing its exit between spawn and registration or while it is alive.
+static HELPERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+pub(crate) struct HelperGuard;
+impl HelperGuard {
+    pub fn new() -> Self {
+        *HELPERS.lock().expect("helper registry") += 1;
+        Self
+    }
+}
+impl Drop for HelperGuard {
+    fn drop(&mut self) {
+        *HELPERS.lock().expect("helper registry") -= 1;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ChildExit {
     pub pid: libc::pid_t,
@@ -115,7 +131,8 @@ impl Reaper {
                 Err(error) => return Err(ReapError { exits, error }),
             }
         }
-        if self.pending.is_some() {
+        let helpers = HELPERS.lock().expect("helper registry");
+        if *helpers != 0 || self.pending.is_some() {
             return Ok(exits);
         }
         // A bounded sweep cannot monopolize socket deadlines. Keep admission

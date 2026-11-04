@@ -114,6 +114,28 @@ impl StartupResources {
                 .ok_or_else(|| invalid("log has no parent"))?,
         )?;
         check_root_metadata(&log_directory, true, None)?;
+        // Version checks must precede lock creation, SQLite pragmas and recovery writes.
+        let database: fs::File =
+            openat2_file(state_directory.as_raw_fd(), Path::new("state.sqlite"))?.into();
+        StateStore::require_version_file(&database).map_err(|e| invalid(e.to_string()))?;
+        drop(database);
+        let mut version_state: fs::File = openat2_file(
+            state_directory.as_raw_fd(),
+            Path::new("audit_ratchet.state"),
+        )?
+        .into();
+        let mut version_log: fs::File = openat2_file(
+            log_directory.as_raw_fd(),
+            Path::new(
+                log_path
+                    .file_name()
+                    .ok_or_else(|| invalid("log needs filename"))?,
+            ),
+        )?
+        .into();
+        AuditLog::validate_versions(&mut version_log, &mut version_state)
+            .map_err(|e| invalid(format!("audit version validation failed: {e}")))?;
+        drop((version_state, version_log));
         let lock_path = PathBuf::from(format!(
             "/proc/self/fd/{}/daemon.lock",
             state_directory.as_raw_fd()
@@ -164,29 +186,6 @@ impl StartupResources {
         );
         let log_file: fs::File = openat2_audit_log(log_directory.as_raw_fd(), log_name)?.into();
         check_root_metadata(&log_file, false, Some(0o600))?;
-        // All state entry access stays relative to the checked directory,
-        // including stale temporary cleanup and future state publication.
-        match openat2_file(
-            state_directory.as_raw_fd(),
-            Path::new("audit_ratchet.state.tmp"),
-        ) {
-            Ok(temporary) => {
-                check_root_metadata(&temporary.into(), false, Some(0o600))?;
-                if unsafe {
-                    libc::unlinkat(
-                        state_directory.as_raw_fd(),
-                        c"audit_ratchet.state.tmp".as_ptr(),
-                        0,
-                    )
-                } != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                state_directory.sync_all()?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
         let mut roots = Vec::new();
         for path in &config.csr_allowed_executable_dirs {
             let root = pin_directory(path)?;
@@ -211,11 +210,8 @@ impl StartupResources {
             state_directory.as_raw_fd()
         ));
         let database = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
             .read(true)
             .write(true)
-            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&database_path)?;
         check_root_metadata(&database, false, Some(0o600))?;
@@ -244,11 +240,34 @@ impl StartupResources {
         let audit = AuditLog::from_verified_files(
             log_file,
             state_file,
-            state_directory,
+            state_directory.try_clone()?,
             state_name,
             Some(&host_id),
         )
         .map_err(|e| invalid(format!("audit recovery failed: {e}")))?;
+        // All state entry access stays relative to the checked directory,
+        // including stale temporary cleanup and future state publication.
+        match openat2_file(
+            state_directory.as_raw_fd(),
+            Path::new("audit_ratchet.state.tmp"),
+        ) {
+            Ok(temporary) => {
+                check_root_metadata(&temporary.into(), false, Some(0o600))?;
+                if unsafe {
+                    libc::unlinkat(
+                        state_directory.as_raw_fd(),
+                        c"audit_ratchet.state.tmp".as_ptr(),
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                state_directory.sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         if !storage.check(config)? {
             return Err(invalid(
                 "audit storage pressure; remediation and restart required",

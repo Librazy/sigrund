@@ -11,24 +11,28 @@ pub(super) use sigrund_core::{
 };
 
 pub(super) const EXEC_ID: &str = "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f";
-pub(super) const GOLDEN: &[u8] = br#"{"command":{"allow_interpreted_script":false,"argv":["/usr/bin/id"],"cwd":"/","executable_path":"/usr/bin/id","executable_sha256":"0000000000000000000000000000000000000000000000000000000000000000","stdin_policy":"null","stdin_sha256":null,"tty_mode":"stdio"},"execution_context":{"caller_env_allowlist":[],"capabilities":[],"env_exact":{"LANG":"C.UTF-8","PATH":"/usr/bin"},"supplementary_gids":[],"target_gid":0,"target_uid":0,"umask":63},"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","host_id":"sigrun-host:sha256:0000000000000000000000000000000000000000000000000000000000000000","policy":{"mode":"one_time","not_after":1900,"not_before":1000},"requester_gid":1001,"requester_uid":1001,"version":"1.0"}"#;
+pub(super) const GOLDEN: &[u8] = include_bytes!("../fixtures/v2-warrant.json");
 
 pub(super) fn fixture() -> Warrant {
     parse_strict(GOLDEN).unwrap()
 }
 pub(super) fn unsigned() -> ClientHello {
     let w = fixture();
-    parse_strict(
-        &serde_json::to_vec(&json!({
-            "caller_env": {}, "mode": "unsigned_csr_request", "tty_mode": "stdio",
-            "requested_command": w.command.requested(),
-            "requested_execution_context": w.execution_context,
-            "requested_policy": {"mode": "one_time", "ttl_secs": 900},
-        }))
-        .unwrap(),
-    )
-    .unwrap()
+    ClientHello {
+        csr_payload: None,
+        caller_env: Default::default(),
+        mode: "thin_csr".into(),
+        tty_mode: "stdio".into(),
+        dsse_envelope: None,
+        requested_command: Some(w.command.requested()),
+        requested_execution_context: Some(w.execution_context.requested()),
+        requested_policy: Some(sigrund_core::protocol::RequestedPolicy {
+            mode: "one_time".into(),
+            ttl_secs: 900,
+        }),
+    }
 }
+
 pub(super) fn identity(now: i64) -> CsrIdentity {
     CsrIdentity {
         grant_id: EXEC_ID.into(),
@@ -46,7 +50,8 @@ pub(super) fn snapshots() -> SnapshotDigests {
         stdin_sha256: None,
     }
 }
-pub(super) fn signed(warrant: Warrant) -> DsseEnvelope {
+pub(super) fn signed(mut warrant: Warrant) -> DsseEnvelope {
+    warrant.intent_sha256 = warrant.intent().unwrap().sha256().unwrap();
     let canonical = CanonicalWarrant::new(warrant).unwrap();
     let key = SigningKey::from_bytes(&[42; 32]);
     let signature = key.sign(&pae(WARRANT_PAYLOAD_TYPE, canonical.as_bytes()));

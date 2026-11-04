@@ -64,6 +64,8 @@ pub struct DaemonConfig {
     pub direct_digest_timeout_ms: u32,
     #[serde(default = "default_stdin")]
     pub max_stdin_bytes: u64,
+    #[serde(default = "default_authorization_timeout")]
+    pub authorization_timeout_ms: u32,
     #[serde(default = "default_request_deadline")]
     pub request_deadline_ms: u32,
     #[serde(default = "default_admissions_global")]
@@ -297,6 +299,7 @@ pub struct CapturedPolicy {
     pub max_direct_digest_bytes: u64,
     pub direct_digest_timeout_ms: u32,
     pub max_stdin_bytes: u64,
+    pub authorization_timeout_ms: u32,
     pub request_deadline_ms: u32,
     pub job_memory_max_bytes: u64,
     pub job_memory_swap_max_bytes: u64,
@@ -326,6 +329,7 @@ impl PolicyGeneration {
             max_direct_digest_bytes: c.max_direct_digest_bytes,
             direct_digest_timeout_ms: c.direct_digest_timeout_ms,
             max_stdin_bytes: c.max_stdin_bytes,
+            authorization_timeout_ms: c.authorization_timeout_ms,
             request_deadline_ms: c.request_deadline_ms,
             job_memory_max_bytes: c.job_memory_max_bytes,
             job_memory_swap_max_bytes: c.job_memory_swap_max_bytes,
@@ -608,6 +612,7 @@ impl DaemonConfig {
             || self.max_io_workers_global > MAX_WORKERS_GLOBAL
             || self.max_io_workers_per_uid == 0
             || self.max_io_workers_per_uid > MAX_WORKERS_UID
+            || !(1_000..=300_000).contains(&self.authorization_timeout_ms)
             || self.request_deadline_ms == 0
             || self.request_deadline_ms > MAX_REQUEST_DEADLINE_MS
             || self.hook_timeout_ms == 0
@@ -894,6 +899,10 @@ fn default_direct_digest_timeout() -> u32 {
     5_000
 }
 
+fn default_authorization_timeout() -> u32 {
+    120_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,6 +934,7 @@ mod tests {
             max_direct_digest_bytes: default_direct_digest_bytes(),
             direct_digest_timeout_ms: default_direct_digest_timeout(),
             max_stdin_bytes: 16_777_216,
+            authorization_timeout_ms: 120_000,
             request_deadline_ms: 5_000,
             request_admissions_global: 256,
             request_admissions_per_uid: 16,

@@ -34,9 +34,11 @@ impl From<SealedSnapshot> for Executable {
     fn from(sealed: SealedSnapshot) -> Self {
         Self {
             digest: sealed.digest.clone(),
+            trust: Some(ExecutableTrust::DigestMemfd {
+                sha256: sealed.digest.sha256.clone(),
+            }),
             sealed: Some(sealed),
             source: None,
-            trust: None,
             post_exec_capabilities: None,
             hash_version: None,
             direct_digest_limit: 0,
@@ -54,15 +56,7 @@ impl AsFd for Executable {
 }
 impl Executable {
     pub fn matches_command(&self, command: &Command) -> bool {
-        use subtle::ConstantTimeEq;
-        let digest_matches = match (&command.executable_sha256, self.sha256()) {
-            (None, None) => true,
-            (Some(expected), Some(actual)) => {
-                bool::from(expected.as_bytes().ct_eq(actual.as_bytes()))
-            }
-            _ => false,
-        };
-        digest_matches && command.executable_trust == self.trust
+        command.executable_sha256.is_none() && command.executable_trust == self.trust
     }
     pub fn model(&self) -> TrustModel {
         self.trust
@@ -76,7 +70,7 @@ impl Executable {
         self.sealed.as_ref()
     }
     pub fn needs_checkpoint(&self) -> bool {
-        self.trust.is_some()
+        self.source.is_some()
     }
     pub fn needs_digest(&self) -> bool {
         self.model() == TrustModel::DigestDirect && self.hash_version.is_none()
@@ -132,6 +126,7 @@ impl Executable {
             return Err(invalid("direct executable is no longer eligible"));
         }
         let observed = match trust {
+            ExecutableTrust::DigestMemfd { .. } => return Err(invalid("not a direct executable")),
             ExecutableTrust::DigestDirect { .. } => {
                 if !local_filesystem(source)? || self.hash_version.is_none() {
                     return Err(invalid("unverified direct digest source"));
@@ -276,39 +271,24 @@ pub fn prepare(
             continue;
         }
         check()?;
-        if *model == TrustModel::DigestMemfd {
-            return snapshot::executable(source, budget, uid, config, check).map(Into::into);
-        }
-        if !selection.trace_available {
-            continue;
-        }
-        let Some(profile) = direct_profile(
+        let Some((trust, profile)) = inspect_model(
             &source,
             &metadata,
-            selection.context,
-            selection.allow_file_capabilities,
+            *model,
+            &selection,
+            config.max_executable_bytes,
+            config.max_direct_digest_bytes,
         )?
         else {
             continue;
         };
-        let trust = match model {
-            TrustModel::FsVerity => verity(&source)?,
-            TrustModel::DigestDirect if local_filesystem(&source)? => {
-                if metadata.len() > config.max_direct_digest_bytes {
-                    // An unsigned request can still select the enabled memfd fallback.
-                    continue;
-                }
-                Some(ExecutableTrust::DigestDirect {
-                    sha256: String::new(),
-                })
-            }
-            TrustModel::Ctime
-                if selection.trace_available && ctime_eligible(&source, &metadata)? =>
-            {
-                Some(ctime(&metadata))
-            }
-            _ => None,
-        };
+        if *model == TrustModel::DigestMemfd {
+            let mut executable: Executable =
+                snapshot::executable(source, budget, uid, config, check)?.into();
+            executable.post_exec_capabilities = Some(profile);
+            return Ok(executable);
+        }
+        let trust = Some(trust);
         if let Some(trust) = trust {
             let mut magic = [0u8; 4];
             source.read_exact_at(&mut magic, 0)?;
@@ -324,7 +304,7 @@ pub fn prepare(
                     sha256: String::new(),
                 },
                 trust: Some(trust),
-                post_exec_capabilities: selection.allow_file_capabilities.then_some(profile),
+                post_exec_capabilities: Some(profile),
                 hash_version: None,
                 direct_digest_limit: config.max_direct_digest_bytes,
             };
@@ -337,6 +317,105 @@ pub fn prepare(
         }
     }
     Err(invalid("no enabled executable trust model applies"))
+}
+
+/// Shared ordering and eligibility rules; inaccessible observations are errors,
+/// whereas conclusively unsupported models permit the next configured candidate.
+fn inspect_model(
+    source: &File,
+    metadata: &std::fs::Metadata,
+    model: TrustModel,
+    selection: &Selection<'_>,
+    max_memfd: u64,
+    max_direct: u64,
+) -> io::Result<Option<(ExecutableTrust, CapabilitySets)>> {
+    if model == TrustModel::DigestMemfd {
+        return Ok((metadata.len() <= max_memfd).then(|| {
+            (
+                ExecutableTrust::DigestMemfd {
+                    sha256: String::new(),
+                },
+                CapabilitySets::ordinary(&selection.context.capabilities),
+            )
+        }));
+    }
+    if !selection.trace_available {
+        return Ok(None);
+    }
+    let Some(profile) = direct_profile(
+        source,
+        metadata,
+        selection.context,
+        selection.allow_file_capabilities,
+    )?
+    else {
+        return Ok(None);
+    };
+    let trust = match model {
+        TrustModel::FsVerity => verity(source)?,
+        TrustModel::Ctime if ctime_eligible(source, metadata)? => Some(ctime(metadata)),
+        TrustModel::DigestDirect if local_filesystem(source)? && metadata.len() <= max_direct => {
+            Some(ExecutableTrust::DigestDirect {
+                sha256: String::new(),
+            })
+        }
+        _ => None,
+    };
+    Ok(trust.map(|t| (t, profile)))
+}
+
+pub(crate) fn client_evidence(
+    source: &File,
+    context: &RequestedExecutionContext,
+    public: &sigrund_core::protocol::PublicContext,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<(ExecutableTrust, CapabilitySets)> {
+    check()?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(invalid("invalid executable"));
+    }
+    let version = ctime(&metadata);
+    let mut magic = [0; 4];
+    source.read_exact_at(&mut magic, 0)?;
+    if magic != *b"\x7fELF" {
+        return Err(invalid("executable is not ELF"));
+    }
+    let selection = Selection {
+        signed: None,
+        context,
+        trace_available: public.features.direct_exec_checkpoint,
+        allow_file_capabilities: public.features.host_file_capabilities,
+    };
+    for model in &public.executable_trust_models {
+        check()?;
+        let Some((mut trust, profile)) = inspect_model(
+            source,
+            &metadata,
+            *model,
+            &selection,
+            public.limits.max_executable_bytes,
+            public.limits.max_direct_digest_bytes,
+        )?
+        else {
+            continue;
+        };
+        match &mut trust {
+            ExecutableTrust::DigestMemfd { sha256 } => {
+                *sha256 = hash_source(source, public.limits.max_executable_bytes, &check)?
+            }
+            ExecutableTrust::DigestDirect { sha256 } => {
+                *sha256 = hash_source(source, public.limits.max_direct_digest_bytes, &check)?
+            }
+            _ => (),
+        }
+        check()?;
+        if ctime(&source.metadata()?) != version {
+            return Err(invalid("executable changed during preparation"));
+        }
+        return Ok((trust, profile));
+    }
+    Err(invalid("no enabled executable model applies"))
 }
 
 /// Only local filesystems with Linux executable write exclusion are admitted.

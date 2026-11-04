@@ -61,12 +61,14 @@ class Evidence:
         self.save()
         print(json.dumps(record), flush=True)
 
+ready, authorized, exited, exit_fields = (SHARED[k] for k in ('ready','authorized','exited','exit_fields'))
+
 
 def connect_envelope(fixture, envelope):
     stream = socket.socket(socket.AF_UNIX)
     stream.settimeout(6)
     stream.connect(str(fixture.client))
-    hello = frame(1, {'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
+    hello = frame(1, {'version': '2.0', 'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
     with open('/dev/null', 'r+b') as null:
         stream.sendmsg([hello[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                     array.array('i', [null.fileno(), null.fileno()]))])
@@ -100,18 +102,19 @@ def run_cli(fixture, command, args=(), input_bytes=None, **settings):
 def failed_request(fixture, envelope, evidence, name, reason=None, minimum_duration=0):
     start = time.monotonic()
     stream = connect_envelope(fixture, envelope)
-    decision = receive(stream, 2)
-    assert decision['status'] == 'SPAWN_FAILED', decision
+    decision = authorized(stream)
+    failure = receive(stream, 5)
+    assert failure['exec_id'] == decision['exec_id'] and failure['status'] in ('SETUP_FAILED', 'EXEC_FAILED'), failure
     assert stream.recv(1) == b'', 'setup failure sent a terminal frame'
     stream.close()
     wait_for(fixture.empty, 'failed-job cleanup')
     records = records_for(fixture, decision)
-    assert [r['event_type'] for r in records] == ['AUTH_COMMIT', 'EXEC_SPAWN_FAILED'], records
+    assert [r['event_type'] for r in records] == ['AUTH_COMMIT', 'AUTH_ABORTED_POST_COMMIT', 'EXEC_SPAWN_FAILED'], records
     if reason is not None:
         assert reason in records[-1]['reason'], records[-1]
     # Every post-commit failure consumes the very same signed bytes permanently.
     replay = connect_envelope(fixture, envelope)
-    assert receive(replay, 2)['status'] == 'REPLAY_DETECTED'
+    assert receive(replay, 2)['status'] == 'TIMEOUT'
     assert replay.recv(1) == b''
     replay.close()
     duration = time.monotonic() - start
@@ -168,9 +171,9 @@ def post_token_death(parent, binaries, evidence):
         gate = Gate(fixture, 'kill-after-ready')
         gate.arm()
         stream = fixture.socket(fixture.commands / 'true')
-        decision = receive(stream, 2)
-        assert decision['status'] == 'READY_TO_EXEC', decision
-        assert receive(stream, 5) == {'exit_code': None, 'signal': signal.SIGKILL}
+        decision = ready(stream)
+        assert decision['status'] == 'APPROVED', decision
+        assert exited(stream) == {'exit_code': None, 'signal': signal.SIGKILL}
         assert stream.recv(1) == b''
         stream.close()
         wait_for(fixture.empty, 'post-token killed child cleanup')
@@ -179,7 +182,7 @@ def post_token_death(parent, binaries, evidence):
         assert records[1]['exec_outcome'] == 'unknown'
         assert records[2]['signal'] == signal.SIGKILL and records[2]['exit_code'] is None
         fixture.stop()
-        evidence.passed('post-token-pre-exec-death', decision='READY_TO_EXEC', exec_outcome='unknown', signal=9)
+        evidence.passed('post-token-pre-exec-death', decision='APPROVED', exec_outcome='unknown', signal=9)
     finally:
         evidence.capture(fixture, 'post-token-pre-exec-death')
         if gate:
@@ -218,8 +221,6 @@ def root_tty_workflow(parent, binaries, evidence):
     directory = evidence.root / 'root-tty-workflow'
     directory.mkdir(exist_ok=True)
     try:
-        config = fixture.base / 'config'
-        config.write_text(config.read_text() + 'approval_signer_id = "' + SHARED['SIGNER'] + '"\n')
         fixture.launch()
         def controlling_tty():
             import fcntl
@@ -248,7 +249,7 @@ def root_tty_workflow(parent, binaries, evidence):
                         prompt += os.read(master, 4096)
                     assert len(prompt) <= 1048576
                 (directory / ('approved.prompt.txt' if approve else 'refused.prompt.txt')).write_bytes(prompt)
-                for field in (b'requester_uid', b'target_uid', b'argv', b'executable_sha256', b'host_id', b'grant_id'):
+                for field in (b'requester_uid', b'target_uid', b'argv', b'executable_trust', b'host_id', b'grant_id'):
                     assert field in prompt, (field, prompt)
                 assert b'65534' in prompt and b'id' in prompt
                 os.write(master, b'yes\n' if approve else b'no\n')
@@ -257,8 +258,8 @@ def root_tty_workflow(parent, binaries, evidence):
                 events = [json.loads(line) for line in status]
             if approve:
                 assert client.returncode == 0 and stdout == b'0\n' and stderr == CLIENT_PROGRESS, (client.returncode, stdout, stderr, events)
-                assert [e.get('status') for e in events] == ['READY_TO_EXEC', None], events
-                assert events[1] == {'exit_code': 0, 'signal': None}
+                assert [e.get('status') for e in events] == ['APPROVED', None, 'EXITED'], events
+                assert exit_fields(events[-1]) == {'exit_code': 0, 'signal': None}
                 records = records_for(fixture, events[0])
                 assert [r['event_type'] for r in records] == ['AUTH_COMMIT', 'EXEC_READY_TO_EXEC', 'EXEC_EXIT'], records
                 assert records[0]['requester_uid'] == 65534 and records[0]['target_uid'] == 0
@@ -292,25 +293,25 @@ def controls_and_races(parent, binaries, evidence):
             streams = [(fixture.socket(fixture.commands / name), expected)
                        for name, expected in [('true', 0), ('false', 1)]]
             for stream, expected in streams:
-                assert receive(stream, 2)['status'] == 'READY_TO_EXEC'
-                assert receive(stream, 5) == {'exit_code': expected, 'signal': None}
+                assert ready(stream)['status'] == 'APPROVED'
+                assert exited(stream) == {'exit_code': expected, 'signal': None}
                 assert stream.recv(1) == b''
                 stream.close()
             wait_for(fixture.empty, 'concurrent exact exit cleanup')
         for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGUSR1, signal.SIGUSR2, signal.SIGTERM):
             stream = fixture.socket(fixture.commands / 'sleep', ('30',))
-            decision = receive(stream, 2)
-            assert decision['status'] == 'READY_TO_EXEC'
+            decision = ready(stream)
+            assert decision['status'] == 'APPROVED'
             stream.sendall(frame(3, {'signal': sig}))
-            assert receive(stream, 5) == {'exit_code': None, 'signal': sig}
+            assert exited(stream) == {'exit_code': None, 'signal': sig}
             assert stream.recv(1) == b''
             stream.close()
             assert records_for(fixture, decision)[-1]['signal'] == sig
             wait_for(fixture.empty, 'signalled job cleanup')
         for kind in ('bad-signal', 'wrong-type', 'ancillary', 'partial-timeout'):
             stream = fixture.socket(fixture.commands / 'sleep', ('30',))
-            decision = receive(stream, 2)
-            assert decision['status'] == 'READY_TO_EXEC'
+            decision = ready(stream)
+            assert decision['status'] == 'APPROVED'
             if kind == 'bad-signal':
                 stream.sendall(frame(3, {'signal': 9}))
             elif kind == 'wrong-type':
@@ -327,10 +328,10 @@ def controls_and_races(parent, binaries, evidence):
                                 for r in records_for(fixture, decision)), 'invalid-control exit audit')
         # No frame means no frame deadline, even after more than five seconds.
         stream = fixture.socket(fixture.commands / 'sleep', ('30',))
-        assert receive(stream, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(stream)['status'] == 'APPROVED'
         time.sleep(5.2)
         stream.sendall(frame(3, {'signal': 15}))
-        assert receive(stream, 5) == {'exit_code': None, 'signal': 15}
+        assert exited(stream) == {'exit_code': None, 'signal': 15}
         stream.close()
         wait_for(fixture.empty, 'idle-control teardown')
         wait_for(lambda: len(list(Path('/proc', str(fixture.process.pid), 'fd').iterdir())) == baseline,
@@ -385,20 +386,20 @@ def observed_execution(parent, binaries, evidence, strace):
                 assert observed['securebits'] == 47 and observed['no_new_privs'] == 1, observed
                 assert observed['umask'] == 0o027 and observed['cwd'] == '/', observed
                 assert observed['session'] == observed['pid'] and observed['fd_signal_checks'], observed
-                assert [s.get('status') for s in status] == ['READY_TO_EXEC', None], status
-                assert status[1] == {'exit_code': 0, 'signal': None}
+                assert [s.get('status') for s in status] == ['APPROVED', None, 'EXITED'], status
+                assert exit_fields(status[-1]) == {'exit_code': 0, 'signal': None}
                 observations.append({'target_uid': uid, 'capabilities': list(caps), 'observed': observed, 'status': status})
                 wait_for(fixture.empty, 'post-exec probe cleanup')
         content = bytes(range(256)) * 4096
         code, out, err, status = run_cli(fixture, fixture.commands / 'cat', input_bytes=content)
         assert code == 0 and out == content and err == CLIENT_PROGRESS, (code, len(out), err, status)
-        assert status[1] == {'exit_code': 0, 'signal': None}
+        assert exit_fields(status[-1]) == {'exit_code': 0, 'signal': None}
         for name, expected in [('id', 0), ('true', 0), ('false', 1)]:
             code, out, err, status = run_cli(fixture, fixture.commands / name)
             assert code == expected and err == CLIENT_PROGRESS, (code, out, err, status)
             if name == 'id':
                 assert b'uid=33' in out and b'gid=33' in out, out
-            assert status[1] == {'exit_code': expected, 'signal': None}
+            assert exit_fields(status[-1]) == {'exit_code': expected, 'signal': None}
         fixture.stop()
         tracer.wait(timeout=6)
         assert tracer.returncode == 0, (directory / 'strace.stderr').read_text()

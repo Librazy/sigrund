@@ -51,6 +51,35 @@ pub fn peer_credentials(fd: RawFd) -> io::Result<PeerCredentials> {
     })
 }
 
+/// Linux captures these groups with the connected peer credentials; no NSS lookup.
+pub fn peer_groups(fd: RawFd) -> io::Result<Vec<u32>> {
+    let mut groups = vec![0u32; 65_536];
+    let mut length = (groups.len() * size_of::<u32>()) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERGROUPS,
+            groups.as_mut_ptr().cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize % size_of::<u32>() != 0 || length as usize > groups.len() * size_of::<u32>()
+    {
+        return Err(invalid("invalid SO_PEERGROUPS"));
+    }
+    groups.truncate(length as usize / size_of::<u32>());
+    if groups.contains(&u32::MAX) {
+        return Err(invalid("unmapped peer group"));
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    Ok(groups)
+}
+
 pub fn disable_ancillary_credentials(fd: RawFd) -> io::Result<()> {
     let disabled: libc::c_int = 0;
     // SO_PASSPIDFD is Linux UAPI 76; older kernels return ENOPROTOOPT.
@@ -193,6 +222,7 @@ pub struct ControlReader {
     first_frame: bool,
     expected_kind: Option<FrameType>,
     reject_frames: bool,
+    execution_frames: bool,
     rights: Vec<OwnedFd>,
     deadline: Option<Instant>,
 }
@@ -207,6 +237,7 @@ impl ControlReader {
             first_frame,
             expected_kind: None,
             reject_frames: false,
+            execution_frames: false,
             rights: Vec::new(),
             deadline: None,
         }
@@ -217,7 +248,11 @@ impl ControlReader {
     pub fn server(kind: FrameType) -> Self {
         assert!(matches!(
             kind,
-            FrameType::ServerAuthDecision | FrameType::ServerChildExit
+            FrameType::ServerAuthDecision
+                | FrameType::ServerExecResult
+                | FrameType::ServerExecReady
+                | FrameType::ServerContext
+                | FrameType::ClientContextQuery
         ));
         Self {
             expected_kind: Some(kind),
@@ -225,6 +260,18 @@ impl ControlReader {
         }
     }
 
+    pub fn server_execution() -> Self {
+        Self {
+            execution_frames: true,
+            ..Self::new(false)
+        }
+    }
+    pub fn context_query() -> Self {
+        Self {
+            expected_kind: Some(FrameType::ClientContextQuery),
+            ..Self::new(false)
+        }
+    }
     pub fn client_signal() -> Self {
         Self {
             expected_kind: Some(FrameType::ClientSignal),
@@ -269,6 +316,9 @@ impl ControlReader {
             };
             if self.received == 0 {
                 if self.reject_frames
+                    || (self.execution_frames
+                        && buffer[0] != FrameType::ServerExecReady as u8
+                        && buffer[0] != FrameType::ServerExecResult as u8)
                     || self
                         .expected_kind
                         .is_some_and(|kind| buffer[0] != kind as u8)
@@ -380,6 +430,15 @@ impl FrameWriter {
         })
     }
 
+    pub(crate) fn private_rights(
+        payload: &[u8],
+        rights: Vec<OwnedFd>,
+        now: Instant,
+    ) -> io::Result<Self> {
+        let mut writer = Self::control(FrameType::ClientHello, payload, now)?;
+        writer.rights = rights;
+        Ok(writer)
+    }
     pub fn hello(payload: &[u8], rights: Vec<OwnedFd>, now: Instant) -> io::Result<Self> {
         if !matches!(rights.len(), 2 | 3) {
             return Err(invalid("invalid hello rights count"));

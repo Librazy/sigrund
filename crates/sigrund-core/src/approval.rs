@@ -18,6 +18,7 @@ pub const MAX_APPROVAL_MESSAGE_BYTES: usize = 524_288;
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
+    pub remaining_ms: u32,
     pub exec_id: String,
     pub signer_id: String,
     pub csr_payload: String,
@@ -61,6 +62,7 @@ impl ProtocolSchema for ApprovalResponse {
 impl ApprovalRequest {
     pub fn new(exec_id: String, signer_id: String, csr: &Csr) -> Result<Self> {
         let request = Self {
+            remaining_ms: 120_000,
             exec_id,
             signer_id,
             csr_payload: String::from_utf8(csr.as_bytes().to_vec()).expect("JCS is UTF-8"),
@@ -71,11 +73,19 @@ impl ApprovalRequest {
 
     pub fn validate(&self) -> Result<()> {
         check_bounds(self)?;
+        if !(1..=300_000).contains(&self.remaining_ms) {
+            return Err(invalid("invalid approval budget"));
+        }
         validate_uuidv7(&self.exec_id)?;
         if self.signer_id.is_empty() || !self.signer_id.is_ascii() {
             return Err(invalid("invalid approval signer_id"));
         }
-        Csr::parse(self.csr_payload.as_bytes())?;
+        let csr = Csr::parse(self.csr_payload.as_bytes())?;
+        if csr.warrant().request_origin == "daemon_expanded_thin"
+            && csr.warrant().approval_exec_id.as_deref() != Some(self.exec_id.as_str())
+        {
+            return Err(invalid("thin approval belongs to another execution"));
+        }
         Ok(())
     }
 

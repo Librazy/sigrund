@@ -70,8 +70,8 @@ pub(super) fn verify_blocked_metadata() {
     let baseline = fd_count();
     let baseline_threads = thread_count();
     assert_eq!(
-        baseline_threads, 7,
-        "expected coordinator, diagnostics, two I/O workers, two disposal workers, and authorization executor"
+        baseline_threads, 11,
+        "expected coordinator, diagnostics, two I/O workers, two context workers, two disposal workers, authorization executor and two job workers"
     );
     let null = OpenOptions::new()
         .read(true)
@@ -83,17 +83,17 @@ pub(super) fn verify_blocked_metadata() {
         let mut body: serde_json::Value =
             serde_json::from_slice(&hello(&fixture.executable)).unwrap();
         match field {
-            "same_uid" => body["requested_execution_context"]["target_uid"] = serde_json::json!(0),
+            "same_uid" => body["intent"]["execution_context"]["target_uid"] = serde_json::json!(0),
             "script" => {
-                body["requested_command"]["allow_interpreted_script"] = serde_json::json!(true)
+                body["intent"]["command"]["allow_interpreted_script"] = serde_json::json!(true)
             }
             "stdin" => {
-                body["requested_command"]["stdin_policy"] =
+                body["intent"]["command"]["stdin_policy"] =
                     serde_json::json!("unrestricted_interactive")
             }
-            "mode" => body["requested_policy"]["mode"] = serde_json::json!("time_range"),
+            "mode" => body["intent"]["policy"]["mode"] = serde_json::json!("time_range"),
             "allowlist" => {
-                body["requested_execution_context"]["caller_env_allowlist"] =
+                body["intent"]["execution_context"]["caller_env_allowlist"] =
                     serde_json::json!(["TERM"])
             }
             _ => unreachable!(),
@@ -107,7 +107,7 @@ pub(super) fn verify_blocked_metadata() {
             &[marker.as_raw_fd(), null.as_raw_fd()],
         );
         socket.write_all(&encoded[1..]).unwrap();
-        assert_eq!(decision(&mut socket).status, "POLICY_VIOLATION", "{field}");
+        assert_eq!(decision(&mut socket).status, "TIMEOUT", "{field}");
         drop(socket);
         wait_for(|| fd_count() == baseline);
         let mut gate = libc::pollfd {
@@ -140,7 +140,7 @@ pub(super) fn verify_blocked_metadata() {
     // can still use the second worker and the event loop remains responsive.
     let mut same_uid = connect(&fixture.socket);
     send_hello(&mut same_uid, &fixture.executable);
-    assert_eq!(decision(&mut same_uid).status, "RESOURCE_EXHAUSTED");
+    assert_eq!(decision(&mut same_uid).status, "TIMEOUT");
     drop(same_uid);
     fixture.peer(65534, "client");
     // Occupy the second worker using another UID, then probe the global cap
@@ -154,7 +154,7 @@ pub(super) fn verify_blocked_metadata() {
         .unwrap();
     entered.read_exact(&mut tid).unwrap();
     fixture.peer(65533, "worker_quota");
-    assert_eq!(decision(&mut stalled).status, "REQUEST_TIMEOUT");
+    assert_eq!(decision(&mut stalled).status, "TIMEOUT");
     expect_closed(&mut stalled);
     drop(stalled);
     // Both sockets expire while their tasks remain in the kernel syscall.
@@ -162,7 +162,7 @@ pub(super) fn verify_blocked_metadata() {
     wait_for(|| fd_count() == baseline + 4);
     let mut timed_out_uid = connect(&fixture.socket);
     send_hello(&mut timed_out_uid, &fixture.executable);
-    assert_eq!(decision(&mut timed_out_uid).status, "RESOURCE_EXHAUSTED");
+    assert_eq!(decision(&mut timed_out_uid).status, "TIMEOUT");
     drop(timed_out_uid);
     holder.stdin.take().unwrap().write_all(b"x").unwrap();
     wait_for(|| holder.try_wait().unwrap().is_some());
@@ -176,18 +176,20 @@ pub(super) fn verify_blocked_metadata() {
         baseline_threads,
         "blocked workers were replaced or leaked"
     );
-    // Late success/error cannot resurrect either timed-out request.
+    // Syntax validation is logged before private preparation. The stalled
+    // request and both other-UID probes reached that stage, but returning
+    // from the blocked syscalls must not restart their preparation.
     let events = fs::read_to_string(&fixture.diagnostics).unwrap();
     assert_eq!(
         events
             .lines()
             .filter(|line| line.contains("CLIENT_HELLO_VALIDATED"))
             .count(),
-        1
+        3
     );
     let mut recovered = connect(&fixture.socket);
     send_hello(&mut recovered, &fixture.executable);
-    assert_eq!(decision(&mut recovered).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut recovered).status, "TIMEOUT");
     drop(recovered);
     wait_for(|| fd_count() == baseline);
     // Disconnect also cancels without prematurely releasing the worker slot.
@@ -203,7 +205,7 @@ pub(super) fn verify_blocked_metadata() {
     wait_for(|| fd_count() == baseline + 2);
     let mut pinned_uid = connect(&fixture.socket);
     send_hello(&mut pinned_uid, &fixture.executable);
-    assert_eq!(decision(&mut pinned_uid).status, "RESOURCE_EXHAUSTED");
+    assert_eq!(decision(&mut pinned_uid).status, "TIMEOUT");
     drop(pinned_uid);
     let completed_before = completed_count();
     release.write_all(b"x").unwrap();
@@ -312,6 +314,35 @@ pub(super) fn verify_blocked_cleanup() {
         .open("/dev/null")
         .unwrap();
     let encoded = encode_frame(FrameType::ClientHello, &hello(&fixture.executable)).unwrap();
+    // Context is public, but received rights can have arbitrary close behavior.
+    // Block a malformed query's close and prove execution admission and another
+    // context query remain serviceable with the original fixed worker pool.
+    let context_path = PathBuf::from(format!("{}.context", fixture.socket.display()));
+    let mut bad_context = connect(&context_path);
+    send_fds(
+        &bad_context,
+        &[FrameType::ClientContextQuery as u8],
+        &[marker.as_raw_fd()],
+    );
+    let mut tid = [0u8; 8];
+    entered.read_exact(&mut tid).unwrap();
+    assert_ne!(u64::from_ne_bytes(tid), u64::from(pid));
+    assert_eq!(thread_count(), threads);
+    let mut public = connect(&context_path);
+    public
+        .write_all(&encode_frame(FrameType::ClientContextQuery, br#"{"version":"2.0"}"#).unwrap())
+        .unwrap();
+    let mut header = [0; 5];
+    public.read_exact(&mut header).unwrap();
+    assert_eq!(header[0], FrameType::ServerContext as u8);
+    let mut payload = vec![0; u32::from_be_bytes(header[1..].try_into().unwrap()) as usize];
+    public.read_exact(&mut payload).unwrap();
+    expect_closed(&mut public);
+    fixture.peer(65534, "client");
+    release.write_all(b"x").unwrap();
+    expect_closed(&mut bad_context);
+    drop((public, bad_context));
+    wait_for(|| fd_count() == baseline);
     for case in [
         "valid",
         "json",
@@ -360,7 +391,7 @@ pub(super) fn verify_blocked_cleanup() {
             "profile" => {
                 let mut body: serde_json::Value =
                     serde_json::from_slice(&hello(&fixture.executable)).unwrap();
-                body["requested_execution_context"]["target_uid"] = serde_json::json!(0);
+                body["intent"]["execution_context"]["target_uid"] = serde_json::json!(0);
                 let bad = encode_frame(FrameType::ClientHello, &serde_json::to_vec(&body).unwrap())
                     .unwrap();
                 send_fds(&socket, &bad[..1], &rights);
@@ -413,23 +444,11 @@ pub(super) fn verify_blocked_cleanup() {
         // caller FDs may be received just to reject this quota-denied request.
         let mut same_uid = connect(&fixture.socket);
         send_hello(&mut same_uid, &fixture.executable);
-        assert_eq!(
-            decision(&mut same_uid).status,
-            "RESOURCE_EXHAUSTED",
-            "{case}"
-        );
+        assert_eq!(decision(&mut same_uid).status, "TIMEOUT", "{case}");
         drop(same_uid);
         fixture.peer(65534, "client");
         if !broker && case != "disconnect" {
-            assert_eq!(
-                decision(&mut socket).status,
-                if case == "valid" {
-                    "TIMEOUT_CSR"
-                } else {
-                    "REQUEST_TIMEOUT"
-                },
-                "{case}"
-            );
+            assert_eq!(decision(&mut socket).status, "TIMEOUT", "{case}");
         }
         drop(socket);
         // The worker may still own a duplicate control socket while closing
@@ -467,7 +486,7 @@ pub(super) fn verify_blocked_cleanup() {
             .count();
         let mut recovered = connect(&fixture.socket);
         send_hello(&mut recovered, &fixture.executable);
-        assert_eq!(decision(&mut recovered).status, "TIMEOUT_CSR", "{case}");
+        assert_eq!(decision(&mut recovered).status, "TIMEOUT", "{case}");
         drop(recovered);
         wait_for(|| {
             let events: Vec<serde_json::Value> = fs::read_to_string(&fixture.diagnostics)
@@ -498,7 +517,7 @@ pub(super) fn verify_blocked_cleanup() {
     stalled.write_all(&encoded[1..]).unwrap();
     let mut tid = [0u8; 8];
     entered.read_exact(&mut tid).unwrap();
-    assert_eq!(decision(&mut stalled).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut stalled).status, "TIMEOUT");
     daemon.begin_stop();
     expect_closed(&mut stalled);
     assert!(daemon.0.try_wait().unwrap().is_none());
@@ -675,6 +694,7 @@ pub(super) fn verify_blocked_socket_disposal() {
         assert_eq!(&message[..count], b"WATCHDOG=1");
     }
     // Retiring an admitted connection remains responsive with disposal full.
+    assert_eq!(decision(&mut held_client).status, "TIMEOUT");
     held_client.shutdown(std::net::Shutdown::Both).unwrap();
     expect_closed(&mut held_client);
     wait_for(|| !registered(held_token));
@@ -687,7 +707,7 @@ pub(super) fn verify_blocked_socket_disposal() {
     // All reserved capacity eventually returns; root can make a fresh request.
     let mut recovered = connect(&fixture.socket);
     send_hello(&mut recovered, &fixture.executable);
-    assert_eq!(decision(&mut recovered).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut recovered).status, "TIMEOUT");
     drop(recovered);
     wait_for(|| fs::read_dir(format!("/proc/{pid}/fd")).unwrap().count() == baseline_fds);
     // Every queued close is done. Remove unused release bytes so a fresh close

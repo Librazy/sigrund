@@ -11,7 +11,7 @@ use std::{
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
 pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nExecution startup requires a dedicated delegated cgroup service.\n       --authorization-only provides the non-executing authorization diagnostic profile.";
-pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nCommands execute through the daemon in its configured execution domain; readiness confirms setup and leaves the exec outcome unknown.";
+pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --full-only --export-csr PATH\n         --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nCommands execute in the daemon execution domain. APPROVED confirms durable authorization; separate readiness reports unknown or exec_event_observed, followed by an execution result.";
 pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty and /etc/sigrund/signers.toml.\nOnly UID 0 with a controlling TTY may approve and sign.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,7 +94,7 @@ pub enum ClientArgs {
     Run {
         socket: PathBuf,
         command: Vec<String>,
-        options: RequestOptions,
+        options: Box<RequestOptions>,
     },
 }
 
@@ -134,12 +134,20 @@ impl ClientArgs {
             {
                 return Err(invalid("duplicate client option"));
             }
+            if flag == "--full-only" {
+                options.full_only = true;
+                continue;
+            }
             let value = arguments
                 .next()
                 .ok_or_else(|| invalid("missing option value"))?;
             match flag.as_str() {
                 "--socket" => socket = absolute_path(value)?,
                 "--warrant" => options.warrant = Some(absolute_path(value)?),
+                "--export-csr" => {
+                    options.export_csr = Some(absolute_path(value)?);
+                    options.full_only = true;
+                }
                 "--target-uid" => options.target_uid = identity(value)?,
                 "--target-gid" => options.target_gid = identity(value)?,
                 "--supplementary-gid" => options.supplementary_gids.push(identity(value)?),
@@ -204,7 +212,7 @@ impl ClientArgs {
             return Ok(Self::Run {
                 socket,
                 command,
-                options,
+                options: Box::new(options),
             });
         }
         if command.is_empty() {
@@ -225,7 +233,7 @@ impl ClientArgs {
         Ok(Self::Run {
             socket,
             command,
-            options,
+            options: Box::new(options),
         })
     }
 }
@@ -233,6 +241,8 @@ impl ClientArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestOptions {
     pub warrant: Option<PathBuf>,
+    pub full_only: bool,
+    pub export_csr: Option<PathBuf>,
     pub target_uid: u32,
     pub target_gid: u32,
     pub supplementary_gids: Vec<u32>,
@@ -249,6 +259,8 @@ impl Default for RequestOptions {
     fn default() -> Self {
         Self {
             warrant: None,
+            full_only: false,
+            export_csr: None,
             target_uid: 0,
             target_gid: 0,
             supplementary_gids: vec![],
@@ -280,8 +292,9 @@ impl RequestOptions {
             .to_str()
             .ok_or_else(|| invalid("cwd is not UTF-8"))?;
         let hello = ClientHello {
+            csr_payload: None,
             caller_env: BTreeMap::new(),
-            mode: "unsigned_csr_request".into(),
+            mode: "thin_csr".into(),
             tty_mode: "stdio".into(),
             dsse_envelope: None,
             requested_command: Some(RequestedCommand {

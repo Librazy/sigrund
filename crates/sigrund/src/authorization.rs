@@ -66,8 +66,20 @@ pub(crate) fn verify(
     else {
         return Err(policy());
     };
+    if request.requester_gid != gid {
+        return Err(policy());
+    }
     let w = warrant.warrant();
     w.validate().map_err(|_| policy())?;
+    if w.intent().map_err(|_| policy())? != request.hello.intent().map_err(|_| policy())? {
+        return Err(policy());
+    }
+    if w.request_origin == "daemon_expanded_thin"
+        && (request.hello.mode != "thin_csr"
+            || w.approval_exec_id.as_deref() != Some(&request.exec_id))
+    {
+        return Err(policy());
+    }
     if w.command.tty_mode != request.hello.tty_mode {
         return Err(policy());
     }
@@ -121,10 +133,28 @@ pub(crate) fn verify(
     {
         return Err(policy());
     }
+    if snapshots.executable.needs_checkpoint() {
+        let metadata = snapshots
+            .executable
+            .as_fd()
+            .try_clone_to_owned()
+            .and_then(|fd| File::from(fd).metadata())
+            .map_err(|_| policy())?;
+        if metadata.dev() != prepared.source_identity.device
+            || metadata.ino() != prepared.source_identity.inode
+        {
+            return Err(policy());
+        }
+    }
     if let Some(sealed) = snapshots.executable.sealed() {
         verify_snapshot(
             sealed,
-            w.command.executable_sha256.as_deref().ok_or_else(policy)?,
+            match &w.command.executable_trust {
+                Some(sigrund_core::executable::ExecutableTrust::DigestMemfd { sha256 }) => {
+                    sha256.as_str()
+                }
+                _ => return Err(policy()),
+            },
             request.policy.max_executable_bytes,
             true,
             || request.check(),

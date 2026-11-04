@@ -80,7 +80,7 @@ systemctl enable --now sigrund.service
 ```
 
 Use the packaged service socket paths explicitly; the bare binaries retain
-their original default paths:
+their default paths. The context endpoint is the client socket plus `.context`:
 
 ```sh
 # Root's controlling terminal; choose your actual SSH identity.
@@ -97,6 +97,11 @@ probes these before serving requests. Installing in a container does not create
 delegation, a systemd manager or host/container routing.
 
 ## Upgrade and removal
+
+The v2 workflow requires matching client/daemon/approver components and a freshly
+provisioned v2 database, audit log and ratchet state. V1 state is rejected and is
+never migrated or deleted automatically. Preserve any old state as a complete
+private archive; explicitly choose fresh provisioning paths before startup.
 
 Upgrades replace executables and reload systemd's unit definitions. They do not
 restart the daemon automatically: finish active work, stop any old approver, and

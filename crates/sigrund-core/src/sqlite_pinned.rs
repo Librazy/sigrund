@@ -21,7 +21,7 @@ pub(crate) fn register() -> Result<()> {
             // built-in Unix VFS, whose lifetime is the entire process. This copy
             // is registered once, never unregistered, and never made the default.
             let mut vfs = Box::new(unsafe { std::ptr::read(base) });
-            vfs.zName = c"sigrund-pinned-v1".as_ptr();
+            vfs.zName = c"sigrund-pinned-v2".as_ptr();
             vfs.pNext = std::ptr::null_mut();
             vfs.xFullPathname = Some(full_pathname);
             let raw = Box::into_raw(vfs);

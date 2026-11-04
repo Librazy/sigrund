@@ -6,13 +6,13 @@ use crate::{
 };
 use sigrund_core::{
     framing::FrameType,
-    protocol::{ChildExit, ClientHello, Decision, DsseEnvelope, parse_strict},
+    protocol::{ClientHello, Decision, DsseEnvelope, parse_strict},
     warrant::Csr,
 };
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Write},
     mem::{size_of, zeroed},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
@@ -23,7 +23,7 @@ use std::{
         Arc,
         mpsc::{self, Receiver, SyncSender},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(crate) struct Signals {
@@ -231,6 +231,46 @@ pub(crate) fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+fn check_input_signals(signals: &Signals, caught: &std::cell::Cell<Option<u8>>) -> io::Result<()> {
+    if let Some(signal) = signals.next()? {
+        caught.set(Some(signal));
+    }
+    if caught.get().is_some() {
+        Err(io::ErrorKind::Interrupted.into())
+    } else {
+        Ok(())
+    }
+}
+struct FiniteInput<'a> {
+    source: File,
+    signals: &'a Signals,
+    caught: &'a std::cell::Cell<Option<u8>>,
+}
+impl Read for FiniteInput<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            check_input_signals(self.signals, self.caught)?;
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.source.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.signals.fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            poll(&mut fds, None)?;
+            check_input_signals(self.signals, self.caught)?;
+            if fds[0].revents != 0 {
+                return self.source.read(bytes);
+            }
+        }
+    }
+}
+
 enum Notice {
     OutputDone(usize),
     Written(usize),
@@ -366,13 +406,14 @@ fn status(writer: &mut Option<Writer>, payload: &[u8]) -> io::Result<()> {
 /// or renew its canonical payload from CLI defaults or the client environment.
 fn signed_hello(bytes: &[u8]) -> io::Result<ClientHello> {
     let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidInput, error);
-    if bytes.len() > 196_608 {
+    if bytes.len() > sigrund_core::framing::max_payload(FrameType::ClientHello) {
         return Err(invalid("signed envelope exceeds wire bound".into()));
     }
     let envelope: DsseEnvelope = parse_strict(bytes).map_err(|e| invalid(e.to_string()))?;
     let warrant = envelope.warrant().map_err(|e| invalid(e.to_string()))?;
     let hello = ClientHello {
-        caller_env: Default::default(),
+        csr_payload: None,
+        caller_env: warrant.warrant().caller_env.clone(),
         mode: "signed".into(),
         tty_mode: warrant.warrant().command.tty_mode.clone(),
         dsse_envelope: Some(envelope),
@@ -386,10 +427,145 @@ fn signed_hello(bytes: &[u8]) -> io::Result<ClientHello> {
     ClientHello::parse_request(&serde_json::to_vec(&hello)?).map_err(|e| invalid(e.to_string()))
 }
 
+pub(crate) fn context_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".context");
+    name.into()
+}
+fn public_context(
+    path: &Path,
+    signals: &Signals,
+) -> io::Result<sigrund_core::protocol::PublicContext> {
+    let socket = connect(&context_path(path), signals)?;
+    let deadline = Instant::now() + transport::FRAME_TIMEOUT;
+    let mut writer = FrameWriter::control(
+        FrameType::ClientContextQuery,
+        br#"{"version":"2.0"}"#,
+        Instant::now(),
+    )?;
+    while !writer.write(socket.as_raw_fd(), Instant::now())? {
+        if signals.next()?.is_some() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        poll(
+            &mut [libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            }],
+            Some(deadline),
+        )?;
+    }
+    let mut reader = ControlReader::server(FrameType::ServerContext);
+    let result = loop {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if let Some(frame) = reader.read(socket.as_raw_fd(), Instant::now())? {
+            break parse_strict::<sigrund_core::protocol::PublicContext>(&frame.payload)
+                .map_err(|e| transport::invalid(e.to_string()))?;
+        }
+        if signals.next()?.is_some() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        poll(
+            &mut [libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }],
+            Some(deadline),
+        )?;
+    };
+    if result.version != "2.0"
+        || result.policy_generation == 0
+        || result.executable_trust_models.is_empty()
+        || result.executable_trust_models.len() > 4
+        || result
+            .executable_trust_models
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != result.executable_trust_models.len()
+        || !result
+            .host_id
+            .strip_prefix("sigrun-host:sha256:")
+            .is_some_and(|v| {
+                v.len() == 64
+                    && v.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        || result.limits.max_executable_bytes > 67_108_864
+        || result.limits.max_direct_digest_bytes > 1_073_741_824
+        || result.limits.max_stdin_bytes > 16_777_216
+        || !(1..=30_000).contains(&result.limits.direct_digest_timeout_ms)
+        || !(1_000..=300_000).contains(&result.limits.authorization_timeout_ms)
+    {
+        return Err(transport::invalid("invalid public preparation context"));
+    }
+    Ok(result)
+}
+fn full_csr(
+    hello: &ClientHello,
+    public: &sigrund_core::protocol::PublicContext,
+    stdin_sha256: Option<String>,
+) -> io::Result<Csr> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let intent = hello
+        .intent()
+        .map_err(|e| transport::invalid(e.to_string()))?;
+    let slash = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open("/")?;
+    let source: File = crate::linux::openat2_file(
+        slash.as_raw_fd(),
+        Path::new(intent.command.executable_path.trim_start_matches('/')),
+    )?
+    .into();
+    let deadline =
+        Instant::now() + Duration::from_millis(public.limits.direct_digest_timeout_ms.into());
+    let (trust, profile) =
+        crate::executable::client_evidence(&source, &intent.execution_context, public, || {
+            if Instant::now() >= deadline {
+                Err(io::ErrorKind::TimedOut.into())
+            } else {
+                Ok(())
+            }
+        })?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs();
+    Csr::from_unsigned(
+        hello,
+        sigrund_core::warrant::CsrIdentity {
+            grant_id: sigrund_core::crypto::new_uuidv7().to_string(),
+            host_id: public.host_id.clone(),
+            requester_uid: unsafe { libc::getuid() },
+            requester_gid: unsafe { libc::getgid() },
+            now: i64::try_from(now).map_err(io::Error::other)?,
+        },
+        sigrund_core::warrant::SnapshotDigests {
+            executable_trust: Some(trust),
+            post_exec_capabilities: Some(profile),
+            executable_sha256: None,
+            stdin_sha256,
+        },
+        public
+            .limits
+            .max_ttl_secs
+            .min(public.limits.max_onetime_window_secs),
+    )
+    .map_err(|e| transport::invalid(e.to_string()))
+}
+
 pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Result<u8> {
-    let hello = if let Some(path) = &options.warrant {
+    let mut hello = if let Some(path) = &options.warrant {
         let mut bytes = Vec::new();
-        File::open(path)?.take(196_609).read_to_end(&mut bytes)?;
+        File::open(path)?
+            .take(sigrund_core::framing::max_payload(FrameType::ClientHello) as u64 + 1)
+            .read_to_end(&mut bytes)?;
         signed_hello(&bytes)?
     } else {
         let cwd = std::env::current_dir()?;
@@ -448,6 +624,61 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
         None
     };
     let signals = Signals::new()?;
+    let public = if options.warrant.is_none() {
+        Some(public_context(path, &signals)?)
+    } else {
+        None
+    };
+    let spool = if let Some(source) = stdin {
+        let maximum = public
+            .as_ref()
+            .map_or(16_777_216, |p| p.limits.max_stdin_bytes);
+        let caught = std::cell::Cell::new(None);
+        let mut input = FiniteInput {
+            source: File::from(source),
+            signals: &signals,
+            caught: &caught,
+        };
+        let mut output = crate::memfd::create("sigrun-input-spool", false)?;
+        let digest =
+            sigrund_core::snapshot::copy_stream(&mut input, &mut output, None, maximum, || {
+                check_input_signals(&signals, &caught)
+            });
+        if let Some(signal) = caught.get() {
+            return Ok(128 + signal);
+        }
+        let digest = digest?;
+        Some((crate::memfd::seal(output, 0o400)?, digest))
+    } else {
+        None
+    };
+    let mut thin_fallback = false;
+    if let Some(public) = &public {
+        match full_csr(&hello, public, spool.as_ref().map(|s| s.1.sha256.clone())) {
+            Ok(csr) => {
+                if let Some(export) = &options.export_csr {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(export)?;
+                    file.write_all(csr.as_bytes())?;
+                    file.sync_all()?;
+                    return Ok(0);
+                }
+                hello.mode = "full_csr".into();
+                hello.csr_payload = Some(String::from_utf8(csr.as_bytes().to_vec()).expect("JCS"));
+            }
+            Err(error) if options.full_only || options.export_csr.is_some() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cannot prepare full CSR: {error}"),
+                ));
+            }
+            Err(_) => thin_fallback = true,
+        }
+    }
     let socket = connect(path, &signals)?;
     let wake_raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     if wake_raw < 0 {
@@ -461,8 +692,9 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
     let (out_r, out_w) = pipe()?;
     let (err_r, err_w) = pipe()?;
     let mut rights = Vec::with_capacity(3);
-    if let Some(stdin) = stdin {
-        rights.push(stdin);
+    if let Some(spool) = &spool {
+        use std::os::fd::AsFd;
+        rights.push(spool.0.as_fd().try_clone_to_owned()?);
     }
     rights.extend([out_w, err_w]);
     let mut outgoing = Some(FrameWriter::hello(
@@ -478,8 +710,15 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
     let mut reporting = report
         .map(|fd| Writer::new(3, fd, notify.clone()))
         .transpose()?;
+    if thin_fallback {
+        diagnostics.queue(
+            b"sigrun: local full preparation unavailable; submitting thin intent\n".to_vec(),
+        )?;
+    }
     diagnostics.queue(b"sigrun: waiting for authorization\n".to_vec())?;
     let mut reader = ControlReader::server(FrameType::ServerAuthDecision);
+    let mut approved = false;
+    let mut execution_id = None;
     let mut ready = false;
     let mut terminal = None;
     let mut drain = false;
@@ -541,65 +780,63 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
                     outgoing = None;
                 }
                 if let Some(frame) = reader.read(socket.as_raw_fd(), Instant::now())? {
-                    if !ready {
+                    if !approved {
                         let decision: Decision = parse_strict(&frame.payload)
                             .map_err(|e| transport::invalid(e.to_string()))?;
                         decision
                             .validate()
                             .map_err(|e| transport::invalid(e.to_string()))?;
-                        if decision.status == "TIMEOUT_CSR" {
-                            Csr::parse(
-                                decision
-                                    .csr_payload
-                                    .as_ref()
-                                    .expect("validated CSR")
-                                    .as_bytes(),
-                            )
-                            .map_err(|e| transport::invalid(e.to_string()))?;
-                        }
-                        if reader
-                            .deadline()
-                            .is_some_and(|deadline| Instant::now() >= deadline)
-                        {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
+                        execution_id = Some(decision.exec_id.clone());
                         status(&mut reporting, &frame.payload)?;
-                        if decision.status == "READY_TO_EXEC" {
-                            ready = true;
-                            reader = ControlReader::server(FrameType::ServerChildExit);
+                        if decision.status == "APPROVED" {
+                            approved = true;
+                            reader = ControlReader::server_execution();
                         } else {
-                            let mut message =
-                                format!("sigrun: {}\n", escaped(&decision.message)).into_bytes();
-                            if let Some(csr) = decision.csr_payload {
-                                message.extend_from_slice(csr.as_bytes());
-                                message.push(b'\n');
-                            }
-                            diagnostics.queue(message)?;
+                            diagnostics
+                                .queue(format!("sigrun: {}\n", decision.status).into_bytes())?;
                             terminal = Some(options.auth_fail_exit_code);
                             active = false;
                             unsafe {
                                 libc::shutdown(socket.as_raw_fd(), libc::SHUT_RDWR);
                             }
                         }
-                    } else {
-                        if terminal.is_some() {
-                            return Err(transport::invalid("duplicate child exit"));
+                    } else if frame.kind == FrameType::ServerExecReady {
+                        if ready || terminal.is_some() {
+                            return Err(transport::invalid("duplicate readiness"));
                         }
-                        let child: ChildExit = parse_strict(&frame.payload)
-                            .map_err(|e| transport::invalid(e.to_string()))?;
-                        child
+                        let notice: sigrund_core::protocol::ExecReady =
+                            parse_strict(&frame.payload)
+                                .map_err(|e| transport::invalid(e.to_string()))?;
+                        notice
                             .validate()
                             .map_err(|e| transport::invalid(e.to_string()))?;
-                        if reader
-                            .deadline()
-                            .is_some_and(|deadline| Instant::now() >= deadline)
-                        {
-                            return Err(io::ErrorKind::TimedOut.into());
+                        if execution_id.as_ref() != Some(&notice.exec_id) {
+                            return Err(transport::invalid("execution ID mismatch"));
                         }
                         status(&mut reporting, &frame.payload)?;
-                        terminal = Some(child.exit_code.unwrap_or_else(|| {
-                            128 + child.signal.expect("validated child signal")
-                        }));
+                        ready = true;
+                        reader = ControlReader::server(FrameType::ServerExecResult);
+                    } else {
+                        if terminal.is_some() {
+                            return Err(transport::invalid("duplicate execution result"));
+                        }
+                        let result: sigrund_core::protocol::ExecResult =
+                            parse_strict(&frame.payload)
+                                .map_err(|e| transport::invalid(e.to_string()))?;
+                        result
+                            .validate()
+                            .map_err(|e| transport::invalid(e.to_string()))?;
+                        if execution_id.as_ref() != Some(&result.exec_id) {
+                            return Err(transport::invalid("execution ID mismatch"));
+                        }
+                        status(&mut reporting, &frame.payload)?;
+                        terminal = Some(if result.status == "EXITED" {
+                            result
+                                .exit_code
+                                .unwrap_or_else(|| 128 + result.signal.expect("validated signal"))
+                        } else {
+                            254
+                        });
                         drain = true;
                         reader = ControlReader::server_finished();
                     }
@@ -743,8 +980,29 @@ mod signed_input_tests {
     }
 
     #[test]
+    fn signed_input_accepts_v2_envelopes_above_the_legacy_wire_limit() {
+        let original = envelope(false);
+        let mut warrant = original.warrant().unwrap().warrant().clone();
+        warrant.command.argv.extend(vec!["a".repeat(4000); 13]);
+        warrant.intent_sha256 = warrant.intent().unwrap().sha256().unwrap();
+        let envelope = DsseEnvelope::from_warrant(
+            &CanonicalWarrant::new(warrant).unwrap(),
+            (0..4)
+                .map(|index| DsseSignature {
+                    keyid: format!("signer-{index}"),
+                    sig: STANDARD.encode(vec![0; 24_576]),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        assert!(bytes.len() > 196_608);
+        assert_eq!(signed_hello(&bytes).unwrap().dsse_envelope, Some(envelope));
+    }
+
+    #[test]
     fn malformed_and_unsupported_signed_input_fails_before_transport() {
-        for bytes in [b"{}".to_vec(), b"not json".to_vec(), vec![b' '; 196_609]] {
+        for bytes in [b"{}".to_vec(), b"not json".to_vec(), vec![b' '; 524_289]] {
             assert_eq!(
                 signed_hello(&bytes).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput
@@ -762,6 +1020,7 @@ mod signed_input_tests {
                     .push("USER".into()),
                 _ => unreachable!(),
             }
+            warrant.intent_sha256 = warrant.intent().unwrap().sha256().unwrap();
             let envelope = DsseEnvelope::from_warrant(
                 &CanonicalWarrant::new(warrant).unwrap(),
                 original.signatures.clone(),
@@ -780,7 +1039,7 @@ mod signed_input_tests {
         assert!(signed_hello(&serde_json::to_vec(&wrong).unwrap()).is_err());
         assert_eq!(
             WARRANT_PAYLOAD_TYPE,
-            "application/vnd.sigrun.warrant.v1+json"
+            "application/vnd.sigrun.warrant.v2+json"
         );
     }
 }

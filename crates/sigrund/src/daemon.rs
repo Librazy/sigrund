@@ -51,7 +51,9 @@ const IO_COMPLETE: u64 = 4;
 const AUDIT_COMPLETE: u64 = 5;
 const JOB_COMPLETE: u64 = 6;
 const SOCKET_DISPOSAL: u64 = 7;
-const FIRST_CONNECTION: u64 = 8;
+const CONTEXT_LISTENER: u64 = 8;
+const CONTEXT_COMPLETE: u64 = 9;
+const FIRST_CONNECTION: u64 = 10;
 
 struct BoundSocket {
     fd: Option<OwnedFd>,
@@ -324,6 +326,15 @@ struct Connection {
     approval_broker: Option<u64>,
     approval_csr: Option<String>,
     approval_reusable: bool,
+    auth_deadline: Instant,
+    preparation_deadline: Instant,
+    mode: String,
+    full_validated: bool,
+    private_failure: Option<serde_json::Value>,
+    provenance: serde_json::Value,
+    silent: bool,
+    retained_lease: Option<RequestLease>,
+    committed_job: Option<Box<sequencer::CommittedJob>>,
 }
 
 #[derive(Default)]
@@ -358,53 +369,65 @@ impl Connection {
         &mut self,
         status: &str,
         message: &str,
-        csr_payload: Option<String>,
+        _csr_payload: Option<String>,
         now: Instant,
         audited: bool,
     ) -> io::Result<()> {
-        let phase = self.lifecycle.state().0;
-        let outcome = if status == "REQUEST_TIMEOUT" {
-            LifecycleDecision::Timeout
-        } else {
+        if self.lifecycle.state().1 != LifecycleDecision::Undecided {
+            return Ok(());
+        }
+        let visible_rejection = status == "REJECTED"
+            && self.mode == "full_csr"
+            && self.full_validated
+            && now < self.auth_deadline;
+        let _ = audited;
+        if self.private_failure.is_none() {
+            self.private_failure = Some(serde_json::json!({"reason_code":status,"reason":message,
+                "intended_public_outcome":if visible_rejection {"REJECTED"} else {"TIMEOUT"}}));
+        }
+        if !visible_rejection && now < self.auth_deadline {
+            self.lifecycle.silence();
+            self.silent = true;
+            self.request_deadline = Some(self.auth_deadline);
+            match &self.input {
+                Input::Validating { _task } | Input::Authorizing { _task } => _task.cancel(),
+                _ => (),
+            }
+            return Ok(());
+        }
+        let outcome = if visible_rejection {
             LifecycleDecision::Rejected
+        } else {
+            LifecycleDecision::Timeout
         };
-        let already_published = matches!(
-            (self.lifecycle.state(), outcome),
-            (
-                (Phase::Failed, LifecycleDecision::Rejected),
-                LifecycleDecision::Rejected
-            ) | (
-                (Phase::Cancelled, LifecycleDecision::Timeout),
-                LifecycleDecision::Timeout
-            )
-        );
-        if !already_published && !self.lifecycle.claim_terminal(phase, outcome) {
-            return Err(invalid("decision already claimed"));
+        if !self
+            .lifecycle
+            .claim_terminal(self.lifecycle.state().0, outcome)
+        {
+            return Ok(());
         }
-        // Cancelling a task never closes its caller rights on this thread.
-        self.input = Input::Client;
+        self.silent = true;
         self.request_deadline = None;
-        self.approval_reserved = false;
         let decision = Decision {
-            csr_payload,
             exec_id: self.exec_id.clone(),
-            status: status.into(),
-            message: message.into(),
+            status: if visible_rejection {
+                "REJECTED"
+            } else {
+                "TIMEOUT"
+            }
+            .into(),
         };
-        decision.validate().map_err(|e| invalid(e.to_string()))?;
-        if !audited {
-            self.queue_decision_audit(&decision)?;
-        }
         self.output = Some(FrameWriter::control(
             FrameType::ServerAuthDecision,
-            &serde_json::to_vec(&decision).map_err(|e| invalid(e.to_string()))?,
+            &serde_json::to_vec(&decision)?,
             now,
         )?);
         Ok(())
     }
 
     fn reading(&self) -> bool {
-        self.output.is_none()
+        !self.silent
+            && self.output.is_none()
             && !matches!(
                 self.input,
                 Input::Validating { .. }
@@ -418,17 +441,22 @@ impl Connection {
         let Some(audit) = self.audit.take() else {
             return Ok(());
         };
-        let work = sequencer::Work::Event {
-            token: self.token,
-            event_type: "AUTH_REJECTED",
-            fields: serde_json::json!({"exec_id":self.exec_id,"requester_uid":self.peer.uid,
-                "requester_gid":self.peer.gid,"status":decision.status,"message":decision.message}),
-            limit: self.policy.audit_record_max_bytes as usize,
-            _audit: audit,
-        };
+        let mut fields = self.provenance.clone();
+        let object = fields.as_object_mut().expect("private provenance object");
+        if let Some(failure) = &self.private_failure {
+            object.extend(failure.as_object().expect("failure object").clone());
+        }
+        object.extend(serde_json::json!({"exec_id":self.exec_id,"requester_uid":self.peer.uid,"requester_gid":self.peer.gid,
+            "submission_mode":self.mode,"public_outcome":decision.status,"delivery_status":self.lifecycle.delivery_status()}).as_object().unwrap().clone());
         self.durable
-            .try_send(work)
-            .map_err(|_| invalid("reserved audit executor capacity unavailable"))
+            .try_send(sequencer::Work::Event {
+                token: self.token,
+                event_type: "PRIVATE_OUTCOME",
+                fields,
+                limit: self.policy.audit_record_max_bytes as usize,
+                _audit: audit,
+            })
+            .map_err(|_| invalid("reserved audit executor unavailable"))
     }
 
     fn finish_validation(
@@ -440,214 +468,153 @@ impl Connection {
         budget: &SnapshotBudget,
         availability: ApprovalAvailability,
     ) -> io::Result<()> {
-        // A timeout, disconnect, or protocol error may already have won. A
-        // stale task can release resources but must not publish a decision.
-        if !matches!(self.input, Input::Validating { .. }) {
-            return Ok(());
-        }
         if self.broker {
-            let _ = log.try_send("{\"event\":\"UNSOLICITED_APPROVAL_REJECTED\"}".into());
             return Err(invalid("unsolicited approval response"));
         }
-        if self.deadline().is_some_and(|deadline| now >= deadline)
-            || result
-                .as_ref()
-                .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
-        {
-            if let Some(csr) = self.approval_csr.clone() {
-                self.respond(
-                    "TIMEOUT_CSR",
-                    "local approval deadline expired",
-                    Some(csr),
-                    now,
-                )
-            } else {
-                self.reject("REQUEST_TIMEOUT", "hello validation deadline expired", now)
+        if self.silent || self.lifecycle.state().1 != LifecycleDecision::Undecided {
+            if let Ok(lease) = result {
+                self.retained_lease = Some(lease);
             }
-        } else if let Ok(lease) = &result {
-            if !lease.matches_admission(self.peer.uid, &self.policy) {
-                return Err(invalid("request admission mismatch"));
+            return Ok(());
+        }
+        if now >= self.auth_deadline {
+            if let Ok(lease) = result {
+                self.retained_lease = Some(lease);
             }
-            if lease.request().pending_preparation.is_some() {
-                if !self
-                    .lifecycle
-                    .transition(Phase::Snapshotting, Phase::Hashing)
-                {
-                    return Err(invalid("stale hash handoff"));
-                }
-                let deadline =
-                    now + Duration::from_millis(u64::from(self.policy.direct_digest_timeout_ms));
-                self.request_deadline = Some(deadline);
-                let mut lease = result.expect("eligible direct source");
-                lease.begin_hashing(deadline);
-                let context = context.clone();
-                let gid = self.peer.gid;
-                lease.continue_on_worker(move |request| {
-                    preparation::hash_and_finish(request, &context, gid)
-                });
-                return Ok(());
+            return self.reject("REQUEST_TIMEOUT", "authorization deadline expired", now);
+        }
+        let mut lease = result?;
+        if !lease.matches_admission(self.peer.uid, &self.policy) {
+            return Err(invalid("request admission mismatch"));
+        }
+        self.mode = lease.hello().mode.clone();
+        lease.set_identity(&self.exec_id);
+        self.provenance = sequencer::request_provenance(lease.request());
+        self.request_deadline = Some(self.auth_deadline);
+        if self.mode != "signed" && !self.approval_reserved {
+            if availability.busy {
+                self.retained_lease = Some(lease);
+                return self.reject("RESOURCE_EXHAUSTED", "approval slot unavailable", now);
             }
-            if let Some(prepared) = lease.prepared() {
-                if self.approval_csr.is_none()
-                    && !self.lifecycle.transition(
-                        if self.lifecycle.state().0 == Phase::Hashing {
-                            Phase::Hashing
-                        } else {
-                            Phase::Snapshotting
-                        },
-                        Phase::Authorizing,
+            self.approval_reserved = true;
+        }
+        if now >= self.auth_deadline {
+            self.retained_lease = Some(lease);
+            return self.reject("REQUEST_TIMEOUT", "authorization deadline expired", now);
+        }
+        if let Some(error) = &lease.request().failure {
+            let status = error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<preparation::Failure>())
+                .map_or("INVALID_REQUEST", |e| e.status);
+            let message = error.to_string();
+            self.approval_reusable = status == "REJECTED";
+            self.retained_lease = Some(lease);
+            return self.reject(status, &message, now);
+        }
+        if lease.request().pending_preparation.is_some() {
+            if !self
+                .lifecycle
+                .transition(Phase::Snapshotting, Phase::Hashing)
+            {
+                return Err(invalid("stale hash handoff"));
+            }
+            let deadline = (now
+                + Duration::from_millis(self.policy.direct_digest_timeout_ms.into()))
+            .min(self.auth_deadline);
+            lease.begin_hashing(deadline);
+            let context = context.clone();
+            let gid = self.peer.gid;
+            lease.continue_on_worker(move |r| preparation::hash_and_finish(r, &context, gid));
+            return Ok(());
+        }
+        if let Some(prepared) = lease.prepared() {
+            let phase = self.lifecycle.state().0;
+            match &prepared.document {
+                Document::Unsigned(csr) => {
+                    self.full_validated = self.mode == "full_csr";
+                    if !self.lifecycle.transition(phase, Phase::Reviewing) {
+                        return Err(invalid("stale review handoff"));
+                    }
+                    let signer_id = self
+                        .policy
+                        .mvp
+                        .as_ref()
+                        .expect("MVP")
+                        .approval_signer_id
+                        .clone();
+                    let Some((broker_token, socket)) = availability.broker else {
+                        self.retained_lease = Some(lease);
+                        return self.reject("NO_APPROVER", "local approver unavailable", now);
+                    };
+                    let mut approval = ApprovalRequest::new(self.exec_id.clone(), signer_id, csr)
+                        .map_err(|e| invalid(e.to_string()))?;
+                    approval.remaining_ms = u32::try_from(
+                        self.auth_deadline
+                            .saturating_duration_since(now)
+                            .as_millis(),
                     )
-                {
-                    return Err(invalid("stale snapshot handoff"));
+                    .unwrap_or(300_000)
+                    .clamp(1, 300_000);
+                    self.approval_csr =
+                        Some(String::from_utf8(csr.as_bytes().to_vec()).expect("JCS"));
+                    self.approval_broker = Some(broker_token);
+                    lease.begin_approval(self.auth_deadline);
+                    let context = context.clone();
+                    let gid = self.peer.gid;
+                    lease.continue_on_worker(move |r| {
+                        preparation::approve(r, &context, gid, approval, socket)
+                    });
                 }
-                self.request_deadline = None;
-                let _ = log.try_send(serde_json::json!({"event":"SNAPSHOTS_PREPARED", "exec_id":self.exec_id,
-                    "root_path":prepared.root_path,"root_device":prepared.root_identity.device,"root_inode":prepared.root_identity.inode,
-                    "source_device":prepared.source_identity.device,"source_inode":prepared.source_identity.inode,
-                    "executable_trust_model":lease.request().snapshots.as_ref().map(|s| s.executable.model()),
-                    "null_stdin":prepared.null_stdin.is_some()}).to_string());
-                match &prepared.document {
-                    Document::Unsigned(csr) => {
-                        let signer_id = self
-                            .policy
-                            .mvp
-                            .as_ref()
-                            .expect("MVP")
-                            .approval_signer_id
-                            .clone();
-                        let csr_payload =
-                            String::from_utf8(csr.as_bytes().to_vec()).expect("canonical UTF-8");
-                        if signer_id.is_empty() || availability.broker.is_none() {
-                            return self.respond(
-                                "TIMEOUT_CSR",
-                                "No local approver is available",
-                                Some(csr_payload),
-                                now,
-                            );
+                Document::Signed { .. } => {
+                    if !self.lifecycle.transition(phase, Phase::Authorizing) {
+                        return Err(invalid("stale authorization handoff"));
+                    }
+                    self.approval_reusable = self.approval_csr.is_some();
+                    lease.set_deadline(self.auth_deadline);
+                    let Input::Validating { _task } =
+                        std::mem::replace(&mut self.input, Input::Client)
+                    else {
+                        return Err(invalid("missing worker owner"));
+                    };
+                    self.input = Input::Authorizing { _task };
+                    let work = sequencer::Work::Authorize(sequencer::AuthorizationTask {
+                        token: self.token,
+                        exec_id: self.exec_id.clone(),
+                        gid: self.peer.gid,
+                        lifecycle: self.lifecycle.clone(),
+                        lease,
+                        control: self.fd.clone(),
+                        audit: self
+                            .audit
+                            .take()
+                            .ok_or_else(|| invalid("missing audit reservation"))?,
+                    });
+                    if let Err(error) = self.durable.try_send(work) {
+                        if let sequencer::Work::Authorize(task) = match error {
+                            std::sync::mpsc::TrySendError::Full(w)
+                            | std::sync::mpsc::TrySendError::Disconnected(w) => w,
+                        } {
+                            self.audit = Some(task.audit);
+                            self.retained_lease = Some(task.lease);
                         }
-                        let approval = ApprovalRequest::new(self.exec_id.clone(), signer_id, csr)
-                            .map_err(|e| invalid(e.to_string()))?;
-                        let (broker_token, socket) =
-                            availability.broker.expect("authenticated broker");
-                        let deadline = now + crate::approver::APPROVAL_TIMEOUT;
-                        self.request_deadline = Some(deadline);
-                        self.approval_csr = Some(csr_payload);
-                        self.approval_broker = Some(broker_token);
-                        let mut lease = result.expect("successful snapshots");
-                        lease.begin_approval(deadline);
-                        let context = context.clone();
-                        let gid = self.peer.gid;
-                        lease.continue_on_worker(move |request| {
-                            preparation::approve(request, &context, gid, approval, socket)
-                        });
-                        Ok(())
-                    }
-                    Document::Signed {
-                        warrant,
-                        signer_ids,
-                    } => {
-                        self.approval_reusable = self.approval_csr.is_some();
-                        let _ = log.try_send(serde_json::json!({"event":"SIGNED_SNAPSHOTS_BOUND", "exec_id":self.exec_id, "grant_id":warrant.warrant().grant_id,"candidate_signer_ids":signer_ids}).to_string());
-                        let mut lease = result.expect("verified signed snapshots");
-                        lease.begin_authorization();
-                        let work = sequencer::Work::Authorize(sequencer::AuthorizationTask {
-                            token: self.token,
-                            exec_id: self.exec_id.clone(),
-                            gid: self.peer.gid,
-                            lifecycle: self.lifecycle.clone(),
-                            lease,
-                            control: self.fd.clone(),
-                            audit: self
-                                .audit
-                                .take()
-                                .ok_or_else(|| invalid("missing audit reservation"))?,
-                        });
-                        if let Err(error) = self.durable.try_send(work) {
-                            let work = match error {
-                                std::sync::mpsc::TrySendError::Full(work) => work,
-                                std::sync::mpsc::TrySendError::Disconnected(_) => {
-                                    return Err(invalid("audit executor stopped"));
-                                }
-                            };
-                            if let sequencer::Work::Authorize(task) = work {
-                                self.audit = Some(task.audit);
-                            }
-                            return self.reject(
-                                "RESOURCE_EXHAUSTED",
-                                "authorization executor is full",
-                                now,
-                            );
-                        }
-                        let Input::Validating { _task } =
-                            std::mem::replace(&mut self.input, Input::Client)
-                        else {
-                            unreachable!()
-                        };
-                        self.input = Input::Authorizing { _task };
-                        self.approval_reserved = false;
-                        Ok(())
-                    }
-                }
-            } else {
-                if lease.hello().mode == "unsigned_csr_request" {
-                    if !lease.unsigned_policy_checked() {
-                        let lease = result.expect("validated hello");
-                        let context = context.clone();
-                        let gid = self.peer.gid;
-                        lease.continue_on_worker(move |request| {
-                            preparation::check_unsigned_policy(request, &context, gid)
-                        });
-                        return Ok(());
-                    }
-                    if availability.busy {
                         return self.reject(
                             "RESOURCE_EXHAUSTED",
-                            "local approval slot is busy",
+                            "authorization queue unavailable",
                             now,
                         );
                     }
-                    self.approval_reserved = true;
                 }
-                let _ = log.try_send(serde_json::json!({"event":"CLIENT_HELLO_VALIDATED", "exec_id":self.exec_id,
-                "requester_pid":self.peer.pid,"requester_uid":self.peer.uid,"requester_gid":self.peer.gid,"request_mode":lease.hello().mode}).to_string());
-                let lease = result.expect("successful lease");
-                let context = context.clone();
-                let budget = budget.clone();
-                let gid = self.peer.gid;
-                lease.continue_on_worker(move |request| {
-                    preparation::prepare(request, &context, &budget, gid)
-                });
-                Ok(())
             }
-        } else if let Some(failure) = result
-            .as_ref()
-            .err()
-            .and_then(|error| error.get_ref())
-            .and_then(|error| error.downcast_ref::<preparation::Failure>())
-        {
-            self.approval_reusable = failure.status == "REJECTED";
-            if failure.status == "TIMEOUT_CSR" {
-                self.respond(
-                    "TIMEOUT_CSR",
-                    &failure.to_string(),
-                    self.approval_csr.clone(),
-                    now,
-                )
-            } else {
-                self.reject(failure.status, &failure.to_string(), now)
-            }
-        } else if result
-            .as_ref()
-            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
-        {
-            self.reject("POLICY_VIOLATION", "unsupported MVP request", now)
         } else {
-            self.reject(
-                "INVALID_REQUEST",
-                "invalid request or stdio descriptors",
-                now,
-            )
+            lease.set_deadline(self.preparation_deadline.min(self.auth_deadline));
+            let context = context.clone();
+            let budget = budget.clone();
+            let gid = self.peer.gid;
+            let _=log.try_send(serde_json::json!({"event":"CLIENT_HELLO_VALIDATED","exec_id":self.exec_id,"request_mode":self.mode,"requester_uid":self.peer.uid,"requester_gid":self.peer.gid}).to_string());
+            lease.continue_on_worker(move |r| preparation::prepare(r, &context, &budget, gid));
         }
+        Ok(())
     }
 
     fn dispatch(
@@ -659,6 +626,22 @@ impl Connection {
     ) -> io::Result<bool> {
         if let Some(output) = &mut self.output {
             if !output.write(self.fd.as_raw_fd(), now)? {
+                return Ok(true);
+            }
+            if !self.broker {
+                self.lifecycle.mark_frame_written();
+            }
+            if let Some(job) = &mut self.committed_job {
+                job.commit_fields["public_outcome"] = "APPROVED".into();
+                job.commit_fields["delivery_status"] = self.lifecycle.delivery_status().into();
+                self.output = None;
+                if !self
+                    .lifecycle
+                    .transition(Phase::ApprovalDelivery, Phase::Approved)
+                {
+                    return Err(invalid("lost approval delivery"));
+                }
+                self.approval_reserved = false;
                 return Ok(true);
             }
             if let Input::Executing {
@@ -678,29 +661,21 @@ impl Connection {
             }
             return Ok(false);
         }
-        if self.deadline().is_some_and(|deadline| now >= deadline) {
-            return match self.input {
-                Input::Client | Input::Validating { .. } => {
-                    if let Some(csr) = self.approval_csr.clone() {
-                        self.respond(
-                            "TIMEOUT_CSR",
-                            "local approval deadline expired",
-                            Some(csr),
-                            now,
-                        )?;
-                    } else {
-                        self.reject("REQUEST_TIMEOUT", "hello assembly deadline expired", now)?;
-                    }
-                    Ok(true)
-                }
-                Input::Approval
-                | Input::Serving { .. }
-                | Input::Authorizing { .. }
-                | Input::Executing { .. } => Ok(false),
-            };
+        if self.deadline().is_some_and(|d| now >= d) {
+            if self.broker {
+                return Ok(false);
+            }
+            if self.lifecycle.state().1 == LifecycleDecision::Undecided {
+                self.reject("REQUEST_TIMEOUT", "authorization deadline expired", now)?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
-        match &self.input {
+        match &mut self.input {
             Input::Client | Input::Approval => {
+                if self.silent {
+                    return Ok(true);
+                }
                 let deadline = self
                     .request_deadline
                     .unwrap_or(now + crate::transport::FRAME_TIMEOUT);
@@ -714,6 +689,9 @@ impl Connection {
                 ) {
                     Ok(task) => {
                         self.input = Input::Validating { _task: task };
+                        if !self.broker {
+                            self.request_deadline = Some(self.auth_deadline);
+                        }
                         let _ = log.try_send(
                             serde_json::json!({"event":"IO_WORKER_RESERVED","worker_task":token})
                                 .to_string(),
@@ -743,15 +721,35 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.lifecycle.cancel();
+        self.lifecycle.mark_undelivered();
+        if let Some(job) = self.committed_job.take() {
+            abort_delivery(job, &self.durable);
+        }
         if self.audit.is_some() {
             let decision = Decision {
-                csr_payload: None,
                 exec_id: self.exec_id.clone(),
-                status: "REJECTED".into(),
-                message: "request disconnected before authorization".into(),
+                status: self.lifecycle.public_outcome().into(),
             };
             let _ = self.queue_decision_audit(&decision);
         }
+    }
+}
+
+fn abort_delivery(job: Box<sequencer::CommittedJob>, durable: &SyncSender<sequencer::Work>) {
+    let mut fields = job.commit_fields.clone();
+    fields["reason"] = "authorization delivery expired or disconnected".into();
+    fields["public_outcome"] = job.lifecycle.public_outcome().into();
+    fields["delivery_status"] = job.lifecycle.delivery_status().into();
+    // Retain the consumed grant, audit and request owners through reconciliation.
+    let work = sequencer::Work::Execution {
+        token: job.token,
+        records: vec![("AUTH_ABORTED_POST_COMMIT", fields)],
+        limit: job.lease.request().policy.audit_record_max_bytes as usize,
+        owner: Some(job),
+    };
+    if durable.try_send(work).is_err() {
+        // Reserved durable capacity must outlive every committed owner.
+        std::process::abort();
     }
 }
 
@@ -760,73 +758,93 @@ fn publish_notices(
     connections: &mut HashMap<u64, Connection>,
     epoll: RawFd,
 ) -> io::Result<()> {
+    use sigrund_core::protocol::{ExecReady, ExecResult};
     for notice in notices {
         let token = match &notice {
-            Notice::Ready(t) | Notice::Failed(t, _) | Notice::Exit(t, _) => *t,
+            Notice::Ready(t, _) | Notice::Failed(t, _) | Notice::Exit(t, _) => *t,
         };
-        let Some(connection) = connections.get_mut(&token) else {
+        let Some(c) = connections.get_mut(&token) else {
             continue;
         };
         match notice {
-            Notice::Ready(_) => {
-                if !sequencer::connection_live(connection.fd.as_raw_fd()) {
-                    connection.lifecycle.cancel();
-                    continue;
+            Notice::Ready(_, outcome) => {
+                if c.lifecycle.state().1 != LifecycleDecision::Approved {
+                    return Err(invalid("readiness without approval"));
                 }
-                let Input::Authorizing { _task } =
-                    std::mem::replace(&mut connection.input, Input::Client)
+                let Input::Authorizing { _task } = std::mem::replace(&mut c.input, Input::Client)
                 else {
-                    return Err(invalid("missing running validation owner"));
+                    return Err(invalid("missing execution owner"));
                 };
-                connection.input = Input::Executing {
+                c.input = Input::Executing {
                     _task,
                     ready_sent: false,
                     finishing: false,
                     terminal: None,
                 };
-                let decision = Decision {
-                    csr_payload: None,
-                    exec_id: connection.exec_id.clone(),
-                    status: "READY_TO_EXEC".into(),
-                    message: "Authorized and ready to attempt exec; exec outcome is unknown".into(),
-                };
-                connection.output = Some(FrameWriter::control(
-                    FrameType::ServerAuthDecision,
-                    &serde_json::to_vec(&decision)?,
+                c.output = Some(FrameWriter::control(
+                    FrameType::ServerExecReady,
+                    &serde_json::to_vec(&ExecReady {
+                        exec_id: c.exec_id.clone(),
+                        exec_outcome: outcome.into(),
+                    })?,
                     Instant::now(),
                 )?);
             }
-            Notice::Failed(_, message) => {
-                connection.respond_inner("SPAWN_FAILED", &message, None, Instant::now(), true)?;
-            }
-            Notice::Exit(_, exit) => {
-                exit.validate().map_err(|e| invalid(e.to_string()))?;
+            other => {
+                let result = match other {
+                    Notice::Exit(_, exit) => ExecResult {
+                        exec_id: c.exec_id.clone(),
+                        status: "EXITED".into(),
+                        exit_code: exit.exit_code,
+                        signal: exit.signal,
+                    },
+                    Notice::Failed(_, status) => ExecResult {
+                        exec_id: c.exec_id.clone(),
+                        status: status.into(),
+                        exit_code: None,
+                        signal: None,
+                    },
+                    _ => unreachable!(),
+                };
+                result.validate().map_err(|e| invalid(e.to_string()))?;
                 let writer = FrameWriter::control(
-                    FrameType::ServerChildExit,
-                    &serde_json::to_vec(&exit)?,
+                    FrameType::ServerExecResult,
+                    &serde_json::to_vec(&result)?,
                     Instant::now(),
                 )?;
-                let Input::Executing {
+                if let Input::Executing {
                     ready_sent,
                     finishing,
                     terminal,
                     ..
-                } = &mut connection.input
-                else {
-                    return Err(invalid("exit before readiness"));
-                };
-                if *ready_sent {
-                    connection.output = Some(writer);
-                    *finishing = true;
+                } = &mut c.input
+                {
+                    if *ready_sent {
+                        c.output = Some(writer);
+                        *finishing = true;
+                    } else {
+                        *terminal = Some(writer);
+                    }
                 } else {
-                    *terminal = Some(writer);
+                    let Input::Authorizing { _task } =
+                        std::mem::replace(&mut c.input, Input::Client)
+                    else {
+                        return Err(invalid("missing result owner"));
+                    };
+                    c.input = Input::Executing {
+                        _task,
+                        ready_sent: true,
+                        finishing: true,
+                        terminal: None,
+                    };
+                    c.output = Some(writer);
                 }
             }
         }
         register(
             epoll,
             libc::EPOLL_CTL_MOD,
-            connection.fd.as_raw_fd(),
+            c.fd.as_raw_fd(),
             token,
             true,
             false,
@@ -838,6 +856,7 @@ fn publish_notices(
 pub struct ForegroundDaemon {
     client: BoundSocket,
     approval: BoundSocket,
+    context_listener: BoundSocket,
     _resources: StartupResources,
     config: Arc<DaemonConfig>,
     _signers: SignerPolicyFile,
@@ -904,15 +923,30 @@ impl ForegroundDaemon {
                 "audit storage pressure after execution startup; remediation and restart required",
             ));
         }
+        if config
+            .mvp
+            .as_ref()
+            .is_none_or(|p| p.approval_signer_id.is_empty())
+        {
+            return Err(invalid("local v2 profile requires an approval signer"));
+        }
+        let context_path = crate::client::context_path(socket);
+        if context_path == approval_socket {
+            return Err(invalid("context and approval sockets must differ"));
+        }
+        let mut context_listener = BoundSocket::bind(&context_path, 0o666)?;
         let mut client = BoundSocket::bind(socket, 0o666)?;
         let mut approval = BoundSocket::bind(approval_socket, 0o600)?;
         let disposal = SocketDisposal::new()?;
+        context_listener.disposal = Some(disposal.reserve().expect("new pool listener capacity"));
         client.disposal = Some(disposal.reserve().expect("new pool listener capacity"));
         approval.disposal = Some(disposal.reserve().expect("new pool listener capacity"));
         // Protect listener final closes before any peer can queue connections.
+        context_listener.listen()?;
         client.listen()?;
         approval.listen()?;
         Ok(Self {
+            context_listener,
             client,
             approval,
             _resources: resources,
@@ -936,6 +970,30 @@ impl ForegroundDaemon {
             host_id: self._resources.host_id.clone(),
             signers: self._signers.clone(),
         });
+        use sigrund_core::protocol::{ContextFeatures, ContextLimits, PublicContext};
+        let public_context = Arc::new(serde_json::to_vec(&PublicContext {
+            version: "2.0".into(),
+            host_id: context.host_id.clone(),
+            policy_generation: 1,
+            executable_trust_models: self.config.executable_trust_models.clone(),
+            limits: ContextLimits {
+                max_executable_bytes: self.config.max_executable_bytes,
+                max_direct_digest_bytes: self.config.max_direct_digest_bytes,
+                direct_digest_timeout_ms: self.config.direct_digest_timeout_ms,
+                max_stdin_bytes: self.config.max_stdin_bytes,
+                max_ttl_secs: self.config.max_ttl_secs,
+                max_onetime_window_secs: self.config.max_onetime_window_secs,
+                authorization_timeout_ms: self.config.authorization_timeout_ms,
+            },
+            features: ContextFeatures {
+                direct_exec_checkpoint: crate::execution::trace_available(),
+                host_file_capabilities: crate::execution::trace_available(),
+                tty_modes: vec!["stdio".into()],
+                stdin_policies: vec!["null".into(), "sha256".into()],
+                grant_modes: vec!["one_time".into()],
+            },
+        })?);
+        let mut context_workers = crate::context::ContextWorkers::new(public_context)?;
         let budget = SnapshotBudget::default();
         let signals = self.signals;
         crate::startup::CgroupLayout::register_subreaper()?;
@@ -943,7 +1001,11 @@ impl ForegroundDaemon {
         // on signalfd even when a metadata syscall cannot be interrupted.
         let mut workers = IoWorkers::new(&self.config)?;
         let storage_closed = self._resources.storage.closed.clone();
-        let mut admission = Admission::new(&self.config, Instant::now());
+        let admission_start = Instant::now();
+        let mut admission = Admission::new(&self.config, admission_start);
+        let mut context_window = 0u64;
+        let mut context_rates: HashMap<u32, u32> = HashMap::new();
+        let mut context_total = 0u32;
         let sequencer_capacity = (self.config.max_pending_audits_global as usize)
             .checked_mul(2)
             .ok_or_else(|| invalid("sequencer capacity overflow"))?;
@@ -964,6 +1026,8 @@ impl ForegroundDaemon {
         }
         let epoll = unsafe { OwnedFd::from_raw_fd(raw) };
         for (fd, token) in [
+            (self.context_listener.fd(), CONTEXT_LISTENER),
+            (context_workers.fd(), CONTEXT_COMPLETE),
             (self.client.fd(), CLIENT_LISTENER),
             (self.approval.fd(), APPROVAL_LISTENER),
             (signals.fd.as_raw_fd(), SIGNALS),
@@ -1058,9 +1122,13 @@ impl ForegroundDaemon {
                             reload_diagnostic_pending = true;
                         }
                     } else if stopping.is_some()
-                        && (token == CLIENT_LISTENER || token == APPROVAL_LISTENER)
+                        && (token == CLIENT_LISTENER
+                            || token == APPROVAL_LISTENER
+                            || token == CONTEXT_LISTENER)
                     {
                         continue;
+                    } else if token == CONTEXT_COMPLETE {
+                        context_workers.drain();
                     } else if token == SOCKET_DISPOSAL {
                         self.disposal.drain();
                     } else if token == AUDIT_COMPLETE {
@@ -1080,6 +1148,7 @@ impl ForegroundDaemon {
                                     let allowed = stopping.is_none()
                                         && connections.get(&token).is_some_and(|c| {
                                             matches!(c.input, Input::Authorizing { .. })
+                                                && Instant::now() < c.auth_deadline
                                                 && sequencer::connection_live(c.fd.as_raw_fd())
                                                 && !c
                                                     .lifecycle
@@ -1096,7 +1165,22 @@ impl ForegroundDaemon {
                                     token,
                                     lease,
                                     denial,
+                                    audit,
+                                    lifecycle,
+                                    fields,
                                 } => {
+                                    if let Some(c) = connections.get_mut(&token) {
+                                        c.audit = Some(audit);
+                                    } else {
+                                        let mut fields = fields;
+                                        fields["public_outcome"] =
+                                            lifecycle.public_outcome().into();
+                                        fields["delivery_status"] =
+                                            lifecycle.delivery_status().into();
+                                        sequencer.sender().try_send(sequencer::Work::Event { token, event_type:"PRIVATE_OUTCOME", fields,
+                                            limit:lease.request().policy.audit_record_max_bytes as usize, _audit:audit })
+                                            .map_err(|_|invalid("reserved outcome reconciliation capacity unavailable"))?;
+                                    }
                                     if let Some(c) = connections.get_mut(&token)
                                         && c.lifecycle.state().1 == LifecycleDecision::Undecided
                                     {
@@ -1112,14 +1196,81 @@ impl ForegroundDaemon {
                                             libc::EPOLL_CTL_MOD,
                                             c.fd.as_raw_fd(),
                                             token,
-                                            true,
+                                            c.output.is_some(),
                                             false,
                                         )?;
                                     }
-                                    drop(lease);
+                                    if let Some(c) = connections.get_mut(&token) {
+                                        c.retained_lease = Some(lease);
+                                    } else {
+                                        drop(lease);
+                                    }
                                 }
                                 sequencer::Completion::Committed(job) => {
-                                    execution.submit(*job)?;
+                                    if let Some(c) = connections.get_mut(&job.token) {
+                                        let now = Instant::now();
+                                        let w = job.authorized.warrant.warrant();
+                                        let valid_now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .ok()
+                                            .and_then(|d| i64::try_from(d.as_secs()).ok())
+                                            .is_some_and(|t| {
+                                                t >= w.policy.not_before
+                                                    && w.policy
+                                                        .not_after
+                                                        .is_some_and(|end| t <= end)
+                                            });
+                                        if now < c.auth_deadline
+                                            && valid_now
+                                            && sequencer::connection_live(c.fd.as_raw_fd())
+                                            && c.lifecycle.transition(
+                                                Phase::Committed,
+                                                Phase::ApprovalDelivery,
+                                            )
+                                            && c.lifecycle.claim_terminal(
+                                                Phase::ApprovalDelivery,
+                                                LifecycleDecision::Approved,
+                                            )
+                                        {
+                                            c.request_deadline = None;
+                                            c.output = Some(FrameWriter::control(
+                                                FrameType::ServerAuthDecision,
+                                                &serde_json::to_vec(&Decision {
+                                                    exec_id: c.exec_id.clone(),
+                                                    status: "APPROVED".into(),
+                                                })?,
+                                                now,
+                                            )?);
+                                            c.committed_job = Some(job);
+                                            register(
+                                                epoll.as_raw_fd(),
+                                                libc::EPOLL_CTL_MOD,
+                                                c.fd.as_raw_fd(),
+                                                c.token,
+                                                true,
+                                                false,
+                                            )?;
+                                        } else {
+                                            c.lifecycle.silence();
+                                            let mut fields = job.commit_fields.clone();
+                                            fields["reason"] =
+                                                "authorization delivery expired or disconnected"
+                                                    .into();
+                                            c.retained_lease = Some(job.lease);
+                                            c.audit = Some(job.audit);
+                                            c.durable.try_send(sequencer::Work::Execution { token:0,
+                                                records:vec![("AUTH_ABORTED_POST_COMMIT",fields)],
+                                                limit:c.policy.audit_record_max_bytes as usize, owner:None})
+                                                .map_err(|_|invalid("reserved reconciliation capacity unavailable"))?;
+                                            c.reject(
+                                                "REQUEST_TIMEOUT",
+                                                "authorization delivery expired",
+                                                now,
+                                            )?;
+                                        }
+                                    } else {
+                                        abort_delivery(job, &sequencer.sender());
+                                    }
                                 }
                                 sequencer::Completion::Denied { token, denial } => {
                                     if let Some(c) = connections.get_mut(&token)
@@ -1137,7 +1288,7 @@ impl ForegroundDaemon {
                                             libc::EPOLL_CTL_MOD,
                                             c.fd.as_raw_fd(),
                                             token,
-                                            true,
+                                            c.output.is_some(),
                                             false,
                                         )?;
                                     }
@@ -1170,9 +1321,8 @@ impl ForegroundDaemon {
                                 }
                             };
                             if let Some(mut connection) = connections.remove(&token) {
-                                let approval_busy = connections
-                                    .values()
-                                    .any(|c| c.approval_reserved && c.output.is_none());
+                                let approval_busy =
+                                    connections.values().any(|c| c.approval_reserved);
                                 let broker = if result.as_ref().is_ok_and(|lease| {
                                     lease.prepared().is_some_and(|p| {
                                         matches!(p.document, Document::Unsigned(_))
@@ -1243,8 +1393,13 @@ impl ForegroundDaemon {
                                 }
                             }
                         }
-                    } else if token == CLIENT_LISTENER || token == APPROVAL_LISTENER {
-                        let listener = if token == CLIENT_LISTENER {
+                    } else if token == CLIENT_LISTENER
+                        || token == APPROVAL_LISTENER
+                        || token == CONTEXT_LISTENER
+                    {
+                        let listener = if token == CONTEXT_LISTENER {
+                            &self.context_listener
+                        } else if token == CLIENT_LISTENER {
                             &self.client
                         } else {
                             &self.approval
@@ -1264,6 +1419,29 @@ impl ForegroundDaemon {
                                 continue;
                             };
                             let broker = token == APPROVAL_LISTENER;
+                            let context_query = token == CONTEXT_LISTENER;
+                            if context_query {
+                                let window = accepted
+                                    .saturating_duration_since(admission_start)
+                                    .as_secs()
+                                    / u64::from(self.config.admission_window_secs);
+                                if window != context_window {
+                                    context_window = window;
+                                    context_total = 0;
+                                    context_rates.clear();
+                                }
+                                if context_total >= 64
+                                    || context_rates.get(&peer.uid).copied().unwrap_or(0) >= 8
+                                    || disable_ancillary_credentials(fd.as_raw_fd()).is_err()
+                                {
+                                    continue;
+                                }
+                                if context_workers.submit(fd, peer.uid, accepted) {
+                                    context_total += 1;
+                                    *context_rates.entry(peer.uid).or_default() += 1;
+                                }
+                                continue;
+                            }
                             // Authenticate before constructing a broker parser or
                             // reading a single byte (including queued signatures).
                             if broker && peer.uid != 0 {
@@ -1313,7 +1491,10 @@ impl ForegroundDaemon {
                                 request_deadline: (!broker).then_some(
                                     accepted
                                         + Duration::from_millis(
-                                            self.config.request_deadline_ms.into(),
+                                            self.config
+                                                .request_deadline_ms
+                                                .min(self.config.authorization_timeout_ms)
+                                                .into(),
                                         ),
                                 ),
                                 exec_id: new_uuidv7().to_string(),
@@ -1324,6 +1505,19 @@ impl ForegroundDaemon {
                                 approval_broker: None,
                                 approval_csr: None,
                                 approval_reusable: false,
+                                auth_deadline: accepted
+                                    + Duration::from_millis(
+                                        self.config.authorization_timeout_ms.into(),
+                                    ),
+                                preparation_deadline: accepted
+                                    + Duration::from_millis(self.config.request_deadline_ms.into()),
+                                mode: String::new(),
+                                full_validated: false,
+                                private_failure: None,
+                                provenance: serde_json::json!({"request_origin":null,"intent_sha256":null,"approval_exec_id":null}),
+                                silent: false,
+                                retained_lease: None,
+                                committed_job: None,
                             };
                             let id = next_token;
                             next_token = next_token
@@ -1386,6 +1580,14 @@ impl ForegroundDaemon {
                         .sender()
                         .try_send(work)
                         .map_err(|_| invalid("reserved diagnostic capacity unavailable"))?;
+                }
+                for c in connections.values_mut() {
+                    if c.lifecycle.state().0 == Phase::Approved
+                        && let Some(mut job) = c.committed_job.take()
+                    {
+                        job.lease.disable_stage_deadline();
+                        execution.submit(*job)?;
+                    }
                 }
                 // Expiry is independent of socket readiness and read progress.
                 let now = Instant::now();
@@ -1468,9 +1670,14 @@ impl ForegroundDaemon {
                     stop_notified = true;
                 }
                 execution.shutdown(false);
+                context_workers.shutdown();
                 // Close both listening endpoints and all control connections
                 // once. Worker-held shared sockets observe shutdown immediately.
-                for listener in [&mut self.client, &mut self.approval] {
+                for listener in [
+                    &mut self.client,
+                    &mut self.approval,
+                    &mut self.context_listener,
+                ] {
                     if listener.fd.is_none() {
                         continue;
                     }
@@ -1530,6 +1737,7 @@ impl ForegroundDaemon {
                 let available = self.disposal.available();
                 if available != listeners_registered {
                     for (listener, token) in [
+                        (&self.context_listener, CONTEXT_LISTENER),
                         (&self.client, CLIENT_LISTENER),
                         (&self.approval, APPROVAL_LISTENER),
                     ] {
@@ -1556,6 +1764,7 @@ impl ForegroundDaemon {
             }
             if let Some(start) = stopping {
                 if execution.is_idle()
+                    && context_workers.is_idle()
                     && workers.is_idle()
                     && admission.is_idle()
                     && self.disposal.used() == 0
@@ -1682,6 +1891,13 @@ mod approval_tests {
             let payload = String::from_utf8(csr.as_bytes().to_vec()).unwrap();
             let (durable, _audit) = sync_channel(1);
             let mut connection = Connection {
+                auth_deadline: deadline,
+                preparation_deadline: deadline,
+                mode: "thin_csr".into(),
+                full_validated: false,
+                silent: false,
+                retained_lease: None,
+                committed_job: None,
                 token: 42,
                 fd,
                 peer: PeerCredentials {
@@ -1701,6 +1917,8 @@ mod approval_tests {
                 approval_reserved: true,
                 approval_broker: None,
                 approval_csr: Some(payload.clone()),
+                private_failure: None,
+                provenance: serde_json::json!({"request_origin":null,"intent_sha256":null,"approval_exec_id":null}),
                 approval_reusable: false,
             };
             let now = deadline + Duration::from_millis(1);
@@ -1724,8 +1942,15 @@ mod approval_tests {
             let mut body = vec![0; u32::from_be_bytes(header[1..].try_into().unwrap()) as usize];
             peer.read_exact(&mut body).unwrap();
             let decision: Decision = parse_strict(&body).unwrap();
-            assert_eq!(decision.status, "TIMEOUT_CSR");
-            assert_eq!(decision.csr_payload.as_deref(), Some(payload.as_str()));
+            assert_eq!(decision.status, "TIMEOUT");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                2
+            );
             // A timer/result arriving after that decision cannot publish again.
             connection
                 .finish_validation(

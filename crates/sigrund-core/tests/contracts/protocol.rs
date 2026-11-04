@@ -40,7 +40,7 @@ fn dsse_rejects_invalid_outer_schema_base64_and_inner_structure() {
 #[test]
 fn signed_hello_validates_canonical_inner_payload_and_caller_environment() {
     let mut hello: ClientHello = parse_strict(&serde_json::to_vec(&json!({
-        "caller_env": {}, "mode": "signed", "tty_mode": "stdio", "dsse_envelope": signed(fixture()),
+        "caller_env": {}, "version":"2.0", "mode": "signed", "tty_mode": "stdio", "dsse_envelope": signed(fixture()),
     })).unwrap()).unwrap();
     hello.validate_request().unwrap();
     hello.caller_env.insert("TERM".into(), "xterm".into());
@@ -59,7 +59,7 @@ fn hello_wire_limits_use_original_bytes_and_preserve_omitted_fields() {
     let bytes = serde_json::to_vec(&hello).unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("dsse_envelope"));
     let mut boundary = bytes.clone();
-    boundary.resize(65_536, b' ');
+    boundary.resize(524_288, b' ');
     ClientHello::parse_request(&boundary).unwrap();
     boundary.push(b' ');
     assert!(ClientHello::parse_request(&boundary).is_err());
@@ -79,10 +79,11 @@ fn hello_wire_limits_use_original_bytes_and_preserve_omitted_fields() {
     assert_eq!(bytes.len(), 65_536);
     ClientHello::parse_request(&bytes).unwrap();
 
-    let mut signed_bytes = serde_json::to_vec(&json!({"caller_env": {}, "mode": "signed",
+    let mut signed_bytes =
+        serde_json::to_vec(&json!({"caller_env": {}, "version":"2.0", "mode": "signed",
         "tty_mode": "stdio", "dsse_envelope": signed(fixture())}))
-    .unwrap();
-    signed_bytes.resize(196_608, b' ');
+        .unwrap();
+    signed_bytes.resize(524_288, b' ');
     ClientHello::parse_request(&signed_bytes).unwrap();
     signed_bytes.push(b' ');
     assert!(ClientHello::parse_request(&signed_bytes).is_err());

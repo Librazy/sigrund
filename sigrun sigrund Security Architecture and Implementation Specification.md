@@ -4,9 +4,9 @@ This is the normative **v2 target contract**, not a description of the current
 runtime. It defines client-generated full CSRs, privately expanded thin CSRs,
 confidential pre-authorization outcomes, all four executable trust models,
 canonical signing, durable authorization, execution, hooks and audit replication.
-The v2 workflow is **not implemented**. Current v1 behavior and runnable recipes
-are documented separately in `IMPLEMENTATION_NOTES.md`; existing tests do not
-establish v2 conformance.
+The local one-time SSH/stdio implementation and runnable recipes are documented
+in `IMPLEMENTATION_NOTES.md`. Deferred features and incomplete acceptance coverage
+remain explicit; the local implementation does not establish full v2 conformance.
 
 V2 is a clean break: reject old clients, request shapes, warrants, signing domains,
 database schemas, audit state and collector contracts. There is no compatibility
@@ -533,8 +533,7 @@ V2 `sigrun --export-csr PATH -- ...` prepares and exports a full canonical CSR
 without execution submission (and implies full-only). It may query public context;
 it never requests privileged expansion. Offline `sigrundctl csr-pae --csr PATH`
 and `pack-warrant` consume those bytes, sign/package without rewriting fields,
-and refuse overwrites. Thin requests have no export/redemption path. These are
-v2 target CLI contracts, not options implemented by the current binaries.
+and refuse overwrites. Thin requests have no export/redemption path. These options apply to the implemented local v2 profile.
 
 ### 2.2.1 Preparation, Access Validation, and Exact Binding
 
@@ -1591,7 +1590,7 @@ signature cannot resume evaluation. Details remain in protected audit only.
 The `[mvp]` profile replaces hook dispatch with one authenticated root approver.
 It uses the same full/thin preparation, provenance, deadlines, durable gates and
 public outcomes. Signed client-full warrants bypass review, not authorization.
-V2 specifies the target profile; the current implementation remains v1.
+The current implementation supports this local v2 profile.
 
 **Configuration:** Exact fields are `tty_mode = "stdio"`, `hooks_enabled = false`,
 `pty_enabled = false`, `max_active_approval_requests = 1`, and a nonempty
@@ -1887,11 +1886,11 @@ state diagrams must have independently checkable fixtures before runtime release
 
 ### 8.3 Implementation Status and Release Gate
 
-The v2 full/thin workflow, context endpoint, access helper, provenance schema,
-confidential outcomes, approval/result split and state formats are **unimplemented**.
-This documentation update does not change executable behavior, configuration
-parsers, binaries, packaging or databases. `IMPLEMENTATION_NOTES.md` describes the
-current v1 local profile and its tests; those results are not v2 conformance.
+The local one-time SSH/stdio profile implements the v2 full/thin workflow,
+context endpoint, requester access helper, signed provenance, confidential outcomes,
+approval/result split and fresh state formats. `IMPLEMENTATION_NOTES.md` describes
+its supported domain and validation limits. This implementation does not by itself
+establish that every applicable V-01–V-20 acceptance case has passed.
 
 The first v2 runtime release must implement and pass every applicable row for the
 local one-time SSH/stdin/stdout profile, including real host filesystem permissions,

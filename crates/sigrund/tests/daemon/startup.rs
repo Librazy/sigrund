@@ -137,7 +137,7 @@ pub(super) fn verify_audit_directory_replacement() {
             for (index, byte) in key.iter_mut().enumerate() {
                 *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
             }
-            let mut record = serde_json::json!({"event_type":"TEST_CRASH_WINDOW",
+            let mut record = serde_json::json!({"schema_version":2,"event_type":"TEST_CRASH_WINDOW",
                 "host_id":genesis["host_id"],"seq":state["seq"],
                 "prev_record_sha256":state["last_record_sha256"]});
             record["entry_hmac"] = entry_hmac(&key, &serde_json::to_vec(&record).unwrap()).into();

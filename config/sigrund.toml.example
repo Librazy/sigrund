@@ -26,6 +26,8 @@ max_direct_digest_bytes = 268435456
 direct_digest_timeout_ms = 5000
 max_stdin_bytes = 16777216
 request_deadline_ms = 5000
+# Fixed admission-based deadline for every TIMEOUT authorization outcome.
+authorization_timeout_ms = 120000
 request_admissions_global = 256
 request_admissions_per_uid = 16
 admission_window_secs = 60
@@ -42,7 +44,7 @@ collector_server_name = "collector.example.invalid"
 collector_ca_file = "/etc/sigrund/collector-ca.pem"
 collector_client_cert_file = "/etc/sigrund/collector-client.crt"
 collector_client_key_file = "/etc/sigrund/collector-client.key"
-collector_key_id = "collector-v1"
+collector_key_id = "collector-v2"
 collector_public_key = "<strict-padded-base64-32-byte-ed25519-key>"
 collector_rpc_timeout_ms = 3000
 

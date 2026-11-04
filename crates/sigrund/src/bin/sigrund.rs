@@ -7,6 +7,13 @@ use sigrund_core::config::{DaemonConfig, SignerPolicyFile};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args == ["--internal-access-helper"] {
+        return if sigrund::access::helper_main().is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(77)
+        };
+    }
     let args = match DaemonArgs::parse(&args) {
         Ok(args) => args,
         Err(error) => {

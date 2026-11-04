@@ -9,5 +9,7 @@ mod json;
 mod protocol;
 #[path = "contracts/support.rs"]
 mod support;
+#[path = "contracts/v2.rs"]
+mod v2;
 #[path = "contracts/warrant.rs"]
 mod warrant;

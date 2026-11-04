@@ -95,7 +95,7 @@ impl JobSupervisor {
         let (sender, tasks) = mpsc::sync_channel::<Task>(capacity);
         let (completed, receiver) = mpsc::sync_channel(capacity * 8);
         let notifier = Notifier { completed, wake };
-        if layout.is_some() {
+        {
             let tasks = Arc::new(Mutex::new(tasks));
             let operation = Arc::new(operation);
             for slot in 0..capacity {
@@ -293,7 +293,7 @@ pub(crate) fn prepare_job(
     if let Err(error) = eligible(job) {
         return (None, error.to_string());
     }
-    if job.lifecycle.state().0 != sigrund_core::lifecycle::Phase::Committed {
+    if job.lifecycle.state().0 != sigrund_core::lifecycle::Phase::Approved {
         return (None, "cancelled job preparation".into());
     }
     if job.gid != job.authorized.warrant.warrant().requester_gid

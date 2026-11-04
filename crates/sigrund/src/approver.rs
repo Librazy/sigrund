@@ -32,6 +32,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
 pub(crate) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ARMOR: usize = 34_000;
 
@@ -226,7 +227,7 @@ fn watch_broker(
                 reader.deadline(),
             )?;
         };
-        let deadline = Instant::now() + APPROVAL_TIMEOUT;
+        let deadline = Instant::now() + Duration::from_millis(request.remaining_ms.into());
         let signer = signers
             .signers
             .iter()
@@ -676,7 +677,7 @@ fn sign_with_helper(
             "-Y",
             "sign",
             "-n",
-            "sigrun.warrant.v1",
+            "sigrun.warrant.v2",
             "-O",
             "hashalg=sha512",
             "-f",
@@ -988,7 +989,7 @@ mod tests {
         // Independently invoke OpenSSH with the wrong domain or without PAE.
         for (namespace, input) in [
             ("wrong.namespace", pae(WARRANT_PAYLOAD_TYPE, payload)),
-            ("sigrun.warrant.v1", payload.to_vec()),
+            ("sigrun.warrant.v2", payload.to_vec()),
         ] {
             let mut child = Command::new("/usr/bin/ssh-keygen")
                 .args(["-Y", "sign", "-n", namespace, "-O", "hashalg=sha512", "-f"])

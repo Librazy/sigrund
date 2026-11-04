@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{CoreError, Result};
 
-pub const WARRANT_PAYLOAD_TYPE: &str = "application/vnd.sigrun.warrant.v1+json";
+pub const WARRANT_PAYLOAD_TYPE: &str = "application/vnd.sigrun.warrant.v2+json";
 
 pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload_type.len() + payload.len() + 32);
@@ -138,7 +138,7 @@ pub fn verify_ssh_signature(
         }
     }
     public_key
-        .verify("sigrun.warrant.v1", &pae(payload_type, payload), &signature)
+        .verify("sigrun.warrant.v2", &pae(payload_type, payload), &signature)
         .map_err(|e| CoreError::Value(format!("SSHSIG verification failed: {e}")))
 }
 
@@ -152,7 +152,7 @@ mod tests {
     };
 
     const TEST_PAYLOAD: &[u8] = b"warrant payload";
-    const TEST_NAMESPACE: &str = "sigrun.warrant.v1";
+    const TEST_NAMESPACE: &str = "sigrun.warrant.v2";
 
     /// Build signatures with an independent Ed25519 implementation, including
     /// the authenticator's signed application, flags, and counter for SK keys.
@@ -279,7 +279,7 @@ mod tests {
     fn pae_matches_spec_vector_prefix() {
         let payload = br#"{"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"1.0"}"#;
         let encoded = pae(WARRANT_PAYLOAD_TYPE, payload);
-        assert!(encoded.starts_with(b"DSSEv1 38 application/vnd.sigrun.warrant.v1+json "));
+        assert!(encoded.starts_with(b"DSSEv1 38 application/vnd.sigrun.warrant.v2+json "));
         assert_eq!(encoded.len(), 119);
     }
 

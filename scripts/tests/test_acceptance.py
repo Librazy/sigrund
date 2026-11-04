@@ -14,7 +14,7 @@ import json, os, signal, sys
 from pathlib import Path
 status, cleaned, mode = sys.argv[1:]
 def complete(signum, frame):
-    outcome = {'exit_code': None, 'signal': 2} if mode != 'wrong' else {'exit_code': 23, 'signal': None}
+    outcome = {'status': 'EXITED', 'exit_code': None, 'signal': 2} if mode != 'wrong' else {'status': 'EXITED', 'exit_code': 23, 'signal': None}
     with open(status, 'a') as output:
         output.write(json.dumps(outcome) + '\n')
     if mode != 'retained':
@@ -22,7 +22,7 @@ def complete(signum, frame):
     sys.exit(130 if mode != 'wrong' else 23)
 signal.signal(signal.SIGINT, signal.SIG_IGN if mode == 'ignored' else complete)
 with open(status, 'a') as output:
-    output.write('{"status":"READY_TO_EXEC"}\n')
+    output.write('{"exec_outcome":"unknown"}\n')
 # Finite output deliberately reproduces the old false positive if the harness
 # starts draining before verifying cancellation.
 for _ in range(512):

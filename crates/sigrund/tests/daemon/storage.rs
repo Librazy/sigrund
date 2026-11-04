@@ -57,6 +57,7 @@ fn namespace_fixture() {
         "event_type": "PRESSURE_FIXTURE",
         "host_id": genesis["host_id"],
         "padding": "",
+        "schema_version":2,
         "prev_record_sha256": audit.state().last_record_sha256,
         "seq": audit.state().seq,
     }))
@@ -85,7 +86,7 @@ fn namespace_fixture() {
         &encode_frame(FrameType::ClientHello, b"{}").unwrap(),
         2,
     );
-    assert_eq!(decision(&mut client).status, "INVALID_REQUEST");
+    assert_eq!(decision(&mut client).status, "TIMEOUT");
     expect_closed(&mut client);
     fixture.wait_for_cleanup(before);
     wait_for(|| fs::metadata(&fixture.log).unwrap().len() >= high_water as u64);
@@ -119,7 +120,8 @@ fn namespace_fixture() {
             .lines()
             .any(|line| {
                 let record: serde_json::Value = serde_json::from_str(line).unwrap();
-                record["event_type"] == "AUTH_REJECTED" && record["status"] == "INVALID_REQUEST"
+                record["event_type"] == "PRIVATE_OUTCOME"
+                    && record["reason_code"] == "INVALID_REQUEST"
             })
     );
 }

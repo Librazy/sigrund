@@ -91,8 +91,34 @@ def receive(stream, kind):
     header = exact(5)
     assert header[0] == kind, header
     size = struct.unpack('>I', header[1:])[0]
-    assert 0 < size <= (524288 if kind == 2 else 128)
+    assert 0 < size <= (524288 if kind == 2 else 512)
     return json.loads(exact(size))
+
+
+def authorized(stream):
+    decision = receive(stream, 2)
+    assert set(decision) == {'exec_id', 'status'} and decision['status'] == 'APPROVED', decision
+    return decision
+
+
+def ready(stream):
+    decision = authorized(stream)
+    notice = receive(stream, 8)
+    assert set(notice) == {'exec_id', 'exec_outcome'} and notice['exec_id'] == decision['exec_id'], notice
+    assert notice['exec_outcome'] in ('unknown', 'exec_event_observed'), notice
+    return decision
+
+
+def exited(stream):
+    result = receive(stream, 5)
+    assert set(result) == {'exec_id', 'status', 'exit_code', 'signal'} and result['status'] == 'EXITED', result
+    assert (result['exit_code'] is None) != (result['signal'] is None), result
+    return exit_fields(result)
+
+
+def exit_fields(event):
+    assert event['status'] == 'EXITED', event
+    return {k: event[k] for k in ('exit_code', 'signal')}
 
 
 def unprivileged():
@@ -102,7 +128,7 @@ def unprivileged():
 
 
 class Fixture:
-    def __init__(self, parent, binaries, models=None):
+    def __init__(self, parent, binaries, models=None, authorization_timeout_ms=2500):
         self.parent = parent
         self.binaries = binaries
         self.directory = tempfile.TemporaryDirectory(prefix='sigrund-runtime-')
@@ -132,7 +158,7 @@ class Fixture:
             (root / name).chmod(0o755)
         roots = json.dumps(sorted(['/usr/bin', str(root)]))
         config = (REPO / 'config/sigrund.toml.example').read_text()
-        # Existing fixtures explicitly exercise the legacy sealed-byte contract.
+        # Default fault fixtures use the v2 sealed-byte model explicitly.
         config = config.replace('executable_trust_models = ["fs_verity", "ctime", "digest_direct", "digest_memfd"]',
                                 'executable_trust_models = ' + json.dumps(models if models is not None else ['digest_memfd']))
         config = config.replace('["/usr/bin", "/usr/sbin"]', roots)
@@ -143,7 +169,9 @@ class Fixture:
             path = self.base / name
             path.write_text('no network use in local-audit gate\n')
             config = config.replace('/etc/sigrund/' + name, str(path))
-        config += '\n[mvp]\n'
+        config = config.replace('authorization_timeout_ms = 120000',
+                                'authorization_timeout_ms = ' + str(authorization_timeout_ms))
+        config += '\n[mvp]\napproval_signer_id = "' + SIGNER + '"\n'
         (self.base / 'config').write_text(config)
         signer = (REPO / 'config/signers.toml.example').read_text()
         signer = signer.replace('type = "sk-ssh-ed25519"', 'type = "ssh-ed25519"')
@@ -188,32 +216,48 @@ class Fixture:
                capabilities=(), env_exact=None, input_bytes=None,
                supplementary_gids=(33,), executable_trust=None):
         genesis = json.loads(self.log.read_text().splitlines()[0])
-        payload = canonical({
-            'version': '1.0', 'grant_id': uuid7(), 'host_id': genesis['host_id'],
-            'requester_uid': uid, 'requester_gid': uid,
+        value = {
+            'version': '2.0', 'grant_id': uuid7(), 'host_id': genesis['host_id'],
+            'requester_uid': uid, 'requester_gid': uid, 'request_origin': 'client_full',
+            'approval_exec_id': None, 'caller_env': {},
             'command': {'allow_interpreted_script': False, 'argv': [str(command), *args], 'cwd': '/',
-                        'executable_path': str(command), 'executable_sha256': hashlib.sha256(Path(command).read_bytes()).hexdigest(),
+                        'executable_path': str(command),
+                        'executable_trust': executable_trust or {'model': 'digest_memfd', 'sha256': hashlib.sha256(Path(command).read_bytes()).hexdigest()},
                         'stdin_policy': 'null' if input_bytes is None else 'sha256',
                         'stdin_sha256': None if input_bytes is None else hashlib.sha256(input_bytes).hexdigest(),
                         'tty_mode': 'stdio'},
             'execution_context': {'target_uid': target_uid, 'target_gid': target_uid,
                                   'supplementary_gids': list(supplementary_gids),
                                   'capabilities': list(capabilities), 'env_exact': env_exact or {},
-                                  'caller_env_allowlist': [], 'umask': 0o027},
+                                  'caller_env_allowlist': [], 'umask': 0o027,
+                                  'post_exec_capabilities': {k: list(capabilities) for k in ('ambient','bounding','effective','inheritable','permitted')}},
             'policy': {'mode': 'one_time', 'not_before': int(time.time()) - 1, 'not_after': int(time.time()) + 120},
-        })
-        if executable_trust is not None:
-            value = json.loads(payload)
-            value['version'] = '1.1'
-            value['command']['executable_sha256'] = None
-            value['command']['executable_trust'] = executable_trust
-            payload = canonical(value)
+        }
+        intent = {'command': {k: v for k,v in value['command'].items() if k not in ('executable_trust', 'stdin_sha256')},
+                  'execution_context': {k: v for k,v in value['execution_context'].items() if k != 'post_exec_capabilities'},
+                  'policy': {'mode':'one_time','ttl_secs':value['policy']['not_after']-value['policy']['not_before']}, 'caller_env':{}}
+        value['intent_sha256'] = hashlib.sha256(canonical(intent)).hexdigest()
+        payload = canonical(value)
         return self.sign_payload(payload)
 
+    def export(self, command, args=(), *, target=0, capabilities=()):
+        directory = self.base / 'exports'
+        directory.mkdir(exist_ok=True)
+        os.chown(directory, 65534, 65534)
+        path = directory / (uuid.uuid4().hex + '.csr')
+        argv = [str(self.client_binary), '--socket', str(self.client), '--export-csr', str(path),
+                '--target-uid', str(target), '--target-gid', str(target), '--cwd', '/']
+        for capability in capabilities:
+            argv += ['--capability', capability]
+        result = subprocess.run([*argv, '--', str(command), *map(str,args)], preexec_fn=unprivileged,
+                                input=b'', capture_output=True, timeout=8)
+        assert result.returncode == 0 and not result.stdout and not result.stderr, result
+        return path
+
     def sign_payload(self, payload):
-        kind = b'application/vnd.sigrun.warrant.v1+json'
+        kind = b'application/vnd.sigrun.warrant.v2+json'
         pae = b'DSSEv1 ' + str(len(kind)).encode() + b' ' + kind + b' ' + str(len(payload)).encode() + b' ' + payload
-        signed = subprocess.run(['ssh-keygen', '-Y', 'sign', '-n', 'sigrun.warrant.v1', '-O', 'hashalg=sha512', '-f', str(self.key)], input=pae, capture_output=True, check=True).stdout
+        signed = subprocess.run(['ssh-keygen', '-Y', 'sign', '-n', 'sigrun.warrant.v2', '-O', 'hashalg=sha512', '-f', str(self.key)], input=pae, capture_output=True, check=True).stdout
         signature = base64.b64decode(b''.join(signed.splitlines()[1:-1]))
         envelope = {'payloadType': kind.decode(), 'payload': base64.b64encode(payload).decode(),
                     'signatures': [{'keyid': SIGNER, 'sig': base64.b64encode(signature).decode()}]}
@@ -232,7 +276,7 @@ class Fixture:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(6)
         stream.connect(str(self.client))
-        hello = frame(1, {'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
+        hello = frame(1, {'version': '2.0', 'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
         with open('/dev/null', 'r+b') as null:
             import array
             stream.sendmsg([hello[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [null.fileno(), null.fileno()]))])
@@ -324,8 +368,8 @@ def registration_shutdown(parent, binaries):
     try:
         gate = Gate(f, 'clone-after')
         known = f.socket(f.commands / 'sleep', ('0.4',))
-        decision = receive(known, 2)
-        assert decision['status'] == 'READY_TO_EXEC'
+        decision = ready(known)
+        assert decision['status'] == 'APPROVED'
         known_pid = next(r['child_pid'] for r in f.records() if r.get('event_type') == 'EXEC_READY_TO_EXEC' and r['exec_id'] == decision['exec_id'])
         gate.arm()
         pending = f.socket(f.commands / 'sleep', ('0.05',))
@@ -333,9 +377,9 @@ def registration_shutdown(parent, binaries):
         wait_for(lambda: not Path('/proc', str(known_pid)).exists(), 'registered primary reaped during barrier')
         wait_for(lambda: Path('/proc', str(pending_pid), 'stat').read_text().split(') ')[1].startswith('Z'), 'unpublished child exits but remains waitable')
         gate.unblock()
-        assert receive(pending, 2)['status'] == 'READY_TO_EXEC'
-        assert receive(pending, 5) == {'exit_code': 0, 'signal': None}
-        assert receive(known, 5) == {'exit_code': 0, 'signal': None}
+        assert ready(pending)['status'] == 'APPROVED'
+        assert exited(pending) == {'exit_code': 0, 'signal': None}
+        assert exited(known) == {'exit_code': 0, 'signal': None}
         assert pending.recv(1) == b'' and known.recv(1) == b''
         pending.close()
         known.close()
@@ -343,6 +387,9 @@ def registration_shutdown(parent, binaries):
         gate.arm()
         pending = f.socket(f.commands / 'sleep', ('30',))
         gate.arrive()
+        # Durable authorization is delivered before clone, even while the
+        # unpublished child remains owned by the blocked spawn worker.
+        authorized(pending)
         f.process.send_signal(signal.SIGTERM)
         assert pending.recv(1) == b''
         assert f.process.poll() is None
@@ -396,7 +443,7 @@ def cleanup_shutdown(parent, binaries):
     try:
         gate = Gate(f, 'cleanup-before')
         client = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(client, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(client)['status'] == 'APPROVED'
         gate.arm()
         client.close()
         gate.arrive()
@@ -421,7 +468,7 @@ def poisoned_shutdown(parent, binaries):
     try:
         gate = Gate(f, 'state-fail', durable=True)
         running = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(running, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(running)['status'] == 'APPROVED'
         gate.arm()
         pending = f.socket(f.commands / 'true')
         gate.arrive()
@@ -459,18 +506,18 @@ def runtime_lifecycle(parent, binaries):
             wait_for(f.empty, 'normal cgroup teardown')
             wait_for(lambda: len(list(Path('/proc', str(f.process.pid), 'fd').iterdir())) == baseline, 'request FD/pidfd disposal')
         client = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(client, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(client)['status'] == 'APPROVED'
         client.sendall(frame(3, {'signal': signal.SIGTERM}))
-        assert receive(client, 5) == {'exit_code': None, 'signal': signal.SIGTERM}
+        assert exited(client) == {'exit_code': None, 'signal': signal.SIGTERM}
         client.close()
         wait_for(f.empty, 'signalled cgroup teardown')
         client = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(client, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(client)['status'] == 'APPROVED'
         client.close()
         wait_for(f.empty, 'disconnect cgroup teardown')
         wait_for(lambda: any(r.get('event_type') == 'EXEC_EXIT' and r.get('disconnected') for r in f.records()), 'disconnect audit')
         client = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(client, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(client)['status'] == 'APPROVED'
         f.stop(signal.SIGINT)
         assert client.recv(1) == b''
         client.close()
@@ -486,8 +533,8 @@ def orphan_recovery(parent, binaries):
     try:
         f.launch()
         running = f.socket(f.commands / 'sleep', ('30',))
-        decision = receive(running, 2)
-        assert decision['status'] == 'READY_TO_EXEC'
+        decision = ready(running)
+        assert decision['status'] == 'APPROVED'
         f.process.kill()
         f.process.wait(timeout=6)
         assert f.process.returncode == -signal.SIGKILL
@@ -496,6 +543,7 @@ def orphan_recovery(parent, binaries):
         # cleanup if restart cannot reconcile these prior-instance cgroups.
         f.client.unlink()
         f.approval.unlink()
+        Path(str(f.client) + '.context').unlink()
         f.launch()
         assert f.empty()
         records = f.records()
@@ -529,6 +577,7 @@ def pre_spawn_shutdown(parent, binaries):
                                 return True
                     return False
                 wait_for(stopped, 'child stopped before writing readiness')
+            authorized(client)
             f.process.send_signal(signal.SIGTERM)
             assert client.recv(1) == b'', 'readiness published after shutdown began'
             if mode == 'prepare-before':
@@ -652,14 +701,14 @@ def service_lifecycle(parent, binaries):
     try:
         service = SystemService(f)
         running = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(running, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(running)['status'] == 'APPROVED'
         service.stop()
         assert running.recv(1) == b''
         running.close()
         service.close()
         service = SystemService(f)
         running = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(running, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(running)['status'] == 'APPROVED'
         pid = service.properties('org.freedesktop.systemd1.Service')['MainPID']
         os.kill(pid, signal.SIGKILL)
         wait_for(service.dead, 'whole-service cleanup after forced daemon death')
@@ -669,6 +718,7 @@ def service_lifecycle(parent, binaries):
         # Operator-owned transient socket cleanup after abrupt death.
         f.client.unlink(missing_ok=True)
         f.approval.unlink(missing_ok=True)
+        Path(str(f.client) + '.context').unlink(missing_ok=True)
         service = SystemService(f)
         cli = f.cli(f.commands / 'id')
         out, err = cli.communicate(timeout=6)
@@ -689,7 +739,7 @@ def service_lifecycle(parent, binaries):
         arm = f.base / 'armed'
         service = SystemService(f, {'LD_PRELOAD': str(library), 'SIGRUND_EXEC_MODE': 'cleanup-fail', 'SIGRUND_EXEC_ARM': str(arm)})
         running = f.socket(f.commands / 'sleep', ('30',))
-        assert receive(running, 2)['status'] == 'READY_TO_EXEC'
+        assert ready(running)['status'] == 'APPROVED'
         arm.write_text('armed')
         running.close()
         # The cleanup owner parks after its failed kill. Fatal shutdown stops
