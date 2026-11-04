@@ -31,6 +31,47 @@ use std::{
 // starve another fixture's admission probes before they begin assertions.
 static NAMESPACE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn read_diagnostic_events(path: &Path) -> Vec<serde_json::Value> {
+    // The daemon can still be writing the final record, including a UTF-8
+    // codepoint or the newline after otherwise valid JSON. Count and parse
+    // only complete records so a later poll cannot skip an unfinished event.
+    fs::read(path)
+        .unwrap()
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| line.ends_with(b"\n"))
+        .map(|line| serde_json::from_slice(line).expect("malformed complete diagnostic record"))
+        .collect()
+}
+
+#[test]
+fn diagnostic_reader_waits_for_complete_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("diagnostics.jsonl");
+    let records = "{\"event\":\"SOCKET_ADMITTED\",\"worker_task\":1}\n{\"event\":\"FD_VALIDATION_COMPLETE\",\"worker_task\":1,\"detail\":\"λ\"}\n";
+    let expected: Vec<serde_json::Value> = records
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    fs::write(&path, []).unwrap();
+    let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+    let mut completed = 0;
+    assert!(read_diagnostic_events(&path).is_empty());
+    for byte in records.bytes() {
+        writer.write_all(&[byte]).unwrap();
+        completed += usize::from(byte == b'\n');
+        assert_eq!(read_diagnostic_events(&path), expected[..completed]);
+    }
+}
+
+#[test]
+#[should_panic(expected = "malformed complete diagnostic record")]
+fn diagnostic_reader_rejects_malformed_complete_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("diagnostics.jsonl");
+    fs::write(&path, b"{\"event\":\n").unwrap();
+    read_diagnostic_events(&path);
+}
+
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
@@ -379,19 +420,14 @@ impl Fixture {
     }
 
     fn diagnostic_count(&self) -> usize {
-        fs::read_to_string(&self.diagnostics)
-            .unwrap()
-            .lines()
-            .count()
+        read_diagnostic_events(&self.diagnostics).len()
     }
 
     fn wait_for_cleanup(&self, events_before: usize) {
         wait_for(|| {
-            let events: Vec<serde_json::Value> = fs::read_to_string(&self.diagnostics)
-                .unwrap()
-                .lines()
+            let events: Vec<serde_json::Value> = read_diagnostic_events(&self.diagnostics)
+                .into_iter()
                 .skip(events_before)
-                .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
             let token = events
                 .iter()
@@ -491,17 +527,14 @@ fn daemon_namespace_fixture() {
         );
     }
     fixture.peer(65534, "client");
+    let mut event = None;
     wait_for(|| {
-        fs::read_to_string(&fixture.diagnostics)
-            .unwrap()
-            .contains("CLIENT_HELLO_VALIDATED")
+        event = read_diagnostic_events(&fixture.diagnostics)
+            .into_iter()
+            .find(|event| event["event"] == "CLIENT_HELLO_VALIDATED");
+        event.is_some()
     });
-    let diagnostics = fs::read_to_string(&fixture.diagnostics).unwrap();
-    let event: serde_json::Value = diagnostics
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .find(|event| event["event"] == "CLIENT_HELLO_VALIDATED")
-        .unwrap();
+    let event = event.unwrap();
     assert_eq!(event["requester_uid"], 65534);
     assert_eq!(event["requester_gid"], 65534);
     fixture.peer(65534, "broker_permissions");
