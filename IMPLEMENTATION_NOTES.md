@@ -391,10 +391,15 @@ module. Tests inside source modules remain beside the implementation.
 | `sigrund/tests/fixtures/{execution,storage,transport}/` | Native probes and fault interposers; fault switches never enter production builds. |
 | `scripts/tests/` | Acceptance cancellation observation order and operator-service lifetime guards. |
 
-The production toolchain is pinned to Rust 1.89.0 in `rust-toolchain.toml`,
-including Clippy and rustfmt. A C compiler, Python 3, OpenSSH and uidmap
-utilities are required. Namespace fixtures need subordinate UID/GID mappings
-and permitted user namespaces. Run ordinary checks as an unprivileged user:
+The MSRV is Rust 1.89, declared in the workspace's `Cargo.toml` and inherited
+by both crates. `rust-toolchain.toml` pins an exact Rust release for development,
+including Clippy, rustfmt and rust-analyzer. Rust sources are opt-in. Cargo resolver 3
+prefers dependencies compatible with the declared MSRV when updating the
+lockfile; CI verifies compatibility with the actual minimum compiler.
+See [maintenance](MAINTENANCE.md) for the toolchain update procedure.
+A C compiler, Python 3, OpenSSH and uidmap utilities are required.
+Namespace fixtures need subordinate UID/GID mappings and permitted user
+namespaces. Run ordinary checks as an unprivileged user:
 
 ```sh
 python3 scripts/check.py --artifacts /tmp/sigrund-checks
@@ -430,15 +435,29 @@ run output; historical results are available through Git history.
 ## Continuous integration
 
 GitHub Actions runs on pushes, pull requests and manual dispatch using disposable
-native `ubuntu-24.04` x86-64 VMs. Formatting uses production Rust 1.89.0;
-the build/Clippy/test matrix explicitly overrides the repository pin with
-1.89.0 and the fixed latest-stable compatibility version 1.99.1. Update that
-compatibility pin deliberately; production and privileged acceptance remain on
-1.89.0. Clippy treats warnings as errors and Cargo uses the lockfile.
+native Ubuntu 24.04 VMs: `ubuntu-24.04` for x86-64 and `ubuntu-24.04-arm` for
+ARM64. Formatting, builds, Clippy, workspace tests and full privileged acceptance
+run on both architectures using the exact toolchain pinned in
+`rust-toolchain.toml`. CI installs the active toolchain from that file, so
+updating the pin updates these jobs and package
+builds together. Formatting and Clippy run only on the development toolchain;
+Clippy reads the MSRV from the crate manifests and treats warnings as errors.
+A separate x86-64 MSRV job reads `workspace.package.rust-version` from
+`Cargo.toml`, installs the first release of that Rust minor version, builds every workspace
+target and runs workspace tests. All builds and tests use the lockfile, so newer
+APIs, syntax or incompatible locked dependencies fail the MSRV job. Development
+build caches include the architecture and resolved compiler version. Acceptance
+artifacts include the architecture so parallel jobs cannot overwrite each other.
 
-Full privileged acceptance follows successful formatting and both matrix jobs.
-It repeats `scripts/check.py` as the unprivileged runner before running the
-root acceptance harness against that exact source/build. Check manifests bind
+Both CI and Packages use the shared `should-run.yml` workflow to skip push checks
+when the branch already heads an open PR within this repository. Pull requests,
+manual runs and tag pushes still run. Each workflow cancels older runs for the
+same branch ref or PR number. Branch and PR groups are separate so a skipped push
+cannot cancel PR checks; CI and Packages also have separate groups.
+
+Full privileged acceptance follows successful formatting, development checks and
+MSRV tests. It repeats `scripts/check.py` as the unprivileged runner before
+running the root acceptance harness against that exact source/build. Check manifests bind
 the toolchain file and record compiler/Cargo versions. Runner preparation
 installs Linux test tools, configures subordinate IDs and permits the namespace
 fixtures. These changes apply only to disposable hosted VMs. Unsupported kernel

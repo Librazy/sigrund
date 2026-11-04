@@ -52,7 +52,10 @@ and provisioning before starting the daemon. See the
 ## Build
 
 Use Linux with Rust installed through rustup, a C compiler and standard build
-tools. The repository pins Rust **1.89.0**, including rustfmt and Clippy.
+tools. The minimum supported Rust version (MSRV) is **1.89**, declared in the
+workspace's `Cargo.toml`. Development uses the exact Rust release pinned in
+`rust-toolchain.toml`, including rustfmt, Clippy and rust-analyzer. Rust sources
+are opt-in; see [maintenance](MAINTENANCE.md) for setup and toolchain updates.
 
 ```sh
 git clone https://github.com/Librazy/sigrund.git
@@ -167,7 +170,12 @@ including dependencies and cleanup requirements, see
 
 [GitHub Actions](https://github.com/Librazy/sigrund/actions/workflows/ci.yml)
 runs formatting, Clippy, workspace tests and privileged acceptance on disposable
-Ubuntu VMs. Acceptance exercises actual approval/execution, replay denial,
+Ubuntu VMs on x86-64 and ARM64 using the pinned development toolchain. A separate
+x86-64 job reads the MSRV from `Cargo.toml`, builds every target and runs
+workspace tests using the committed lockfile. Clippy uses the manifest's MSRV
+when suggesting APIs; Cargo's resolver prefers MSRV-compatible dependencies
+when updating the lockfile.
+Acceptance exercises actual approval/execution, replay denial,
 cancellation, recovery and service shutdown; ordinary unit tests alone do not
 validate those kernel and service-manager boundaries.
 
