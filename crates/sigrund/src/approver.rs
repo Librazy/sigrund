@@ -822,6 +822,18 @@ mod tests {
         pair
     }
 
+    fn confirmation_terminal() -> (File, File) {
+        let (master, tty) = terminal();
+        // Packet mode reports the post-prompt TCIFLUSH, so the simulated
+        // operator can wait until confirmation actually accepts input.
+        let enabled: libc::c_int = 1;
+        assert_eq!(
+            unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCPKT, &enabled) },
+            0
+        );
+        (master, tty)
+    }
+
     fn identity(dir: &Path, name: &str) -> (File, SignerConfig) {
         let path = dir.join(name);
         assert!(
@@ -844,18 +856,32 @@ mod tests {
     }
 
     fn read_prompt(terminal: &mut File) {
+        read_flushed_terminal(terminal, b"Approve and sign? [y/yes/n/no] ");
+    }
+
+    fn read_flushed_terminal(terminal: &mut File, suffix: &[u8]) {
+        // Linux PTY packet flags are not exposed by libc on all architectures.
+        const TIOCPKT_DATA: u8 = 0;
+        const TIOCPKT_FLUSHREAD: u8 = 1;
         nonblocking(terminal.as_raw_fd()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut text = Vec::new();
+        let mut flushed = false;
         loop {
             assert!(
                 Instant::now() < deadline,
-                "confirmation prompt did not arrive"
+                "confirmation terminal did not reach its post-flush state: flushed={flushed}, output={text:?}"
             );
             let mut bytes = [0; 4096];
             match terminal.read(&mut bytes) {
                 Ok(0) => panic!("terminal closed before confirmation prompt"),
-                Ok(n) => text.extend_from_slice(&bytes[..n]),
+                Ok(n) => {
+                    if bytes[0] == TIOCPKT_DATA {
+                        text.extend_from_slice(&bytes[1..n]);
+                    } else {
+                        flushed |= bytes[0] & TIOCPKT_FLUSHREAD != 0;
+                    }
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     poll(
                         &mut [event(terminal.as_raw_fd(), libc::POLLIN)],
@@ -865,7 +891,12 @@ mod tests {
                 }
                 Err(error) => panic!("confirmation terminal: {error}"),
             }
-            if text.ends_with(b"Approve and sign? [y/yes/n/no] ") {
+            // Control packets can precede earlier output, so require both
+            // the complete prompt and its flush notification in either order.
+            // Echo from discarded typeahead can arrive after the prompt text.
+            let displayed =
+                suffix.is_empty() || text.windows(suffix.len()).any(|bytes| bytes == suffix);
+            if flushed && displayed {
                 return;
             }
         }
@@ -873,7 +904,7 @@ mod tests {
 
     #[test]
     fn confirmation_discards_typeahead_and_reprompts_until_an_explicit_answer() {
-        let (mut master, tty) = terminal();
+        let (mut master, tty) = confirmation_terminal();
         nonblocking(tty.as_raw_fd()).unwrap();
         let (socket, _peer) = UnixStream::pair().unwrap();
         let signals = Signals::new().unwrap();
@@ -916,7 +947,7 @@ mod tests {
 
     #[test]
     fn confirmation_without_enter_expires_and_partial_input_is_discarded() {
-        let (mut master, tty) = terminal();
+        let (mut master, tty) = confirmation_terminal();
         nonblocking(tty.as_raw_fd()).unwrap();
         let (socket, _peer) = UnixStream::pair().unwrap();
         let signals = Signals::new().unwrap();
@@ -939,6 +970,9 @@ mod tests {
             operator.join().unwrap();
         });
         discard_confirmation_input(&tty).unwrap();
+        // Consume this cancellation flush so it cannot acknowledge the next
+        // prompt's flush before that prompt has actually finished discarding.
+        read_flushed_terminal(&mut master, b"");
         let mut byte = [0];
         assert_eq!(
             tty.try_clone().unwrap().read(&mut byte).unwrap_err().kind(),
