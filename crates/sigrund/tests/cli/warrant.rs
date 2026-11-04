@@ -15,8 +15,15 @@ fn signed_warrant_input_is_mutually_exclusive_with_unsigned_construction() {
         "42",
     ]))
     .unwrap();
+    let ClientArgs::Run {
+        command, options, ..
+    } = parsed
+    else {
+        panic!("expected signed request");
+    };
+    assert!(command.is_empty());
     assert!(
-        matches!(parsed, ClientArgs::Run {command,options:RequestOptions {warrant:Some(path),status_fd:Some(9),auth_fail_exit_code:42,..},..} if command.is_empty() && path.to_str()==Some("/tmp/envelope.json"))
+        matches!(*options, RequestOptions {warrant:Some(path),status_fd:Some(9),auth_fail_exit_code:42,..} if path.to_str()==Some("/tmp/envelope.json"))
     );
     for suffix in [
         vec!["--", "/usr/bin/id"],
@@ -50,7 +57,7 @@ fn malformed_warrant_files_fail_before_connecting() {
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let file = directory.path().join("envelope.json");
-    for bytes in [b"{}".to_vec(), b"[]".to_vec(), vec![b' '; 196_609]] {
+    for bytes in [b"{}".to_vec(), b"[]".to_vec(), vec![b' '; 524_289]] {
         std::fs::write(&file, bytes).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_sigrun"))
             .arg("--socket")

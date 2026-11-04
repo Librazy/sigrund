@@ -2,7 +2,7 @@
 //! here. A validated request can return to the same worker without releasing
 //! its reservation or transferring raw descriptor ownership to the coordinator.
 use crate::socket_disposal::Socket;
-use crate::transport::{ApprovalReader, ControlReader, invalid, validate_stdio_checked};
+use crate::transport::{ApprovalReader, ControlReader, invalid};
 use sigrund_core::{config::DaemonConfig, protocol::ClientHello};
 use std::{
     collections::HashMap,
@@ -18,6 +18,11 @@ use std::{
 };
 
 pub(crate) struct ValidationHandle(Arc<AtomicBool>);
+impl ValidationHandle {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 impl Drop for ValidationHandle {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
@@ -30,6 +35,10 @@ pub(crate) struct ValidatedRequest {
     // Shared control ownership retains its separate bounded disposal permit
     // through the actual final close, including unread queued SCM_RIGHTS.
     pub deferred_cleanup: Vec<Socket>,
+    pub failure: Option<io::Error>,
+    pub exec_id: String,
+    pub requester_gid: u32,
+    pub requester_groups: Option<Vec<u32>>,
     pub hello: ClientHello,
     pub rights: Vec<OwnedFd>,
     pub snapshots: Option<MeasuredSnapshots>,
@@ -101,8 +110,14 @@ impl RequestLease {
         request.deadline = deadline;
         request.deadline_active = true;
     }
-    pub fn begin_authorization(&mut self) {
+    pub fn disable_stage_deadline(&mut self) {
         self.request.as_mut().expect("live lease").deadline_active = false;
+    }
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.request.as_mut().expect("live lease").deadline = deadline;
+    }
+    pub fn set_identity(&mut self, exec_id: &str) {
+        self.request.as_mut().expect("live lease").exec_id = exec_id.into();
     }
     pub fn matches_admission(&self, uid: u32, policy: &Arc<DaemonConfig>) -> bool {
         let request = self.request.as_ref().expect("live lease");
@@ -113,12 +128,6 @@ impl RequestLease {
     }
     pub fn prepared(&self) -> Option<&crate::preparation::Prepared> {
         self.request.as_ref().expect("live lease").prepared.as_ref()
-    }
-    pub fn unsigned_policy_checked(&self) -> bool {
-        self.request
-            .as_ref()
-            .expect("live lease")
-            .unsigned_policy_checked
     }
     /// Only the coordinator calls this after winning the snapshot handoff CAS.
     pub fn begin_approval(&mut self, deadline: Instant) {
@@ -265,16 +274,46 @@ fn read_request(
             reader.deadline().unwrap_or(deadline).min(deadline),
         )?;
     };
-    drop(socket);
-    let hello = ClientHello::parse_request(&frame.payload).map_err(|e| invalid(e.to_string()))?;
-    policy
-        .mvp
-        .as_ref()
-        .expect("startup requires MVP")
-        .validate_for_peer(&hello, uid)
-        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
-    let request = ValidatedRequest {
+    // Unsupported versions are transport faults; bounded semantic failures retain rights.
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame.payload)
+        && value.get("version").is_some_and(|v| v != "2.0")
+    {
+        return Err(invalid("unsupported wire version"));
+    }
+    let parsed = ClientHello::parse_request(&frame.payload);
+    let (hello, mut failure) = match parsed {
+        Ok(hello) => (hello, None),
+        Err(e) => (
+            ClientHello {
+                caller_env: Default::default(),
+                mode: "invalid".into(),
+                tty_mode: "stdio".into(),
+                csr_payload: None,
+                dsse_envelope: None,
+                requested_command: None,
+                requested_execution_context: None,
+                requested_policy: None,
+            },
+            Some(invalid(e.to_string())),
+        ),
+    };
+    let peer = crate::transport::peer_credentials(socket.as_raw_fd())?;
+    let requester_groups = crate::transport::peer_groups(socket.as_raw_fd()).ok();
+    if failure.is_none() {
+        failure = policy
+            .mvp
+            .as_ref()
+            .expect("startup requires MVP")
+            .validate_for_peer(&hello, uid)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))
+            .err();
+    }
+    let mut request = ValidatedRequest {
         deferred_cleanup: vec![],
+        failure,
+        exec_id: String::new(),
+        requester_gid: peer.gid,
+        requester_groups,
         hello,
         rights: frame.rights,
         snapshots: None,
@@ -287,8 +326,9 @@ fn read_request(
         deadline_active: true,
         cancelled,
     };
-    validate_stdio_checked(&request.hello, &request.rights, || request.check())?;
-    request.check()?;
+    if let Err(e) = request.check() {
+        request.failure = Some(e);
+    }
     Ok(request)
 }
 fn read_broker(
@@ -386,14 +426,10 @@ impl IoWorkers {
                                     request.check()
                                 }))
                                 .unwrap_or_else(|_| Err(invalid("request continuation panicked")));
-                                let result = match result {
-                                    Ok(()) => Ok(request),
-                                    Err(error) => {
-                                        drop(request);
-                                        Err(error)
-                                    }
-                                };
-                                publish(token, result, sender, &completed, &wake);
+                                if let Err(error) = result {
+                                    request.failure = Some(error);
+                                }
+                                publish(token, Ok(request), sender, &completed, &wake);
                             }
                             Work::Dispose { token, request } => {
                                 drop(request);
@@ -535,12 +571,12 @@ mod tests {
     }
     fn send(socket: &mut UnixStream, fd: i32) {
         let body=serde_json::to_vec(&serde_json::json!({
-            "mode":"unsigned_csr_request", "tty_mode":"stdio", "caller_env":{},
-            "requested_command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
+            "version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},
+            "command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
                 "executable_path":"/usr/bin/id","stdin_policy":"null","tty_mode":"stdio"},
-            "requested_execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
+            "execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
                 "supplementary_gids":[],"target_gid":0,"target_uid":0,"umask":63},
-            "requested_policy":{"mode":"one_time","ttl_secs":60}
+            "policy":{"mode":"one_time","ttl_secs":60}}
         })).unwrap();
         let encoded = encode_frame(FrameType::ClientHello, &body).unwrap();
         let mut control = [0usize; 8];
@@ -606,7 +642,7 @@ mod tests {
         send(&mut sender, file.as_raw_fd());
         let request = lease(next(&mut workers));
         assert!(request.matches_admission(1001, &policy));
-        assert_eq!(request.hello().mode, "unsigned_csr_request");
+        assert_eq!(request.hello().mode, "thin_csr");
         assert!(
             workers
                 .submit(11, 1001, &receiver, policy.clone(), false, deadline)
@@ -674,7 +710,12 @@ mod tests {
         while !workers.reservations.is_empty() {
             for completion in workers.drain() {
                 if let Completion::Validated { result, .. } = completion {
-                    assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Interrupted);
+                    let lease = result.unwrap();
+                    assert_eq!(
+                        lease.request().failure.as_ref().unwrap().kind(),
+                        io::ErrorKind::Interrupted
+                    );
+                    drop(lease);
                     rejected = true;
                 }
             }
@@ -725,7 +766,12 @@ mod tests {
         release.send(()).unwrap();
         match next(&mut workers) {
             Completion::Validated { result, .. } => {
-                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut)
+                let lease = result.unwrap();
+                assert_eq!(
+                    lease.request().failure.as_ref().unwrap().kind(),
+                    io::ErrorKind::TimedOut
+                );
+                drop(lease);
             }
             _ => panic!("unexpected completion"),
         }
@@ -796,7 +842,6 @@ mod tests {
             Ok(())
         });
         let mut request = lease(next(&mut workers));
-        request.begin_authorization();
         let csr = Csr::from_unsigned(
             request.hello(),
             CsrIdentity {

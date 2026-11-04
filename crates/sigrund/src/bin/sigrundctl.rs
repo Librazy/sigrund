@@ -21,7 +21,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "--help") {
         println!(
-            "Usage: sigrundctl init-host [--state-dir PATH] [--log-path PATH]\n       sigrundctl csr-pae --status PATH --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
+            "Usage: sigrundctl init-host [--state-dir PATH] [--log-path PATH]\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
         );
         return ExitCode::SUCCESS;
     }
@@ -62,9 +62,9 @@ fn main() -> ExitCode {
 }
 
 fn offline_warrant(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use sigrund::warrant_tools::{csr_pae, extract_csr, pack_warrant};
+    use sigrund::warrant_tools::{csr_pae, pack_warrant};
     let expected: &[&str] = if args[0] == "csr-pae" {
-        &["--status", "--csr", "--pae"]
+        &["--csr", "--pae"]
     } else {
         &["--csr", "--signature", "--signer-id", "--output"]
     };
@@ -102,8 +102,11 @@ fn offline_warrant(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         file.sync_all()
     };
     if args[0] == "csr-pae" {
-        let csr = extract_csr(&bounded_read(options["--status"], 524_288)?)?;
-        write_new(options["--csr"], csr.as_bytes())?;
+        let csr = sigrund_core::warrant::CanonicalWarrant::parse(&bounded_read(
+            options["--csr"],
+            65_536,
+        )?)?;
+        csr.warrant().require_client_full()?;
         write_new(options["--pae"], &csr_pae(&csr))?;
     } else {
         let envelope = pack_warrant(
@@ -127,7 +130,12 @@ fn init_host(args: &[String]) -> ExitCode {
         .unwrap_or_else(|| PathBuf::from("/var/log/sigrund/audit.jsonl"));
     let key_path = state_dir.join("host_identity.key");
     let state_path = state_dir.join("audit_ratchet.state");
-    if key_path.exists() || state_path.exists() || log_path.exists() {
+    if key_path.exists()
+        || state_path.exists()
+        || log_path.exists()
+        || state_dir.join("state.sqlite").exists()
+        || state_dir.read_dir().is_ok_and(|mut d| d.next().is_some())
+    {
         eprintln!("sigrundctl: refusing to overwrite existing host identity, state, or log");
         return ExitCode::from(73);
     }
@@ -187,6 +195,7 @@ fn init_host(args: &[String]) -> ExitCode {
     let host_id = format!("sigrun-host:sha256:{}", sha256_hex(&public_key));
     let zero_digest = "0".repeat(64);
     let mut body = BTreeMap::new();
+    body.insert("schema_version", serde_json::json!(2));
     body.insert("event_type", serde_json::Value::String("AUDIT_INIT".into()));
     body.insert("host_id", serde_json::Value::String(host_id.clone()));
     body.insert("prev_record_sha256", serde_json::Value::String(zero_digest));
@@ -212,6 +221,7 @@ fn init_host(args: &[String]) -> ExitCode {
     };
     let next_key = next_ratchet_key(&ratchet_key);
     let state = serde_json::json!({
+        "schema_version":2,
         "key_hex": next_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "initial_key_hex": ratchet_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "last_record_sha256": sha256_hex(&record_bytes),
@@ -219,6 +229,9 @@ fn init_host(args: &[String]) -> ExitCode {
         "seq": 1
     });
     let result = (|| -> std::io::Result<()> {
+        let _database =
+            sigrund_core::state::StateStore::create_in_directory(state_directory.try_clone()?)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         write_provisioning_files(
             &state_dir,
             &log_path,
@@ -241,6 +254,7 @@ fn init_host(args: &[String]) -> ExitCode {
             println!(
                 "{}",
                 serde_json::json!({
+                    "schema_version": 2,
                     "host_id": host_id,
                     "initial_seq": 0,
                     "anchor_key_hex": ratchet_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),

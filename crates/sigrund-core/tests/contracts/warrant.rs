@@ -22,7 +22,7 @@ fn direct_executable_evidence_is_versioned_canonical_and_signed() {
         },
     ] {
         let mut w = fixture();
-        w.version = "1.1".into();
+        w.version = "2.0".into();
         w.command.executable_sha256 = None;
         w.command.executable_trust = Some(evidence.clone());
         let canonical = CanonicalWarrant::new(w.clone()).unwrap();
@@ -110,6 +110,7 @@ fn maximum_canonical_warrant_and_outer_documents_round_trip() {
     let remaining = 65_536 - canonical_bytes(&warrant).unwrap().len() - 3;
     assert!(remaining <= 4096);
     warrant.command.argv.push("x".repeat(remaining));
+    warrant.intent_sha256 = warrant.intent().unwrap().sha256().unwrap();
     let canonical = CanonicalWarrant::new(warrant.clone()).unwrap();
     assert_eq!(canonical.as_bytes().len(), 65_536);
     CanonicalWarrant::parse(canonical.as_bytes()).unwrap();
@@ -128,6 +129,7 @@ fn maximum_canonical_warrant_and_outer_documents_round_trip() {
     assert!(CanonicalWarrant::new(warrant).is_err());
     let mut warrant = fixture();
     warrant.command.argv = vec!["x"; 256].into_iter().map(String::from).collect();
+    warrant.intent_sha256 = warrant.intent().unwrap().sha256().unwrap();
     CanonicalWarrant::new(warrant).unwrap();
 }
 
@@ -141,8 +143,8 @@ fn canonical_warrants_reject_alternate_encodings_duplicates_and_unknown_fields()
         text.replace("1900", "1.9e3"),
         text.replace("1900", "1900.0"),
         text.replace(
-            "\"version\":\"1.0\"",
-            "\"version\":\"1.0\",\"version\":\"1.0\"",
+            "\"version\":\"2.0\"",
+            "\"version\":\"2.0\",\"version\":\"2.0\"",
         ),
         text.replace("\"cwd\":\"/\"", "\"cwd\":\"/\",\"cwd\":\"/\""),
         text.replace("/usr/bin/id", "\\/usr/bin/id"),
@@ -208,7 +210,7 @@ fn warrant_schema_rejects_invalid_bounds_controls_and_compatibility() {
         ("/command/tty_mode", json!("pty")),
         ("/command/stdin_policy", json!("sha256")),
         ("/command/stdin_sha256", json!("00".repeat(32))),
-        ("/command/executable_sha256", json!("AA".repeat(32))),
+        ("/command/executable_trust/sha256", json!("AA".repeat(32))),
         ("/policy/mode", json!("permanent")),
         ("/policy/not_after", Value::Null),
         ("/policy/not_after", json!(999)),
@@ -282,10 +284,10 @@ fn csr_checks_captured_ttl_timestamp_arithmetic_and_stdin_bindings() {
 }
 
 #[test]
-fn direct_v12_binds_exact_capability_sets_without_changing_legacy_bytes() {
+fn v2_requires_and_binds_exact_capability_sets() {
     use sigrund_core::executable::{CapabilitySets, ExecutableTrust};
     let mut w = fixture();
-    w.version = "1.2".into();
+    w.version = "2.0".into();
     w.command.executable_sha256 = None;
     w.command.executable_trust = Some(ExecutableTrust::FsVerity {
         algorithm: "sha256".into(),
@@ -295,6 +297,7 @@ fn direct_v12_binds_exact_capability_sets_without_changing_legacy_bytes() {
     let mut sets = CapabilitySets::ordinary(&w.execution_context.capabilities);
     sets.ambient.clear();
     w.execution_context.post_exec_capabilities = Some(sets);
+    w.intent_sha256 = w.intent().unwrap().sha256().unwrap();
     let csr = Csr::new(w.clone()).unwrap();
     let envelope = signed(w.clone());
     csr.bind_envelope(&envelope).unwrap();
@@ -324,19 +327,19 @@ fn direct_v12_binds_exact_capability_sets_without_changing_legacy_bytes() {
     w.execution_context.post_exec_capabilities = None;
     assert!(Csr::new(w.clone()).is_err());
     w.version = "1.1".into();
-    assert!(Csr::new(w.clone()).is_ok());
+    assert!(Csr::new(w.clone()).is_err());
     w.execution_context.post_exec_capabilities = Some(CapabilitySets::ordinary(&[]));
     assert!(Csr::new(w).is_err());
     let mut hello = serde_json::to_value(unsigned()).unwrap();
-    hello["requested_execution_context"]["post_exec_capabilities"] = json!({});
+    hello["intent"]["execution_context"]["post_exec_capabilities"] = json!({});
     assert!(parse_strict::<ClientHello>(&serde_json::to_vec(&hello).unwrap()).is_err());
 }
 
 #[test]
-fn digest_direct_requires_v12_and_binds_full_file_digest() {
+fn digest_direct_requires_v2_and_binds_full_file_digest() {
     use sigrund_core::executable::{CapabilitySets, ExecutableTrust};
     let mut w = fixture();
-    w.version = "1.2".into();
+    w.version = "2.0".into();
     w.command.executable_sha256 = None;
     w.command.executable_trust = Some(ExecutableTrust::DigestDirect {
         sha256: "ab".repeat(32),
@@ -351,7 +354,7 @@ fn digest_direct_requires_v12_and_binds_full_file_digest() {
     w.version = "1.1".into();
     w.execution_context.post_exec_capabilities = None;
     assert!(Csr::new(w.clone()).is_err());
-    w.version = "1.2".into();
+    w.version = "2.0".into();
     w.execution_context.post_exec_capabilities = Some(CapabilitySets::ordinary(&[]));
     for digest in ["AB".repeat(32), "ab".repeat(31), "gg".repeat(32)] {
         w.command.executable_trust = Some(ExecutableTrust::DigestDirect { sha256: digest });

@@ -1,7 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-use crate::{CoreError, Result};
-
+//! Atomic public decisions are independent of irreversible operation ownership.
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Phase {
@@ -15,37 +13,46 @@ pub enum Phase {
     Failed = 8,
     Releasing = 9,
     Hashing = 10,
+    SilentTimeout = 11,
+    ApprovalDelivery = 12,
+    Approved = 13,
+    Reviewing = 14,
+    Finished = 15,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Decision {
     Undecided = 0,
-    Ready = 1,
+    Approved = 1,
     Rejected = 2,
     Timeout = 3,
     NoReply = 4,
 }
-
 pub struct Lifecycle {
     word: AtomicU64,
+    delivery: AtomicU8,
     pub cancelled: AtomicBool,
 }
-
-const CANCELLATION_PENDING: u64 = 1 << 16;
-
+const PENDING: u64 = 1 << 16;
+const READY: u64 = 1 << 17;
+impl Default for Lifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Lifecycle {
     pub fn new() -> Self {
         Self {
             word: AtomicU64::new(Self::pack(Phase::Snapshotting, Decision::Undecided)),
+            delivery: AtomicU8::new(0),
             cancelled: AtomicBool::new(false),
         }
     }
-    fn pack(phase: Phase, decision: Decision) -> u64 {
-        (phase as u64) | ((decision as u64) << 8)
+    fn pack(p: Phase, d: Decision) -> u64 {
+        p as u64 | ((d as u64) << 8)
     }
-    fn unpack(word: u64) -> (Phase, Decision) {
-        let phase = match (word & 0xff) as u8 {
+    fn unpack(w: u64) -> (Phase, Decision) {
+        let p = match w & 255 {
             1 => Phase::Snapshotting,
             2 => Phase::Authorizing,
             3 => Phase::Committing,
@@ -53,202 +60,255 @@ impl Lifecycle {
             5 => Phase::Spawning,
             6 => Phase::Running,
             7 => Phase::Cancelled,
+            8 => Phase::Failed,
             9 => Phase::Releasing,
             10 => Phase::Hashing,
-            _ => Phase::Failed,
+            11 => Phase::SilentTimeout,
+            12 => Phase::ApprovalDelivery,
+            13 => Phase::Approved,
+            14 => Phase::Reviewing,
+            _ => Phase::Finished,
         };
-        let decision = match ((word >> 8) & 0xff) as u8 {
-            1 => Decision::Ready,
+        let d = match (w >> 8) & 255 {
+            1 => Decision::Approved,
             2 => Decision::Rejected,
             3 => Decision::Timeout,
             4 => Decision::NoReply,
             _ => Decision::Undecided,
         };
-        (phase, decision)
+        (p, d)
     }
     pub fn state(&self) -> (Phase, Decision) {
         Self::unpack(self.word.load(Ordering::Acquire))
     }
-    /// Release a commit reservation only after a successful rollback has made
-    /// its result known. Pending cancellation stays visible to the coordinator.
-    pub fn rolled_back_commit(&self) -> bool {
-        loop {
-            let current = self.word.load(Ordering::Acquire);
-            if Self::unpack(current) != (Phase::Committing, Decision::Undecided) {
-                return false;
-            }
-            let next = Self::pack(Phase::Authorizing, Decision::Undecided)
-                | (current & CANCELLATION_PENDING);
-            if self
-                .word
-                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
+    /// A completed socket write is not proof of receipt by the requester.
+    pub fn mark_frame_written(&self) {
+        let _ = self
+            .delivery
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+    pub fn mark_undelivered(&self) {
+        let _ = self.delivery.compare_exchange(
+            0,
+            if self.state().1 == Decision::NoReply {
+                3
+            } else {
+                2
+            },
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+    pub fn delivery_status(&self) -> &'static str {
+        match self.delivery.load(Ordering::Acquire) {
+            1 => "sent",
+            2 => "failed",
+            3 => "no_reply",
+            _ => "not_started",
+        }
+    }
+    pub fn public_outcome(&self) -> &'static str {
+        match self.state().1 {
+            Decision::Approved => "APPROVED",
+            Decision::Rejected => "REJECTED",
+            Decision::Timeout => "TIMEOUT",
+            Decision::NoReply => "NO_REPLY",
+            _ => "UNDECIDED",
         }
     }
     pub fn transition(&self, from: Phase, to: Phase) -> bool {
-        if !matches!(
+        let allowed = matches!(
             (from, to),
-            (Phase::Snapshotting, Phase::Authorizing)
-                | (Phase::Snapshotting, Phase::Hashing)
-                | (Phase::Hashing, Phase::Authorizing)
+            (
+                Phase::Snapshotting,
+                Phase::Hashing | Phase::Reviewing | Phase::Authorizing
+            ) | (Phase::Hashing, Phase::Reviewing | Phase::Authorizing)
+                | (Phase::Reviewing, Phase::Authorizing)
                 | (Phase::Authorizing, Phase::Committing)
                 | (Phase::Committing, Phase::Committed)
-                | (Phase::Committed, Phase::Spawning)
+                | (Phase::Committed, Phase::ApprovalDelivery)
+                | (Phase::ApprovalDelivery, Phase::Approved)
+                | (Phase::Approved, Phase::Spawning)
                 | (Phase::Spawning, Phase::Running)
                 | (Phase::Running, Phase::Releasing)
                 | (Phase::Releasing, Phase::Running)
-        ) {
+        );
+        if !allowed {
             return false;
         }
         loop {
-            let current = self.word.load(Ordering::Acquire);
-            let (phase, decision) = Self::unpack(current);
-            if phase != from || decision != Decision::Undecided {
-                return false;
-            }
-            // The executor must finish recording the result of a reserved
-            // operation even when cancellation became pending during it.
-            if current & CANCELLATION_PENDING != 0
-                && !matches!(from, Phase::Committing | Phase::Spawning | Phase::Releasing)
+            let w = self.word.load(Ordering::Acquire);
+            let (p, d) = Self::unpack(w);
+            let reconcile = matches!(from, Phase::Committing | Phase::Spawning | Phase::Releasing);
+            let post = matches!(
+                from,
+                Phase::ApprovalDelivery
+                    | Phase::Approved
+                    | Phase::Spawning
+                    | Phase::Running
+                    | Phase::Releasing
+            );
+            if p != from
+                || (!reconcile && w & PENDING != 0)
+                || (!reconcile
+                    && d != if post {
+                        Decision::Approved
+                    } else {
+                        Decision::Undecided
+                    })
             {
                 return false;
             }
-            let next = Self::pack(to, decision) | (current & CANCELLATION_PENDING);
+            let next = (w & !255) | to as u64;
             if self
                 .word
-                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(w, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return true;
             }
         }
     }
-
-    /// Atomically publishes readiness without ending the running lifecycle.
-    pub fn publish_ready(&self) -> bool {
-        self.word
-            .compare_exchange(
-                Self::pack(Phase::Running, Decision::Undecided),
-                Self::pack(Phase::Running, Decision::Ready),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    pub fn claim_terminal(&self, phase: Phase, decision: Decision) -> bool {
-        // Preserve the existing decision API while keeping readiness live.
-        if decision == Decision::Ready {
-            return phase == Phase::Running && self.publish_ready();
-        }
-        if decision == Decision::Undecided || matches!(phase, Phase::Cancelled | Phase::Failed) {
-            return false;
-        }
-        if matches!(
-            phase,
-            Phase::Committing | Phase::Spawning | Phase::Releasing
-        ) {
-            if matches!(decision, Decision::Timeout | Decision::NoReply) {
-                // A phase-specific timeout must not cancel a later phase if
-                // completion wins while this callback is waiting to run.
-                let current = self.word.load(Ordering::Acquire);
-                if Self::unpack(current) == (phase, Decision::Undecided)
-                    && self
-                        .word
-                        .compare_exchange(
-                            current,
-                            current | CANCELLATION_PENDING,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                {
-                    self.cancelled.store(true, Ordering::Release);
-                }
-            }
-            return false;
-        }
-        let current = self.word.load(Ordering::Acquire);
-        let (current_phase, current_decision) = Self::unpack(current);
-        if current_phase != phase || current_decision != Decision::Undecided {
-            return false;
-        }
-        let terminal = if decision == Decision::Rejected {
-            Phase::Failed
-        } else {
-            Phase::Cancelled
-        };
-        let next = Self::pack(terminal, decision) | (current & CANCELLATION_PENDING);
-        let won = self
-            .word
-            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if won && terminal == Phase::Cancelled {
-            self.cancelled.store(true, Ordering::Release);
-        }
-        won
-    }
-
-    /// Completes a reserved spawn after the syscall result is known.
-    pub fn finish_spawn(&self, decision: Decision) -> bool {
-        if matches!(decision, Decision::Undecided | Decision::Ready) {
-            return false;
-        }
+    pub fn rolled_back_commit(&self) -> bool {
         loop {
-            let current = self.word.load(Ordering::Acquire);
-            let (phase, current_decision) = Self::unpack(current);
-            if phase != Phase::Spawning || current_decision != Decision::Undecided {
+            let w = self.word.load(Ordering::Acquire);
+            let (p, d) = Self::unpack(w);
+            if p != Phase::Committing {
                 return false;
             }
-            let terminal = if decision == Decision::Rejected {
-                Phase::Failed
+            let to = if d == Decision::Undecided && w & PENDING == 0 {
+                Phase::Authorizing
             } else {
-                Phase::Cancelled
+                Phase::SilentTimeout
             };
-            let next = Self::pack(terminal, decision) | (current & CANCELLATION_PENDING);
             if self
                 .word
-                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    w,
+                    (w & !255) | to as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
-                if terminal == Phase::Cancelled {
+                return true;
+            }
+        }
+    }
+    pub fn silence(&self) -> bool {
+        loop {
+            let w = self.word.load(Ordering::Acquire);
+            let (p, d) = Self::unpack(w);
+            if d != Decision::Undecided
+                || matches!(p, Phase::SilentTimeout | Phase::Cancelled | Phase::Failed)
+            {
+                return false;
+            }
+            let next = if p == Phase::Committing {
+                w | PENDING
+            } else {
+                (w & !255) | Phase::SilentTimeout as u64 | PENDING
+            };
+            if self
+                .word
+                .compare_exchange(w, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.cancelled.store(true, Ordering::Release);
+                return true;
+            }
+        }
+    }
+    pub fn claim_terminal(&self, phase: Phase, decision: Decision) -> bool {
+        if decision == Decision::Undecided {
+            return false;
+        }
+        loop {
+            let w = self.word.load(Ordering::Acquire);
+            let (p, d) = Self::unpack(w);
+            if p != phase || d != Decision::Undecided {
+                return false;
+            }
+            if decision == Decision::Approved && (p != Phase::ApprovalDelivery || w & PENDING != 0)
+            {
+                return false;
+            }
+            if decision == Decision::Rejected && p != Phase::Reviewing {
+                return false;
+            }
+            let next_phase = match decision {
+                Decision::Approved => p,
+                Decision::Rejected => Phase::Failed,
+                _ if p == Phase::Committing => p,
+                _ => Phase::Cancelled,
+            };
+            let next = Self::pack(next_phase, decision) | (w & (PENDING | READY));
+            if self
+                .word
+                .compare_exchange(w, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if decision != Decision::Approved {
                     self.cancelled.store(true, Ordering::Release);
                 }
                 return true;
             }
         }
     }
-
-    /// Requests cancellation. Returns true only when a terminal phase was
-    /// claimed. During reservations, the owner must reconcile the syscall's
-    /// result before calling this again to finish cancellation.
+    pub fn publish_ready(&self) -> bool {
+        loop {
+            let w = self.word.load(Ordering::Acquire);
+            if Self::unpack(w) != (Phase::Running, Decision::Approved) || w & (PENDING | READY) != 0
+            {
+                return false;
+            }
+            if self
+                .word
+                .compare_exchange(w, w | READY, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+    pub fn finish_spawn(&self, _reason: Decision) -> bool {
+        loop {
+            let w = self.word.load(Ordering::Acquire);
+            if Self::unpack(w).0 != Phase::Spawning {
+                return false;
+            }
+            if self
+                .word
+                .compare_exchange(
+                    w,
+                    (w & !255) | Phase::Failed as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
     pub fn cancel(&self) -> bool {
         loop {
-            let current = self.word.load(Ordering::Acquire);
-            let (phase, decision) = Self::unpack(current);
-            if matches!(phase, Phase::Cancelled | Phase::Failed) {
+            let w = self.word.load(Ordering::Acquire);
+            let (p, d) = Self::unpack(w);
+            if matches!(p, Phase::Cancelled | Phase::Failed | Phase::Finished) {
                 return false;
             }
-            let reserved = matches!(
-                phase,
-                Phase::Committing | Phase::Spawning | Phase::Releasing
-            );
-            let next = if reserved {
-                current | CANCELLATION_PENDING
+            let reserved = matches!(p, Phase::Committing | Phase::Spawning | Phase::Releasing);
+            let d = if d == Decision::Undecided {
+                Decision::NoReply
             } else {
-                let outcome = if decision == Decision::Undecided {
-                    Decision::NoReply
-                } else {
-                    decision
-                };
-                Self::pack(Phase::Cancelled, outcome) | CANCELLATION_PENDING
+                d
             };
+            let next =
+                Self::pack(if reserved { p } else { Phase::Cancelled }, d) | (w & READY) | PENDING;
             if self
                 .word
-                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(w, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 self.cancelled.store(true, Ordering::Release);
@@ -256,151 +316,82 @@ impl Lifecycle {
             }
         }
     }
-    pub fn require(&self, expected: Phase) -> Result<()> {
-        if self.state().0 == expected {
-            Ok(())
-        } else {
-            Err(CoreError::Protocol(
-                "invalid request lifecycle transition".into(),
-            ))
-        }
-    }
 }
-
-impl Default for Lifecycle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hashing_has_one_handoff_and_rejects_stale_snapshot_timeouts() {
-        let lifecycle = Lifecycle::new();
-        assert!(lifecycle.transition(Phase::Snapshotting, Phase::Hashing));
-        assert!(!lifecycle.transition(Phase::Snapshotting, Phase::Hashing));
-        assert!(!lifecycle.claim_terminal(Phase::Snapshotting, Decision::Timeout));
-        assert!(lifecycle.transition(Phase::Hashing, Phase::Authorizing));
-        assert!(!lifecycle.claim_terminal(Phase::Hashing, Decision::Timeout));
-        let cancelled = Lifecycle::new();
-        assert!(cancelled.transition(Phase::Snapshotting, Phase::Hashing));
-        assert!(cancelled.cancel());
-        assert!(!cancelled.transition(Phase::Hashing, Phase::Authorizing));
+    fn commit(l: &Lifecycle) {
+        assert!(l.transition(Phase::Snapshotting, Phase::Authorizing));
+        assert!(l.transition(Phase::Authorizing, Phase::Committing));
     }
-
-    #[test]
-    fn only_one_terminal_winner() {
-        let lifecycle = Lifecycle::new();
-        assert!(lifecycle.claim_terminal(Phase::Snapshotting, Decision::Timeout));
-        assert!(!lifecycle.claim_terminal(Phase::Snapshotting, Decision::Rejected));
-        assert_eq!(lifecycle.state(), (Phase::Cancelled, Decision::Timeout));
+    fn approved(l: &Lifecycle) {
+        commit(l);
+        assert!(l.transition(Phase::Committing, Phase::Committed));
+        assert!(l.transition(Phase::Committed, Phase::ApprovalDelivery));
+        assert!(l.claim_terminal(Phase::ApprovalDelivery, Decision::Approved));
+        assert!(l.transition(Phase::ApprovalDelivery, Phase::Approved));
     }
-
-    fn advance_to(lifecycle: &Lifecycle, target: Phase) {
-        for (from, to) in [
-            (Phase::Snapshotting, Phase::Authorizing),
-            (Phase::Authorizing, Phase::Committing),
-            (Phase::Committing, Phase::Committed),
-            (Phase::Committed, Phase::Spawning),
-            (Phase::Spawning, Phase::Running),
-        ] {
-            assert!(lifecycle.transition(from, to));
-            if to == target {
-                break;
-            }
-        }
-    }
-
     #[test]
-    fn cancellation_preserves_reservations_until_results_are_known() {
-        for (reserved, completed) in [
-            (Phase::Committing, Phase::Committed),
-            (Phase::Spawning, Phase::Running),
-        ] {
-            let lifecycle = Lifecycle::new();
-            advance_to(&lifecycle, reserved);
-            assert!(!lifecycle.cancel());
-            assert_eq!(lifecycle.state(), (reserved, Decision::Undecided));
-            assert!(lifecycle.cancelled.load(Ordering::Acquire));
-            assert!(!lifecycle.claim_terminal(reserved, Decision::Timeout));
-            assert!(lifecycle.transition(reserved, completed));
-            assert!(!lifecycle.publish_ready());
-            assert!(!lifecycle.transition(completed, Phase::Spawning));
-            assert!(lifecycle.cancel());
-            assert_eq!(lifecycle.state(), (Phase::Cancelled, Decision::NoReply));
-        }
+    fn silent_failure_cannot_be_revived_by_late_approval() {
+        let l = Lifecycle::new();
+        assert!(l.transition(Phase::Snapshotting, Phase::Reviewing));
+        assert!(l.silence());
+        assert_eq!(l.state(), (Phase::SilentTimeout, Decision::Undecided));
+        assert!(!l.transition(Phase::Reviewing, Phase::Authorizing));
+        assert!(l.claim_terminal(Phase::SilentTimeout, Decision::Timeout));
+        assert!(!l.claim_terminal(Phase::Cancelled, Decision::Approved));
     }
-
     #[test]
-    fn exec_release_reservation_reconciles_cancellation() {
-        let lifecycle = Lifecycle::new();
-        advance_to(&lifecycle, Phase::Running);
-        assert!(lifecycle.transition(Phase::Running, Phase::Releasing));
-        assert!(!lifecycle.cancel());
-        assert!(!lifecycle.publish_ready());
-        assert_eq!(lifecycle.state().0, Phase::Releasing);
-        assert!(lifecycle.transition(Phase::Releasing, Phase::Running));
-        assert!(!lifecycle.publish_ready());
-        assert!(lifecycle.cancel());
-        assert_eq!(lifecycle.state().0, Phase::Cancelled);
+    fn timeout_wins_while_commit_ownership_reconciles() {
+        let l = Lifecycle::new();
+        commit(&l);
+        assert!(l.silence());
+        assert!(l.claim_terminal(Phase::Committing, Decision::Timeout));
+        assert_eq!(l.state(), (Phase::Committing, Decision::Timeout));
+        assert!(l.transition(Phase::Committing, Phase::Committed));
+        assert!(!l.transition(Phase::Committed, Phase::ApprovalDelivery));
+        assert!(!l.claim_terminal(Phase::Committed, Decision::Approved));
     }
-
     #[test]
-    fn reserved_executor_reconciles_cancellation_after_result_gate() {
-        use std::sync::{Arc, mpsc};
-        for (reserved, completed) in [
-            (Phase::Committing, Phase::Committed),
-            (Phase::Spawning, Phase::Running),
-        ] {
-            let lifecycle = Arc::new(Lifecycle::new());
-            advance_to(&lifecycle, reserved);
-            let (release, result_known) = mpsc::channel();
-            let executor_context = lifecycle.clone();
-            let executor = std::thread::spawn(move || {
-                result_known.recv().unwrap();
-                assert!(executor_context.transition(reserved, completed));
-                assert!(!executor_context.publish_ready());
-                assert!(executor_context.cancel());
-            });
-            assert!(!lifecycle.cancel());
-            assert_eq!(lifecycle.state(), (reserved, Decision::Undecided));
-            release.send(()).unwrap();
-            executor.join().unwrap();
-            assert_eq!(lifecycle.state(), (Phase::Cancelled, Decision::NoReply));
-        }
+    fn silence_before_commit_result_keeps_the_pending_public_timeout() {
+        let l = Lifecycle::new();
+        commit(&l);
+        assert!(l.silence());
+        assert!(l.transition(Phase::Committing, Phase::Committed));
+        assert!(!l.transition(Phase::Committed, Phase::ApprovalDelivery));
+        assert!(l.claim_terminal(Phase::Committed, Decision::Timeout));
     }
-
     #[test]
-    fn stale_reservation_timeout_cannot_cancel_a_later_phase() {
-        let lifecycle = Lifecycle::new();
-        advance_to(&lifecycle, Phase::Running);
-        assert!(!lifecycle.claim_terminal(Phase::Committing, Decision::Timeout));
-        assert!(!lifecycle.claim_terminal(Phase::Spawning, Decision::Timeout));
-        assert_eq!(lifecycle.state(), (Phase::Running, Decision::Undecided));
-        assert!(!lifecycle.cancelled.load(Ordering::Acquire));
-        assert!(lifecycle.publish_ready());
+    fn approval_is_final_and_precedes_spawn_and_readiness() {
+        let l = Lifecycle::new();
+        assert!(!l.claim_terminal(Phase::Snapshotting, Decision::Approved));
+        approved(&l);
+        assert!(!l.claim_terminal(Phase::Approved, Decision::Timeout));
+        assert!(l.transition(Phase::Approved, Phase::Spawning));
+        assert!(l.transition(Phase::Spawning, Phase::Running));
+        assert!(l.publish_ready());
+        assert!(!l.publish_ready());
+        assert!(l.cancel());
+        assert_eq!(l.state(), (Phase::Cancelled, Decision::Approved));
     }
-
     #[test]
-    fn readiness_retains_running_and_teardown_retains_decision() {
-        let lifecycle = Lifecycle::new();
-        advance_to(&lifecycle, Phase::Running);
-        assert!(lifecycle.claim_terminal(Phase::Running, Decision::Ready));
-        assert_eq!(lifecycle.state(), (Phase::Running, Decision::Ready));
-        assert!(!lifecycle.publish_ready());
-        assert!(lifecycle.cancel());
-        assert_eq!(lifecycle.state(), (Phase::Cancelled, Decision::Ready));
+    fn disconnect_during_reserved_spawn_preserves_the_approval() {
+        let l = Lifecycle::new();
+        approved(&l);
+        assert!(l.transition(Phase::Approved, Phase::Spawning));
+        assert!(!l.cancel());
+        assert_eq!(l.state(), (Phase::Spawning, Decision::Approved));
+        assert!(l.transition(Phase::Spawning, Phase::Running));
+        assert!(!l.publish_ready());
+        assert!(l.cancel());
     }
-
     #[test]
-    fn rejection_fails_and_terminal_states_cannot_be_revived() {
-        let lifecycle = Lifecycle::new();
-        assert!(lifecycle.claim_terminal(Phase::Snapshotting, Decision::Rejected));
-        assert_eq!(lifecycle.state(), (Phase::Failed, Decision::Rejected));
-        assert!(!lifecycle.transition(Phase::Failed, Phase::Authorizing));
-        assert!(!lifecycle.claim_terminal(Phase::Failed, Decision::Ready));
+    fn explicit_rejection_requires_review_and_is_final() {
+        let l = Lifecycle::new();
+        assert!(!l.claim_terminal(Phase::Snapshotting, Decision::Rejected));
+        assert!(l.transition(Phase::Snapshotting, Phase::Reviewing));
+        assert!(l.claim_terminal(Phase::Reviewing, Decision::Rejected));
+        assert!(!l.transition(Phase::Reviewing, Phase::Authorizing));
+        assert!(!l.claim_terminal(Phase::Failed, Decision::Timeout));
     }
 }

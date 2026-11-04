@@ -101,70 +101,67 @@ pub(crate) fn check_unsigned_policy(
     gid: u32,
 ) -> io::Result<()> {
     request.check()?;
-    if request
+    let intent = request
         .hello
-        .requested_policy
-        .as_ref()
-        .is_some_and(|p| p.ttl_secs > request.policy.max_ttl_secs)
-    {
-        return Err(fail("POLICY_VIOLATION", "TTL exceeds captured policy"));
-    }
-    if request.hello.mode == "unsigned_csr_request"
-        && let Some(profile) = &request.policy.mvp
-        && !profile.approval_signer_id.is_empty()
-    {
-        let now = realtime()?;
-        let candidate = Csr::from_unsigned(
-            &request.hello,
-            CsrIdentity {
-                grant_id: new_uuidv7().to_string(),
-                host_id: context.host_id.clone(),
-                requester_uid: request.requester_uid,
-                requester_gid: gid,
-                now,
-            },
-            SnapshotDigests {
-                post_exec_capabilities: None,
-                executable_sha256: Some("0".repeat(64)),
-                executable_trust: None,
-                stdin_sha256: request
-                    .hello
-                    .requested_command
-                    .as_ref()
-                    .filter(|c| c.stdin_policy == "sha256")
-                    .map(|_| "0".repeat(64)),
-            },
-            request.policy.max_ttl_secs,
-        )
-        .map_err(|_| fail("POLICY_VIOLATION", "request exceeds policy bounds"))?;
-        let signer = context
-            .signers
-            .signers
+        .intent()
+        .map_err(|e| fail("INVALID_REQUEST", e.to_string()))?;
+    let c = &intent.execution_context;
+    let signer = context
+        .signers
+        .signers
+        .iter()
+        .find(|s| {
+            request
+                .policy
+                .mvp
+                .as_ref()
+                .is_some_and(|p| p.approval_signer_id == s.signer_id)
+        })
+        .ok_or_else(|| fail("POLICY_VIOLATION", "approval signer unavailable"))?;
+    let ttl = intent.policy.ttl_secs;
+    if intent.policy.mode != "one_time"
+        || ttl > request.policy.max_ttl_secs
+        || ttl > request.policy.max_onetime_window_secs
+        || ttl > signer.max_ttl_secs
+        || !signer
+            .allowed_requester_uids
+            .contains(&request.requester_uid)
+        || !signer.allowed_target_uids.contains(&c.target_uid)
+        || !signer.allowed_target_gids.contains(&c.target_gid)
+        || c.target_uid == request.requester_uid
+        || !c
+            .supplementary_gids
             .iter()
-            .find(|s| s.signer_id == profile.approval_signer_id)
-            .ok_or_else(|| fail("POLICY_VIOLATION", "approval signer unavailable"))?;
-        select_root(
-            std::path::Path::new(&candidate.warrant().command.executable_path),
+            .all(|g| signer.allowed_supplementary_gids.contains(g))
+        || !c
+            .capabilities
+            .iter()
+            .all(|c| signer.allowed_capabilities.contains(c))
+        || !signer.allowed_modes.contains(&intent.policy.mode)
+        || select_root(
+            std::path::Path::new(&intent.command.executable_path),
             &signer.allowed_executable_dirs,
         )
-        .map_err(|_| {
-            fail(
-                "POLICY_VIOLATION",
-                "executable outside approval signer roots",
-            )
-        })?;
+        .is_err()
+    {
+        return Err(fail("POLICY_VIOLATION", "intent exceeds static policy"));
+    }
+    if let Some(payload) = &request.hello.csr_payload {
+        let csr =
+            Csr::parse(payload.as_bytes()).map_err(|e| fail("INVALID_REQUEST", e.to_string()))?;
+        let w = csr.warrant();
+        let now = realtime()?;
         if !static_policy(
             signer,
-            candidate.warrant(),
+            w,
             request.requester_uid,
             gid,
             &context.host_id,
             &request.policy,
-        ) {
-            return Err(fail(
-                "POLICY_VIOLATION",
-                "request exceeds approval signer policy",
-            ));
+        ) || now < w.policy.not_before
+            || w.policy.not_after.is_none_or(|end| now > end)
+        {
+            return Err(fail("POLICY_VIOLATION", "full CSR exceeds static policy"));
         }
     }
     request.unsigned_policy_checked = true;
@@ -178,13 +175,27 @@ pub(crate) fn prepare(
     gid: u32,
 ) -> io::Result<()> {
     request.check()?;
-    if request.hello.mode == "unsigned_csr_request" && !request.unsigned_policy_checked {
+    crate::transport::validate_stdio_checked(&request.hello, &request.rights, || request.check())?;
+    if request.hello.mode != "signed" && !request.unsigned_policy_checked {
         check_unsigned_policy(request, context, gid)?;
     }
     let signed = if let Some(envelope) = &request.hello.dsse_envelope {
         let warrant = envelope
             .warrant()
             .map_err(|_| fail("INVALID_REQUEST", "invalid canonical warrant"))?;
+        let now = realtime()?;
+        if now < warrant.warrant().policy.not_before
+            || warrant
+                .warrant()
+                .policy
+                .not_after
+                .is_none_or(|end| now > end)
+        {
+            return Err(fail(
+                "EXPIRED_OR_NOT_YET_VALID",
+                "warrant outside validity window",
+            ));
+        }
         let signer_ids: Vec<_> = context
             .signers
             .signers
@@ -220,6 +231,12 @@ pub(crate) fn prepare(
             ));
         }
         Some((warrant, signer_ids))
+    } else if let Some(payload) = &request.hello.csr_payload {
+        Some((
+            CanonicalWarrant::parse(payload.as_bytes())
+                .map_err(|e| fail("INVALID_REQUEST", e.to_string()))?,
+            vec![],
+        ))
     } else {
         None
     };
@@ -233,6 +250,34 @@ pub(crate) fn prepare(
         &request.policy.csr_allowed_executable_dirs,
     )
     .map_err(|_| fail("POLICY_VIOLATION", "executable is outside configured roots"))?;
+    // Complete finite input before the first private target observation. Never
+    // remove the original endpoint from the outcome owner's descriptor table.
+    let stdin = if command.stdin_policy == "sha256" {
+        let source: File = request
+            .rights
+            .first()
+            .ok_or_else(|| fail("INVALID_REQUEST", "missing stdin"))?
+            .try_clone()?
+            .into();
+        Some(
+            snapshot::stdin(
+                source,
+                budget,
+                request.requester_uid,
+                &request.policy,
+                || request.check(),
+            )
+            .map_err(|e| snapshot_error(e, "STDIN_HASH_MISMATCH"))?,
+        )
+    } else {
+        None
+    };
+    if let Some((warrant, _)) = &signed {
+        let observed = stdin.as_ref().map(|input| &input.digest.sha256);
+        if observed != warrant.warrant().command.stdin_sha256.as_ref() {
+            return Err(fail("STDIN_HASH_MISMATCH", "signed stdin digest differs"));
+        }
+    }
     let root = context
         .roots
         .iter()
@@ -240,14 +285,25 @@ pub(crate) fn prepare(
         .ok_or_else(|| fail("POLICY_VIOLATION", "captured executable root unavailable"))?;
     let root_identity = FileIdentity::read(&root.directory)?;
     request.check()?;
-    let source: File = openat2_executable(root.directory.as_raw_fd(), &selected.relative_path)
-        .map_err(|_| {
+    let source: File = if request.hello.mode == "full_csr" {
+        let groups = request.requester_groups.as_deref().ok_or_else(|| {
             fail(
-                "EXECUTABLE_MUTATED_OR_TOO_LARGE",
-                "executable resolution failed",
+                "REQUESTER_ACCESS",
+                "authenticated supplementary groups unavailable",
             )
-        })?
-        .into();
+        })?;
+        crate::access::open(
+            &selected.root,
+            &selected.relative_path,
+            &root_identity,
+            request.requester_uid,
+            gid,
+            groups,
+            || request.check(),
+        )?
+    } else {
+        openat2_executable(root.directory.as_raw_fd(), &selected.relative_path)?.into()
+    };
     request.check()?;
     let source_identity = FileIdentity::read(&source)?;
     request.check()?;
@@ -259,11 +315,12 @@ pub(crate) fn prepare(
     let executable = crate::executable::prepare(
         source,
         crate::executable::Selection {
-            signed: signed.as_ref().map(|(w, _)| &w.warrant().command),
-            context: &execution_context,
-            allow_file_capabilities: signed
+            signed: signed
                 .as_ref()
-                .is_none_or(|(w, _)| w.warrant().version == "1.2"),
+                .filter(|_| request.hello.mode == "signed")
+                .map(|(w, _)| &w.warrant().command),
+            context: &execution_context,
+            allow_file_capabilities: true,
             trace_available: crate::execution::trace_available(),
         },
         budget,
@@ -272,35 +329,17 @@ pub(crate) fn prepare(
         || request.check(),
     )
     .map_err(|e| snapshot_error(e, "EXECUTABLE_MUTATED_OR_TOO_LARGE"))?;
-    request.snapshots = Some(MeasuredSnapshots {
-        executable,
-        stdin: None,
-    });
+    request.snapshots = Some(MeasuredSnapshots { executable, stdin });
     let null_stdin = if command.stdin_policy == "sha256" {
-        let source = File::from(request.rights.remove(0));
-        let stdin = snapshot::stdin(
-            source,
-            budget,
-            request.requester_uid,
-            &request.policy,
-            || request.check(),
-        )
-        .map_err(|e| snapshot_error(e, "STDIN_HASH_MISMATCH"))?;
-        request
-            .snapshots
-            .as_mut()
-            .expect("executable snapshot")
-            .stdin = Some(stdin);
         None
     } else {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open("/dev/null")?;
-        let metadata = file.metadata()?;
-        if metadata.mode() & libc::S_IFMT != libc::S_IFCHR || metadata.rdev() != libc::makedev(1, 3)
-        {
-            return Err(fail("INVALID_REQUEST", "invalid null stdin device"));
+        let m = file.metadata()?;
+        if m.mode() & libc::S_IFMT != libc::S_IFCHR || m.rdev() != libc::makedev(1, 3) {
+            return Err(fail("INVALID_REQUEST", "invalid null device"));
         }
         Some(file.into())
     };
@@ -371,9 +410,16 @@ fn finish_document(request: &mut ValidatedRequest, context: &Context, gid: u32) 
         if !stdin_matches {
             return Err(fail("STDIN_HASH_MISMATCH", "signed stdin digest differs"));
         }
-        Document::Signed {
-            warrant,
-            signer_ids,
+        if request.hello.mode == "full_csr" {
+            Document::Unsigned(
+                Csr::parse(warrant.as_bytes())
+                    .map_err(|e| fail("INVALID_REQUEST", e.to_string()))?,
+            )
+        } else {
+            Document::Signed {
+                warrant,
+                signer_ids,
+            }
         }
     } else {
         let now = SystemTime::now()
@@ -404,8 +450,22 @@ fn finish_document(request: &mut ValidatedRequest, context: &Context, gid: u32) 
                 "CSR exceeds captured policy or document bounds",
             )
         })?;
-        Document::Unsigned(csr)
+        let mut w = csr.warrant().clone();
+        w.request_origin = "daemon_expanded_thin".into();
+        w.approval_exec_id = Some(request.exec_id.clone());
+        Document::Unsigned(Csr::new(w).map_err(|e| fail("INVALID_REQUEST", e.to_string()))?)
     };
+    let canonical = match &document {
+        Document::Unsigned(csr) => csr.warrant(),
+        Document::Signed { warrant, .. } => warrant.warrant(),
+    };
+    let now = realtime()?;
+    if now < canonical.policy.not_before || canonical.policy.not_after.is_none_or(|end| now > end) {
+        return Err(fail(
+            "EXPIRED_OR_NOT_YET_VALID",
+            "prepared request expired before review",
+        ));
+    }
     request.prepared = Some(Prepared {
         document,
         root_path,
@@ -437,6 +497,11 @@ pub(crate) fn static_policy(
         && signer.allowed_target_uids.contains(&context.target_uid)
         && signer.allowed_target_gids.contains(&context.target_gid)
         && context.target_uid != uid
+        && select_root(
+            std::path::Path::new(&warrant.command.executable_path),
+            &signer.allowed_executable_dirs,
+        )
+        .is_ok()
         && context
             .supplementary_gids
             .iter()
@@ -498,13 +563,13 @@ pub(crate) fn approve(
     })()
     .map_err(|_| {
         fail(
-            "TIMEOUT_CSR",
+            "APPROVAL_FAILED",
             "approval connection lost, expired or malformed",
         )
     })?;
     request
         .check()
-        .map_err(|_| fail("TIMEOUT_CSR", "approval deadline expired"))?;
+        .map_err(|_| fail("APPROVAL_FAILED", "approval deadline expired"))?;
     let warrant = approval
         .bind_response(&exchange)
         .map_err(|_| fail("POLICY_VIOLATION", "approval differs from retained request"))?;
@@ -636,7 +701,7 @@ mod tests {
             string(bytes, &mut envelope);
         }
         ClientHello::parse_request(&serde_json::to_vec(&serde_json::json!({
-            "mode":"signed", "tty_mode":"stdio", "caller_env":{},
+            "version":"2.0","mode":"signed", "tty_mode":"stdio", "caller_env":{},
             "dsse_envelope":{"payloadType":WARRANT_PAYLOAD_TYPE,
                 "payload":STANDARD.encode(warrant.as_bytes()),
                 "signatures":[{"keyid":"mandator-alice-yubikey", "sig":STANDARD.encode(envelope)}]}
@@ -666,6 +731,12 @@ mod tests {
             .unwrap();
             config.csr_allowed_executable_dirs = vec![dir.path().to_owned()];
             config.max_stdin_bytes = 4096;
+            config.mvp = Some(sigrund_core::config::MvpProfile {
+                approval_signer_id: "mandator-alice-yubikey".into(),
+                ..Default::default()
+            });
+            config.executable_trust_models =
+                vec![sigrund_core::executable::TrustModel::DigestMemfd];
             let mut public = Vec::new();
             string(b"ssh-ed25519", &mut public);
             string(
@@ -725,9 +796,20 @@ mod tests {
                 rights.push(file.into());
             }
             for _ in 0..2 {
-                rights.push(File::open("/dev/null").unwrap().into());
+                rights.push(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/dev/null")
+                        .unwrap()
+                        .into(),
+                );
             }
             ValidatedRequest {
+                failure: None,
+                exec_id: new_uuidv7().to_string(),
+                requester_gid: 1001,
+                requester_groups: Some(vec![]),
                 deferred_cleanup: vec![],
                 hello,
                 rights,
@@ -748,7 +830,10 @@ mod tests {
             let Document::Unsigned(csr) = &request.prepared.as_ref().unwrap().document else {
                 panic!()
             };
-            CanonicalWarrant::parse(csr.as_bytes()).unwrap()
+            let mut w = csr.warrant().clone();
+            w.request_origin = "client_full".into();
+            w.approval_exec_id = None;
+            CanonicalWarrant::new(w).unwrap()
         }
     }
 
@@ -806,8 +891,10 @@ mod tests {
                 .unwrap();
             assert_eq!(bytes, original);
             assert_eq!(
-                csr.warrant().command.executable_sha256,
-                Some(sigrund_core::crypto::sha256_hex(&bytes))
+                csr.warrant().command.executable_trust,
+                Some(sigrund_core::executable::ExecutableTrust::DigestMemfd {
+                    sha256: sigrund_core::crypto::sha256_hex(&bytes)
+                })
             );
             std::fs::write(&source, &original).unwrap();
             drop(request);
@@ -841,7 +928,11 @@ mod tests {
     fn final_authorization_namespace_fixture() {
         assert_eq!(std::env::var("SIGRUND_FINAL_GATE").unwrap(), "1");
         let mut fixture = Fixture::new();
-        Arc::make_mut(&mut fixture.config).mvp = Some(Default::default());
+        Arc::make_mut(&mut fixture.config)
+            .mvp
+            .as_mut()
+            .unwrap()
+            .approval_signer_id = "mandator-alice-yubikey".into();
         let canonical = fixture.warrant();
         for case in [
             "valid",
@@ -856,7 +947,7 @@ mod tests {
             "same_uid",
         ] {
             let mut request =
-                fixture.request(signed_hello(&canonical, "sigrun.warrant.v1", 7), None);
+                fixture.request(signed_hello(&canonical, "sigrun.warrant.v2", 7), None);
             prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap();
             let prepared = request.prepared.as_mut().unwrap();
             match case {
@@ -875,7 +966,11 @@ mod tests {
                         panic!()
                     };
                     let mut changed = warrant.warrant().clone();
-                    changed.command.executable_sha256 = Some("0".repeat(64));
+                    changed.command.executable_trust =
+                        Some(sigrund_core::executable::ExecutableTrust::DigestMemfd {
+                            sha256: "0".repeat(64),
+                        });
+                    changed.intent_sha256 = changed.intent().unwrap().sha256().unwrap();
                     *warrant = CanonicalWarrant::new(changed).unwrap();
                     request.snapshots.as_mut().unwrap().executable.digest.sha256 = "0".repeat(64);
                 }
@@ -895,6 +990,7 @@ mod tests {
                     };
                     let mut changed = warrant.warrant().clone();
                     changed.execution_context.target_uid = 1001;
+                    changed.intent_sha256 = changed.intent().unwrap().sha256().unwrap();
                     *warrant = CanonicalWarrant::new(changed).unwrap();
                 }
                 _ => unreachable!(),
@@ -918,7 +1014,7 @@ mod tests {
     fn signed_preparation_verifies_candidate_before_open_and_binds_both_digests() {
         let fixture = Fixture::new();
         let warrant = fixture.warrant();
-        let mut request = fixture.request(signed_hello(&warrant, "sigrun.warrant.v1", 7), None);
+        let mut request = fixture.request(signed_hello(&warrant, "sigrun.warrant.v2", 7), None);
         prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap();
         assert!(
             matches!(&request.prepared.as_ref().unwrap().document, Document::Signed { signer_ids, .. } if signer_ids==&["mandator-alice-yubikey"])
@@ -931,11 +1027,15 @@ mod tests {
                 w.command.stdin_policy = "sha256".into();
                 w.command.stdin_sha256 = Some("0".repeat(64));
             } else {
-                w.command.executable_sha256 = Some("0".repeat(64));
+                w.command.executable_trust =
+                    Some(sigrund_core::executable::ExecutableTrust::DigestMemfd {
+                        sha256: "0".repeat(64),
+                    });
             }
+            w.intent_sha256 = w.intent().unwrap().sha256().unwrap();
             let w = CanonicalWarrant::new(w).unwrap();
             let mut request = fixture.request(
-                signed_hello(&w, "sigrun.warrant.v1", 7),
+                signed_hello(&w, "sigrun.warrant.v2", 7),
                 stdin.then_some(b"input".as_slice()),
             );
             let error = prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap_err();
@@ -958,7 +1058,7 @@ mod tests {
         std::fs::remove_file(fixture.dir.path().join("program")).unwrap();
         let mut bad = Vec::new();
         bad.push(signed_hello(&warrant, "wrong-namespace", 7));
-        bad.push(signed_hello(&warrant, "sigrun.warrant.v1", 8));
+        bad.push(signed_hello(&warrant, "sigrun.warrant.v2", 8));
         for field in ["host", "uid", "gid", "target", "ttl", "capability", "root"] {
             let mut w = warrant.warrant().clone();
             match field {
@@ -967,13 +1067,20 @@ mod tests {
                 "gid" => w.requester_gid = 1002,
                 "target" => w.execution_context.target_uid = 44,
                 "ttl" => w.policy.not_after = Some(w.policy.not_before + 3601),
-                "capability" => w.execution_context.capabilities = vec!["CAP_SYS_ADMIN".into()],
+                "capability" => {
+                    w.execution_context.capabilities = vec!["CAP_SYS_ADMIN".into()];
+                    w.execution_context.post_exec_capabilities =
+                        Some(sigrund_core::executable::CapabilitySets::ordinary(
+                            &w.execution_context.capabilities,
+                        ));
+                }
                 "root" => w.command.executable_path = "/outside/program".into(),
                 _ => unreachable!(),
             }
+            w.intent_sha256 = w.intent().unwrap().sha256().unwrap();
             bad.push(signed_hello(
                 &CanonicalWarrant::new(w).unwrap(),
-                "sigrun.warrant.v1",
+                "sigrun.warrant.v2",
                 7,
             ));
         }

@@ -7,7 +7,10 @@ pub enum FrameType {
     ServerAuthDecision = 0x02,
     ClientSignal = 0x03,
     ClientWinsize = 0x04,
-    ServerChildExit = 0x05,
+    ServerExecResult = 0x05,
+    ClientContextQuery = 0x06,
+    ServerContext = 0x07,
+    ServerExecReady = 0x08,
 }
 
 impl TryFrom<u8> for FrameType {
@@ -19,7 +22,10 @@ impl TryFrom<u8> for FrameType {
             0x02 => Ok(Self::ServerAuthDecision),
             0x03 => Ok(Self::ClientSignal),
             0x04 => Ok(Self::ClientWinsize),
-            0x05 => Ok(Self::ServerChildExit),
+            0x05 => Ok(Self::ServerExecResult),
+            0x06 => Ok(Self::ClientContextQuery),
+            0x07 => Ok(Self::ServerContext),
+            0x08 => Ok(Self::ServerExecReady),
             _ => Err(CoreError::Protocol(format!(
                 "unknown frame type 0x{value:02x}"
             ))),
@@ -29,11 +35,13 @@ impl TryFrom<u8> for FrameType {
 
 pub fn max_payload(frame: FrameType) -> usize {
     match frame {
-        FrameType::ClientHello => 196_608,
-        FrameType::ServerAuthDecision => 524_288,
+        FrameType::ClientHello => 524_288,
+        FrameType::ServerAuthDecision => 1024,
         FrameType::ClientSignal => 64,
         FrameType::ClientWinsize => 128,
-        FrameType::ServerChildExit => 128,
+        FrameType::ServerExecResult | FrameType::ServerExecReady => 1024,
+        FrameType::ClientContextQuery => 64,
+        FrameType::ServerContext => 16384,
     }
 }
 
@@ -51,7 +59,8 @@ pub fn validate_client_frame(frame: FrameType, ready: bool, pty: bool) -> Result
 pub fn validate_server_frame(frame: FrameType, decided: bool, ready: bool) -> Result<()> {
     match frame {
         FrameType::ServerAuthDecision if !decided => Ok(()),
-        FrameType::ServerChildExit if decided && ready => Ok(()),
+        FrameType::ServerExecResult if decided => Ok(()),
+        FrameType::ServerExecReady if decided && !ready => Ok(()),
         _ => Err(CoreError::Protocol(
             "server frame is invalid in current state".into(),
         )),
@@ -151,8 +160,8 @@ mod tests {
     #[test]
     fn rejects_unknown_and_oversized_headers() {
         assert!(decode_header([0xff, 0, 0, 0, 1]).is_err());
-        assert!(decode_header([1, 0, 3, 0, 1]).is_err());
-        assert!(validate_server_frame(FrameType::ServerChildExit, false, true).is_err());
-        assert!(validate_server_frame(FrameType::ServerChildExit, true, true).is_ok());
+        assert!(decode_header([1, 0, 8, 0, 1]).is_err());
+        assert!(validate_server_frame(FrameType::ServerExecResult, false, true).is_err());
+        assert!(validate_server_frame(FrameType::ServerExecResult, true, true).is_ok());
     }
 }

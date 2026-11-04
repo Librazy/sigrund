@@ -37,6 +37,8 @@ Fixture, wait_for, receive = SHARED['Fixture'], SHARED['wait_for'], SHARED['rece
 canonical, unprivileged = SHARED['canonical'], SHARED['unprivileged']
 Evidence = FAILURES['Evidence']
 
+ready, authorized, exited, exit_fields = (SHARED[k] for k in ('ready','authorized','exited','exit_fields'))
+
 
 def run(command, *, log=None, **kwargs):
     result = subprocess.run([str(a) for a in command], check=True, **kwargs)
@@ -80,25 +82,25 @@ def cancel_blocked_output(client, output, status_path, jobs_empty, *, timeout=6)
         return [json.loads(line) for line in status_path.read_bytes().split(b'\n')[:-1]]
 
     wait_for(pipe_full, 'full output pipe without reads', timeout=timeout)
-    wait_for(lambda: any(e.get('status') == 'READY_TO_EXEC' for e in events()),
+    wait_for(lambda: any('exec_outcome' in e for e in events()),
              'blocked output client readiness', timeout=timeout)
     assert client.poll() is None and not jobs_empty(), 'workload completed before cancellation'
     client.send_signal(signal.SIGINT)
     wait_for(lambda: any('signal' in e for e in events()),
              'child signal outcome while output remains blocked', timeout=timeout)
-    assert events()[-1] == {'exit_code': None, 'signal': signal.SIGINT}, events()
+    assert exit_fields(events()[-1]) == {'exit_code': None, 'signal': signal.SIGINT}, events()
     wait_for(jobs_empty, 'blocked-output cancellation cleanup without reads', timeout=timeout)
     assert pipe_full(), 'output was drained before cancellation was verified'
     # The client legitimately waits for its relays to drain after child exit.
     code, _, _, result = finish(client, output)
-    assert code == 128 + signal.SIGINT and result[-1] == {'exit_code': None, 'signal': signal.SIGINT}, (code, result)
+    assert code == 128 + signal.SIGINT and exit_fields(result[-1]) == {'exit_code': None, 'signal': signal.SIGINT}, (code, result)
     return {'signal': signal.SIGINT, 'exit_code': code, 'cleanup_before_drain': True}
 
 
 def deny(f, warrant, status, input_bytes=None):
     client, output, _ = cli(f, warrant)
     code, out, err, events = finish(client, output, input_bytes)
-    assert code == 255 and out == b'' and len(events) == 1 and events[0]['status'] == status, (code, out, err, events)
+    assert code == 255 and out == b'' and len(events) == 1 and events[0]['status'] == 'TIMEOUT', (code, out, err, events)
     return events[0]
 
 
@@ -108,25 +110,17 @@ def count(f):
 
 
 def package_workflow(parent, binaries, evidence):
-    """Use the shipped offline helper on a daemon-generated CSR, never a rebuilt payload."""
+    """Export a client-full CSR and preserve its bytes through offline signing."""
     f = Fixture(parent, binaries)
     try:
         f.launch()
-        status = f.base / 'capture.status'
-        with open(status, 'w+b') as output:
-            client = subprocess.Popen([str(f.client_binary), '--socket', str(f.client), '--status-fd', str(output.fileno()),
-                                       '--cwd', '/', '--', str(f.commands / 'id'), '-u'],
-                                      preexec_fn=unprivileged, pass_fds=(output.fileno(),),
-                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = client.communicate(timeout=8)
-        assert client.returncode == 255 and not out, (client.returncode, out, err)
-        assert count(f) == 0
-        csr, pae = f.base / 'request.csr', f.base / 'request.pae'
+        csr = f.export(f.commands / 'id', ('-u',))
+        original = csr.read_bytes()
+        pae = f.base / 'request.pae'
         ctl = binaries / 'sigrundctl'
-        run([ctl, 'csr-pae', '--status', status, '--csr', csr, '--pae', pae])
-        original = json.loads(status.read_bytes())['csr_payload'].encode()
-        assert csr.read_bytes() == original
-        signed = run(['ssh-keygen', '-Y', 'sign', '-n', 'sigrun.warrant.v1', '-O', 'hashalg=sha512',
+        run([ctl, 'csr-pae', '--csr', csr, '--pae', pae])
+        assert count(f) == 0
+        signed = run(['ssh-keygen', '-Y', 'sign', '-n', 'sigrun.warrant.v2', '-O', 'hashalg=sha512',
                       '-f', f.key, pae], capture_output=True)
         envelope = f.base / 'packaged.json'
         run([ctl, 'pack-warrant', '--csr', csr, '--signature', str(pae) + '.sig', '--signer-id', SHARED['SIGNER'],
@@ -136,12 +130,12 @@ def package_workflow(parent, binaries, evidence):
         client, output, status_path = cli(f, envelope)
         code, out, err, events = finish(client, output)
         assert code == 0 and out == b'0\n' and err == SHARED['CLIENT_PROGRESS'], (code, out, err, events)
-        assert events[-1] == {'exit_code': 0, 'signal': None}
+        assert exit_fields(events[-1]) == {'exit_code': 0, 'signal': None}
         assert count(f) == 1
         deny(f, envelope, 'REPLAY_DETECTED')
         directory = evidence.root / 'offline-workflow'
         directory.mkdir(exist_ok=True)
-        for source in (status, csr, pae, Path(str(pae) + '.sig'), envelope, status_path):
+        for source in (csr, pae, Path(str(pae) + '.sig'), envelope, status_path):
             (directory / source.name).write_bytes(source.read_bytes())
         evidence.passed('offline-workflow', csr_sha256=hashlib.sha256(original).hexdigest(), output='0\n', replay='REPLAY_DETECTED')
         f.stop()
@@ -158,6 +152,11 @@ def binding_and_replay(parent, binaries, evidence):
         changed = copy.deepcopy(envelope)
         value = json.loads(base64.b64decode(changed['payload']))
         value['command']['argv'].append('changed-after-signing')
+        intent = {'command': {k: v for k,v in value['command'].items() if k not in ('executable_trust', 'stdin_sha256')},
+                  'execution_context': {k: v for k,v in value['execution_context'].items() if k != 'post_exec_capabilities'},
+                  'policy': {'mode': value['policy']['mode'], 'ttl_secs': value['policy']['not_after'] - value['policy']['not_before']},
+                  'caller_env': value['caller_env']}
+        value['intent_sha256'] = hashlib.sha256(canonical(intent)).hexdigest()
         changed['payload'] = base64.b64encode(canonical(value)).decode()
         altered = f.base / 'altered.json'
         altered.write_bytes(canonical(changed))
@@ -175,7 +174,7 @@ def binding_and_replay(parent, binaries, evidence):
         clients = [cli(f, warrant) for _ in range(2)]
         results = [finish(c, out) for c, out, _ in clients]
         assert sorted(r[0] for r in results) == [0, 255], results
-        assert sorted(r[3][0]['status'] for r in results) == ['READY_TO_EXEC', 'REPLAY_DETECTED'], results
+        assert sorted(r[3][0]['status'] for r in results) == ['APPROVED', 'TIMEOUT'], results
         assert count(f) == 1
         commits = [r for r in f.records() if r.get('event_type') == 'AUTH_COMMIT']
         assert len(commits) == 1
@@ -204,7 +203,7 @@ def output_and_limits(parent, binaries, evidence):
         code, out, err, events = finish(client, output)
         expected = bytes(range(256)) * (2097152 // 256)
         assert code == 23 and out == expected and err == SHARED['CLIENT_PROGRESS'] + expected, (code, len(out), len(err), events)
-        assert events[-1] == {'exit_code': 23, 'signal': None}
+        assert exit_fields(events[-1]) == {'exit_code': 23, 'signal': None}
         # A genuinely blocked local sink must not prevent a signal cancellation.
         blocked, _ = f.signed(probe, ('blocked-output',))
         client, output, status_path = cli(f, blocked)
@@ -228,7 +227,7 @@ def output_and_limits(parent, binaries, evidence):
         assert int(memory_events['oom_kill']) >= 1, memory_events
         gate.unblock()
         code, out, err, events = finish(client, output)
-        assert code == 137 and events[-1] == {'exit_code': None, 'signal': 9}, (code, out, err, events)
+        assert code == 137 and exit_fields(events[-1]) == {'exit_code': None, 'signal': 9}, (code, out, err, events)
         wait_for(f.empty, 'OOM job cleanup')
         pids, _ = f.signed(probe, ('pids',))
         gate.arm()
@@ -260,7 +259,9 @@ def failed_job_limit(parent, binaries, evidence):
         gate = SHARED['Gate'](f, 'limit-fail')
         gate.arm()
         warrant, _ = f.signed(f.commands / 'true')
-        deny(f, warrant, 'SPAWN_FAILED')
+        child, output, _ = cli(f, warrant)
+        code, out, err, events = finish(child, output)
+        assert code == 254 and not out and events[0]['status'] == 'APPROVED' and events[-1]['status'] == 'SETUP_FAILED', (code,out,err,events)
         assert count(f) == 1
         wait_for(f.empty, 'failed cgroup setup cleanup')
         assert not any(r.get('event_type') == 'EXEC_READY_TO_EXEC' for r in f.records())
@@ -391,7 +392,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
             if answer == b'no\n':
                 assert child.returncode == 255 and events[0]['status'] == 'REJECTED', (terminal, events)
             else:
-                assert child.returncode == 0 and events[-1] == {'exit_code': 0, 'signal': None}, (terminal, events)
+                assert child.returncode == 0 and exit_fields(events[-1]) == {'exit_code': 0, 'signal': None}, (terminal, events)
                 assert terminal == SHARED['CLIENT_PROGRESS'] + (b'0\n' if stdin_bytes is None else stdin_bytes), terminal
             directory = evidence.root / 'operator-workflow'
             directory.mkdir(exist_ok=True)
@@ -489,6 +490,7 @@ def inside(args):
             ('platform', [sys.executable, REPO / 'scripts/verify-platform.py', args.platform_binary, '--cgroup-parent', parent]),
             ('runtime', [sys.executable, REPO / 'scripts/verify-runtime.py', '--cgroup-parent', parent,
                          '--binaries', args.binaries, '--systemd']),
+            ('v2', [sys.executable, REPO / 'scripts/verify-v2.py', '--cgroup-parent', parent, '--binaries', args.binaries]),
             ('trust', [sys.executable, REPO / 'scripts/verify-trust.py', '--cgroup-parent', parent,
                        '--binaries', args.binaries, '--artifacts', args.artifacts / 'trust']),
             ('failures', [sys.executable, REPO / 'scripts/verify-execution.py', '--cgroup-parent', parent,

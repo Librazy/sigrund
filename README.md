@@ -7,21 +7,35 @@ a root operator reviews it on their own terminal and signs it with an SSH key.
 The daemon verifies the signature and policy, records the authorization,
 executes the command, and returns its output and exit status to the requester.
 
-The implemented MVP supports local interactive approval and offline, pre-signed
-one-time warrants. The broader [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-includes features that are not yet implemented; see [current scope](#current-scope).
+The local **v2** profile supports client-generated full CSRs and private daemon
+expansion of thin CSRs. The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
+defines the protocol and broader target. Thin requests receive only approval or
+an admission-based timeout; expanded evidence and refusal reasons stay private.
+Full requests additionally permit explicit rejection after requester-access and
+evidence validation. No authorization response contains a CSR or diagnostic.
 
-## How it works
+V2 retains all four executable trust models and separates durable authorization
+from execution readiness/results. It breaks old protocol, warrant, signature and
+state formats. Provision fresh state and use matching components; there is no
+migration or automatic deletion. See [implementation status](IMPLEMENTATION_NOTES.md#v2-implementation-and-validation).
 
-1. `sigrun` submits the executable, arguments, target credentials and input policy
-   over a local Unix socket.
-2. `sigrund` captures sealed executable/input snapshots and prepares the exact
-   request for approval.
-3. `sigrund-approve`, running as root on a controlling TTY, displays the request
-   and signs it with the selected SSH identity after confirmation.
-4. `sigrund` checks signature, policy, expiry and revocation, consumes the one-time
-   grant, and persists local audit before executing with per-job cgroup limits.
-5. `sigrun` relays stdout/stderr and returns the primary child's exit status.
+## How the current implementation works
+
+1. `sigrun` queries public preparation context on a separate socket, captures finite
+   stdin once, and tries to prepare a full CSR with its own file access. If it
+   cannot, it submits the same intent as a thin CSR. `--full-only` forbids fallback;
+   `--export-csr PATH` exports a full CSR without requesting execution.
+2. `sigrund` independently verifies full requests through a process using the
+   requester's authenticated UID/GID/groups, or privately expands thin requests.
+   It retains exact executable evidence and immutable input before review.
+3. `sigrund-approve`, running as root on a controlling TTY, displays the complete
+   request, including origin and intent hash, and signs after confirmation.
+4. The daemon verifies policy/signature, consumes the one-time grant and persists
+   audit, then completely sends `APPROVED` before spawning. Unsuccessful requests
+   receive `TIMEOUT` at the fixed deadline; only validated full requests may
+   receive an explicit mandator `REJECTED`.
+5. Separate readiness and execution-result frames accompany stdout/stderr.
+   `sigrun` returns the primary child's exit status and drains remaining output.
 
 `sigrundctl` provisions host state and packages offline warrants. The
 `sigrund-collector` binary currently provides validation diagnostics only.

@@ -50,7 +50,7 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
         ClientArgs::Run {
             socket: "/tmp/client.sock".into(),
             command: args(&["/usr/bin/printf", "--socket", "two words", ""]),
-            options: RequestOptions::default()
+            options: Box::new(RequestOptions::default())
         }
     );
     assert!(matches!(

@@ -22,6 +22,10 @@ pub enum AuthorizationResult {
 }
 
 pub struct AuthorizationRequest<'a> {
+    pub exec_id: &'a str,
+    pub request_origin: &'a str,
+    pub intent_sha256: &'a str,
+    pub approval_exec_id: Option<&'a str>,
     pub grant_id: &'a str,
     pub payload: &'a [u8],
     pub signer_id: &'a str,
@@ -40,9 +44,17 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        if path.as_ref() == Path::new(":memory:") {
+            let c = Connection::open_in_memory().map_err(db)?;
+            Self::create_schema(&c)?;
+            return Self::initialize(c, None);
+        }
+        Self::require_version_file(
+            &File::open(path.as_ref()).map_err(|e| CoreError::Database(e.to_string()))?,
+        )?;
         let connection = Connection::open_with_flags(
             path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(db)?;
         Self::initialize(connection, None)
@@ -56,34 +68,102 @@ impl StateStore {
         let path = format!("/proc/self/fd/{}/state.sqlite", directory.as_raw_fd());
         let connection = Connection::open_with_flags_and_vfs(
             path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            "sigrund-pinned-v1",
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            "sigrund-pinned-v2",
         )
         .map_err(db)?;
         Self::initialize(connection, Some(directory))
     }
 
+    /// Explicit fresh provisioning; an existing file is never initialized.
+    pub fn create_in_directory(directory: File) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        crate::sqlite_pinned::register()?;
+        let path = format!("/proc/self/fd/{}/state.sqlite", directory.as_raw_fd());
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        drop(file);
+        let connection = Connection::open_with_flags_and_vfs(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            "sigrund-pinned-v2",
+        )
+        .map_err(db)?;
+        Self::create_schema(&connection)?;
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(db)?;
+        Self::initialize(connection, Some(directory))
+    }
+
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.as_ref())
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        drop(file);
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(db)?;
+        Self::create_schema(&connection)?;
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(db)?;
+        Self::initialize(connection, None)
+    }
+    pub fn require_version_file(file: &File) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut header = [0u8; 100];
+        file.read_exact_at(&mut header, 0)
+            .map_err(|e| CoreError::Database(e.to_string()))?;
+        if &header[..16] != b"SQLite format 3\0"
+            || u32::from_be_bytes(header[60..64].try_into().unwrap()) != 2
+        {
+            return Err(CoreError::Database(
+                "database requires schema version 2; provision fresh state".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn create_schema(connection: &Connection) -> Result<()> {
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+            CREATE TABLE consumed_grants (
+                grant_id TEXT PRIMARY KEY, payload_sha256 BLOB NOT NULL UNIQUE,
+                signer_id TEXT NOT NULL, requester_uid INTEGER NOT NULL, exec_id TEXT NOT NULL,
+                request_origin TEXT NOT NULL CHECK(request_origin IN ('client_full','daemon_expanded_thin')),
+                intent_sha256 BLOB NOT NULL CHECK(length(intent_sha256)=32), approval_exec_id TEXT,
+                not_after INTEGER NOT NULL, consumed_at INTEGER NOT NULL,
+                CHECK((request_origin='client_full' AND approval_exec_id IS NULL) OR
+                    (request_origin='daemon_expanded_thin' AND approval_exec_id IS NOT NULL AND approval_exec_id=exec_id))
+            ) STRICT;
+            CREATE TABLE revocations (
+                target_type TEXT NOT NULL CHECK(target_type IN ('grant_id','payload_sha256','signer_id')),
+                target_value TEXT NOT NULL, revoked_at INTEGER NOT NULL, reason TEXT NOT NULL,
+                PRIMARY KEY(target_type,target_value)
+            ) STRICT;
+            PRAGMA user_version=2;").map_err(db)
+    }
     fn initialize(connection: Connection, directory: Option<File>) -> Result<Self> {
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(db)?;
+        if version != 2 {
+            return Err(CoreError::Database(
+                "database requires schema version 2".into(),
+            ));
+        }
         connection
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
-                 PRAGMA busy_timeout = 5000;
-                 CREATE TABLE IF NOT EXISTS consumed_grants (
-                     grant_id TEXT PRIMARY KEY,
-                     payload_sha256 BLOB NOT NULL UNIQUE,
-                     signer_id TEXT NOT NULL,
-                     requester_uid INTEGER NOT NULL,
-                     not_after INTEGER NOT NULL,
-                     consumed_at INTEGER NOT NULL
-                 ) STRICT;
-                 CREATE TABLE IF NOT EXISTS revocations (
-                     target_type TEXT NOT NULL CHECK (target_type IN ('grant_id', 'payload_sha256', 'signer_id')),
-                     target_value TEXT NOT NULL,
-                     revoked_at INTEGER NOT NULL,
-                     reason TEXT NOT NULL,
-                     PRIMARY KEY (target_type, target_value)
-                 ) STRICT;",
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
             )
             .map_err(db)?;
         Ok(Self {
@@ -126,6 +206,16 @@ impl StateStore {
         reserve_commit: impl FnOnce() -> Result<bool>,
         permit_commit: impl FnOnce() -> Result<bool>,
     ) -> Result<(AuthorizationResult, Option<&'a str>)> {
+        let intent_digest = hex_digest(request.intent_sha256)?;
+        if !(matches!(
+            (request.request_origin, request.approval_exec_id),
+            ("client_full", None)
+        ) || (request.request_origin == "daemon_expanded_thin"
+            && request.approval_exec_id == Some(request.exec_id)
+            && request.mode == GrantMode::OneTime))
+        {
+            return Err(CoreError::Value("invalid consumption provenance".into()));
+        }
         if additional_signer_ids.len() > 3 {
             return Err(CoreError::Value("expected 1..=4 eligible signers".into()));
         }
@@ -188,15 +278,15 @@ impl StateStore {
         if request.mode == GrantMode::OneTime {
             let inserted = transaction.execute(
                 "INSERT INTO consumed_grants
-                 (grant_id, payload_sha256, signer_id, requester_uid, not_after, consumed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (grant_id,payload_sha256,signer_id,requester_uid,not_after,consumed_at,exec_id,request_origin,intent_sha256,approval_exec_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     request.grant_id,
                     digest_bytes.as_slice(),
                     signer_id,
                     request.requester_uid,
                     request.not_after.unwrap_or(0),
-                    now
+                    now,request.exec_id,request.request_origin,&intent_digest[..],request.approval_exec_id
                 ],
             );
             if let Err(error) = inserted {
@@ -252,6 +342,17 @@ impl StateStore {
     }
 }
 
+fn hex_digest(text: &str) -> Result<[u8; 32]> {
+    if !crate::warrant::valid_digest(text) {
+        return Err(CoreError::Value("invalid intent digest".into()));
+    }
+    let mut bytes = [0; 32];
+    for (i, chunk) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
+    }
+    Ok(bytes)
+}
+
 fn db(error: rusqlite::Error) -> CoreError {
     CoreError::Database(error.to_string())
 }
@@ -262,6 +363,10 @@ mod tests {
 
     fn request(grant_id: &str) -> AuthorizationRequest<'_> {
         AuthorizationRequest {
+            exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
+            request_origin: "client_full",
+            intent_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            approval_exec_id: None,
             grant_id,
             payload: b"sensitive warrant payload",
             signer_id: "signer",
@@ -359,7 +464,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
-        let mut blocker = StateStore::open(&path).unwrap();
+        let mut blocker = StateStore::create(&path).unwrap();
         let mut store = StateStore::open(&path).unwrap();
         let transaction = blocker
             .connection
@@ -410,7 +515,7 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite");
-        drop(StateStore::open(&path).unwrap());
+        drop(StateStore::create(&path).unwrap());
         let barrier = Arc::new(Barrier::new(2));
         let (results, received) = mpsc::channel();
         let mut executors = Vec::new();
@@ -459,6 +564,7 @@ mod tests {
         let retained = fixture.path().join("retained");
         std::fs::create_dir(&original).unwrap();
         let directory = File::open(&original).unwrap();
+        drop(StateStore::create(original.join("state.sqlite")).unwrap());
         let mut store = StateStore::open_in_directory(directory).unwrap();
         std::fs::rename(&original, &retained).unwrap();
         std::fs::create_dir(&original).unwrap();
@@ -488,6 +594,7 @@ mod tests {
     #[test]
     fn pinned_database_observes_revocations_from_an_administrative_connection() {
         let fixture = tempfile::tempdir().unwrap();
+        drop(StateStore::create(fixture.path().join("state.sqlite")).unwrap());
         let mut daemon =
             StateStore::open_in_directory(File::open(fixture.path()).unwrap()).unwrap();
         let administrator = StateStore::open(fixture.path().join("state.sqlite")).unwrap();
@@ -565,6 +672,10 @@ mod tests {
         let mut store = StateStore::open(":memory:").unwrap();
         let first = store
             .authorize(AuthorizationRequest {
+                exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
+                request_origin: "client_full",
+                intent_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                approval_exec_id: None,
                 grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
                 payload: b"payload",
                 signer_id: "signer",
@@ -577,6 +688,10 @@ mod tests {
             .unwrap();
         let second = store
             .authorize(AuthorizationRequest {
+                exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
+                request_origin: "client_full",
+                intent_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                approval_exec_id: None,
                 grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
                 payload: b"payload",
                 signer_id: "signer",
@@ -601,6 +716,7 @@ mod tests {
         assert_eq!(
             store
                 .authorize(AuthorizationRequest {
+                    exec_id:"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",request_origin:"client_full",intent_sha256:"0000000000000000000000000000000000000000000000000000000000000000",approval_exec_id:None,
                     grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
                     payload: b"payload",
                     signer_id: "signer",

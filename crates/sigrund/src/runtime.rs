@@ -25,8 +25,8 @@ use std::{
 pub(crate) const SYNC_TAG: u64 = 1 << 63;
 pub(crate) const PID_TAG: u64 = 1 << 62;
 pub(crate) enum Notice {
-    Ready(u64),
-    Failed(u64, String),
+    Ready(u64, &'static str),
+    Failed(u64, &'static str),
     Exit(u64, protocol::ChildExit),
 }
 struct Active {
@@ -46,6 +46,7 @@ struct Active {
     outcome: Option<SyncOutcome>,
     exit: Option<ChildExit>,
     failure: Option<String>,
+    failure_status: &'static str,
     task: bool,
     cleanup: bool,
     ready_audited: bool,
@@ -119,6 +120,7 @@ impl Execution {
             outcome: None,
             exit: None,
             failure: None,
+            failure_status: "SETUP_FAILED",
             task: true,
             cleanup: false,
             ready_audited: false,
@@ -188,6 +190,7 @@ impl Execution {
                                 result
                             });
                         if let Err(error) = result {
+                            job.failure_status = "EXEC_FAILED";
                             job.failure = Some(format!("exec checkpoint failed: {error}"));
                             if job.outcome.is_some() {
                                 job.outcome = Some(SyncOutcome::SpawnFailed);
@@ -235,6 +238,7 @@ impl Execution {
                                     match crate::execution::attach_checkpoint(pid, &gate) {
                                         Ok(()) => self.reaper.traced(pid),
                                         Err(error) => {
+                                            job.failure_status = "EXEC_FAILED";
                                             job.failure = Some(format!(
                                                 "exec checkpoint attach failed: {error}"
                                             ))
@@ -320,18 +324,19 @@ impl Execution {
                     wire_exit(job.exit.expect("reaped primary")),
                 )]
             } else {
-                vec![Notice::Failed(
-                    token,
-                    format!(
-                        "{}; authorization committed and one-time grant remains consumed",
-                        job.failure.unwrap_or_else(|| "child setup failed".into())
-                    ),
-                )]
+                vec![Notice::Failed(token, job.failure_status)]
             }
         } else {
             job.ready_audited = true;
             if !self.stopping && job.lifecycle.publish_ready() {
-                vec![Notice::Ready(token)]
+                vec![Notice::Ready(
+                    token,
+                    if job.exec_verified {
+                        "exec_event_observed"
+                    } else {
+                        "unknown"
+                    },
+                )]
             } else {
                 vec![]
             }
@@ -456,6 +461,7 @@ impl Execution {
                         Task::VerifyExec(owner, stop.pid, deadline)
                     })
                 } else {
+                    job.failure_status = "EXEC_FAILED";
                     job.failure = Some("unexpected ptrace stop".into());
                     if job.outcome.is_some() {
                         job.outcome = Some(SyncOutcome::SpawnFailed);
@@ -479,6 +485,9 @@ impl Execution {
                 unwatch(epoll, fd.as_raw_fd())?;
                 job.sync = None;
                 if outcome != SyncOutcome::ReadyToExec {
+                    if matches!(outcome, SyncOutcome::ExecFailed { .. }) {
+                        job.failure_status = "EXEC_FAILED";
+                    }
                     job.failure = Some(format!("child setup failed: {outcome:?}"));
                 }
                 job.outcome = Some(if job.failure.is_some() {
@@ -502,6 +511,7 @@ impl Execution {
                     .or(job.deadline)
                     .is_some_and(|deadline| Instant::now() >= deadline)
             {
+                job.failure_status = "EXEC_FAILED";
                 job.failure = Some("exec checkpoint timed out".into());
                 if job.outcome.is_some() {
                     job.outcome = Some(SyncOutcome::SpawnFailed);
@@ -584,14 +594,10 @@ impl Execution {
                         .unwrap_or_else(|| "cancelled before spawn".into())
                         .into();
                     fields["status"] = "SPAWN_FAILED".into();
-                    records.push((
-                        if job.spawn_reserved {
-                            "EXEC_SPAWN_FAILED"
-                        } else {
-                            "AUTH_ABORTED_POST_COMMIT"
-                        },
-                        fields.clone(),
-                    ));
+                    records.push(("AUTH_ABORTED_POST_COMMIT", fields.clone()));
+                    if job.spawn_reserved {
+                        records.push(("EXEC_SPAWN_FAILED", fields.clone()));
+                    }
                 }
                 if job.pid.is_some() && (job.outcome == Some(SyncOutcome::ReadyToExec) || cancelled)
                 {
@@ -638,7 +644,7 @@ impl Execution {
                 self.ready.push_front(token);
                 break;
             }
-            if !job.lifecycle.transition(Phase::Committed, Phase::Spawning) {
+            if !job.lifecycle.transition(Phase::Approved, Phase::Spawning) {
                 assert!(self.reaper.complete(token, None).is_ok());
                 continue;
             }

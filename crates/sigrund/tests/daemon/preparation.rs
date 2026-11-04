@@ -11,22 +11,30 @@ pub(super) fn verify_preparation_requests() {
         Some(b"".as_slice()),
         Some(b"finite input\0\xff".as_slice()),
     ] {
-        let events_before = fixture.diagnostic_count();
+        let export_dir = fixture.directory.path().join("exports");
+        fs::create_dir_all(&export_dir).unwrap();
+        fs::set_permissions(&export_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let export = export_dir.join(format!("{}.csr", new_uuidv7()));
         let mut command = Command::new(fixture.directory.path().join("sigrun"));
-        command.arg("--socket").arg(&fixture.socket).args([
-            "--target-uid",
-            "33",
-            "--target-gid",
-            "0",
-            "--cwd",
-            "/",
-            "--env",
-            "LANG=en_US.UTF-8",
-            "--env",
-            "EMPTY=",
-            "--ttl-secs",
-            "60",
-        ]);
+        command
+            .arg("--socket")
+            .arg(&fixture.socket)
+            .arg("--export-csr")
+            .arg(&export)
+            .args([
+                "--target-uid",
+                "33",
+                "--target-gid",
+                "0",
+                "--cwd",
+                "/",
+                "--env",
+                "LANG=en_US.UTF-8",
+                "--env",
+                "EMPTY=",
+                "--ttl-secs",
+                "60",
+            ]);
         if let Some(input) = input {
             let path = fixture.directory.path().join("input");
             fs::write(&path, input).unwrap();
@@ -55,14 +63,13 @@ pub(super) fn verify_preparation_requests() {
         let output = command.output().unwrap();
         assert_eq!(
             output.status.code(),
-            Some(255),
+            Some(0),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(output.stdout.is_empty());
-        let text = String::from_utf8(output.stderr).unwrap();
-        let csr =
-            sigrund_core::warrant::Csr::parse(text.lines().last().unwrap().as_bytes()).unwrap();
+        assert!(output.stderr.is_empty());
+        let csr = sigrund_core::warrant::Csr::parse(&fs::read(export).unwrap()).unwrap();
         let w = csr.warrant();
         assert_eq!((w.requester_uid, w.requester_gid), (65534, 65534));
         assert_eq!(
@@ -77,8 +84,10 @@ pub(super) fn verify_preparation_requests() {
             [fixture.executable.to_str().unwrap(), "two words", ""]
         );
         assert_eq!(
-            w.command.executable_sha256,
-            Some(sha256_hex(&fs::read(&fixture.executable).unwrap()))
+            w.command.executable_trust,
+            Some(sigrund_core::executable::ExecutableTrust::DigestMemfd {
+                sha256: sha256_hex(&fs::read(&fixture.executable).unwrap())
+            })
         );
         assert_eq!(w.command.stdin_sha256, input.map(sha256_hex));
         assert_eq!(w.policy.not_after.unwrap() - w.policy.not_before, 60);
@@ -87,7 +96,6 @@ pub(super) fn verify_preparation_requests() {
         assert_eq!(w.execution_context.env_exact["EMPTY"], "");
         assert!(w.execution_context.caller_env_allowlist.is_empty());
         assert_eq!(w.execution_context.umask, 0o77);
-        fixture.wait_for_cleanup(events_before);
         wait_for(|| {
             fs::read_dir(format!("/proc/{}/fd", daemon.0.id()))
                 .unwrap()
@@ -119,17 +127,13 @@ pub(super) fn verify_preparation_requests() {
         }
         let events_before = fixture.diagnostic_count();
         let mut body: serde_json::Value = serde_json::from_slice(&hello(&path)).unwrap();
-        body["requested_command"]["executable_path"] = path.to_str().unwrap().into();
+        body["intent"]["command"]["executable_path"] = path.to_str().unwrap().into();
         let mut socket = connect(&fixture.socket);
         let encoded =
             encode_frame(FrameType::ClientHello, &serde_json::to_vec(&body).unwrap()).unwrap();
         send_rights(&socket, &encoded[..1], 2);
         socket.write_all(&encoded[1..]).unwrap();
-        assert_eq!(
-            decision(&mut socket).status,
-            "EXECUTABLE_MUTATED_OR_TOO_LARGE",
-            "{kind}"
-        );
+        assert_eq!(decision(&mut socket).status, "TIMEOUT", "{kind}");
         drop(socket);
         drop(listener);
         fixture.wait_for_cleanup(events_before);

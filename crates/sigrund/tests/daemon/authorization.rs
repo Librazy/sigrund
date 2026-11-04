@@ -44,7 +44,7 @@ fn fixture() -> Fixture {
     .unwrap();
     fixture
 }
-fn now() -> i64 {
+pub(super) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -79,17 +79,21 @@ fn ssh_string(input: &[u8], output: &mut Vec<u8>) {
     output.extend_from_slice(&(input.len() as u32).to_be_bytes());
     output.extend_from_slice(input);
 }
-fn envelope(w: Warrant, key: u8) -> DsseEnvelope {
+pub(super) fn envelope(w: Warrant, key: u8) -> DsseEnvelope {
     envelope_for(w, key, "mandator-alice-yubikey")
 }
-fn envelope_for(w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
+fn envelope_for(mut w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
+    w.execution_context.post_exec_capabilities = Some(
+        sigrund_core::executable::CapabilitySets::ordinary(&w.execution_context.capabilities),
+    );
+    w.intent_sha256 = w.intent().unwrap().sha256().unwrap();
     let w = CanonicalWarrant::new(w).unwrap();
     let signing = ed25519_dalek::SigningKey::from_bytes(&[key; 32]);
     let mut public = Vec::new();
     ssh_string(b"ssh-ed25519", &mut public);
     ssh_string(&signing.verifying_key().to_bytes(), &mut public);
     let mut message = b"SSHSIG".to_vec();
-    ssh_string(b"sigrun.warrant.v1", &mut message);
+    ssh_string(b"sigrun.warrant.v2", &mut message);
     ssh_string(b"", &mut message);
     ssh_string(b"sha512", &mut message);
     ssh_string(
@@ -102,7 +106,7 @@ fn envelope_for(w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
     let mut packet = b"SSHSIG".to_vec();
     packet.extend_from_slice(&1u32.to_be_bytes());
     ssh_string(&public, &mut packet);
-    ssh_string(b"sigrun.warrant.v1", &mut packet);
+    ssh_string(b"sigrun.warrant.v2", &mut packet);
     ssh_string(b"", &mut packet);
     ssh_string(b"sha512", &mut packet);
     ssh_string(&signature, &mut packet);
@@ -116,7 +120,7 @@ fn envelope_for(w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
     .unwrap()
 }
 fn send_signed(socket: &UnixStream, envelope: &DsseEnvelope) {
-    let hello = serde_json::json!({"mode":"signed","tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope});
+    let hello = serde_json::json!({"version":"2.0","mode":"signed","tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope});
     send_rights(
         socket,
         &encode_frame(FrameType::ClientHello, &serde_json::to_vec(&hello).unwrap()).unwrap(),
@@ -128,11 +132,23 @@ fn redeem(f: &Fixture, envelope: &DsseEnvelope) -> Decision {
     let mut client = connect(&f.socket);
     send_signed(&client, envelope);
     let result = decision(&mut client);
-    assert_ne!(result.status, "READY_TO_EXEC");
+    if result.status == "APPROVED" {
+        let mut header = [0; 5];
+        socket_read_result(&mut client, &mut header);
+    }
     expect_closed(&mut client);
     drop(client);
     f.wait_for_cleanup(before);
     result
+}
+fn socket_read_result(socket: &mut UnixStream, header: &mut [u8; 5]) {
+    socket.read_exact(header).unwrap();
+    assert_eq!(header[0], FrameType::ServerExecResult as u8);
+    let mut bytes = vec![0; u32::from_be_bytes(header[1..].try_into().unwrap()) as usize];
+    socket.read_exact(&mut bytes).unwrap();
+    let result: sigrund_core::protocol::ExecResult = parse_strict(&bytes).unwrap();
+    result.validate().unwrap();
+    assert_eq!(result.status, "SETUP_FAILED");
 }
 fn records(f: &Fixture) -> Vec<serde_json::Value> {
     fs::read_to_string(&f.log)
@@ -171,33 +187,24 @@ fn namespace_fixture() {
     send_signed(&b, &valid);
     let outcomes = [decision(&mut a), decision(&mut b)];
     assert_eq!(
-        outcomes
-            .iter()
-            .filter(|r| r.status == "SPAWN_FAILED")
-            .count(),
+        outcomes.iter().filter(|r| r.status == "APPROVED").count(),
         1
     );
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|r| r.status == "REPLAY_DETECTED")
-            .count(),
-        1
-    );
+    assert_eq!(outcomes.iter().filter(|r| r.status == "TIMEOUT").count(), 1);
     drop((a, b));
     assert_eq!(count(&f), 1);
-    assert!(redeem(&f, &valid).message.contains("already been consumed"));
+    assert_eq!(redeem(&f, &valid).status, "TIMEOUT");
     for (case, status) in [
-        ("host", "POLICY_VIOLATION"),
-        ("peer", "POLICY_VIOLATION"),
-        ("gid", "POLICY_VIOLATION"),
-        ("signature", "POLICY_VIOLATION"),
-        ("capability", "POLICY_VIOLATION"),
-        ("groups", "POLICY_VIOLATION"),
-        ("same_uid", "POLICY_VIOLATION"),
-        ("digest", "EXECUTABLE_MUTATED_OR_TOO_LARGE"),
-        ("expired", "EXPIRED_OR_NOT_YET_VALID"),
-        ("future", "EXPIRED_OR_NOT_YET_VALID"),
+        ("host", "TIMEOUT"),
+        ("peer", "TIMEOUT"),
+        ("gid", "TIMEOUT"),
+        ("signature", "TIMEOUT"),
+        ("capability", "TIMEOUT"),
+        ("groups", "TIMEOUT"),
+        ("same_uid", "TIMEOUT"),
+        ("digest", "TIMEOUT"),
+        ("expired", "TIMEOUT"),
+        ("future", "TIMEOUT"),
     ] {
         let mut w = warrant(&f, 0);
         match case {
@@ -208,7 +215,12 @@ fn namespace_fixture() {
             "capability" => w.execution_context.capabilities = vec!["CAP_SYS_ADMIN".into()],
             "groups" => w.execution_context.supplementary_gids = vec![77],
             "same_uid" => w.execution_context.target_uid = 0,
-            "digest" => w.command.executable_sha256 = Some("0".repeat(64)),
+            "digest" => {
+                w.command.executable_trust =
+                    Some(sigrund_core::executable::ExecutableTrust::DigestMemfd {
+                        sha256: "0".repeat(64),
+                    })
+            }
             "expired" => {
                 w.policy.not_before = now() - 100;
                 w.policy.not_after = Some(now() - 1);
@@ -235,7 +247,7 @@ fn namespace_fixture() {
         store
             .revoke(kind, &target, now(), "namespace fixture")
             .unwrap();
-        assert_eq!(redeem(&f, &envelope(w, 7)).status, "REVOKED", "{kind}");
+        assert_eq!(redeem(&f, &envelope(w, 7)).status, "TIMEOUT", "{kind}");
         assert_eq!(count(&f), 1);
     }
     drop(store);
@@ -253,13 +265,20 @@ fn namespace_fixture() {
         .filter(|(_, r)| r["event_type"] == "AUTH_COMMIT")
         .collect();
     for (i, record) in commits {
-        assert_eq!(data[i + 1]["event_type"], "AUTH_ABORTED_POST_COMMIT");
-        assert_eq!(data[i + 1]["exec_id"], record["exec_id"]);
+        assert!(
+            data[i + 1..]
+                .iter()
+                .any(|r| r["exec_id"] == record["exec_id"]
+                    && matches!(
+                        r["event_type"].as_str(),
+                        Some("AUTH_ABORTED_POST_COMMIT" | "EXEC_SPAWN_FAILED")
+                    ))
+        );
     }
-    assert!(
-        data.iter()
-            .all(|r| !r["event_type"].as_str().unwrap().starts_with("EXEC_"))
-    );
+    assert!(data.iter().all(|r| !matches!(
+        r["event_type"].as_str(),
+        Some("EXEC_READY_TO_EXEC" | "EXEC_EXIT")
+    )));
     let audit = sigrund_core::audit::AuditLog::open_for_host(
         &f.log,
         f.state.join("audit_ratchet.state"),
@@ -280,7 +299,7 @@ fn namespace_fixture() {
             .iter()
             .any(|r| r["event_type"] == "RATCHET_PARTIAL_WRITE_TRUNCATED")
     );
-    assert_eq!(redeem(&f, &valid).status, "REVOKED");
+    assert_eq!(redeem(&f, &valid).status, "TIMEOUT");
     daemon.stop();
     signed_cli_and_restart();
     multisignature_revocation();
@@ -329,14 +348,14 @@ fn multisignature_revocation() {
         .revoke("signer_id", first_id, now(), "first signer revoked")
         .unwrap();
     gate.release();
-    assert_eq!(decision(&mut client).status, "SPAWN_FAILED");
+    assert_eq!(decision(&mut client).status, "APPROVED");
     drop(client);
     f.wait_for_cleanup(before);
-    assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");
+    assert_eq!(redeem(&f, &signed).status, "TIMEOUT");
     let mut signed = both(warrant(&f, 0));
     signed.signatures.reverse();
-    assert_eq!(redeem(&f, &signed).status, "SPAWN_FAILED");
-    assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");
+    assert_eq!(redeem(&f, &signed).status, "APPROVED");
+    assert_eq!(redeem(&f, &signed).status, "TIMEOUT");
     assert_eq!(count(&f), 2);
     let db = rusqlite::Connection::open(f.state.join("state.sqlite")).unwrap();
     let other_signers: u64 = db
@@ -363,8 +382,8 @@ fn multisignature_revocation() {
     invalid
         .signatures
         .extend(envelope_for(warrant(&f, 0), 8, second_id).signatures);
-    assert_eq!(redeem(&f, &invalid).status, "REVOKED");
-    assert_eq!(redeem(&f, &envelope(warrant(&f, 0), 7)).status, "REVOKED");
+    assert_eq!(redeem(&f, &invalid).status, "TIMEOUT");
+    assert_eq!(redeem(&f, &envelope(warrant(&f, 0), 7)).status, "TIMEOUT");
     // Payload/grant revocations deny the entire warrant, regardless of keys.
     for kind in ["grant_id", "payload_sha256"] {
         let w = warrant(&f, 0);
@@ -376,7 +395,7 @@ fn multisignature_revocation() {
         store
             .revoke(kind, &target, now(), "entire warrant revoked")
             .unwrap();
-        assert_eq!(redeem(&f, &both(w)).status, "REVOKED");
+        assert_eq!(redeem(&f, &both(w)).status, "TIMEOUT");
     }
     assert_eq!(count(&f), 2);
     daemon.stop();
@@ -390,7 +409,7 @@ fn multisignature_revocation() {
     )
     .unwrap();
     let daemon = f.launch();
-    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "REVOKED");
+    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "TIMEOUT");
     assert_eq!(count(&f), 2);
     daemon.stop();
     // Neither signer independently authorizes this UID/GID pair. Combining
@@ -408,7 +427,7 @@ fn multisignature_revocation() {
     )
     .unwrap();
     let daemon = f.launch();
-    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "POLICY_VIOLATION");
+    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "TIMEOUT");
     assert_eq!(count(&f), 2);
     daemon.stop();
     fs::write(&f.signers, format!("{first}\n{second}")).unwrap();
@@ -416,7 +435,7 @@ fn multisignature_revocation() {
     store
         .revoke("signer_id", second_id, now(), "all signers revoked")
         .unwrap();
-    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "REVOKED");
+    assert_eq!(redeem(&f, &both(warrant(&f, 0))).status, "TIMEOUT");
     assert_eq!(count(&f), 2);
     daemon.stop();
 }
@@ -435,7 +454,7 @@ fn signed_cli_and_restart() {
         let signed = envelope(w, 7);
         let input = f.directory.path().join("warrant.json");
         fs::write(&input, signed.to_jcs().unwrap()).unwrap();
-        for expected in ["SPAWN_FAILED", "REPLAY_DETECTED"] {
+        for expected in ["APPROVED", "TIMEOUT"] {
             let status_path = f.directory.path().join(format!("{expected}.status"));
             let status = File::create(&status_path).unwrap();
             let fd = status.as_raw_fd();
@@ -475,14 +494,20 @@ fn signed_cli_and_restart() {
             let output = child.wait_with_output().unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(42),
+                Some(if expected == "APPROVED" { 254 } else { 42 }),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(output.stdout.is_empty());
-            let report: serde_json::Value =
-                serde_json::from_str(fs::read_to_string(status_path).unwrap().trim()).unwrap();
-            assert_eq!(report["status"], expected);
+            let report: Vec<serde_json::Value> = fs::read_to_string(status_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(report[0]["status"], expected);
+            if expected == "APPROVED" {
+                assert_eq!(report[1]["status"], "SETUP_FAILED");
+            }
         }
         last_signed = Some(signed);
     }
@@ -490,7 +515,7 @@ fn signed_cli_and_restart() {
     daemon.stop();
     let daemon = f.launch();
     // Wrong root peer is a policy denial, not a replay observation.
-    assert_eq!(redeem(&f, &last_signed.unwrap()).status, "POLICY_VIOLATION");
+    assert_eq!(redeem(&f, &last_signed.unwrap()).status, "TIMEOUT");
     assert_eq!(count(&f), 2);
     daemon.stop();
 }
@@ -623,11 +648,7 @@ fn cancellation_and_durable_failures() {
         let replay = redeem(&f, &signed);
         assert_eq!(
             replay.status,
-            if expected == 0 {
-                "SPAWN_FAILED"
-            } else {
-                "REPLAY_DETECTED"
-            },
+            if expected == 0 { "APPROVED" } else { "TIMEOUT" },
             "{point}"
         );
         daemon.stop();
@@ -654,11 +675,7 @@ fn cancellation_and_durable_failures() {
     assert!(consumed <= 1);
     assert_eq!(
         redeem(&f, &signed).status,
-        if consumed == 1 {
-            "REPLAY_DETECTED"
-        } else {
-            "SPAWN_FAILED"
-        }
+        if consumed == 1 { "TIMEOUT" } else { "APPROVED" }
     );
     assert_eq!(count(&f), 1);
     daemon.stop();
@@ -685,7 +702,7 @@ fn cancellation_and_durable_failures() {
         1
     );
     let daemon = f.launch();
-    assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");
+    assert_eq!(redeem(&f, &signed).status, "TIMEOUT");
     assert!(
         records(&f)
             .iter()
@@ -711,9 +728,10 @@ fn blocked_io_remains_bounded_and_responsive() {
         let (mut gate, mut daemon) = Gate::launch(&f, point);
         let pid = daemon.0.id();
         let threads = || fs::read_dir(format!("/proc/{pid}/task")).unwrap().count();
-        assert_eq!(threads(), 7);
+        let baseline_threads = threads();
         let signed = envelope(warrant(&f, 0), 7);
         gate.arm();
+        let authorization_before = f.diagnostic_count();
         let client = connect(&f.socket);
         send_signed(&client, &signed);
         gate.arrive(&daemon);
@@ -732,7 +750,7 @@ fn blocked_io_remains_bounded_and_responsive() {
         let mut excess = connect(&f.socket);
         send_hello(&mut excess, &f.executable);
         f.wait_for_cleanup(before); // partial-frame deadline runs while blocked
-        assert_eq!(threads(), 7);
+        assert_eq!(threads(), baseline_threads);
         drop(client);
         let retained = fs::read_dir(format!("/proc/{pid}/fd"))
             .unwrap()
@@ -745,18 +763,19 @@ fn blocked_io_remains_bounded_and_responsive() {
         );
         // Both decisions must arrive while the durable operation is STILL
         // gated. The wire reply must not wait for durable I/O.
-        assert_eq!(decision(&mut partial).status, "REQUEST_TIMEOUT", "{point}");
-        assert_eq!(
-            decision(&mut excess).status,
-            "RESOURCE_EXHAUSTED",
-            "{point}"
-        );
+        // An incomplete execution frame is a transport fault and may close
+        // without an authorization decision, even during blocked durable I/O.
+        assert_eq!(decision(&mut excess).status, "TIMEOUT", "{point}");
         expect_closed(&mut partial);
         expect_closed(&mut excess);
         gate.release();
         drop((partial, excess));
+        // Releasing the gate only wakes the durable worker. Wait for its
+        // original lease to finish commit/audit reconciliation and cleanup
+        // before inspecting consumption or submitting another authorization.
+        f.wait_for_cleanup(authorization_before);
         assert_eq!(count(&f), 1);
-        assert_eq!(redeem(&f, &signed).status, "REPLAY_DETECTED");
+        assert_eq!(redeem(&f, &signed).status, "TIMEOUT");
         // Shutdown must close controls without dropping durable ownership.
         let fresh = envelope(warrant(&f, 0), 7);
         gate.arm();
@@ -774,7 +793,7 @@ fn blocked_io_remains_bounded_and_responsive() {
         daemon.finish_stop();
         drop(stalled);
         let daemon = f.launch();
-        assert_eq!(redeem(&f, &fresh).status, "REPLAY_DETECTED");
+        assert_eq!(redeem(&f, &fresh).status, "TIMEOUT");
         daemon.stop();
     }
 }

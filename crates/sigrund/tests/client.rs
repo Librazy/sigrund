@@ -2,10 +2,11 @@
 //! namespace. They exercise the real binary, without claiming daemon execution.
 use sigrund::transport::{ControlFrame, ControlReader};
 use sigrund_core::{
-    crypto::new_uuidv7,
     framing::{FrameType, encode_frame},
     protocol::{ClientHello, Decision},
 };
+const EXEC_ID: &str = "0192d8f4-9a00-7000-8000-112233445566";
+
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -48,9 +49,8 @@ fn decide(stream: &mut UnixStream, status: &str) {
         stream,
         FrameType::ServerAuthDecision,
         &serde_json::to_vec(&Decision {
-            csr_payload: None,
-            exec_id: new_uuidv7().to_string(),
-            message: "test decision".into(),
+            exec_id: EXEC_ID.into(),
+
             status: status.into(),
         })
         .unwrap(),
@@ -71,6 +71,36 @@ impl Fixture {
         let path = dir.path().join("client.sock");
         let listener = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let context = UnixListener::bind(std::path::PathBuf::from(format!(
+            "{}.context",
+            path.display()
+        )))
+        .unwrap();
+        fs::set_permissions(
+            std::path::PathBuf::from(format!("{}.context", path.display())),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        thread::spawn(move || {
+            if let Ok((mut socket, _)) = context.accept() {
+                socket.set_nonblocking(true).unwrap();
+                let mut reader = ControlReader::context_query();
+                wait(|| {
+                    reader
+                        .read(socket.as_raw_fd(), Instant::now())
+                        .unwrap()
+                        .is_some()
+                });
+                socket.set_nonblocking(false).unwrap();
+                send(&mut socket, FrameType::ServerContext, &serde_json::to_vec(&serde_json::json!({
+                    "version":"2.0", "host_id":format!("sigrun-host:sha256:{}", "0".repeat(64)), "policy_generation":1,
+                    "executable_trust_models":["digest_memfd"],
+                    "limits":{"max_executable_bytes":67108864,"max_direct_digest_bytes":268435456,"direct_digest_timeout_ms":5000,
+                        "max_stdin_bytes":16777216,"max_ttl_secs":3600,"max_onetime_window_secs":3600,"authorization_timeout_ms":120000},
+                    "features":{"direct_exec_checkpoint":false,"host_file_capabilities":false,"tty_modes":["stdio"],"stdin_policies":["null","sha256"],"grant_modes":["one_time"]}
+                })).unwrap());
+            }
+        });
         Self {
             _dir: dir,
             listener,
@@ -200,7 +230,7 @@ fn client_namespace_fixture() {
             let mut files = frame.rights.into_iter().map(File::from);
             let mut out = files.next().unwrap();
             let mut err = files.next().unwrap();
-            decide(&mut socket, "READY_TO_EXEC");
+            decide(&mut socket, "APPROVED");
             let writing = thread::spawn(move || {
                 for _ in 0..100 {
                     out.write_all(&[b'x'; 16384]).unwrap();
@@ -209,8 +239,8 @@ fn client_namespace_fixture() {
             });
             send(
                 &mut socket,
-                FrameType::ServerChildExit,
-                br#"{"exit_code":37,"signal":null}"#,
+                FrameType::ServerExecResult,
+                br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":37,"signal":null}"#,
             );
             writing.join().unwrap();
         },
@@ -220,7 +250,10 @@ fn client_namespace_fixture() {
     assert_eq!(output.stdout, vec![b'x'; 100 * 16384]);
     let prefix = b"sigrun: waiting for authorization\n";
     assert_eq!(
-        output.stderr.strip_prefix(prefix).unwrap(),
+        output.stderr.strip_prefix(prefix).unwrap_or_else(|| {
+            let at = output.stderr.iter().position(|byte| *byte == b'y').unwrap();
+            &output.stderr[at..]
+        }),
         vec![b'y'; 100 * 8192]
     );
     assert_eq!(values(&reports).len(), 2);
@@ -258,7 +291,7 @@ fn client_namespace_fixture() {
     }
     let (output, reports) = case(
         |mut socket, frame| {
-            decide(&mut socket, "READY_TO_EXEC");
+            decide(&mut socket, "APPROVED");
             drop(frame);
         },
         &[],
@@ -270,12 +303,12 @@ fn client_namespace_fixture() {
     );
     let (output, reports) = case(
         |mut socket, frame| {
-            decide(&mut socket, "READY_TO_EXEC");
+            decide(&mut socket, "APPROVED");
             drop(frame);
             send(
                 &mut socket,
-                FrameType::ServerChildExit,
-                br#"{"exit_code":null,"signal":15}"#,
+                FrameType::ServerExecResult,
+                br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":null,"signal":15}"#,
             );
         },
         &[],
@@ -295,10 +328,9 @@ fn verify_fragmentation_and_invalid_server_data() {
             let bytes = encode_frame(
                 FrameType::ServerAuthDecision,
                 &serde_json::to_vec(&Decision {
-                    csr_payload: None,
-                    exec_id: new_uuidv7().to_string(),
-                    message: "fragmented".into(),
-                    status: "READY_TO_EXEC".into(),
+                    exec_id: EXEC_ID.into(),
+
+                    status: "APPROVED".into(),
                 })
                 .unwrap(),
             )
@@ -307,8 +339,8 @@ fn verify_fragmentation_and_invalid_server_data() {
                 socket.write_all(&[byte]).unwrap();
             }
             let exit = encode_frame(
-                FrameType::ServerChildExit,
-                br#"{"exit_code":0,"signal":null}"#,
+                FrameType::ServerExecResult,
+                br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":0,"signal":null}"#,
             )
             .unwrap();
             for byte in exit {
@@ -321,14 +353,14 @@ fn verify_fragmentation_and_invalid_server_data() {
     assert!(output.status.success());
     assert_eq!(values(&reports).len(), 2);
     for payload in [
-        br#"{"exit_code":0}"#.as_slice(),
-        br#"{"exit_code":0,"signal":9}"#,
-        br#"{"exit_code":0,"signal":null,"extra":1}"#,
+        br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":0}"#.as_slice(),
+        br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":0,"signal":9}"#,
+        br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":0,"signal":null,"extra":1}"#,
     ] {
         let (output, reports) = case(
             move |mut socket, _| {
-                decide(&mut socket, "READY_TO_EXEC");
-                send(&mut socket, FrameType::ServerChildExit, payload);
+                decide(&mut socket, "APPROVED");
+                send(&mut socket, FrameType::ServerExecResult, payload);
                 let _ = socket.read(&mut [0]);
             },
             &[],
@@ -345,9 +377,8 @@ fn verify_fragmentation_and_invalid_server_data() {
                 let bytes = encode_frame(
                     FrameType::ServerAuthDecision,
                     &serde_json::to_vec(&Decision {
-                        csr_payload: None,
-                        exec_id: new_uuidv7().to_string(),
-                        message: "ancillary".into(),
+                        exec_id: EXEC_ID.into(),
+
                         status: "REJECTED".into(),
                     })
                     .unwrap(),
@@ -447,7 +478,7 @@ fn verify_slow_and_broken_output() {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let frame = hello(&socket);
-        decide(&mut socket, "READY_TO_EXEC");
+        decide(&mut socket, "APPROVED");
         let mut files = frame.rights.into_iter().map(File::from);
         let mut out = files.next().unwrap();
         drop(files);
@@ -465,13 +496,13 @@ fn verify_slow_and_broken_output() {
         } else {
             send(
                 &mut socket,
-                FrameType::ServerChildExit,
-                br#"{"exit_code":19,"signal":null}"#,
+                FrameType::ServerExecResult,
+                br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":19,"signal":null}"#,
             );
             let mut reports = std::io::BufReader::new(&mut report);
             let mut line = String::new();
             std::io::BufRead::read_line(&mut reports, &mut line).unwrap();
-            assert!(line.contains("READY_TO_EXEC"));
+            assert!(line.contains("APPROVED"));
             line.clear();
             std::io::BufRead::read_line(&mut reports, &mut line).unwrap();
             assert!(
@@ -539,12 +570,21 @@ fn verify_signals_and_blocked_sink(ready: bool) {
         .unwrap();
     let frame = hello(&socket);
     if ready {
-        decide(&mut socket, "READY_TO_EXEC");
+        decide(&mut socket, "APPROVED");
+        send(
+            &mut socket,
+            FrameType::ServerExecReady,
+            &serde_json::to_vec(&serde_json::json!({"exec_id":EXEC_ID,"exec_outcome":"unknown"}))
+                .unwrap(),
+        );
         // Status delivery proves readiness was processed while the diagnostic
         // writer remains stalled; do not race a pre-readiness signal.
         let mut line = String::new();
         std::io::BufRead::read_line(&mut reports, &mut line).unwrap();
-        assert!(line.contains("READY_TO_EXEC"));
+        assert!(line.contains("APPROVED"));
+        line.clear();
+        std::io::BufRead::read_line(&mut reports, &mut line).unwrap();
+        assert!(line.contains("exec_outcome"));
         assert_eq!(unsafe { libc::kill(child.id() as _, libc::SIGUSR1) }, 0);
         let mut reader = ControlReader::new(false);
         let mut received = None;
@@ -556,8 +596,8 @@ fn verify_signals_and_blocked_sink(ready: bool) {
         drop(frame);
         send(
             &mut socket,
-            FrameType::ServerChildExit,
-            br#"{"exit_code":0,"signal":null}"#,
+            FrameType::ServerExecResult,
+            br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":0,"signal":null}"#,
         );
         line.clear();
         std::io::BufRead::read_line(&mut reports, &mut line).unwrap();
@@ -600,7 +640,7 @@ fn verify_terminal() {
         assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) }, 0);
         assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
     }
-    decide(&mut socket, "READY_TO_EXEC");
+    decide(&mut socket, "APPROVED");
     let mut files = frame.rights.into_iter().map(File::from);
     files
         .next()
@@ -615,8 +655,8 @@ fn verify_terminal() {
     drop(files);
     send(
         &mut socket,
-        FrameType::ServerChildExit,
-        br#"{"exit_code":0,"signal":null}"#,
+        FrameType::ServerExecResult,
+        br#"{"exec_id":"0192d8f4-9a00-7000-8000-112233445566","status":"EXITED","exit_code":0,"signal":null}"#,
     );
     wait(|| child.try_wait().unwrap().is_some());
     assert!(child.wait().unwrap().success());

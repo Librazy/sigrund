@@ -22,6 +22,9 @@ pub fn default_models() -> Vec<TrustModel> {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "model", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutableTrust {
+    DigestMemfd {
+        sha256: String,
+    },
     DigestDirect {
         sha256: String,
     },
@@ -42,6 +45,7 @@ impl ExecutableTrust {
     pub fn model(&self) -> TrustModel {
         match self {
             Self::DigestDirect { .. } => TrustModel::DigestDirect,
+            Self::DigestMemfd { .. } => TrustModel::DigestMemfd,
             Self::FsVerity { .. } => TrustModel::FsVerity,
             Self::Ctime { .. } => TrustModel::Ctime,
         }
@@ -53,7 +57,7 @@ impl ExecutableTrust {
             (n.to_string() == text).then_some(n)
         }
         match self {
-            Self::DigestDirect { sha256 } => {
+            Self::DigestDirect { sha256 } | Self::DigestMemfd { sha256 } => {
                 sha256.len() == 64
                     && sha256
                         .bytes()

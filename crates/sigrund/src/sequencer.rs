@@ -76,6 +76,9 @@ pub(crate) enum Completion {
         token: u64,
         lease: RequestLease,
         denial: Denial,
+        audit: AuditLease,
+        lifecycle: Arc<Lifecycle>,
+        fields: serde_json::Value,
     },
     Committed(Box<CommittedJob>),
     Denied {
@@ -161,19 +164,35 @@ impl Sequencer {
                                 // Once its result and audit are reconciled,
                                 // finish that transition even without a live
                                 // connection to consume the completion.
-                                if lifecycle.cancelled.load(Ordering::Acquire) {
+                                if lifecycle.cancelled.load(Ordering::Acquire)
+                                    && lifecycle.state().1
+                                        != sigrund_core::lifecycle::Decision::Undecided
+                                {
                                     lifecycle.cancel();
                                 }
                                 match outcome {
-                                    Ok(AuthorizationOutcome::Denied { lease, denial }) => notify(
-                                        &completed,
-                                        &thread_wake,
-                                        Completion::Finished {
-                                            token,
-                                            lease,
-                                            denial,
-                                        },
-                                    ),
+                                    Ok(AuthorizationOutcome::Denied {
+                                        lease,
+                                        denial,
+                                        audit,
+                                    }) => {
+                                        let mut fields = request_provenance(lease.request());
+                                        fields["exec_id"] = lease.request().exec_id.clone().into();
+                                        fields["reason_code"] = denial.status.into();
+                                        fields["reason"] = denial.message.into();
+                                        notify(
+                                            &completed,
+                                            &thread_wake,
+                                            Completion::Finished {
+                                                token,
+                                                lease,
+                                                denial,
+                                                audit,
+                                                lifecycle: lifecycle.clone(),
+                                                fields,
+                                            },
+                                        )
+                                    }
                                     Ok(AuthorizationOutcome::Committed(job)) => {
                                         notify(&completed, &thread_wake, Completion::Committed(job))
                                     }
@@ -300,8 +319,23 @@ fn realtime() -> sigrund_core::Result<i64> {
         .ok_or_else(|| sigrund_core::CoreError::Value("invalid realtime clock".into()))
 }
 enum AuthorizationOutcome {
-    Denied { lease: RequestLease, denial: Denial },
+    Denied {
+        lease: RequestLease,
+        denial: Denial,
+        audit: AuditLease,
+    },
     Committed(Box<CommittedJob>),
+}
+
+pub(crate) fn request_provenance(request: &crate::workers::ValidatedRequest) -> serde_json::Value {
+    let origin = match request.hello.mode.as_str() {
+        "thin_csr" => Some("daemon_expanded_thin"),
+        "full_csr" | "signed" => Some("client_full"),
+        _ => None,
+    };
+    let intent = request.hello.intent().ok().and_then(|i| i.sha256().ok());
+    serde_json::json!({"request_origin":origin,"intent_sha256":intent,
+        "approval_exec_id":if origin==Some("daemon_expanded_thin") {Some(request.exec_id.as_str())} else {None}})
 }
 
 fn authorize(
@@ -328,6 +362,7 @@ fn authorize(
             return Ok(AuthorizationOutcome::Denied {
                 lease: task.lease,
                 denial,
+                audit: task.audit,
             });
         }
     };
@@ -352,6 +387,7 @@ fn authorize(
         return Ok(AuthorizationOutcome::Denied {
             lease: task.lease,
             denial,
+            audit: task.audit,
         });
     }
     let w = verified.warrant.warrant();
@@ -360,6 +396,10 @@ fn authorize(
         .store
         .authorize_candidates_guarded(
             AuthorizationRequest {
+                exec_id: &task.exec_id,
+                request_origin: &w.request_origin,
+                intent_sha256: &w.intent_sha256,
+                approval_exec_id: w.approval_exec_id.as_deref(),
                 grant_id: &w.grant_id,
                 payload: verified.warrant.as_bytes(),
                 signer_id: candidates[0],
@@ -399,7 +439,7 @@ fn authorize(
         .map_err(|e| format!("authorization database failed; reconciliation required: {e}"))?;
     let signer_id = signer_id.map(str::to_owned);
     let limit = request.policy.audit_record_max_bytes as usize;
-    let fields = serde_json::json!({"exec_id":task.exec_id, "grant_id":w.grant_id,
+    let fields = serde_json::json!({"exec_id":task.exec_id,"request_origin":w.request_origin,"intent_sha256":w.intent_sha256,"approval_exec_id":w.approval_exec_id, "grant_id":w.grant_id,
         "payload_sha256":sha256_hex(verified.warrant.as_bytes()), "signer_id":signer_id,
         "policy_mode":w.policy.mode,"not_before":w.policy.not_before,"not_after":w.policy.not_after,
         "requester_uid":w.requester_uid,"requester_gid":w.requester_gid,
@@ -430,7 +470,7 @@ fn authorize(
             || !connection_live(task.control.as_raw_fd());
         let now = realtime().map_err(|e| e.to_string())?;
         let expired = now < w.policy.not_before || w.policy.not_after.is_none_or(|end| now > end);
-        if !cancelled && !expired && resources.execution_layout().is_some() {
+        if !cancelled && !expired {
             let mut lease = task.lease;
             let control = lease.retain_control(task.control);
             return Ok(AuthorizationOutcome::Committed(Box::new(CommittedJob {
@@ -476,6 +516,7 @@ fn authorize(
         Ok(AuthorizationOutcome::Denied {
             lease: task.lease,
             denial,
+            audit: task.audit,
         })
     } else {
         if task.lifecycle.state().0 == Phase::Committing && !task.lifecycle.rolled_back_commit() {
@@ -504,6 +545,7 @@ fn authorize(
         Ok(AuthorizationOutcome::Denied {
             lease: task.lease,
             denial,
+            audit: task.audit,
         })
     }
 }

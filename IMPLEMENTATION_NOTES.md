@@ -1,9 +1,51 @@
 # sigrun/sigrund implementation notes
 
 The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-is normative. These notes describe the implemented local approval profile,
-operator workflow, test layout and remaining scope. Historical milestone reports
-and acceptance artifacts remain in Git history.
+is the normative **v2 target**. These notes describe the implemented local
+one-time SSH/stdio profile. Deferred features and acceptance limits below remain
+part of the release assessment; implementation alone is not full v2 conformance.
+
+## V2 implementation and validation
+
+Clients prepare canonical full CSRs from bounded public context or submit unchanged
+thin intent. Full-only/export never request privileged expansion. Finite stdin is
+spooled once locally and sealed again by the daemon before target inspection.
+The separate context listener is the execution socket pathname plus `.context`;
+it has independent rate/active limits and a fixed worker pool for reads and
+ancillary descriptor cleanup, and publishes no target-specific data.
+
+Full requests require an isolated fresh-exec access helper with kernel-authenticated
+UID/GID/supplementary groups, cleared capabilities and `no_new_privs`. It traverses
+from `/` without privileged directory handles, validates the pinned root identity,
+and returns a retained readable FD through private IPC. It stays non-dumpable
+through the credential transition and file access. The supported access domain
+requires initial user-namespace mappings and protected `fs.suid_dumpable` (0 or 2).
+Unsupported domains fail closed; namespace fixtures cannot establish this boundary.
+Read permission is sufficient; requester execute permission is not required.
+
+Thin expansion uses pinned roots privately. Canonical intent, signed origin and
+active execution ID bind the complete evidence and exact capability profile.
+Thin approvals cannot be exported or redeemed through the signed endpoint.
+The daemon retains observable endpoints and thin review capacity until the public
+outcome, hiding preparation failures and mandator refusal behind the configurable
+admission-based deadline. Validated full requests may receive explicit refusal;
+signed failures time out. Decisions contain only `exec_id` and `status`.
+
+Durable authorization precedes `APPROVED`; complete delivery precedes spawn.
+Readiness and results are separate frames. Late durable commits remain consumed
+and are reconciled/audited without execution. Private outcome audit distinguishes
+scheduled outcomes from completed frame writes and undelivered responses.
+
+Wire/warrant version 2.0, v2 signature/ratchet domains, and versioned database,
+audit and ratchet state reject legacy formats. Explicitly provision a fresh,
+coherent state set; startup never migrates or deletes old records.
+
+The regression suites cover v2 schemas, local preparation, deadlines, provenance,
+state rejection and the existing execution profile. `scripts/verify-v2.py` adds
+native raw-socket DAC/ACL/ancestor/supplementary-group checks and compares hidden
+thin failures, output endpoint behavior, exact outcomes and private audit.
+The complete applicable V-01–V-20 acceptance matrix remains the release gate;
+passing a subset does not establish full v2 conformance.
 
 ## Supported workflow and limits
 
@@ -20,10 +62,11 @@ Execution requires the `[mvp]` daemon profile and a configured
 finite stdin. It rejects direct scripts, caller environment forwarding,
 same-UID execution, PTY, hooks and remote audit acknowledgements. Collector
 configuration is still mandatory and validated. The approval capacity is one;
-busy requests receive `RESOURCE_EXHAUSTED`. Without an approver, a completed
-request immediately returns `TIMEOUT_CSR` for offline signing. Refusal returns
-`REJECTED`; broker loss or the cumulative 120-second approval deadline returns
-`TIMEOUT_CSR`. None of these pre-commit outcomes consumes a grant.
+busy requests silently time out. Absent approvers, invalid requests, broker
+loss and thin refusal remain silent until `authorization_timeout_ms` from
+admission (120 seconds by default; configurable from 1 to 300 seconds).
+An explicit mandator refusal of a validated full CSR returns `REJECTED`.
+No unsuccessful pre-commit outcome consumes a grant.
 
 The client defaults to UID/GID `0:0`, no supplementary groups or capabilities,
 its captured absolute cwd, exact environment `LANG=C.UTF-8` and
@@ -38,12 +81,12 @@ and usage errors to 64; successful execution returns the child's status.
 Root approves only with `y` or `yes` after every CSR field and the selected key
 fingerprint are displayed with escaped arguments. Confirmation requires Enter;
 `n` or `no` rejects. Pending TTY input is discarded after each prompt. Blank,
-invalid and overlong answers reprompt within the original 120-second deadline.
+invalid and overlong answers reprompt within the admission-based authorization deadline.
 Timeout or broker disconnect aborts that exchange and reconnects the watcher
 for future requests, discarding unfinished confirmation. Local signals, TTY
 loss and trust/protocol failures still stop it. The root-owned identity may
 be a private key or a public key backed by root's SSH agent. Signing uses
-OpenSSH SSHSIG over DSSE PAE, with namespace `sigrun.warrant.v1` and SHA-512.
+OpenSSH SSHSIG over DSSE PAE, with namespace `sigrun.warrant.v2` and SHA-512.
 Passphrases stay on the verified TTY; askpass is disabled, and terminal settings
 are restored after helper cancellation. Software, encrypted-key and agent paths
 have fixtures; simulated security-key signatures do not prove physical FIDO
@@ -125,11 +168,10 @@ inode-checked alias in the child's private mount namespace; an unavailable or
 replaced path fails closed while the original FD stays pinned. Set-ID files, extended ACLs and noexec
 mounts require fallback; unknown/namespaced/idmapped file capabilities do too.
 
-New direct warrants are v1.2 and sign all five expected post-exec capability
-sets, in addition to the authority ceiling. Unsigned contexts cannot specify
-those derived sets. Legacy v1.0 memfd and v1.1 direct bytes remain valid with
-unchanged implicit profiles; legacy requests never acquire new file-capability
-semantics. See normative Section 2.2.2 for the evidence and credential table.
+All v2 warrants sign origin, canonical intent hash and all five expected post-exec
+capability sets for every trust model, in addition to the requested authority
+ceiling. Legacy warrant versions and signature domains fail closed. See normative
+Section 2.2.2 for the evidence and credential table.
 
 Direct execution uses no executable snapshot RAM. Verity/ctime may exceed both
 size limits. Digest_direct uses a fixed 64 KiB buffer and its own
@@ -203,16 +245,25 @@ Approval prints the target UID and returns the child's status. A service-user
 request can add `--target-uid 33 --target-gid 33`; `--stdin sha256` binds piped
 or redirected input. Keep status in its own file and inspect it separately.
 
-For offline signing, stop the approver and capture a fresh `TIMEOUT_CSR` using
-the requester invocation above. As root, extract and review the exact CSR, sign
-its PAE, and package the envelope:
+For offline signing, run full export as the **requester** into a new file in a
+writable directory:
 
 ```sh
-"$TEST_BIN/sigrundctl" csr-pae --status /home/requester/request.status.jsonl \
-  --csr "$TEST_BASE/request.csr" --pae "$TEST_BASE/request.pae"
+"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --cwd / \
+  --export-csr request.csr -- "$TEST_COMMANDS/id" -u
+```
+
+Export queries only public context; unreadable or incomplete evidence fails locally.
+Have root obtain the exact file, review every field, then sign and package it.
+Choose new output paths; the helpers refuse overwrites. The example below assumes
+root has copied that requester file to `$TEST_BASE/request.csr`:
+
+```sh
+"$TEST_BIN/sigrundctl" csr-pae --csr "$TEST_BASE/request.csr" \
+  --pae "$TEST_BASE/request.pae"
 python3 -m json.tool "$TEST_BASE/request.csr"
 # Review every field before signing.
-ssh-keygen -Y sign -n sigrun.warrant.v1 -O hashalg=sha512 \
+ssh-keygen -Y sign -n sigrun.warrant.v2 -O hashalg=sha512 \
   -f "$TEST_SSH_IDENTITY" "$TEST_BASE/request.pae"
 "$TEST_BIN/sigrundctl" pack-warrant --csr "$TEST_BASE/request.csr" \
   --signature "$TEST_BASE/request.pae.sig" --signer-id "$TEST_SIGNER_ID" \
@@ -276,7 +327,7 @@ python3 /absolute/sigrund/scripts/verify-acceptance.py \
 ```
 
 The entry point supervises `verify-platform.py`, `verify-runtime.py` and
-`verify-execution.py`, then exercises offline signing, binding/concurrent replay,
+`verify-execution.py`, plus the native `verify-v2.py` gate, then exercises offline signing, binding/concurrent replay,
 output/limits, post-commit failure, local recovery and both operator recipes.
 Checks include real root/service credentials, setup and registration races,
 shutdown/restart/escalation, and cancellation while output stays blocked.
@@ -318,18 +369,17 @@ installation/upgrade/removal tests validate packaging; they do not replace the
 native privileged execution gates. Packages never provision or automatically
 start the daemon, and preserve operator state on removal.
 
-The local workflow covers applicable portions of V-01–V-11, V-13–V-15 and
-V-17–V-19. Full rows remain incomplete wherever they include deferred features;
-V-12/PTY and V-16/hooks are outside this profile. Full v1.0 conformance requires:
+The normative v2 matrix requires integrated evidence across the supported local
+profile before release. Beyond the implemented workflow, the broader target requires:
 
 - PTY transfer, window relaying, terminal cleanup and unrestricted input.
-- Hook execution/fallback and strict deadline/output integration.
+- Trusted hook execution and strict deadline/output/confidentiality integration.
 - Remote TLS collector service, replication/ACK, receipts, durable cursors,
   provisioning anchors and external rollback/checkpoint protection. The
   collector binary currently supplies validation diagnostics only.
 - Policy reload with aggregate generation quotas, scripts/reusable grants,
   OpenPGP/Sigstore adapters and safe administrative revocation tooling.
-- Complete V-01–V-19 end-to-end cases for those integrations and real hardware
+- Complete applicable v2 V-01–V-20 end-to-end cases and real hardware
   signing acceptance before claiming physical security-key support.
 
 Interpreter artifact binding and selectable host/container execution domains

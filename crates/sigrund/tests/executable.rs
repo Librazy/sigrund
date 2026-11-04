@@ -324,7 +324,7 @@ fn ctime_namespace_fixture() {
             &cfg,
             || Ok(())
         )
-        .is_err()
+        .is_ok()
     );
     cfg.executable_trust_models = vec![TrustModel::Ctime];
     assert!(

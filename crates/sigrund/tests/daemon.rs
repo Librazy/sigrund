@@ -85,12 +85,12 @@ fn send_fds(socket: &UnixStream, bytes: &[u8], rights: &[RawFd]) {
 
 fn hello(executable: &Path) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "mode":"unsigned_csr_request", "tty_mode":"stdio", "caller_env":{},
-        "requested_command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
+        "version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},
+        "command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
             "executable_path":executable,"stdin_policy":"null","tty_mode":"stdio"},
-        "requested_execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
+        "execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
             "supplementary_gids":[],"target_gid":0,"target_uid":33,"umask":18},
-        "requested_policy":{"mode":"one_time","ttl_secs":60}
+        "policy":{"mode":"one_time","ttl_secs":60}}
     }))
     .unwrap()
 }
@@ -199,6 +199,10 @@ impl Fixture {
                 "max_active_sockets_per_uid = 2",
             )
             .replace("request_deadline_ms = 5000", "request_deadline_ms = 1500")
+            .replace(
+                "authorization_timeout_ms = 120000",
+                "authorization_timeout_ms = 2500",
+            )
             // This regression fixture deliberately exceeds production-default
             // rate windows; dedicated admission tests cover those defaults.
             .replace(
@@ -220,7 +224,7 @@ impl Fixture {
             configuration =
                 configuration.replace(&format!("/etc/sigrund/{name}"), path.to_str().unwrap());
         }
-        configuration.push_str("\n[mvp]\n");
+        configuration.push_str("\n[mvp]\napproval_signer_id = \"mandator-alice-yubikey\"\n");
         fs::write(&config, configuration).unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
         let public = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
@@ -542,39 +546,25 @@ fn daemon_namespace_fixture() {
         // A truncated ancillary set can be rejected on the first byte before
         // the remaining write. SIGPIPE is suppressed by Rust's socket writes.
         let _ = socket.write_all(&encoded[1..]);
-        let response = decision(&mut socket);
-        let status = response.status;
-        assert!(
-            matches!(status.as_str(), "INVALID_REQUEST" | "TIMEOUT_CSR"),
-            "iteration {iteration}: unexpected status {status}"
-        );
-        expect_closed(&mut socket);
-        // A reply/EOF does not release a worker lease. Wait for this request's
-        // actual cleanup so the next serial probe tests parsing, not quota
-        // exhaustion caused by deliberately retained disposal reservations.
+        if iteration % 3 == 0 {
+            expect_closed(&mut socket);
+        } else {
+            assert_eq!(decision(&mut socket).status, "TIMEOUT");
+            expect_closed(&mut socket);
+        }
         fixture.wait_for_cleanup(events_before);
-        // Denial delivery is independent of durable auditing. A fast runner
-        // can exhaust the pending-audit quota even after FD cleanup; keep
-        // this parser sweep serial with respect to audit publication too.
-        wait_for(|| {
-            fs::read_to_string(&fixture.log)
-                .unwrap()
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .any(|record| record["exec_id"] == response.exec_id)
-        });
     }
     let events_before = fixture.diagnostic_count();
     let mut oversized = connect(&fixture.socket);
-    oversized.write_all(&[1, 0, 3, 0, 1]).unwrap();
-    assert_eq!(decision(&mut oversized).status, "INVALID_REQUEST");
+    oversized.write_all(&[1, 0, 8, 0, 1]).unwrap();
+    expect_closed(&mut oversized);
     drop(oversized);
     fixture.wait_for_cleanup(events_before);
     let events_before = fixture.diagnostic_count();
     let mut misplaced = connect(&fixture.socket);
     misplaced.write_all(&[1]).unwrap();
     send_rights(&misplaced, &[0], 2);
-    assert_eq!(decision(&mut misplaced).status, "INVALID_REQUEST");
+    expect_closed(&mut misplaced);
     drop(misplaced);
     fixture.wait_for_cleanup(events_before);
     wait_for(|| fd_count() == baseline);
@@ -607,11 +597,11 @@ fn daemon_namespace_fixture() {
     send_rights(&replacement, &[1], 2);
     let encoded = encode_frame(FrameType::ClientHello, &hello(&fixture.executable)).unwrap();
     replacement.write_all(&encoded[1..]).unwrap();
-    assert_eq!(decision(&mut replacement).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut replacement).status, "TIMEOUT");
     holder.stdin.take().unwrap().write_all(b"x").unwrap();
     assert!(holder.wait().unwrap().success());
     // The accept-based deadline also applies when no frame has started.
-    assert_eq!(decision(&mut first).status, "REQUEST_TIMEOUT");
+    assert_eq!(decision(&mut first).status, "TIMEOUT");
     expect_closed(&mut first);
     drop(first);
     wait_for(|| fd_count() == baseline);
@@ -623,7 +613,7 @@ fn daemon_namespace_fixture() {
     send_rights(&trickle, &[1], 2);
     thread::sleep(Duration::from_millis(400));
     trickle.write_all(&[0]).unwrap();
-    assert_eq!(decision(&mut trickle).status, "REQUEST_TIMEOUT");
+    expect_closed(&mut trickle);
     assert!(accepted.elapsed() < Duration::from_millis(2100));
     drop(trickle);
     wait_for(|| fd_count() == baseline);
@@ -665,7 +655,7 @@ fn daemon_namespace_fixture() {
     }
     let genesis: serde_json::Value =
         serde_json::from_slice(original.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
-    let mut record = serde_json::json!({"event_type":"TEST_CRASH_WINDOW","host_id":genesis["host_id"],
+    let mut record = serde_json::json!({"schema_version":2,"event_type":"TEST_CRASH_WINDOW","host_id":genesis["host_id"],
         "seq":state["seq"],"prev_record_sha256":state["last_record_sha256"]});
     let hmac = entry_hmac(&key, &serde_json::to_vec(&record).unwrap());
     record["entry_hmac"] = hmac.into();
@@ -804,7 +794,7 @@ fn daemon_pid_namespace_fixture() {
     // A mappable peer still works after both sockets rejected pid=0 peers.
     let mut socket = connect(&fixture.socket);
     send_hello(&mut socket, &fixture.executable);
-    assert_eq!(decision(&mut socket).status, "TIMEOUT_CSR");
+    assert_eq!(decision(&mut socket).status, "TIMEOUT");
     drop(socket);
     let mut broker = connect(&fixture.broker);
     broker.write_all(&[0, 0, 0, 2, b'{', b'}']).unwrap();
@@ -826,17 +816,13 @@ fn daemon_peer_probe() {
             send_rights(&socket, &encoded[..1], 2);
             socket.write_all(&encoded[1..]).unwrap();
             let decision = decision(&mut socket);
-            assert_eq!(decision.status, "TIMEOUT_CSR");
-            let csr = sigrund_core::warrant::Csr::parse(decision.csr_payload.unwrap().as_bytes())
-                .unwrap();
-            assert_eq!(csr.warrant().requester_uid, unsafe { libc::getuid() });
-            assert_eq!(csr.warrant().requester_gid, unsafe { libc::getgid() });
+            assert_eq!(decision.status, "TIMEOUT");
             expect_closed(&mut socket);
         }
         "worker_quota" => {
             let mut socket = connect(&client);
             send_hello(&mut socket, &executable);
-            assert_eq!(decision(&mut socket).status, "RESOURCE_EXHAUSTED");
+            assert_eq!(decision(&mut socket).status, "TIMEOUT");
             expect_closed(&mut socket);
         }
         "blocked_metadata" => {
@@ -859,7 +845,7 @@ fn daemon_peer_probe() {
             );
             socket.write_all(&encoded[1..]).unwrap();
             io::stdin().read_exact(&mut [0u8]).unwrap();
-            assert_eq!(decision(&mut socket).status, "REQUEST_TIMEOUT");
+            assert_eq!(decision(&mut socket).status, "TIMEOUT");
             expect_closed(&mut socket);
         }
         "broker_permissions" => assert_eq!(
@@ -921,3 +907,6 @@ mod workers;
 
 #[path = "daemon/service.rs"]
 mod service;
+
+#[path = "daemon/v2.rs"]
+mod v2;

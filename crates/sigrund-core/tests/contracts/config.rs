@@ -81,7 +81,7 @@ fn profile_restrictions_apply_to_signed_and_unsigned_requests() {
     let profile = MvpProfile::default();
     let signed_hello = |warrant| -> ClientHello {
         parse_strict(&serde_json::to_vec(&json!({
-            "mode": "signed", "tty_mode": "stdio", "caller_env": {}, "dsse_envelope": signed(warrant)
+            "version":"2.0", "mode": "signed", "tty_mode": "stdio", "caller_env": {}, "dsse_envelope": signed(warrant)
         })).unwrap()).unwrap()
     };
     for mode in ["null", "sha256"] {
@@ -128,6 +128,9 @@ fn profile_restrictions_apply_to_signed_and_unsigned_requests() {
         hello.requested_command = Some(warrant.command.requested());
         hello.requested_execution_context = Some(warrant.execution_context.requested());
         hello.requested_policy.as_mut().unwrap().mode = warrant.policy.mode.clone();
+        if warrant.policy.mode == "permanent" {
+            hello.requested_policy.as_mut().unwrap().ttl_secs = 0;
+        }
         hello.validate_request().unwrap();
         assert!(
             profile.validate_for_peer(&hello, 1001).is_err(),

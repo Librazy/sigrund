@@ -9,8 +9,7 @@ fn every_warrant_field_is_bound_to_the_csr_even_with_a_valid_signature() {
         ("/command/argv", json!(["/usr/bin/id", "-u"])),
         ("/command/cwd", json!("/tmp")),
         ("/command/executable_path", json!("/usr/bin/true")),
-        ("/command/executable_sha256", json!("11".repeat(32))),
-        ("/execution_context/capabilities", json!(["CAP_CHOWN"])),
+        ("/command/executable_trust/sha256", json!("11".repeat(32))),
         ("/execution_context/caller_env_allowlist", json!(["TERM"])),
         ("/execution_context/env_exact", json!({"PATH": "/usr/bin"})),
         ("/execution_context/supplementary_gids", json!([33])),
@@ -50,7 +49,7 @@ fn every_warrant_field_is_bound_to_the_csr_even_with_a_valid_signature() {
     permanent.policy.not_after = None;
     assert!(csr.bind_envelope(&signed(permanent)).is_err());
     let mut wrong_version = fixture();
-    wrong_version.version = "2.0".into();
+    wrong_version.version = "1.2".into();
     assert!(CanonicalWarrant::new(wrong_version).is_err());
 }
 

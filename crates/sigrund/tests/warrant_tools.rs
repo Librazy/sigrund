@@ -32,19 +32,15 @@ fn csr() -> Csr {
 }
 
 #[test]
-fn offline_cli_preserves_daemon_csr_and_openssh_signature_bytes() {
+fn offline_cli_preserves_client_csr_and_openssh_signature_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let path = |name| temp.path().join(name);
     let csr = csr();
-    let status = serde_json::json!({"exec_id":csr.warrant().grant_id,"status":"TIMEOUT_CSR",
-        "message":"No approver", "csr_payload":std::str::from_utf8(csr.as_bytes()).unwrap()});
-    fs::write(path("status"), serde_json::to_vec(&status).unwrap()).unwrap();
+    fs::write(path("csr"), csr.as_bytes()).unwrap();
     let ctl = env!("CARGO_BIN_EXE_sigrundctl");
     let prepare = || {
         Command::new(ctl)
-            .args(["csr-pae", "--status"])
-            .arg(path("status"))
-            .arg("--csr")
+            .args(["csr-pae", "--csr"])
             .arg(path("csr"))
             .arg("--pae")
             .arg(path("pae"))
@@ -75,7 +71,7 @@ fn offline_cli_preserves_daemon_csr_and_openssh_signature_bytes() {
                 "-Y",
                 "sign",
                 "-n",
-                "sigrun.warrant.v1",
+                "sigrun.warrant.v2",
                 "-O",
                 "hashalg=sha512",
                 "-f"
@@ -142,6 +138,7 @@ fn offline_cli_preserves_daemon_csr_and_openssh_signature_bytes() {
     );
     let mut changed = csr.warrant().clone();
     changed.command.argv.push("extra".into());
+    changed.intent_sha256 = changed.intent().unwrap().sha256().unwrap();
     let changed = Csr::new(changed).unwrap();
     assert!(
         pack_warrant(
@@ -154,20 +151,39 @@ fn offline_cli_preserves_daemon_csr_and_openssh_signature_bytes() {
 }
 
 #[test]
-fn offline_extraction_rejects_ambiguous_status_and_noncanonical_csr() {
-    use sigrund::warrant_tools::extract_csr;
+fn offline_tools_reject_legacy_status_extraction_and_thin_exports() {
+    let temp = tempfile::tempdir().unwrap();
     let csr = csr();
-    for status in ["REJECTED", "READY_TO_EXEC"] {
-        let bytes = serde_json::to_vec(&serde_json::json!({"exec_id":csr.warrant().grant_id,
-            "status":status,"message":"", "csr_payload":null}))
-        .unwrap();
-        assert!(extract_csr(&bytes).is_err());
-    }
-    let payload = std::str::from_utf8(csr.as_bytes()).unwrap();
-    let bytes = serde_json::to_vec(&serde_json::json!({"exec_id":csr.warrant().grant_id,
-        "status":"TIMEOUT_CSR","message":"", "csr_payload":format!("{payload}\n")}))
-    .unwrap();
-    assert!(extract_csr(&bytes).is_err());
-    assert!(extract_csr(br#"{"status":"TIMEOUT_CSR","status":"TIMEOUT_CSR"}"#).is_err());
-    assert!(extract_csr(br#"{}{}"#).is_err());
+    let mut thin = csr.warrant().clone();
+    thin.request_origin = "daemon_expanded_thin".into();
+    thin.approval_exec_id = Some(thin.grant_id.clone());
+    let thin = Csr::new(thin).unwrap();
+    std::fs::write(temp.path().join("thin"), thin.as_bytes()).unwrap();
+    let ctl = env!("CARGO_BIN_EXE_sigrundctl");
+    assert!(
+        !Command::new(ctl)
+            .args(["csr-pae", "--csr"])
+            .arg(temp.path().join("thin"))
+            .arg("--pae")
+            .arg(temp.path().join("pae"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!temp.path().join("pae").exists());
+    assert!(
+        !Command::new(ctl)
+            .args([
+                "csr-pae",
+                "--status",
+                "/nonexistent",
+                "--csr",
+                "/nonexistent",
+                "--pae",
+                "/nonexistent"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
 }

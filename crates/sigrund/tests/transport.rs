@@ -61,12 +61,12 @@ fn fd_count() -> usize {
 
 fn hello(policy: &str) -> ClientHello {
     ClientHello::parse_request(serde_json::json!({
-        "mode":"unsigned_csr_request", "tty_mode":"stdio", "caller_env":{},
-        "requested_command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
+        "version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},
+        "command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
             "executable_path":"/usr/bin/id","stdin_policy":policy,"tty_mode":"stdio"},
-        "requested_execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
+        "execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
             "supplementary_gids":[],"target_gid":0,"target_uid":0,"umask":18},
-        "requested_policy":{"mode":"one_time","ttl_secs":60}
+        "policy":{"mode":"one_time","ttl_secs":60}}
     }).to_string().as_bytes()).unwrap()
 }
 
@@ -211,7 +211,7 @@ fn bounded_transport_fragmentation_ancillary_ownership_and_deadlines() {
         io::ErrorKind::TimedOut
     );
     // Hostile advertised sizes are rejected without waiting for the body.
-    for header in [[1, 0, 3, 0, 1], [1, 0, 0, 0, 0], [255, 0, 0, 0, 1]] {
+    for header in [[1, 0, 8, 0, 1], [1, 0, 0, 0, 0], [255, 0, 0, 0, 1]] {
         let (mut sender, receiver) = pair();
         sender.write_all(&header).unwrap();
         assert!(

@@ -23,9 +23,9 @@ pub struct Command {
     pub argv: Vec<String>,
     pub cwd: String,
     pub executable_path: String,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(skip)]
     pub executable_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_nullable")]
     pub executable_trust: Option<crate::executable::ExecutableTrust>,
     pub stdin_policy: String,
     #[serde(deserialize_with = "required_nullable")]
@@ -57,7 +57,7 @@ pub struct ExecutionContext {
     pub target_gid: u32,
     pub target_uid: u32,
     pub umask: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_nullable")]
     pub post_exec_capabilities: Option<crate::executable::CapabilitySets>,
 }
 impl From<RequestedExecutionContext> for ExecutionContext {
@@ -105,6 +105,11 @@ pub struct GrantPolicy {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Warrant {
+    pub request_origin: String,
+    pub intent_sha256: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub approval_exec_id: Option<String>,
+    pub caller_env: std::collections::BTreeMap<String, String>,
     pub command: Command,
     pub execution_context: ExecutionContext,
     pub grant_id: String,
@@ -120,6 +125,37 @@ impl ProtocolSchema for Command {}
 impl ProtocolSchema for GrantPolicy {}
 
 impl Warrant {
+    pub fn require_client_full(&self) -> Result<()> {
+        if self.request_origin != "client_full" || self.approval_exec_id.is_some() {
+            return Err(invalid(
+                "standalone warrant must have client-full provenance",
+            ));
+        }
+        Ok(())
+    }
+    pub fn intent(&self) -> Result<crate::protocol::Intent> {
+        let ttl_secs = match self.policy.not_after {
+            Some(end) => u64::try_from(
+                end.checked_sub(self.policy.not_before)
+                    .ok_or_else(|| invalid("TTL overflow"))?,
+            )
+            .map_err(|_| invalid("negative TTL"))?,
+            None if self.policy.mode == "permanent" => 0,
+            _ => return Err(invalid("missing validity")),
+        };
+        let intent = crate::protocol::Intent {
+            command: self.command.requested(),
+            execution_context: self.execution_context.requested(),
+            policy: RequestedPolicy {
+                mode: self.policy.mode.clone(),
+                ttl_secs,
+            },
+            caller_env: self.caller_env.clone(),
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
     pub fn validate(&self) -> Result<()> {
         let bytes = canonical_bytes(self)?;
         if bytes.len() > MAX_WARRANT_BYTES {
@@ -131,32 +167,28 @@ impl Warrant {
             .host_id
             .strip_prefix("sigrun-host:sha256:")
             .is_some_and(valid_digest);
-        let executable_valid = match (
-            self.version.as_str(),
-            &self.command.executable_sha256,
-            &self.command.executable_trust,
-        ) {
-            ("1.0", Some(digest), None) => {
-                valid_digest(digest) && self.execution_context.post_exec_capabilities.is_none()
+        let executable_valid = self.version == "2.0"
+            && self.command.executable_sha256.is_none()
+            && self
+                .command
+                .executable_trust
+                .as_ref()
+                .is_some_and(|t| t.valid())
+            && self
+                .execution_context
+                .post_exec_capabilities
+                .as_ref()
+                .is_some_and(|sets| sets.valid(&self.execution_context.capabilities));
+        match (self.request_origin.as_str(), &self.approval_exec_id) {
+            ("client_full", None) => (),
+            ("daemon_expanded_thin", Some(id)) if self.policy.mode == "one_time" => {
+                validate_uuidv7(id)?;
             }
-            ("1.1", None, Some(trust)) => {
-                trust.valid()
-                    && !matches!(
-                        trust,
-                        crate::executable::ExecutableTrust::DigestDirect { .. }
-                    )
-                    && self.execution_context.post_exec_capabilities.is_none()
-            }
-            ("1.2", None, Some(trust)) => {
-                trust.valid()
-                    && self
-                        .execution_context
-                        .post_exec_capabilities
-                        .as_ref()
-                        .is_some_and(|sets| sets.valid(&self.execution_context.capabilities))
-            }
-            _ => false,
-        };
+            _ => return Err(invalid("invalid CSR provenance")),
+        }
+        if !valid_digest(&self.intent_sha256) || self.intent()?.sha256()? != self.intent_sha256 {
+            return Err(invalid("intent digest mismatch"));
+        }
         if !executable_valid
             || !valid_host
             || self.requester_uid == u32::MAX
@@ -181,7 +213,7 @@ impl Warrant {
                 mode: self.policy.mode.clone(),
                 ttl_secs: 0,
             },
-            &Default::default(),
+            &self.caller_env,
         )?;
         if !(0..=MAX_TIMESTAMP).contains(&self.policy.not_before) {
             return Err(invalid("not_before outside timestamp bounds"));
@@ -272,7 +304,7 @@ impl Csr {
         max_ttl_secs: u64,
     ) -> Result<Self> {
         hello.validate_request()?;
-        if hello.mode != "unsigned_csr_request" {
+        if hello.mode != "thin_csr" {
             return Err(invalid("CSR requires unsigned request"));
         }
         let command = hello
@@ -297,27 +329,32 @@ impl Csr {
                     .ok_or_else(|| invalid("timestamp overflow"))?,
             )
         };
-        let version = if snapshots.post_exec_capabilities.is_some() {
-            "1.2"
-        } else if snapshots.executable_trust.is_some() {
-            "1.1"
-        } else {
-            "1.0"
-        };
+        let version = "2.0";
         let mut execution_context: ExecutionContext = hello
             .requested_execution_context
             .clone()
             .expect("validated unsigned request")
             .into();
-        execution_context.post_exec_capabilities = snapshots.post_exec_capabilities;
+        execution_context.post_exec_capabilities =
+            Some(snapshots.post_exec_capabilities.unwrap_or_else(|| {
+                crate::executable::CapabilitySets::ordinary(&execution_context.capabilities)
+            }));
         Self::new(Warrant {
+            request_origin: "client_full".into(),
+            intent_sha256: hello.intent()?.sha256()?,
+            approval_exec_id: None,
+            caller_env: hello.caller_env.clone(),
             command: Command {
                 allow_interpreted_script: command.allow_interpreted_script,
                 argv: command.argv.clone(),
                 cwd: command.cwd.clone(),
                 executable_path: command.executable_path.clone(),
-                executable_sha256: snapshots.executable_sha256,
-                executable_trust: snapshots.executable_trust,
+                executable_sha256: None,
+                executable_trust: snapshots.executable_trust.or_else(|| {
+                    snapshots
+                        .executable_sha256
+                        .map(|sha256| crate::executable::ExecutableTrust::DigestMemfd { sha256 })
+                }),
                 stdin_policy: command.stdin_policy.clone(),
                 stdin_sha256: snapshots.stdin_sha256,
                 tty_mode: command.tty_mode.clone(),
@@ -354,7 +391,7 @@ impl DsseEnvelope {
     }
 
     pub fn parse_jcs(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > 196_608 {
+        if bytes.len() > 524_288 {
             return Err(invalid("DSSE envelope exceeds frame ceiling"));
         }
         let envelope: Self = parse_strict(bytes)?;
@@ -368,7 +405,7 @@ impl DsseEnvelope {
         // Apply the outer schema's string limits even to programmatically
         // constructed envelopes, and retain its larger Base64 field limits.
         let bytes = canonical_bytes(self)?;
-        if bytes.len() > 196_608 {
+        if bytes.len() > 524_288 {
             return Err(invalid("DSSE envelope exceeds frame ceiling"));
         }
         crate::json::preflight_with_string_limits(&bytes, 8, &Self::string_limit)?;
