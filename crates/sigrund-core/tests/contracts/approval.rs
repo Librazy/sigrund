@@ -1,6 +1,27 @@
 use super::support::*;
 
 #[test]
+fn composefs_notice_requires_direct_digest_and_round_trips() {
+    let mut warrant = fixture();
+    warrant.command.executable_trust =
+        Some(sigrund_core::executable::ExecutableTrust::DigestDirect {
+            sha256: "00".repeat(32),
+        });
+    warrant.command.executable_sha256 = None;
+    let csr = Csr::new(warrant).unwrap();
+    let mut request = ApprovalRequest::new(EXEC_ID.into(), "test".into(), &csr).unwrap();
+    request.admin_trusted_composefs = true;
+    assert_eq!(
+        ApprovalRequest::parse_jcs(&request.to_jcs().unwrap()).unwrap(),
+        request
+    );
+    let mut request =
+        ApprovalRequest::new(EXEC_ID.into(), "test".into(), &Csr::new(fixture()).unwrap()).unwrap();
+    request.admin_trusted_composefs = true;
+    assert!(request.validate().is_err());
+}
+
+#[test]
 fn every_warrant_field_is_bound_to_the_csr_even_with_a_valid_signature() {
     let csr = Csr::new(fixture()).unwrap();
     let original: Value = serde_json::from_slice(GOLDEN).unwrap();

@@ -563,6 +563,11 @@ impl Connection {
                     };
                     let mut approval = ApprovalRequest::new(self.exec_id.clone(), signer_id, csr)
                         .map_err(|e| invalid(e.to_string()))?;
+                    approval.admin_trusted_composefs = lease
+                        .request()
+                        .snapshots
+                        .as_ref()
+                        .is_some_and(|s| s.executable.admin_trusted_composefs());
                     approval.remaining_ms = u32::try_from(
                         self.auth_deadline
                             .saturating_duration_since(now)
@@ -899,7 +904,7 @@ impl ForegroundDaemon {
     }
 
     pub fn prepare_with_mode(
-        config: DaemonConfig,
+        mut config: DaemonConfig,
         signers: SignerPolicyFile,
         state_dir: &Path,
         log_path: &Path,
@@ -913,6 +918,29 @@ impl ForegroundDaemon {
             .map_err(|e| invalid(e.to_string()))?;
         let signals = SignalSource::new()?;
         let mut resources = StartupResources::prepare(&config, state_dir, log_path)?;
+        // Runtime enrollment is never trusted from callers/configuration.
+        config.admin_trusted_composefs_mounts.clear();
+        if config.digest_direct.allow_admin_trusted_composefs
+            && config
+                .executable_trust_models
+                .contains(&sigrund_core::executable::TrustModel::DigestDirect)
+        {
+            match crate::composefs::discover() {
+                Ok(Some(enrollment)) => {
+                    config
+                        .admin_trusted_composefs_mounts
+                        .push(enrollment.mount_id);
+                    resources.composefs = Some(enrollment);
+                }
+                Ok(None) => (),
+                Err(error) => eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event":"COMPOSEFS_ENROLLMENT_UNAVAILABLE", "error":error.to_string()
+                    })
+                ),
+            }
+        }
         if !authorization_only {
             let layout = crate::startup::CgroupLayout::discover()?;
             layout.initialize()?;
@@ -1000,6 +1028,7 @@ impl ForegroundDaemon {
                 authorization_timeout_ms: self.config.authorization_timeout_ms,
             },
             features: ContextFeatures {
+                admin_trusted_composefs_mounts: self.config.admin_trusted_composefs_mounts.clone(),
                 direct_exec_checkpoint: crate::execution::trace_available(),
                 host_file_capabilities: crate::execution::trace_available(),
                 tty_modes: vec!["stdio".into()],
@@ -1073,6 +1102,7 @@ impl ForegroundDaemon {
             serde_json::json!({"event":"DAEMON_READY", "host_id":context.host_id,
             "profile":"local-approval", "local_audit_forward_secure":false,
             "executable_trust_models":self.config.executable_trust_models,
+            "admin_trusted_composefs_mounts":self.config.admin_trusted_composefs_mounts,
             "ctime_checkpoint_available":crate::execution::trace_available()})
             .to_string(),
         );

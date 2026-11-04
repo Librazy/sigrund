@@ -662,13 +662,45 @@ signature or protection against malicious privileged timestamp manipulation.
 
 **digest_direct.** Admit only ext-family, F2FS, Btrfs, XFS and tmpfs, whose Linux
 executable write exclusion makes a full hash at the exec stop authoritative.
-Remote, FUSE, overlay and unknown filesystems are ineligible. Hash the retained
+Remote, FUSE, generic overlay and unknown filesystems are ineligible. The
+administrator-maintained OSTree ComposeFS exception below is enabled by default. Hash the retained
 source with a buffer of at most 64 KiB; never allocate an executable snapshot.
 Sign the full-file SHA-256. An internal dev/inode/size/ctime fingerprint permits
 skipping unchanged pre-consumption rehashes; it is not signed and never replaces
 the mandatory post-exec hash. Reject mutation during hashing. Kernel exec fails
 with an outstanding writer; the stopped loaded inode cannot be ordinarily
 modified before release. Privileged kernel/filesystem bypass is out of scope.
+
+**Administrator-maintained ComposeFS exception.**
+`[digest_direct].allow_admin_trusted_composefs` defaults to true. False disables
+this exception. Scope remains limited by the executable directory allowlists.
+Qualify only the host's booted read-only OSTree ComposeFS root, with the expected
+single metadata lower/data-only object-store arrangement and no writable upper,
+workdir, userxattr or unknown mount options. Require initial user identity
+mapping and the host PID 1 user/mount namespaces during daemon discovery.
+Identify the root using its descriptor's mount ID; preserve that root and the
+backing-store descriptor for the lifetime of enrollment. Require root ownership,
+no group/other writes or extended access/default ACLs on all backing-store
+ancestors, directories and regular objects; reject nested mounts and unsupported
+storage. Scan without following symlinks and bound startup work. OSTree symlink
+objects cannot serve as data-only sources. The detached metadata layer is trusted
+as administrator-created boot state, not measured as fs-verity evidence.
+
+The administrator must maintain those protections and must not modify active
+backing objects in place. This is an additional trust assumption, not Linux
+executable write exclusion. It includes administrator actions through privileged
+jobs and writable aliases. Discovery failure leaves this exception unavailable.
+Public context advertises the daemon-qualified mount ID; the daemon never
+accepts client enrollment claims. Revalidate the source mount identity,
+read-only status, root ownership and ordinary execution metadata at selection,
+authorization and the exec checkpoint. Initially exclude file capabilities.
+Always hash at preparation, before consumption and at the exec checkpoint;
+never use overlay ctime to skip a hash. Preserve existing inode and credential
+checks. Record the ComposeFS basis in audit and online approval display. Keep
+the signed evidence as `digest_direct` plus SHA-256; never change models after
+approval. The administrator-maintenance assumption is what prevents changes
+after the last hash; no protection against violating that assumption is claimed.
+
 
 `max_direct_digest_bytes` defaults to 256 MiB, maximum 1 GiB;
 `direct_digest_timeout_ms` defaults to 5000, maximum 30000. These bounds are

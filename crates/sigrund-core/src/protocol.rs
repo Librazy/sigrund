@@ -483,6 +483,10 @@ pub struct ContextLimits {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextFeatures {
+    /// Mount IDs qualified by the daemon in its execution namespace. Clients
+    /// in another mount namespace conservatively use sealed snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admin_trusted_composefs_mounts: Vec<u64>,
     pub direct_exec_checkpoint: bool,
     pub host_file_capabilities: bool,
     pub tty_modes: Vec<String>,

@@ -575,6 +575,9 @@ fn render_request(
             .map_err(|e| invalid(e.to_string()))?,
         &mut out,
     );
+    if request.admin_trusted_composefs {
+        out.push_str("executable_storage = administrator-maintained ComposeFS; backing objects must remain unchanged during execution\n");
+    }
     out.push_str(&format!(
         "umask_octal = {:03o}\n",
         csr.warrant().execution_context.umask

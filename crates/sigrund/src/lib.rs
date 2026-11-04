@@ -5,6 +5,7 @@ mod authorization;
 mod cgroup;
 pub mod cli;
 pub mod client;
+mod composefs;
 mod context;
 pub mod daemon;
 pub mod executable;

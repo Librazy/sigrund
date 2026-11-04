@@ -18,6 +18,8 @@ pub const MAX_APPROVAL_MESSAGE_BYTES: usize = 524_288;
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin_trusted_composefs: bool,
     pub remaining_ms: u32,
     pub exec_id: String,
     pub signer_id: String,
@@ -62,6 +64,7 @@ impl ProtocolSchema for ApprovalResponse {
 impl ApprovalRequest {
     pub fn new(exec_id: String, signer_id: String, csr: &Csr) -> Result<Self> {
         let request = Self {
+            admin_trusted_composefs: false,
             remaining_ms: 120_000,
             exec_id,
             signer_id,
@@ -81,6 +84,14 @@ impl ApprovalRequest {
             return Err(invalid("invalid approval signer_id"));
         }
         let csr = Csr::parse(self.csr_payload.as_bytes())?;
+        if self.admin_trusted_composefs
+            && !matches!(
+                csr.warrant().command.executable_trust,
+                Some(crate::executable::ExecutableTrust::DigestDirect { .. })
+            )
+        {
+            return Err(invalid("ComposeFS approval requires digest_direct"));
+        }
         if csr.warrant().request_origin == "daemon_expanded_thin"
             && csr.warrant().approval_exec_id.as_deref() != Some(self.exec_id.as_str())
         {

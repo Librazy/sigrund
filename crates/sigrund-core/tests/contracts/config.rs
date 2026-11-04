@@ -1,6 +1,23 @@
 use super::support::*;
 
 #[test]
+fn composefs_defaults_on_can_opt_out_and_is_captured() {
+    let default = config("").unwrap();
+    assert!(default.digest_direct.allow_admin_trusted_composefs);
+    assert!(default.admin_trusted_composefs_mounts.is_empty());
+    let disabled = config("[digest_direct]\nallow_admin_trusted_composefs = false").unwrap();
+    assert!(!disabled.digest_direct.allow_admin_trusted_composefs);
+    let store = sigrund_core::config::PolicyStore::new(default);
+    let captured = store.capture();
+    store.reload(disabled).unwrap();
+    assert!(captured.allow_admin_trusted_composefs);
+    assert!(!store.capture().allow_admin_trusted_composefs);
+    assert!(config("[digest_direct]\nallow_admin_trusted_composefs = 'true'").is_err());
+    assert!(config("[digest_direct]\nunknown = true").is_err());
+    assert!(config("admin_trusted_composefs_mounts = [46]").is_err());
+}
+
+#[test]
 fn executable_models_are_ordered_nonempty_and_captured() {
     use sigrund_core::executable::{TrustModel, default_models};
     let mut cfg = config("").unwrap();
