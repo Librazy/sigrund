@@ -63,6 +63,13 @@ fn domain() -> io::Result<()> {
     }
     Ok(())
 }
+
+fn current_image() -> Command {
+    // Keep using the running image across atomic package replacement. Resolving
+    // current_exe() would yield an unopenable pathname with a " (deleted)" suffix.
+    Command::new("/proc/self/exe")
+}
+
 pub(crate) fn open(
     root: &Path,
     relative: &Path,
@@ -101,7 +108,7 @@ pub(crate) fn open(
     }
     let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
     let _registration = crate::reaper::HelperGuard::new();
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = current_image();
     command
         .arg("--internal-access-helper")
         .env_clear()
@@ -252,4 +259,68 @@ pub fn helper_main() -> io::Result<()> {
         pause(socket.as_raw_fd(), libc::POLLOUT)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn helper_launch_survives_executable_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("daemon-image");
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        let output = Command::new(&image)
+            .args([
+                "--exact",
+                "access::tests::replaced_image_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SIGRUND_REPLACED_IMAGE", &image)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "invoked from a disposable copy of the test executable"]
+    fn replaced_image_fixture() {
+        let inode = std::fs::metadata("/proc/self/exe").unwrap().ino();
+        if let Ok(expected) = std::env::var("SIGRUND_EXPECTED_IMAGE_INODE") {
+            assert_eq!(inode, expected.parse::<u64>().unwrap());
+            return;
+        }
+        let image = std::path::PathBuf::from(std::env::var_os("SIGRUND_REPLACED_IMAGE").unwrap());
+        // Install a different executable at the same pathname, unlinking our
+        // image just as a package manager does during an atomic upgrade.
+        let replacement = image.with_extension("new");
+        std::fs::write(&replacement, b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(replacement, &image).unwrap();
+        assert!(
+            std::env::current_exe()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b" (deleted)")
+        );
+        let status = current_image()
+            .args([
+                "--exact",
+                "access::tests::replaced_image_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SIGRUND_EXPECTED_IMAGE_INODE", inode.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 }
