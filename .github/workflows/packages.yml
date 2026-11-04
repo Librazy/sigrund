@@ -9,12 +9,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: packages-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  should-run:
+    permissions:
+      pull-requests: read
+    uses: ./.github/workflows/should-run.yml
+
   packages:
     name: ${{ matrix.distribution }} (x86_64)
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     strategy:

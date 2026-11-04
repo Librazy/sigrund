@@ -80,7 +80,7 @@ long syscall(long number,...) {
         }
         if(number==SYS_unshare&&!strcmp(mode,"fd-exhaust")) {
             const struct rlimit limit={128,128};
-            if(real_call(SYS_setrlimit,RLIMIT_NOFILE,&limit)<0)real_call(SYS_exit_group,98);
+            if(real_call(SYS_prlimit64,0,RLIMIT_NOFILE,&limit,NULL)<0)real_call(SYS_exit_group,98);
             while(real_call(SYS_openat,AT_FDCWD,"/dev/null",O_RDONLY|O_CLOEXEC,0)>=0){}
         }
         if(number==SYS_mount_setattr&&!strcmp(mode,"mount-unavailable")){errno=ENOSYS;return -1;}
@@ -131,7 +131,7 @@ int openat(int dir,const char *path,int flags,...) {
 ssize_t write(int fd,const void *data,size_t len) {
     if(!strcmp(mode,"cleanup-before")||!strcmp(mode,"cleanup-fail")||!strcmp(mode,"prepare-before")||!strcmp(mode,"limit-fail")) {
         char name[64],path[4096];snprintf(name,sizeof(name),"/proc/self/fd/%d",fd);
-        long n=real_call(SYS_readlink,name,path,sizeof(path)-1);
+        long n=real_call(SYS_readlinkat,AT_FDCWD,name,path,sizeof(path)-1);
         if(n>0){path[n]=0;size_t size=strlen(path);const char *tail=(!strcmp(mode,"prepare-before")||!strcmp(mode,"limit-fail"))?"/pids.max":"/cgroup.kill";
             if(size>=strlen(tail)&&!strcmp(path+size-strlen(tail),tail)&&take_arm()) {
                 if((!strcmp(mode,"cleanup-fail")||!strcmp(mode,"limit-fail"))){errno=EIO;return -1;}

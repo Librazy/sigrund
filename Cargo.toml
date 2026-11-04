@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/sigrund-core", "crates/sigrund"]
-resolver = "2"
+# Prefer dependencies compatible with the declared MSRV when updating the lockfile.
+resolver = "3"
 
 [workspace.package]
 edition = "2024"
