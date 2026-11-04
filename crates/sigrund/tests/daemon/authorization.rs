@@ -731,6 +731,7 @@ fn blocked_io_remains_bounded_and_responsive() {
         let baseline_threads = threads();
         let signed = envelope(warrant(&f, 0), 7);
         gate.arm();
+        let authorization_before = f.diagnostic_count();
         let client = connect(&f.socket);
         send_signed(&client, &signed);
         gate.arrive(&daemon);
@@ -769,6 +770,10 @@ fn blocked_io_remains_bounded_and_responsive() {
         expect_closed(&mut excess);
         gate.release();
         drop((partial, excess));
+        // Releasing the gate only wakes the durable worker. Wait for its
+        // original lease to finish commit/audit reconciliation and cleanup
+        // before inspecting consumption or submitting another authorization.
+        f.wait_for_cleanup(authorization_before);
         assert_eq!(count(&f), 1);
         assert_eq!(redeem(&f, &signed).status, "TIMEOUT");
         // Shutdown must close controls without dropping durable ownership.
