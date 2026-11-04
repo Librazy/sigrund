@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const OVERLAY: i64 = 0x794c7630;
+const OVERLAY: u64 = 0x794c7630;
 const DATA: &str = "/sysroot/ostree/repo/objects";
 const LOWER: &str = "/run/ostree/.private/cfsroot-lower";
 const MAX_MOUNTINFO: u64 = 4 * 1024 * 1024;
@@ -237,7 +237,7 @@ pub(crate) fn eligible(source: &File, mounts: &[u64]) -> io::Result<bool> {
     if unsafe { libc::fstatvfs(source.as_raw_fd(), &mut mount) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    if s.f_type as i64 != OVERLAY || mount.f_flag & libc::ST_RDONLY == 0 {
+    if s.f_type as u64 != OVERLAY || mount.f_flag & libc::ST_RDONLY == 0 {
         return Ok(false);
     }
     if !mounts.contains(&mount_id(source)?) || !trusted(source)? {
