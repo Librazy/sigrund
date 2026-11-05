@@ -96,7 +96,8 @@ Interpreter approval grants programmable authority within the selected
 credentials. An executable digest does not bind mutable script files, libraries
 or imports. Jobs execute in the daemon's configured domain; requester namespaces
 are not followed automatically. Cross-container/host routing is unimplemented.
-See [interpreter and execution-domain design notes](docs/INTERPRETERS_AND_EXECUTION_DOMAINS.md).
+See [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
+[namespace-aware execution design](docs/NAMESPACE_AWARE_EXECUTION.md).
 
 ### Deferred namespace-aware executable evidence
 
