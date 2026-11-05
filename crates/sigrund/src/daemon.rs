@@ -741,6 +741,12 @@ impl Drop for Connection {
     fn drop(&mut self) {
         self.lifecycle.cancel();
         self.lifecycle.mark_undelivered();
+        // Durable tasks and I/O workers can retain shared socket ownership.
+        // End peer communication now; final close and caller-FD cleanup stay
+        // on their reserved workers even if audit persistence is stalled.
+        unsafe {
+            libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR);
+        }
         if let Some(job) = self.committed_job.take() {
             abort_delivery(job, &self.durable);
         }
@@ -1116,6 +1122,7 @@ impl ForegroundDaemon {
         let mut service = crate::service::Service::new()?;
         let mut stop_notified = false;
         let mut listeners_registered = true;
+        let mut storage_pressure_reported = false;
         service.ready();
         loop {
             let now = Instant::now();
@@ -1771,6 +1778,16 @@ impl ForegroundDaemon {
                 }
             }
             if stopping.is_none() {
+                // File growth precedes fsync and ratchet publication. Report
+                // pressure only after the durable executor closes admission,
+                // so observers can synchronize without submitting more work.
+                if !storage_pressure_reported
+                    && storage_closed.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    storage_pressure_reported = log
+                        .try_send("{\"event\":\"STORAGE_ADMISSION_CLOSED\"}".into())
+                        .is_ok();
+                }
                 // Do not accept an FD without reserved final-close capacity.
                 // Remove level-triggered listeners while full to avoid a spin;
                 // disposal completion wakes epoll so admission can resume.
@@ -2039,7 +2056,13 @@ mod approval_tests {
                     ApprovalAvailability::default(),
                 )
                 .unwrap();
+            // A queued authorization/audit task can retain the control socket
+            // after terminal delivery. Peer EOF must not wait for its fsyncs.
+            let retained_control = connection.fd.clone();
             drop(connection);
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            drop(retained_control);
             drop(peer);
             let released = Instant::now() + Duration::from_secs(2);
             loop {

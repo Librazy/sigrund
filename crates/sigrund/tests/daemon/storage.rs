@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 fn exit_gate() {
-    let _gate = NAMESPACE_GATE.lock().unwrap();
+    let _gate = namespace_gate();
     let output = Command::new("unshare")
         .args(["--user", "--map-auto", "--map-root-user"])
         .arg(std::env::current_exe().unwrap())
@@ -89,11 +89,15 @@ fn namespace_fixture() {
     assert_eq!(decision(&mut client).status, "TIMEOUT");
     expect_closed(&mut client);
     fixture.wait_for_cleanup(before);
-    wait_for(|| fs::metadata(&fixture.log).unwrap().len() >= high_water as u64);
-    // Response delivery intentionally precedes durable auditing. Give its
-    // state publication and capacity check time to finish without submitting
-    // another durable operation that could mask a missing post-append check.
-    thread::sleep(Duration::from_millis(100));
+    // Response delivery and visible file growth precede durable auditing and
+    // the pressure latch. Wait for admission closure itself, without another
+    // durable operation that could mask a missing post-append capacity check.
+    wait_for(|| {
+        read_diagnostic_events(&fixture.diagnostics)
+            .iter()
+            .any(|event| event["event"] == "STORAGE_ADMISSION_CLOSED")
+    });
+    assert!(fs::metadata(&fixture.log).unwrap().len() >= high_water as u64);
     let admissions = || {
         fs::read_to_string(&fixture.diagnostics)
             .unwrap()

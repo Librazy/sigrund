@@ -4,7 +4,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 #[test]
 fn confidentiality_gate() {
-    let _gate = NAMESPACE_GATE.lock().unwrap();
+    let _gate = namespace_gate();
     let output = Command::new("unshare")
         .args(["--user", "--map-auto", "--map-root-user"])
         .arg(std::env::current_exe().unwrap())

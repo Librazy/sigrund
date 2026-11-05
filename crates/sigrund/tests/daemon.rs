@@ -31,6 +31,15 @@ use std::{
 // starve another fixture's admission probes before they begin assertions.
 static NAMESPACE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn namespace_gate() -> std::sync::MutexGuard<'static, ()> {
+    // This mutex serializes independent child processes; it protects no shared
+    // fixture state. Preserve serialization after a failed gate without hiding
+    // the remaining tests behind secondary PoisonError failures.
+    NAMESPACE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn read_diagnostic_events(path: &Path) -> Vec<serde_json::Value> {
     // The daemon can still be writing the final record, including a UTF-8
     // codepoint or the newline after otherwise valid JSON. Count and parse
@@ -494,7 +503,7 @@ impl Drop for DaemonChild {
 
 #[test]
 fn daemon_gate_in_user_namespace() {
-    let _gate = NAMESPACE_GATE.lock().unwrap();
+    let _gate = namespace_gate();
     let output = Command::new("unshare")
         .args(["--user", "--map-auto", "--map-root-user"])
         .arg(std::env::current_exe().unwrap())
