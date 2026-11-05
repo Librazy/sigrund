@@ -83,18 +83,31 @@ Keep architecture identifiers in build cache keys and acceptance artifact names.
 The acceptance jobs run natively with real delegation and identities on both
 architectures; cross-compilation alone does not validate these operations.
 
-Both CI and Packages call `.github/workflows/should-run.yml` before their checks.
-For branch pushes, it queries open PRs and skips the checks if the head branch
-belongs to this repository and matches the pushed branch. Only the small
-selection job runs for these duplicate push events. Branches without an open PR,
-tag pushes, pull request events (including forks) and manual dispatches run their
-normal jobs. Failure to query PRs fails the selection job.
+CI and Packages run on every push and manual dispatch, using ordinary jobs to
+avoid duplicate PR-triggered runs, skipped duplicate checks and reusable-call
+name prefixes. Each workflow first runs `scripts/resolve-ci-revision.py`. For a
+branch with exactly one open PR matching this repository, branch and event SHA,
+it selects GitHub's test merge commit and verifies that its parents match the
+PR's base and the pushed commit. Every subsequent job checks out that same SHA,
+and build cache keys use the selected revision.
 
-Concurrency groups include the workflow name and either the PR number or branch
-ref, with `cancel-in-progress: true`. This keeps at most one current run per
-workflow for each branch or PR, including manual branch runs. Keep branch and PR
-groups separate: a skipped push must not cancel the corresponding PR run. Keep
-CI and Packages groups separate so both workflows can validate the same change.
+Branches without a matching PR, conflicting PRs and tag pushes test the event
+commit. A PR that closes or moves while resolving also falls back to the event
+commit. Pending mergeability or stale merge parents are retried briefly; an
+unresolved merge, ambiguous PR targets or API errors fail revision selection.
+The run summary records the selected SHA and why it was chosen. The checks
+remain attached to the event SHA, even when a merge commit was tested.
+
+Opening a PR after a push, updating its base branch or retargeting it does not
+start another run. Push again to refresh its checks against the new merge, or
+dispatch manually to inspect the current revision. Manual workflow checks do
+not satisfy PR required-check rules. Fork PRs do not trigger CI in this repository;
+their pushes can run the workflows in the fork.
+
+Concurrency groups include the workflow name and branch or tag ref, with
+`cancel-in-progress: true`. This keeps at most one current run per workflow for
+each ref, including manual branch runs. Keep CI and Packages groups separate so
+both workflows can validate the same change.
 
 Lint workflow changes with:
 
