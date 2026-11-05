@@ -151,7 +151,8 @@ not bind mutable script files, imports or libraries. Execution uses the daemon's
 configured domain; it does not follow requester namespaces or automatically
 cross container boundaries. Root inside a container alone does not supply the
 required delegation and kernel access. These boundaries are discussed in
-[interpreter and execution-domain design notes](docs/INTERPRETERS_AND_EXECUTION_DOMAINS.md).
+[privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
+[namespace-aware execution design](docs/NAMESPACE_AWARE_EXECUTION.md).
 
 ## Development and verification
 
