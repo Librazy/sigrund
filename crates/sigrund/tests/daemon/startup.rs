@@ -243,7 +243,7 @@ pub(super) fn verify_audit_directory_replacement() {
 
 #[test]
 fn stale_audit_temporary_gate() {
-    let _gate = NAMESPACE_GATE.lock().unwrap();
+    let _gate = namespace_gate();
     let output = Command::new("unshare")
         .args(["--user", "--map-auto", "--map-root-user"])
         .arg(std::env::current_exe().unwrap())
