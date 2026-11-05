@@ -19,7 +19,7 @@ jobs:
     uses: ./.github/workflows/should-run.yml
 
   packages:
-    name: Packages
+    name: Build and smoke tests
     needs: should-run
     if: needs.should-run.outputs.run == 'true'
     uses: ./.github/workflows/packages-jobs.yml

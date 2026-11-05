@@ -19,7 +19,7 @@ jobs:
     uses: ./.github/workflows/should-run.yml
 
   ci:
-    name: CI
+    name: Rust validation
     needs: should-run
     if: needs.should-run.outputs.run == 'true'
     uses: ./.github/workflows/ci-jobs.yml
