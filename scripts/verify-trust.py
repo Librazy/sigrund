@@ -238,7 +238,10 @@ def ctime_gate(parent, binaries):
         native.chmod(0o755)
         # Offline export excludes ctime; even a correctly signed, unconsumed
         # client-full ctime warrant cannot be redeemed without its live guard.
-        payload, value = csr(f, native)
+        # Keep offline hashing above the snapshot bound without making this
+        # selection check depend on debug SHA-256 throughput on ARM64 runners.
+        offline = program(f, 'offline', size=SNAPSHOT_MAX_BYTES + 1)
+        payload, value = csr(f, offline)
         assert value['command']['executable_trust']['model'] == 'digest_direct'
         approved(f, payload, b'0\n')
         with OnlineApproval(f, native) as pending:
@@ -254,7 +257,7 @@ def ctime_gate(parent, binaries):
         old, _ = f.signed(native)
         code, out, _, events = finish(*request(f, warrant=old))
         assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', events
-        payload, value = csr(f, native)
+        payload, value = csr(f, offline)
         value['command']['executable_trust']['sha256'] = '00' * 32
         denied(f, canonical(value))
         # A surviving writable mapping excludes ctime before approval. The
@@ -323,7 +326,7 @@ def ctime_gate(parent, binaries):
         assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
         approved(f, payload, b'0\n')
         # Removing a model rejects outstanding warrants instead of downgrading.
-        payload, _ = csr(f, native)
+        payload, _ = csr(f, offline)
         f.stop()
         configure(f, ['digest_memfd'])
         f.launch()
