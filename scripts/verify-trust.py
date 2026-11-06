@@ -3,9 +3,11 @@
 import argparse
 import errno
 import hashlib
+import mmap
 import socket
 import json
 import os
+import re
 from pathlib import Path
 import runpy
 import select
@@ -87,6 +89,76 @@ def denied(f, payload, status='EXECUTABLE_MUTATED_OR_TOO_LARGE'):
     wait_for(f.empty, 'rejected trust job cleanup')
 
 
+class OnlineApproval:
+    """Keep the real approval broker connected throughout a guarded request."""
+    def __init__(self, fixture, program, **kwargs):
+        self.fixture, self.program, self.kwargs = fixture, program, kwargs
+        self.broker = None
+        self.child = self.output = None
+
+    def __enter__(self):
+        f = self.fixture
+        self.broker = socket.socket(socket.AF_UNIX)
+        self.broker.settimeout(6)
+        try:
+            before = f.diagnostics.read_text().count('"broker":true')
+            self.broker.connect(str(f.approval))
+            wait_for(lambda: f.diagnostics.read_text().count('"broker":true') > before,
+                     'trust approval broker registered')
+            self.child, self.output = request(f, command=self.program, **self.kwargs)
+            def exact(size):
+                result = b''
+                while len(result) < size:
+                    chunk = self.broker.recv(size - len(result))
+                    assert chunk, ('approval EOF', f.diagnostics.read_text())
+                    result += chunk
+                return result
+            length = struct.unpack('>I', exact(4))[0]
+            assert 0 < length <= 524288, length
+            self.approval = json.loads(exact(length))
+            self.payload = self.approval['csr_payload'].encode()
+            self.value = json.loads(self.payload)
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def sign(self):
+        _, self.envelope = self.fixture.sign_payload(self.payload)
+
+    def approve(self):
+        self.sign()
+        self.send()
+
+    def send(self):
+        response = canonical({'status': 'approved', 'exec_id': self.approval['exec_id'],
+                              'dsse_envelope': self.envelope})
+        self.broker.sendall(struct.pack('>I', len(response)) + response)
+
+    def finish(self):
+        return finish(self.child, self.output)
+
+    def __exit__(self, *ignored):
+        if self.child is not None and self.child.poll() is None:
+            self.child.kill()
+            self.child.communicate(timeout=5)
+        if self.output is not None:
+            self.output.close()
+        if self.broker is not None:
+            self.broker.close()
+
+
+def online_approved(f, program, expected, **kwargs):
+    with OnlineApproval(f, program, **kwargs) as pending:
+        pending.approve()
+        code, stdout, stderr, events = pending.finish()
+        assert code == 0 and stdout == expected, (code, stdout, stderr, events, f.diagnostics.read_text())
+        assert [event.get('status') for event in events] == ['APPROVED', None, 'EXITED'], events
+        wait_for(f.empty, 'online trust job cleanup')
+        records = [r for r in f.records() if r.get('exec_id') == events[0]['exec_id']]
+        return pending.value, records
+
+
 def program(f, name='native', size=67_108_865, pause=False):
     source = f.base / 'native.c'
     source.write_text('#include <unistd.h>\n#include <stdio.h>\n#include <fcntl.h>\n#include <signal.h>\n'
@@ -110,8 +182,8 @@ def configure(f, models=None):
     text = path.read_text().replace('max_executable_bytes = 67108864',
                                     f'max_executable_bytes = {SNAPSHOT_MAX_BYTES}')
     if models is not None:
-        text = text.replace('executable_trust_models = ' + json.dumps(DEFAULT_MODELS),
-                            'executable_trust_models = ' + json.dumps(models))
+        text = re.sub(r'^executable_trust_models = .*$',
+                      'executable_trust_models = ' + json.dumps(models), text, flags=re.MULTILINE)
     path.write_text(text)
 
 
@@ -132,22 +204,20 @@ def ctime_gate(parent, binaries):
         configure(f)
         f.launch()
         for target, caps in [(0, ()), (33, ()), (33, ('CAP_NET_BIND_SERVICE',))]:
-            payload, value = csr(f, native, target=target, capabilities=caps)
+            value, records = online_approved(f, native, f'{target}\n'.encode(),
+                                             target=target, capabilities=caps)
             assert value['version'] == '2.0' and 'executable_sha256' not in value['command']
             trust = value['command']['executable_trust']
             assert trust['model'] == 'ctime' and int(trust['size']) == 67_108_865, trust
-            records = approved(f, payload, f'{target}\n'.encode())
             assert records[1]['exec_outcome'] == 'exec_event_observed', records
             assert records[0]['executable_trust'] == trust, records
         # A detached ctime job may suspend normally and resume without being
         # mistaken for an unexpected ptrace stop by the coordinator.
         suspend = program(f, 'suspend', size=None, pause=True)
         marker = f.base / 'suspended'
-        payload, value = csr(f, suspend, args=(marker,))
-        assert value['command']['executable_trust']['model'] == 'ctime'
-        path, _ = f.sign_payload(payload)
-        child, output = request(f, warrant=path)
-        try:
+        with OnlineApproval(f, suspend, args=(marker,)) as pending:
+            assert pending.value['command']['executable_trust']['model'] == 'ctime'
+            pending.approve()
             wait_for(marker.exists, 'suspend program entry')
             pids = [int(pid) for group in (f.group / 'jobs').glob('job-*/cgroup.procs')
                     for pid in group.read_text().split()]
@@ -155,29 +225,91 @@ def ctime_gate(parent, binaries):
             status = Path(f'/proc/{pids[0]}/status')
             wait_for(lambda: '\nState:\tT (stopped)\n' in status.read_text(), 'ordinary SIGSTOP')
             time.sleep(0.15)  # Let the coordinator poll the stopped child.
-            assert child.poll() is None and status.exists(), f.diagnostics.read_text()
+            assert pending.child.poll() is None and status.exists(), f.diagnostics.read_text()
             os.kill(pids[0], signal.SIGCONT)
-            code, stdout, stderr, events = finish(child, output)
+            code, stdout, stderr, events = pending.finish()
             assert code == 0 and stdout == b'0\n', (code, stdout, stderr, events)
             wait_for(f.empty, 'resumed ctime job cleanup')
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.communicate(timeout=5)
-            output.close()
+        # An execute-only source uses thin expansion and the same lease guard.
+        native.chmod(0o111)
+        value, _ = online_approved(f, native, b'0\n')
+        assert value['request_origin'] == 'daemon_expanded_thin'
+        assert value['command']['executable_trust']['model'] == 'ctime'
+        native.chmod(0o755)
+        # Offline export excludes ctime; even a correctly signed, unconsumed
+        # client-full ctime warrant cannot be redeemed without its live guard.
+        payload, value = csr(f, native)
+        assert value['command']['executable_trust']['model'] == 'digest_direct'
+        approved(f, payload, b'0\n')
+        with OnlineApproval(f, native) as pending:
+            assert pending.value['request_origin'] == 'client_full'
+            response = canonical({
+                'status': 'rejected', 'exec_id': pending.approval['exec_id'], 'reason': 'fixture',
+            })
+            pending.broker.sendall(struct.pack('>I', len(response)) + response)
+            assert pending.finish()[0] == 255
+            payload = pending.payload
+        denied(f, payload)
         # A signed legacy digest may not silently use either direct model.
         old, _ = f.signed(native)
         code, out, _, events = finish(*request(f, warrant=old))
         assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', events
         payload, value = csr(f, native)
-        value['command']['executable_trust']['inode'] = '1'
+        value['command']['executable_trust']['sha256'] = '00' * 32
         denied(f, canonical(value))
-        # An already-open writer prevents exec, regardless of unchanged ctime.
+        # A surviving writable mapping excludes ctime before approval. The
+        # full CSR fixes its model, so selection cannot silently downgrade it.
         marker = f.base / 'must-not-exist'
-        payload, _ = csr(f, native, args=(marker,))
-        with native.open('r+b'):
-            denied(f, payload, 'SPAWN_FAILED')
+        with native.open('r+b') as writer:
+            mapping = mmap.mmap(writer.fileno(), 4096, flags=mmap.MAP_SHARED,
+                                prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        try:
+            child, output = request(f, command=native, args=(marker,))
+            code, out, _, events = finish(child, output)
+            assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', events
+        finally:
+            mapping.close()
         assert not marker.exists()
+        # Breaking the lease before or after signing invalidates the attempt,
+        # even though the nonblocking open never changes the executable.
+        for after_signing in (False, True):
+            with OnlineApproval(f, native, args=(marker,)) as pending:
+                before = native.stat().st_ctime_ns
+                if after_signing:
+                    pending.sign()
+                try:
+                    fd = os.open(native, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as error:
+                    assert error.errno == errno.EWOULDBLOCK, error
+                else:
+                    os.close(fd)
+                    raise AssertionError('guarded executable accepted a writer')
+                assert native.stat().st_ctime_ns == before
+                try:
+                    if after_signing:
+                        pending.send()
+                    else:
+                        pending.approve()
+                except BrokenPipeError:
+                    pass
+                code, out, _, events = pending.finish()
+                assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', events
+            wait_for(f.empty, 'broken lease cleanup')
+            fd = os.open(native, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(fd)
+            assert not marker.exists()
+        assert any('lease' in r.get('reason', '') for r in f.records()), f.records()
+        # No response and a lost broker both release their leases on failure.
+        for disconnect in (False, True):
+            with OnlineApproval(f, native, args=(marker,)) as pending:
+                if disconnect:
+                    pending.broker.close()
+                code, out, _, events = pending.finish()
+                assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', events
+            wait_for(f.empty, 'abandoned approval cleanup')
+            fd = os.open(native, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(fd)
+            assert not marker.exists()
         # Unsafe permissions fall through to the original snapshot path.
         unsafe = program(f, 'unsafe', size=None)
         unsafe.chmod(0o777)
@@ -197,6 +329,16 @@ def ctime_gate(parent, binaries):
         f.launch()
         denied(f, payload)
         f.stop()
+        # A ctime-only policy cannot export an offline CSR.
+        configure(f, ['ctime'])
+        f.launch()
+        export = f.base / 'ctime-only.csr'
+        result = subprocess.run([str(f.client_binary), '--socket', str(f.client), '--cwd', '/',
+                                 '--export-csr', str(export), '--', str(native)],
+                                preexec_fn=unprivileged, capture_output=True, timeout=6)
+        assert result.returncode != 0 and b'no enabled executable model' in result.stderr, result
+        assert not export.exists()
+        f.stop()
     finally:
         cleanup(f)
 
@@ -210,21 +352,23 @@ def mutation_gate(parent, binaries):
         configure(f)
         gate = Gate(f, 'clone-after')
         marker = f.base / 'mutation-must-not-run'
-        payload, _ = csr(f, native, args=(marker,))
-        path, _ = f.sign_payload(payload)
         gate.arm()
-        child, output = request(f, warrant=path)
-        gate.arrive()
-        before = native.stat()
-        with native.open('r+b') as writer:
-            writer.seek(-1, os.SEEK_END)
-            writer.write(b'X')
-        assert native.stat().st_size == before.st_size
-        assert native.stat().st_ctime_ns != before.st_ctime_ns
-        gate.unblock()
-        code, out, err, events = finish(child, output)
-        child = output = None
-        assert code == 254 and not out and events[0]['status'] == 'APPROVED' and events[-1]['status'] in ('SETUP_FAILED','EXEC_FAILED'), (code, out, err, events)
+        with OnlineApproval(f, native, args=(marker,)) as pending:
+            assert pending.value['command']['executable_trust']['model'] == 'ctime'
+            pending.approve()
+            gate.arrive()
+            before = native.stat().st_ctime_ns
+            try:
+                fd = os.open(native, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                assert error.errno == errno.EWOULDBLOCK, error
+            else:
+                os.close(fd)
+                raise AssertionError('post-signing writer was not excluded')
+            assert native.stat().st_ctime_ns == before
+            gate.unblock()
+            code, out, err, events = pending.finish()
+            assert code == 254 and not out and events[0]['status'] == 'APPROVED' and events[-1]['status'] in ('SETUP_FAILED','EXEC_FAILED'), (code, out, err, events)
         assert not marker.exists()
         wait_for(f.empty, 'mutated exec stopped and cleaned')
         assert any('exec checkpoint failed' in r.get('reason', '') for r in f.records()), f.records()
@@ -420,7 +564,7 @@ def noexec_gate(parent, binaries):
         configure(f)
         f.launch()
         payload, value = csr(f, native)
-        assert value['command']['executable_trust']['model'] == 'ctime'
+        assert value['command']['executable_trust']['model'] == 'digest_direct'
         f.stop()
         subprocess.run(['mount', '-o', 'remount,noexec,nosuid,nodev', str(f.commands)], check=True)
         f.launch()
@@ -443,25 +587,33 @@ def tracer_death_gate(parent, binaries):
         configure(f)
         gate = Gate(f, 'exec-detach')
         marker = f.base / 'tracer-death-must-not-run'
-        payload, _ = csr(f, native, args=(marker,))
-        path, _ = f.sign_payload(payload)
         gate.arm()
-        child, output = request(f, warrant=path)
-        assert select.select([gate.entered], [], [], 6)[0], f.diagnostics.read_text()
-        message = b''
-        while len(message) < 16:
-            message += gate.entered.recv(16 - len(message))
-        tid, pid = struct.unpack('=QQ', message)
-        assert tid == f.process.pid, (tid, f.process.pid)
-        assert not marker.exists()
-        pidfd = os.pidfd_open(pid)
-        f.process.kill()
-        f.process.wait(timeout=5)
-        assert select.select([pidfd], [], [], 5)[0], 'EXITKILL did not kill the stopped tracee'
-        assert not marker.exists()
-        code, out, _, _ = finish(child, output)
-        child = output = None
-        assert code != 0 and not out
+        with OnlineApproval(f, native, args=(marker,)) as pending:
+            assert pending.value['command']['executable_trust']['model'] == 'ctime'
+            pending.approve()
+            assert select.select([gate.entered], [], [], 6)[0], f.diagnostics.read_text()
+            message = b''
+            while len(message) < 16:
+                message += gate.entered.recv(16 - len(message))
+            tid, pid = struct.unpack('=QQ', message)
+            assert tid == f.process.pid, (tid, f.process.pid)
+            assert not marker.exists()
+            # The lease has been handed off, but the stopped loaded inode
+            # already rejects writers through executable write exclusion.
+            try:
+                fd = os.open(native, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                assert error.errno == errno.ETXTBSY, error
+            else:
+                os.close(fd)
+                raise AssertionError('exec handoff left a writable gap')
+            pidfd = os.pidfd_open(pid)
+            f.process.kill()
+            f.process.wait(timeout=5)
+            assert select.select([pidfd], [], [], 5)[0], 'EXITKILL did not kill the stopped tracee'
+            assert not marker.exists()
+            code, out, _, _ = pending.finish()
+            assert code != 0 and not out
     finally:
         if pidfd is not None:
             os.close(pidfd)

@@ -635,7 +635,7 @@ after rename/unlink or integrity of the loader, shared libraries or other inputs
 | Model | Signed executable evidence | Before durable consumption | At exec stop |
 | --- | --- | --- | --- |
 | `fs_verity` | Kernel verity algorithm and descriptor measurement | Remeasure and recheck eligibility/expected credentials | Same inode, verity measurement, eligibility and exact credentials |
-| `ctime` | Device, inode, size, ctime seconds and nanoseconds | Same version and root-managed eligibility | Same version, inode, eligibility and exact credentials |
+| `ctime` | Device, inode, size, ctime seconds and nanoseconds; online approval only | Same version, root-managed eligibility and uninterrupted read lease from before approval | Same version, inode, eligibility and exact credentials; hand off intact lease to kernel executable write exclusion |
 | `digest_direct` | Full-file SHA-256 | Recheck eligibility; rehash if the internal version fingerprint changed | Same inode, mandatory full-file hash, eligibility and exact credentials |
 | `digest_memfd` | Typed full-file `sha256` | Verify sealed snapshot and existing bounds | Existing untraced exec path |
 
@@ -659,6 +659,37 @@ size as canonical unsigned decimal strings (inode/size positive, size at most
 `i64::MAX`), and ctime as nonnegative bounded seconds plus nanoseconds below one
 billion. Updates require fresh approval. This is a version check, not a content
 signature or protection against malicious privileged timestamp manipulation.
+
+Ctime is available only for online approval. Client evidence is tentative;
+equality with the client's earlier byte observation is best effort. The required
+content-integrity interval begins before the mandator signs and ends at the
+verified exec checkpoint. Before requesting approval, the daemon acquires
+`F_SETLEASE(F_RDLCK)` on the retained source. Retry contention every 10 ms for at
+most 250 ms, checking cancellation and the request deadline. Unsupported leasing
+or exhausted contention makes this candidate unavailable before approval;
+completed full CSRs cannot change their selected model.
+
+Under the lease, bracket `fsync` with `statx(AT_EMPTY_PATH | AT_STATX_FORCE_SYNC)`
+and require identical device/inode/size/ctime, rechecked eligibility and an intact
+read lease. I/O failures, inconsistent observations and late results reject.
+These operations run on the reserved worker; the deadline cannot forcibly
+interrupt a blocked filesystem syscall. Fsync does not reconstruct historical
+mapped writes and is not the source of the integrity guarantee.
+
+Keep the same lease through approval, authorization and launch. Consume SIGIO as
+a wakeup through the daemon's signalfd, and use `F_GETLEASE` to detect pending
+breaks and forced revocation independently of notification delivery. Any break,
+loss or query failure irreversibly invalidates the attempt, even without changed
+bytes; never reacquire a lease for that approval. After all exec-stop inode,
+evidence, eligibility and credential checks succeed, release the lease on the
+worker and hand protection to the loaded inode's kernel executable write
+exclusion before allowing target instructions. Existing cleanup and durable
+consumption rules apply. Administrative writers may interrupt approval.
+
+Offline CSR export skips ctime while preserving the remaining configured model
+order. Reject ctime warrants on the pre-signed redemption endpoint, including
+older warrants and separately resubmitted online approvals. No protected offline
+signing session is provided.
 
 **digest_direct.** Admit only ext-family, F2FS, Btrfs, XFS and tmpfs, whose Linux
 executable write exclusion makes a full hash at the exec stop authoritative.

@@ -189,6 +189,13 @@ avoid executable hashing. Other files use digest+sealed memfd. Set
 `["digest_memfd"]` for snapshot-only operation; see the executable trust section
 in [implementation notes](IMPLEMENTATION_NOTES.md) for guarantees and compatibility.
 
+Ctime is available only for online approval. The daemon holds a read lease from
+before signing through the verified exec stop; a lease break invalidates the
+request even if no bytes changed. Administrative writers can therefore interrupt
+an approval. Offline CSR export skips ctime, and pre-signed ctime warrants are
+rejected. Client evidence is tentative; the daemon establishes the protected
+baseline before requesting approval.
+
 Recognized OSTree ComposeFS roots use `digest_direct` by default after daemon
 startup checks the administrator-protected backing object store. This trusts
 administrators to preserve object protection and never modify active objects in

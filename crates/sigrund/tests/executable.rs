@@ -362,13 +362,15 @@ fn ctime_namespace_fixture() {
         .is_err()
     );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The metadata failure above invalidates this approval. Release its lease
+    // before intentionally opening a writer for subsequent digest-model tests.
+    drop(prepared);
     File::options()
         .write(true)
         .open(&path)
         .unwrap()
         .set_len(100)
         .unwrap();
-    assert!(prepared.verify_direct(&context().into()).is_err());
     assert_eq!(budget.usage(1001), (0, 0));
 
     // Writable local sources use bounded direct hashing without snapshot RAM.

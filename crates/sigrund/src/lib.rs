@@ -7,6 +7,7 @@ pub mod cli;
 pub mod client;
 mod composefs;
 mod context;
+mod ctime_guard;
 pub mod daemon;
 pub mod executable;
 pub mod execution;

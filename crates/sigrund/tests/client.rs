@@ -63,6 +63,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_models(&["digest_memfd"], false)
+    }
+    fn with_models(models: &[&str], checkpoint: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let binary = dir.path().join("sigrun");
@@ -81,6 +84,7 @@ impl Fixture {
             fs::Permissions::from_mode(0o666),
         )
         .unwrap();
+        let models: Vec<String> = models.iter().map(|model| (*model).to_owned()).collect();
         thread::spawn(move || {
             if let Ok((mut socket, _)) = context.accept() {
                 socket.set_nonblocking(true).unwrap();
@@ -94,10 +98,10 @@ impl Fixture {
                 socket.set_nonblocking(false).unwrap();
                 send(&mut socket, FrameType::ServerContext, &serde_json::to_vec(&serde_json::json!({
                     "version":"2.0", "host_id":format!("sigrun-host:sha256:{}", "0".repeat(64)), "policy_generation":1,
-                    "executable_trust_models":["digest_memfd"],
+                    "executable_trust_models":models,
                     "limits":{"max_executable_bytes":67108864,"max_direct_digest_bytes":268435456,"direct_digest_timeout_ms":5000,
                         "max_stdin_bytes":16777216,"max_ttl_secs":3600,"max_onetime_window_secs":3600,"authorization_timeout_ms":120000},
-                    "features":{"direct_exec_checkpoint":false,"host_file_capabilities":false,"tty_modes":["stdio"],"stdin_policies":["null","sha256"],"grant_modes":["one_time"]}
+                    "features":{"direct_exec_checkpoint":checkpoint,"host_file_capabilities":false,"tty_modes":["stdio"],"stdin_policies":["null","sha256"],"grant_modes":["one_time"]}
                 })).unwrap());
             }
         });
@@ -320,6 +324,76 @@ fn client_namespace_fixture() {
     verify_signals_and_blocked_sink(false);
     verify_signals_and_blocked_sink(true);
     verify_terminal();
+    verify_ctime_online_and_offline_selection();
+}
+
+fn verify_ctime_online_and_offline_selection() {
+    for offline in [false, true] {
+        let fixture = Fixture::with_models(&["ctime", "digest_direct", "digest_memfd"], true);
+        let program = fixture._dir.path().join("program");
+        fs::copy("/bin/true", &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = fixture.command();
+        if offline {
+            let export = fixture._dir.path().join("export");
+            fs::create_dir(&export).unwrap();
+            fs::set_permissions(&export, fs::Permissions::from_mode(0o777)).unwrap();
+            let path = export.join("request.csr");
+            let output = command
+                .arg("--export-csr")
+                .arg(&path)
+                .arg("--")
+                .arg(&program)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(
+                value["command"]["executable_trust"]["model"],
+                "digest_direct"
+            );
+            assert!(fixture.listener.set_nonblocking(true).is_ok());
+            assert_eq!(
+                fixture.listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        } else {
+            let mut child = command.arg("--").arg(&program).spawn().unwrap();
+            let (mut socket, _) = fixture.listener.accept().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let frame = hello(&socket);
+            let hello: ClientHello = serde_json::from_slice(&frame.payload).unwrap();
+            assert_eq!(hello.mode, "full_csr");
+            let value: serde_json::Value =
+                serde_json::from_str(hello.csr_payload.as_ref().unwrap()).unwrap();
+            assert_eq!(value["command"]["executable_trust"]["model"], "ctime");
+            decide(&mut socket, "REJECTED");
+            assert_eq!(child.wait().unwrap().code(), Some(255));
+        }
+    }
+    let fixture = Fixture::with_models(&["ctime"], true);
+    let program = fixture._dir.path().join("program");
+    fs::copy("/bin/true", &program).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = fixture
+        .command()
+        .arg("--export-csr")
+        .arg(fixture._dir.path().join("must-not-exist"))
+        .arg("--")
+        .arg(&program)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no enabled executable model applies"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn verify_fragmentation_and_invalid_server_data() {
