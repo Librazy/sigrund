@@ -89,6 +89,19 @@ def denied(f, payload, status='EXECUTABLE_MUTATED_OR_TOO_LARGE'):
     wait_for(f.empty, 'rejected trust job cleanup')
 
 
+def wait_for_lease_cleanup(path):
+    # Empty job cgroups do not imply that the reserved worker has disposed of
+    # the request and released its executable lease. Observe that separately.
+    def writable():
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        except BlockingIOError:
+            return False
+        os.close(fd)
+        return True
+    wait_for(writable, 'executable read lease cleanup')
+
+
 class OnlineApproval:
     """Keep the real approval broker connected throughout a guarded request."""
     def __init__(self, fixture, program, **kwargs):
@@ -298,8 +311,7 @@ def ctime_gate(parent, binaries):
                 code, out, _, events = pending.finish()
                 assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', events
             wait_for(f.empty, 'broken lease cleanup')
-            fd = os.open(native, os.O_WRONLY | os.O_NONBLOCK)
-            os.close(fd)
+            wait_for_lease_cleanup(native)
             assert not marker.exists()
         assert any('lease' in r.get('reason', '') for r in f.records()), f.records()
         # No response and a lost broker both release their leases on failure.
@@ -310,8 +322,7 @@ def ctime_gate(parent, binaries):
                 code, out, _, events = pending.finish()
                 assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', events
             wait_for(f.empty, 'abandoned approval cleanup')
-            fd = os.open(native, os.O_WRONLY | os.O_NONBLOCK)
-            os.close(fd)
+            wait_for_lease_cleanup(native)
             assert not marker.exists()
         # Unsafe permissions fall through to the original snapshot path.
         unsafe = program(f, 'unsafe', size=None)

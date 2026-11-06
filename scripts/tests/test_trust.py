@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tempfile
 import tomllib
 from types import SimpleNamespace
@@ -14,6 +15,47 @@ TRUST = runpy.run_path(str(REPO / 'scripts/verify-trust.py'))
 
 
 class TrustFixtureTests(unittest.TestCase):
+    def test_lease_cleanup_waits_for_delayed_owner_disposal(self):
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:
+            path = Path(directory) / 'executable'
+            path.write_bytes(b'fixture')
+            # The owner releases its lease after receiving a break notification,
+            # as a delayed request-disposal worker would do after rejection.
+            owner = subprocess.Popen([sys.executable, '-c', '''
+import fcntl
+import os
+import signal
+import sys
+import time
+
+source = open(sys.argv[1], 'rb')
+def dispose(signum, frame):
+    time.sleep(0.1)
+    source.close()
+    raise SystemExit(0)
+signal.signal(signal.SIGIO, dispose)
+fcntl.fcntl(source, fcntl.F_SETOWN, os.getpid())
+fcntl.fcntl(source, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+print('ready', flush=True)
+signal.pause()
+''', str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(owner.stdout.readline(), 'ready\n')
+                with self.assertRaises(BlockingIOError):
+                    os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                TRUST['wait_for_lease_cleanup'](path)
+                _, stderr = owner.communicate(timeout=5)
+                self.assertEqual(owner.returncode, 0, stderr)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                owner.communicate(timeout=5)
+
+    def test_lease_cleanup_propagates_unrelated_open_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(FileNotFoundError):
+                TRUST['wait_for_lease_cleanup'](Path(directory) / 'missing')
+
     def test_native_programs_straddle_snapshot_bound_and_remain_executable(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
