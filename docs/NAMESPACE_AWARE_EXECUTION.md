@@ -88,6 +88,12 @@ remain visible; they cannot be converted into support claims by documentation.
 **Dependencies:** None. **Subsystems:** source transport, target acquisition,
 Linux helpers, cgroups/reaping, LSM verification, core policy/schema design.
 
+The [Phase 0 contracts and experiment record](NAMESPACE_PHASE0.md) defines the
+constrained-anchor prototype, bounded schemas, commands and qualification limits.
+Its isolated experiments do not enable production namespace execution. In
+particular, strict safety under concurrent SELinux policy replacement remains a
+blocked deployment combination.
+
 **Deliverables:**
 
 - Resolve G-01: define connector versus message-sender attribution for self;

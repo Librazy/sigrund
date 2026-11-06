@@ -514,6 +514,15 @@ of manager execution policy (NS-13).
 
 ## 2. Wire Protocol, Request Shapes, and Job Lifecycle
 
+The [Phase 0 contract supplement](docs/NAMESPACE_PHASE0.md) fixes the initial
+constrained-anchor source-attribution mechanism, bounded private acquisition and
+constraint records, target-scoped policy/management grammar, binding distribution
+and quota defaults. Its experimental validators and fixtures are the concrete
+draft schema reference for the initial profile. These are not production v2
+interfaces. Unsupported combinations and the concurrent-SELinux-policy-replacement
+limitation remain blocked; later runtime gates must implement and validate the
+same contracts before issuing bindings or making support claims.
+
 ### 2.1 Binary Framing & Public Outcome Contract
 
 Use the existing five-byte framing: one type byte, then a four-byte unsigned

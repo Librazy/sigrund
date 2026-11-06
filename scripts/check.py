@@ -44,6 +44,7 @@ def main():
         ('diff', ['git', 'diff', '--check']),
         ('python', [sys.executable, '-c', "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').glob('*.py')]"]),
         ('harness-tests', [sys.executable, '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-v']),
+        ('namespace-vectors', [sys.executable, 'scripts/namespace-phase0/verify-vectors.py']),
         ('platform-build', ['cargo', 'test', '-p', 'sigrund', '--test', 'cgroup', '--locked', '--no-run', '--message-format=json']),
     ]
     try:

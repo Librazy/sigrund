@@ -4,6 +4,11 @@ The [security specification](<sigrun sigrund Security Architecture and Implement
 now defines the **draft v3 target**, including namespace-aware execution. These
 notes describe the implemented **v2 local one-time SSH/stdio profile**; the
 specification rewrite does not change runtime contracts or establish v3 support.
+The [Phase 0 supplement](docs/NAMESPACE_PHASE0.md) records isolated namespace
+experiments and draft schema fixtures in the non-production `sigrund-phase0`
+crate. Passing experiments do not establish integrated namespace support; strict
+concurrent SELinux policy-replacement safety remains blocked.
+
 The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) tracks v3 delivery and
 release gates. Deferred features and acceptance limits below remain part of the
 current implementation assessment.

@@ -1,0 +1,35 @@
+policy_module(sigrund_phase0, 1.0)
+
+# Disposable-host feasibility policy, not production daemon packaging policy.
+type sigrund_phase0_t;
+domain_type(sigrund_phase0_t)
+type sigrund_phase0_supervisor_t;
+domain_type(sigrund_phase0_supervisor_t)
+# The experimental host authority needs broad administrative access. This is
+# deliberately separate from the confined workload and is not packaging policy.
+unconfined_domain(sigrund_phase0_supervisor_t)
+type sigrund_phase0_supervisor_exec_t;
+domain_entry_file(sigrund_phase0_supervisor_t, sigrund_phase0_supervisor_exec_t)
+type sigrund_phase0_exec_t;
+domain_entry_file(sigrund_phase0_t, sigrund_phase0_exec_t)
+type sigrund_phase0_secret_t;
+files_type(sigrund_phase0_secret_t)
+
+gen_require(`
+    type unconfined_t;
+    role unconfined_r;
+')
+role unconfined_r types sigrund_phase0_t;
+role unconfined_r types sigrund_phase0_supervisor_t;
+allow unconfined_t sigrund_phase0_supervisor_t:process transition;
+allow unconfined_t sigrund_phase0_t:process { transition ptrace signal sigkill sigstop getattr };
+allow unconfined_t sigrund_phase0_t:process2 { nnp_transition nosuid_transition };
+allow sigrund_phase0_t unconfined_t:fd use;
+allow sigrund_phase0_t unconfined_t:fifo_file { write getattr };
+allow sigrund_phase0_t self:process { sigchld getcap };
+allow sigrund_phase0_supervisor_t sigrund_phase0_t:process { transition ptrace signal sigkill sigstop getattr };
+allow sigrund_phase0_supervisor_t sigrund_phase0_t:process2 { nnp_transition nosuid_transition };
+allow sigrund_phase0_t sigrund_phase0_supervisor_t:fd use;
+allow sigrund_phase0_t sigrund_phase0_supervisor_t:fifo_file { write getattr };
+files_search_all(sigrund_phase0_t)
+# Deliberately no read/open permission for sigrund_phase0_secret_t.
