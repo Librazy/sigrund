@@ -230,6 +230,15 @@ pub(crate) fn prepare(
                 "no verified signer satisfies static policy",
             ));
         }
+        if matches!(
+            warrant.warrant().command.executable_trust,
+            Some(sigrund_core::executable::ExecutableTrust::Ctime { .. })
+        ) {
+            return Err(fail(
+                "POLICY_VIOLATION",
+                "ctime warrants require a live online approval read lease",
+            ));
+        }
         Some((warrant, signer_ids))
     } else if let Some(payload) = &request.hello.csr_payload {
         Some((
@@ -561,15 +570,15 @@ pub(crate) fn approve(
             broker_poll(socket.as_raw_fd(), libc::POLLIN)?;
         }
     })()
-    .map_err(|_| {
+    .map_err(|error| {
         fail(
             "APPROVAL_FAILED",
-            "approval connection lost, expired or malformed",
+            format!("approval connection lost, expired or malformed: {error}"),
         )
     })?;
     request
         .check()
-        .map_err(|_| fail("APPROVAL_FAILED", "approval deadline expired"))?;
+        .map_err(|error| fail("APPROVAL_FAILED", format!("approval check failed: {error}")))?;
     let warrant = approval
         .bind_response(&exchange)
         .map_err(|_| fail("POLICY_VIOLATION", "approval differs from retained request"))?;
@@ -1020,6 +1029,25 @@ mod tests {
             matches!(&request.prepared.as_ref().unwrap().document, Document::Signed { signer_ids, .. } if signer_ids==&["mandator-alice-yubikey"])
         );
         drop(request);
+        // A valid signature cannot establish a lease back to signing time.
+        // Reject this before opening the source, independently of model policy.
+        let mut ctime = warrant.warrant().clone();
+        ctime.command.executable_trust = Some(sigrund_core::executable::ExecutableTrust::Ctime {
+            device: "1".into(),
+            inode: "1".into(),
+            size: "1".into(),
+            ctime_sec: 1,
+            ctime_nsec: 0,
+        });
+        let ctime = CanonicalWarrant::new(ctime).unwrap();
+        let mut request = fixture.request(signed_hello(&ctime, "sigrun.warrant.v2", 7), None);
+        let error = prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("live online approval read lease")
+        );
+        assert!(request.snapshots.is_none());
         // Digest failures happen after authenticated candidate selection.
         for stdin in [false, true] {
             let mut w = warrant.warrant().clone();

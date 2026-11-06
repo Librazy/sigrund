@@ -198,6 +198,37 @@ against whole-state rollback without an external checkpoint.
 "digest_memfd"]`. Selection precedes approval; a signed warrant never switches
 models. Set `["digest_memfd"]` for snapshot-only operation.
 
+Ctime is online-only. Unprivileged clients submit a tentative version fingerprint;
+matching their earlier byte observation is best effort. Before requesting the
+mandator's signature, the daemon acquires `F_SETLEASE(F_RDLCK)` on the retained
+source and establishes a protected baseline. Existing writable FDs and surviving
+shared writable mappings prevent acquisition. Contention is retried every 10 ms
+for at most 250 ms, within the request deadline. Unsupported leasing or exhausted
+contention permits selection of another model before approval; a completed full
+CSR naming ctime is rejected if that model cannot be established.
+
+Under the lease, two `statx(AT_EMPTY_PATH | AT_STATX_FORCE_SYNC)` observations
+bracket `fsync`; device, inode, size and ctime must agree, and eligibility is
+rechecked. Synchronization runs on a reserved worker and does not promise an
+interruptible syscall. Late completion is rejected under the existing deadline.
+The uninterrupted lease, rather than timestamp changes during synchronization,
+protects content from signing through execution.
+
+The daemon consumes SIGIO through signalfd; `F_GETLEASE` is authoritative even
+when signals coalesce or arrive late. A pending break, forced revocation or failed
+lease query invalidates the attempt without reacquisition or refund after durable
+consumption. The lease remains held through approval, authorization and launch.
+After inode, evidence, metadata and credential verification at the exec stop, the
+worker releases it: kernel executable write exclusion already protects the loaded
+inode before target entry. Rejection, cancellation, timeout and shutdown release
+leases through worker-owned cleanup. Administrative writers can delay acquisition
+or interrupt approval even without modifying bytes.
+
+Offline export skips ctime and chooses the first remaining eligible configured
+model; a ctime-only policy cannot export a CSR. Pre-signed ctime warrants,
+including warrants from older builds or resubmitted online approvals, are rejected
+because redemption cannot establish protection back to their signing time.
+
 `[digest_direct].allow_admin_trusted_composefs` defaults to `true`; set it to
 `false` to exclude ComposeFS from direct execution. Existing executable-root
 allowlists still apply. At startup the daemon recognizes only the host's booted,
@@ -238,7 +269,8 @@ privileged writer changing executable pages after the final hash. A read-only
 view alone is insufficient. `ctime` and `fs_verity` eligibility are unchanged.
 
 Verity binds a kernel-measured descriptor digest. Ctime binds the version of an
-eligible root-managed local ELF. Digest_direct signs a full-file SHA-256 and
+eligible root-managed local ELF under a continuous online-approval read lease.
+Digest_direct signs a full-file SHA-256 and
 executes the retained source, then hashes again at `PTRACE_EVENT_EXEC` before any
 loader/target instruction. All direct models revalidate execution metadata and
 exact credentials at authorization and at the exec stop. Supported direct files
@@ -344,7 +376,8 @@ writable directory:
   --export-csr request.csr -- "$TEST_COMMANDS/id" -u
 ```
 
-Export queries only public context; unreadable or incomplete evidence fails locally.
+Export queries only public context and skips the online-only ctime model;
+unreadable, incomplete or unavailable offline evidence fails locally.
 Have root obtain the exact file, review every field, then sign and package it.
 Choose new output paths; the helpers refuse overwrites. The example below assumes
 root has copied that requester file to `$TEST_BASE/request.csr`:

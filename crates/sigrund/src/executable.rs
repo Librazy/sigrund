@@ -1,5 +1,6 @@
 //! Worker-owned executable selection and evidence verification.
 use crate::{
+    ctime_guard::CtimeGuard,
     snapshot::{self, SealedSnapshot, SnapshotBudget},
     transport::invalid,
 };
@@ -30,6 +31,7 @@ pub struct Executable {
     hash_version: Option<ExecutableTrust>,
     direct_digest_limit: u64,
     admin_trusted_composefs_mount: Option<u64>,
+    ctime_guard: Option<CtimeGuard>,
 }
 impl From<SealedSnapshot> for Executable {
     fn from(sealed: SealedSnapshot) -> Self {
@@ -44,6 +46,7 @@ impl From<SealedSnapshot> for Executable {
             hash_version: None,
             direct_digest_limit: 0,
             admin_trusted_composefs_mount: None,
+            ctime_guard: None,
         }
     }
 }
@@ -57,6 +60,12 @@ impl AsFd for Executable {
     }
 }
 impl Executable {
+    pub(crate) fn check_ctime_guard(&self) -> io::Result<()> {
+        if let Some(guard) = &self.ctime_guard {
+            guard.check()?;
+        }
+        Ok(())
+    }
     pub fn admin_trusted_composefs(&self) -> bool {
         self.admin_trusted_composefs_mount.is_some()
     }
@@ -112,6 +121,7 @@ impl Executable {
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
         check()?;
+        self.check_ctime_guard()?;
         let source = self
             .source
             .as_ref()
@@ -169,6 +179,7 @@ impl Executable {
         if &observed != trust {
             return Err(invalid("executable evidence changed"));
         }
+        self.check_ctime_guard()?;
         check()
     }
     /// Called off-loop with the tracee stopped before its first user instruction.
@@ -250,6 +261,10 @@ impl Executable {
         if field("NoNewPrivs:") != Some("1") {
             return Err(invalid("exec lost no_new_privs"));
         }
+        check()?;
+        if let Some(guard) = &self.ctime_guard {
+            guard.handoff_to_exec()?;
+        }
         Ok(())
     }
 }
@@ -270,7 +285,7 @@ pub fn prepare(
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<Executable> {
     check()?;
-    let metadata = source.metadata()?;
+    let mut metadata = source.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(invalid("invalid executable type or size"));
     }
@@ -279,12 +294,15 @@ pub fn prepare(
             .as_ref()
             .map_or(TrustModel::DigestMemfd, ExecutableTrust::model)
     });
+    if required == Some(TrustModel::Ctime) {
+        return Err(invalid("ctime requires a live online approval read lease"));
+    }
     for model in &config.executable_trust_models {
         if required.is_some_and(|required| required != *model) {
             continue;
         }
         check()?;
-        let Some((trust, profile)) = inspect_model(
+        let Some((mut trust, mut profile)) = inspect_model(
             &source,
             &metadata,
             *model,
@@ -299,6 +317,27 @@ pub fn prepare(
         )?
         else {
             continue;
+        };
+        let ctime_guard = if *model == TrustModel::Ctime {
+            let Some(guard) = CtimeGuard::acquire(&source, &check)? else {
+                continue;
+            };
+            trust = guard.establish(&check)?;
+            metadata = source.metadata()?;
+            if !ctime_eligible(&source, &metadata)? || ctime(&metadata) != trust {
+                return Err(invalid("ctime executable changed during preparation"));
+            }
+            profile = direct_profile(
+                &source,
+                &metadata,
+                selection.context,
+                selection.allow_file_capabilities,
+            )?
+            .ok_or_else(|| invalid("ctime executable no longer eligible"))?;
+            guard.check()?;
+            Some(guard)
+        } else {
+            None
         };
         if *model == TrustModel::DigestMemfd {
             let mut executable: Executable =
@@ -332,6 +371,7 @@ pub fn prepare(
                 hash_version: None,
                 direct_digest_limit: config.max_direct_digest_bytes,
                 admin_trusted_composefs_mount,
+                ctime_guard,
             };
             let mut context: ExecutionContext = selection.context.clone().into();
             context.post_exec_capabilities = executable.post_exec_capabilities.clone();
@@ -394,10 +434,17 @@ fn inspect_model(
     Ok(trust.map(|t| (t, profile)))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum EvidencePurpose {
+    Online,
+    OfflineExport,
+}
+
 pub(crate) fn client_evidence(
     source: &File,
     context: &RequestedExecutionContext,
     public: &sigrund_core::protocol::PublicContext,
+    purpose: EvidencePurpose,
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<(ExecutableTrust, CapabilitySets)> {
     check()?;
@@ -418,6 +465,9 @@ pub(crate) fn client_evidence(
         allow_file_capabilities: public.features.host_file_capabilities,
     };
     for model in &public.executable_trust_models {
+        if *model == TrustModel::Ctime && matches!(purpose, EvidencePurpose::OfflineExport) {
+            continue;
+        }
         check()?;
         let Some((mut trust, profile)) = inspect_model(
             source,

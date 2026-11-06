@@ -511,6 +511,7 @@ fn full_csr(
     hello: &ClientHello,
     public: &sigrund_core::protocol::PublicContext,
     stdin_sha256: Option<String>,
+    purpose: crate::executable::EvidencePurpose,
 ) -> io::Result<Csr> {
     use std::os::unix::fs::OpenOptionsExt;
     let intent = hello
@@ -527,14 +528,19 @@ fn full_csr(
     .into();
     let deadline =
         Instant::now() + Duration::from_millis(public.limits.direct_digest_timeout_ms.into());
-    let (trust, profile) =
-        crate::executable::client_evidence(&source, &intent.execution_context, public, || {
+    let (trust, profile) = crate::executable::client_evidence(
+        &source,
+        &intent.execution_context,
+        public,
+        purpose,
+        || {
             if Instant::now() >= deadline {
                 Err(io::ErrorKind::TimedOut.into())
             } else {
                 Ok(())
             }
-        })?;
+        },
+    )?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -656,7 +662,17 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
     };
     let mut thin_fallback = false;
     if let Some(public) = &public {
-        match full_csr(&hello, public, spool.as_ref().map(|s| s.1.sha256.clone())) {
+        let purpose = if options.export_csr.is_some() {
+            crate::executable::EvidencePurpose::OfflineExport
+        } else {
+            crate::executable::EvidencePurpose::Online
+        };
+        match full_csr(
+            &hello,
+            public,
+            spool.as_ref().map(|s| s.1.sha256.clone()),
+            purpose,
+        ) {
             Ok(csr) => {
                 if let Some(export) = &options.export_csr {
                     use std::os::unix::fs::OpenOptionsExt;

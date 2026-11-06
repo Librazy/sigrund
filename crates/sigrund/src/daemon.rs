@@ -220,7 +220,13 @@ impl SignalSource {
         let mut previous = unsafe { zeroed() };
         unsafe {
             libc::sigemptyset(&mut mask);
-            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGCHLD] {
+            for signal in [
+                libc::SIGTERM,
+                libc::SIGINT,
+                libc::SIGHUP,
+                libc::SIGCHLD,
+                libc::SIGIO,
+            ] {
                 libc::sigaddset(&mut mask, signal);
             }
         }
@@ -283,6 +289,17 @@ impl SignalSource {
 impl Drop for SignalSource {
     fn drop(&mut self) {
         unsafe {
+            // A break can race the shutdown signal. Once owners have cleaned
+            // up, discard our pending wakeups before restoring a mask that
+            // may otherwise deliver SIGIO with its terminating disposition.
+            let mut mask = zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGIO);
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            while libc::sigtimedwait(&mask, std::ptr::null_mut(), &timeout) >= 0 {}
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
             libc::sigaction(libc::SIGCHLD, &self.previous_child, std::ptr::null_mut());
         }
@@ -1166,7 +1183,7 @@ impl ForegroundDaemon {
                                 }
                                 break;
                             }
-                            if signal == libc::SIGCHLD as u32 {
+                            if signal == libc::SIGCHLD as u32 || signal == libc::SIGIO as u32 {
                                 continue;
                             }
                             let _ = log.try_send("{\"event\":\"RELOAD_UNAVAILABLE\",\"message\":\"reload is unavailable in the local-approval profile\"}".into());

@@ -62,6 +62,9 @@ impl ValidatedRequest {
         } else if self.cancelled.load(Ordering::Acquire) {
             return Err(io::ErrorKind::Interrupted.into());
         }
+        if let Some(snapshots) = &self.snapshots {
+            snapshots.executable.check_ctime_guard()?;
+        }
         if self.snapshots.as_ref().is_some_and(|snapshots| {
             (snapshots.executable.sealed().is_some()
                 && snapshots.executable.digest.bytes > self.policy.max_executable_bytes)
