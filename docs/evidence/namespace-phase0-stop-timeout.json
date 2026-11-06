@@ -1,0 +1,106 @@
+{
+  "schema": "sigrund.phase0-stop-timeout-review.v1",
+  "result": "passed",
+  "phase0_exit_gate": "blocked",
+  "review": "A systemctl stop timeout skipped host SELinux policy recovery in both runners",
+  "reproduction": "Mocked systemctl stop TimeoutExpired in the original main runner; recover_policy was not called",
+  "fix": "Share stop/kill/recovery in both outer cleanup paths; on stop failure kill all service processes, then confirm inactive/failed state and an empty/removed cgroup before restoring enforcement, deleting owned domain permissiveness and removing the test module",
+  "termination_failure": "Report failure and retain ownership markers if outstanding policy transactions cannot be confirmed stopped",
+  "source_sha256": {
+    "scripts/verify-namespace-phase0.py": "2722df398c03970a9cff6e9f5be8ab5931e8e1e582d1413cac6be7aba3adf4ec",
+    "scripts/verify-namespace-phase0-recovery.py": "0cfc10f2762b61621c19ce4092784b101d60ec2107a723f2ee123fe74e264afa",
+    "scripts/tests/test_namespace_phase0.py": "c101ab9e0c20988f20a02922da67679fbe3503811284e846510e8f15f3b6111d"
+  },
+  "local_validation": {
+    "python_tests": "23 passed, including 9 new service cleanup regressions",
+    "phase0_rust_tests": "10 passed",
+    "independent_vectors": "passed",
+    "python_compile_and_diff_check": "passed"
+  },
+  "vm": {
+    "id": 9030,
+    "name": "sigrund-phase0-review",
+    "kernel": "6.19.10-300.fc44.x86_64",
+    "architecture": "x86_64",
+    "final_policy_state": "Enforcing; no sigrund_phase0_t permissive setting or sigrund_phase0 module"
+  },
+  "native_regressions": {
+    "stop_timeout": {
+      "artifact": "target/namespace-phase0-stop-timeout-evidence/ns0-stop-timeout/recovery.json",
+      "manifest_sha256": "d7f6239a0617b3570ad2910759a515e20325bfd21c10e8f7109b9ac35d932a8b",
+      "evidence": {
+        "schema": "sigrund.phase0-recovery-evidence.v1",
+        "result": "passed",
+        "kernel": "6.19.10-300.fc44.x86_64",
+        "architecture": "x86_64",
+        "source_sha256": {
+          "scripts/verify-namespace-phase0-recovery.py": "0cfc10f2762b61621c19ce4092784b101d60ec2107a723f2ee123fe74e264afa",
+          "scripts/verify-namespace-phase0.py": "2722df398c03970a9cff6e9f5be8ab5931e8e1e582d1413cac6be7aba3adf4ec",
+          "scripts/namespace-phase0/sigrund_phase0.te": "c25e40ecbc67928cf050db3801df99e8277b5de675294a3cc409ac51cfb9a6ad"
+        },
+        "command": [
+          "/var/tmp/ns0-stop-review-source/scripts/verify-namespace-phase0-recovery.py",
+          "--disposable-host",
+          "--stop-timeout-regression",
+          "--artifacts",
+          "/var/tmp/ns0-stop-timeout"
+        ],
+        "unit": "sigrund-phase0-recovery-3e64bb65c6dc4edcab46633e5101d150.service",
+        "permissive_before_kill": true,
+        "globally_permissive_before_cleanup": true,
+        "stop_outcome": {
+          "stop_timed_out": true,
+          "forced_kill": true
+        },
+        "service_after_kill": "ActiveState=failed\nResult=signal",
+        "enforcing_after_recovery": true,
+        "permissive_removed": true,
+        "module_removed": true,
+        "ownership_markers_removed": true
+      }
+    },
+    "sigkill": {
+      "artifact": "target/namespace-phase0-stop-timeout-evidence/ns0-stop-kill/recovery.json",
+      "manifest_sha256": "f268412539ad8c61a93513561723b6491f097afcc60b78fd11ecdad285f3b53b",
+      "evidence": {
+        "schema": "sigrund.phase0-recovery-evidence.v1",
+        "result": "passed",
+        "kernel": "6.19.10-300.fc44.x86_64",
+        "architecture": "x86_64",
+        "source_sha256": {
+          "scripts/verify-namespace-phase0-recovery.py": "0cfc10f2762b61621c19ce4092784b101d60ec2107a723f2ee123fe74e264afa",
+          "scripts/verify-namespace-phase0.py": "2722df398c03970a9cff6e9f5be8ab5931e8e1e582d1413cac6be7aba3adf4ec",
+          "scripts/namespace-phase0/sigrund_phase0.te": "c25e40ecbc67928cf050db3801df99e8277b5de675294a3cc409ac51cfb9a6ad"
+        },
+        "command": [
+          "/var/tmp/ns0-stop-review-source/scripts/verify-namespace-phase0-recovery.py",
+          "--disposable-host",
+          "--artifacts",
+          "/var/tmp/ns0-stop-kill"
+        ],
+        "unit": "sigrund-phase0-recovery-c8855516e77840caa78889cff9be26ad.service",
+        "permissive_before_kill": true,
+        "globally_permissive_before_cleanup": true,
+        "service_after_kill": "ActiveState=failed\nResult=signal",
+        "enforcing_after_recovery": true,
+        "permissive_removed": true,
+        "module_removed": true,
+        "ownership_markers_removed": true
+      }
+    }
+  },
+  "timeout_injection": "ExecStop=/usr/bin/sleep 60 and TimeoutStopSec=60; stop client timeout=0.2 seconds. Journal confirms SIGKILL to both the control process (sleep) and main process (python3)",
+  "journal": {
+    "artifact": "target/namespace-phase0-stop-timeout-evidence/stop-timeout-journal.log",
+    "sha256": "e03afa965244e48fac26edb0327684e68d8bae8f9b106eb0da3e70d28165be7f"
+  },
+  "native_phase0_rerun": {
+    "result": "passed",
+    "artifact": "target/namespace-phase0-stop-timeout-evidence/ns0-stop-main",
+    "manifest_sha256": "ee9a8c52198bc03543eeb0b9c19bcef9383bb8eaef4faca0d9f005ae8d8c3750",
+    "runner_sha256": "2722df398c03970a9cff6e9f5be8ab5931e8e1e582d1413cac6be7aba3adf4ec",
+    "case_count": 62,
+    "acquisition_count": 40,
+    "independent_validation": "sigrund-phase0-contract verified all 62 cases and 40 acquisition records against current sources"
+  }
+}
