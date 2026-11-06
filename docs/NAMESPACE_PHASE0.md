@@ -27,8 +27,18 @@ records a subsequent correction to both outer cleanup paths. A real stop-client
 timeout and direct SIGKILL both recover global/domain enforcement, remove the
 test module and ownership markers, and permit repeated cleanup. All 62 native
 cases and 40 acquisition records were rerun and independently checked against
-the updated runner. Current generated evidence is in
-`target/namespace-phase0-stop-timeout-evidence/`. The full Phase 0 exit gate
+the updated runner. Those artifacts are in
+`target/namespace-phase0-stop-timeout-evidence/`.
+
+The [PR review validation](evidence/namespace-phase0-pr14-review.json) records
+explicit opt-in native Rust tests, a real SELinux context mismatch rejected by
+the shared exec checkpoint, and a guard-bypass mutation detected by that negative
+case. All 62 native cases and 40 acquisition records were rerun against these
+sources. The shared-FS mutator cleanup was also checked against the original
+helper in both rootful and rootless modes; namespace-init teardown already reaps
+it, and each probe now checks for leftover children before exiting. Current
+generated evidence is in `target/namespace-phase0-pr14-evidence/`.
+The full Phase 0 exit gate
 remains blocked on the strict concurrent-policy-
 replacement requirement described under G-04 below.
 
@@ -48,6 +58,19 @@ cargo test -p sigrund-phase0 --locked
 python3 scripts/namespace-phase0/verify-vectors.py
 python3 -m unittest discover -s scripts/tests -p test_namespace_phase0.py -v
 ```
+
+The two environment-dependent tests in `tests/probe.rs` are explicitly ignored
+by ordinary workspace tests. On x86-64 Linux, run them separately with:
+
+```sh
+cargo test -p sigrund-phase0 --test probe --locked -- --ignored
+```
+
+They require `cc`, coreutils `timeout` and the relevant kernel interfaces
+(including `SO_PEERPIDFD`). The mount test additionally needs util-linux
+`unshare --map-auto --map-root-user`, configured subordinate UID/GID maps and
+permission to create user/mount namespaces. An explicitly requested native test
+fails if these prerequisites are unavailable; ordinary tests report it ignored.
 
 The privileged runner needs a **disposable x86-64 systemd host with enforcing
 SELinux**, a C compiler, Python, libselinux, the SELinux development Makefile,
@@ -224,6 +247,10 @@ must produce no workload output. Host pidfds, parentage, ptrace waits and a
 subreaper cover final-child ownership. Separate tests kill the tracer/launcher,
 exhaust the PID limit, adopt/reap descendants and retain ownership until cleanup.
 The service cgroup provides an independent ceiling if the harness dies.
+Each probe also requires `waitpid(-1, __WALL | WNOHANG)` to report `ECHILD`
+before returning, while the outer service is still alive. In the shared-FS
+fixture, the anchor is PID 1 of its new PID namespace; killing it makes the
+kernel kill and reap the mutator before the wrapper finishes waiting.
 
 The test filesystem exposes only fixture endpoints and no management sockets or
 delegated cgroup controls. Production containment still needs the host-service
@@ -257,7 +284,12 @@ stable token, then recheck immediately before releasing the exec stop. The reloa
 tests change policy while the workload is held at exec stop and require rejection
 without target instructions. Namespaced tests cover rootful/rootless entry with
 both direct and memfd executables; separate namespaced negative cases reject
-global/domain permissiveness before launcher creation. The current validation
+global/domain permissiveness before launcher creation. The context-mismatch
+fixture sets the child's actual exec label to a different category set while
+preserving the authorized context. The same checkpoint used for ordinary host
+and namespaced execution must return `context_mismatch`; the observation records
+both contexts, SIGKILL/reaping and no workload output. Test mode does not select
+the rejection branch. The current validation
 record includes passing native results for all these cases; the original 54-case
 record remains historical.
 

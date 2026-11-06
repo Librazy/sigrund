@@ -51,11 +51,14 @@ static const char *execution_context;
 static int namespace_memfd;
 static pid_t observed_child;
 enum { POLICY_NORMAL, POLICY_RELOAD, POLICY_DOMAIN_PERMISSIVE, POLICY_GLOBAL_PERMISSIVE };
+enum exec_verdict { EXEC_ALLOWED, EXEC_CONTEXT_MISMATCH, EXEC_CONSTRAINT_MISMATCH, EXEC_POLICY_CHANGED };
 static int policy_mode, policy_rejected;
 struct selinux_page { uint32_t version, sequence, enforcing, policyload, deny_unknown; };
 static struct selinux_page status_page(void);
 static int domain_enforcing(const char *context);
 static int policy_matches(struct selinux_page before, const char *context, struct selinux_page *after);
+static enum exec_verdict exec_checkpoint(pid_t child, const char *context, struct selinux_page before,
+                                        struct selinux_page *after, char actual[4096]);
 static int memfd_copy(const char *path);
 static void fail(const char *expr, int line) {
     if (error_fd >= 0) {
@@ -629,14 +632,11 @@ static void execution_case(struct target *target, const char *cgroup, const char
     MUST(ptrace(PTRACE_CONT, child, 0, 0) == 0);
     int status; MUST(waitpid(child, &status, __WALL) == child && WIFSTOPPED(status) && (status >> 16) == PTRACE_EVENT_EXEC);
     verify_child(child, target, rootless);
-    if (execution_context) {
-        int attr = open_proc(child, "attr/current", O_RDONLY); char actual[4096]; MUST(attr >= 0); read_text(attr, actual, sizeof(actual)); close(attr);
-        actual[strcspn(actual, "\n")] = 0; MUST(!strcmp(actual, execution_context) && field(child, "Seccomp:") == 2);
-    }
     revalidate(target);
     int fd = open_proc(child, "cgroup", O_RDONLY); char text[4096]; MUST(fd >= 0); read_text(fd, text, sizeof(text)); close(fd);
     const char *suffix = strstr(cgroup, "/sys/fs/cgroup"); MUST(suffix != NULL);
     MUST(strstr(text, suffix + strlen("/sys/fs/cgroup")) != NULL);
+    enum exec_verdict verdict = EXEC_ALLOWED;
     if (execution_context) {
         if (policy_mode == POLICY_RELOAD) {
             puts("{\"ready\":\"policy-reload-at-exec-stop\"}"); fflush(stdout);
@@ -645,23 +645,25 @@ static void execution_case(struct target *target, const char *cgroup, const char
         }
         /* Last check before release, in the host supervisor. Neither a
          * completed reload nor a permissive domain may release instructions. */
-        if (!policy_matches(policy_before, execution_context, &policy_after)) policy_rejected = 2;
+        char actual[4096];
+        verdict = exec_checkpoint(child, execution_context, policy_before, &policy_after, actual);
+        if (verdict == EXEC_POLICY_CHANGED) policy_rejected = 2;
     }
-    if (inject == 8 || inject == 9 || policy_rejected) {
+    if (inject == 8 || inject == 9 || verdict != EXEC_ALLOWED) {
         if (inject == 9) MUST(syscall(SYS_pidfd_send_signal, target->pidfd, SIGKILL, NULL, 0) == 0);
         int killed = syscall(SYS_pidfd_send_signal, child_pidfd, SIGKILL, NULL, 0);
         MUST(killed == 0 || (killed == -1 && errno == ESRCH));
         MUST(waitpid(child, &status, __WALL) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
     } else MUST(ptrace(PTRACE_DETACH, child, 0, 0) == 0);
     MUST(waitpid(launcher, &status, 0) == launcher && WIFEXITED(status)
-        && WEXITSTATUS(status) == (inject >= 8 || policy_rejected ? 128 + SIGKILL : 0));
+        && WEXITSTATUS(status) == (inject >= 8 || verdict != EXEC_ALLOWED ? 128 + SIGKILL : 0));
     struct pollfd poller = {.fd = child_pidfd, .events = POLLIN}; MUST(poll(&poller, 1, 1000) == 1);
     char result[128] = {0}; ssize_t size = read(output[0], result, sizeof(result));
-    MUST(inject >= 8 || policy_rejected ? size == 0 : (execution_context ? (size == 27 && !memcmp(result, "selinux-and-seccomp-denied\n", 27))
+    MUST(inject >= 8 || verdict != EXEC_ALLOWED ? size == 0 : (execution_context ? (size == 27 && !memcmp(result, "selinux-and-seccomp-denied\n", 27))
         : (size == 23 && !memcmp(result, "namespace-workload-ran\n", 23))));
     close(errors[0]); close(output[0]); close(ipc[0]); close(child_pidfd); close(launcher_pidfd);
     if (policy_mode == POLICY_RELOAD) MUST(policy_rejected == 2 && policy_before.policyload != policy_after.policyload && policy_before.sequence != policy_after.sequence);
-    else MUST(!policy_rejected);
+    else MUST(verdict == EXEC_ALLOWED);
 }
 static void namespace_case(const char *root, const char *socket, const char *cgroup, const char *exe, int rootless, int filtered, int inject) {
     int before_fds = fd_count();
@@ -820,6 +822,15 @@ static int policy_matches(struct selinux_page before, const char *context, struc
         && before.sequence == start.sequence && start.sequence == after->sequence
         && before.policyload == start.policyload && start.policyload == after->policyload;
 }
+static enum exec_verdict exec_checkpoint(pid_t child, const char *context, struct selinux_page before,
+                                        struct selinux_page *after, char actual[4096]) {
+    int fd = open_proc(child, "attr/current", O_RDONLY); MUST(fd >= 0);
+    read_text(fd, actual, 4096); close(fd); actual[strcspn(actual, "\n")] = 0;
+    int policy_ok = policy_matches(before, context, after);
+    if (strcmp(context, actual)) return EXEC_CONTEXT_MISMATCH;
+    if (field(child, "NoNewPrivs:") != 1 || field(child, "Seccomp:") != 2) return EXEC_CONSTRAINT_MISMATCH;
+    return policy_ok ? EXEC_ALLOWED : EXEC_POLICY_CHANGED;
+}
 static void lsm_case(const char *executable, const char *secret, const char *context, int mode) {
     MUST(mode >= 0 && mode <= 5);
     struct selinux_page before = status_page();
@@ -833,6 +844,12 @@ static void lsm_case(const char *executable, const char *secret, const char *con
         puts("{\"case\":\"domain-permissive\",\"result\":\"passed\",\"rejected_before_spawn\":true}"); return;
     }
     MUST(domain_enforcing(context));
+    char changed_context[4096];
+    const char *child_context = context;
+    if (mode == 2) {
+        MUST(snprintf(changed_context, sizeof(changed_context), "%s,c3", context) < (int)sizeof(changed_context));
+        child_context = changed_context; /* Keep the authorized context unchanged. */
+    }
     int memfd = mode == 1;
     int exe = memfd ? memfd_copy(executable) : open(executable, O_RDONLY | O_CLOEXEC); MUST(exe >= 0);
     if (memfd) {
@@ -845,7 +862,7 @@ static void lsm_case(const char *executable, const char *secret, const char *con
         close(gate[1]); close(output[0]);
         char byte; MUST(read(gate[0], &byte, 1) == 1);
         MUST(dup2(output[1], 1) == 1);
-        MUST(write_path("/proc/self/attr/exec", context) == 0);
+        MUST(write_path("/proc/self/attr/exec", child_context) == 0);
         deny_getppid();
         MUST(dup3(exe, 3, O_CLOEXEC) == 3 || (exe == 3 && errno == EINVAL));
         MUST(syscall(SYS_close_range, 4U, ~0U, 0U) == 0);
@@ -855,31 +872,30 @@ static void lsm_case(const char *executable, const char *secret, const char *con
     close(gate[0]); close(output[1]); attach(child);
     MUST(write(gate[1], "X", 1) == 1); close(gate[1]); MUST(ptrace(PTRACE_CONT, child, 0, 0) == 0);
     int status; MUST(waitpid(child, &status, __WALL) == child && WIFSTOPPED(status) && (status >> 16) == PTRACE_EVENT_EXEC);
-    int fd = open_proc(child, "attr/current", O_RDONLY); char actual[4096]; MUST(fd >= 0); read_text(fd, actual, sizeof(actual)); close(fd);
-    actual[strcspn(actual, "\n")] = 0;
-    MUST(!strcmp(context, actual) && field(child, "NoNewPrivs:") == 1 && field(child, "Seccomp:") == 2);
     if (mode == 3) {
         puts("{\"ready\":\"policy-reload-at-exec-stop\"}"); fflush(stdout);
         char command; MUST(read(0, &command, 1) == 1 && command == 'R');
     }
-    struct selinux_page after;
-    int policy_ok = policy_matches(before, context, &after);
-    if (mode == 3) MUST(!policy_ok && after.enforcing == 1 && before.policyload != after.policyload && before.sequence != after.sequence);
-    else MUST(policy_ok);
-    if (mode == 2 || mode == 3) {
-        /* A mismatch/reload is terminal, with no target instructions released. */
-        if (mode == 2) {
-            char expected[4096]; MUST(strlen(context) + 4 < sizeof(expected));
-            strcpy(expected, context); strcat(expected, ",c3"); MUST(strcmp(expected, actual));
-        }
-        MUST(kill(child, SIGKILL) == 0 && waitpid(child, &status, __WALL) == child && WIFSIGNALED(status));
+    struct selinux_page after; char actual[4096];
+    enum exec_verdict verdict = exec_checkpoint(child, context, before, &after, actual);
+    if (verdict != EXEC_ALLOWED) {
+        /* The shared checkpoint decides rejection; the test mode only checks
+         * the observed reason after termination and reaping. */
+        MUST(kill(child, SIGKILL) == 0 && waitpid(child, &status, __WALL) == child
+             && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
         char byte; MUST(read(output[0], &byte, 1) == 0); close(output[0]); close(exe);
-        printf("{\"case\":\"selinux-%s\",\"result\":\"passed\",\"rejected_at_exec_stop\":true,\"no_workload_output\":true,\"before_policyload\":%u,\"after_policyload\":%u}\n", mode == 2 ? "context-mismatch" : "policy-reload", before.policyload, after.policyload); return;
+        MUST((mode == 2 && verdict == EXEC_CONTEXT_MISMATCH) || (mode == 3 && verdict == EXEC_POLICY_CHANGED));
+        if (mode == 3) MUST(after.enforcing == 1 && before.policyload != after.policyload && before.sequence != after.sequence);
+        printf("{\"case\":\"selinux-%s\",\"result\":\"passed\",\"rejected_at_exec_stop\":true,\"context_rejected_at_exec_stop\":%s,\"rejection_reason\":\"%s\",\"no_workload_output\":true,\"child_reaped\":true,\"before_policyload\":%u,\"after_policyload\":%u,\"requested_context\":",
+            mode == 2 ? "context-mismatch" : "policy-reload", verdict == EXEC_CONTEXT_MISMATCH ? "true" : "false",
+            verdict == EXEC_CONTEXT_MISMATCH ? "context_mismatch" : "policy_changed", before.policyload, after.policyload);
+        json_string(context); printf(",\"actual_context\":"); json_string(actual); puts("}"); return;
     }
     MUST(ptrace(PTRACE_DETACH, child, 0, 0) == 0);
     MUST(waitpid(child, &status, 0) == child && status == 0);
     char result[128] = {0}; MUST(read(output[0], result, sizeof(result)) == 27 && !memcmp(result, "selinux-and-seccomp-denied\n", 27));
     close(output[0]); close(exe);
+    MUST(mode == 0 || mode == 1); /* A negative fixture must never be released. */
     int attr = open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC); char own_label[4096]; MUST(attr >= 0); read_text(attr, own_label, sizeof(own_label)); close(attr);
     own_label[strcspn(own_label, "\n")] = 0;
     printf("{\"case\":\"selinux-%s\",\"result\":\"passed\",\"nnp\":true,\"ptrace_exec_stop\":true,\"actual_context_verified\":true,\"selinux_denial\":true,\"seccomp_denial\":true,\"policyload\":%u,\"workload_pid\":%d,\"supervisor_label\":", memfd ? "memfd" : "direct", before.policyload, child);
@@ -900,16 +916,24 @@ int main(int argc, char **argv) {
         else MUST(0);
         MUST(execution_context != NULL);
     }
-    if (argc == 3 && !strcmp(argv[1], "peer")) { peer_case(argv[2]); return 0; }
-    if (argc == 4 && !strcmp(argv[1], "lifecycle")) { lifecycle_case(argv[2], atoi(argv[3])); return 0; }
-    if (argc == 3 && !strcmp(argv[1], "tracer-death")) { tracer_death_case(argv[2]); return 0; }
-    if (argc == 2 && !strcmp(argv[1], "selinux-status")) {
+    if (argc == 3 && !strcmp(argv[1], "peer")) peer_case(argv[2]);
+    else if (argc == 4 && !strcmp(argv[1], "lifecycle")) lifecycle_case(argv[2], atoi(argv[3]));
+    else if (argc == 3 && !strcmp(argv[1], "tracer-death")) tracer_death_case(argv[2]);
+    else if (argc == 2 && !strcmp(argv[1], "selinux-status")) {
         struct selinux_page page = status_page();
-        printf("{\"sequence\":%u,\"policyload\":%u,\"enforcing\":%u}\n", page.sequence, page.policyload, page.enforcing); return 0;
+        printf("{\"sequence\":%u,\"policyload\":%u,\"enforcing\":%u}\n", page.sequence, page.policyload, page.enforcing);
     }
-    if (argc == 6 && !strcmp(argv[1], "selinux")) { lsm_case(argv[2], argv[3], argv[4], atoi(argv[5])); return 0; }
-    if (argc == 9 && !strcmp(argv[1], "namespace")) { namespace_case(argv[2], argv[3], argv[4], argv[5], atoi(argv[6]), atoi(argv[7]), atoi(argv[8])); return 0; }
-    if (argc == 8 && !strcmp(argv[1], "route")) { route_case(argv[2], argv[3], argv[4], argv[5], atoi(argv[6]), atoi(argv[7])); return 0; }
-    fprintf(stderr, "usage: probe peer SOCKET | namespace ROOT SOCKET CGROUP EXE ROOTLESS FILTERED FAULT | selinux EXE SECRET CONTEXT MEMFD | selinux-status\n");
-    return 64;
+    else if (argc == 6 && !strcmp(argv[1], "selinux")) lsm_case(argv[2], argv[3], argv[4], atoi(argv[5]));
+    else if (argc == 9 && !strcmp(argv[1], "namespace")) namespace_case(argv[2], argv[3], argv[4], argv[5], atoi(argv[6]), atoi(argv[7]), atoi(argv[8]));
+    else if (argc == 8 && !strcmp(argv[1], "route")) route_case(argv[2], argv[3], argv[4], argv[5], atoi(argv[6]), atoi(argv[7]));
+    else {
+        fprintf(stderr, "usage: probe peer SOCKET | namespace ROOT SOCKET CGROUP EXE ROOTLESS FILTERED FAULT | selinux EXE SECRET CONTEXT MEMFD | selinux-status\n");
+        return 64;
+    }
+    /* In particular, filtered-5's anchor is PID 1: killing it makes the
+     * kernel kill/reap its namespace's mutator before wrapper wait completes.
+     * Check before exiting the probe, while the outer service is still alive. */
+    int status; errno = 0;
+    MUST(waitpid(-1, &status, __WALL | WNOHANG) == -1 && errno == ECHILD);
+    return 0;
 }

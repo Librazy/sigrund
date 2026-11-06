@@ -372,7 +372,7 @@ def run_inside(artifacts):
                 namespace_lsm_case(rootless, model)
                 namespace_lsm_case(rootless, model, 'reload')
         manifest['selinux_policy_sha256'] = digest(Path('/sys/fs/selinux/policy'))
-        case('selinux-context-mismatch', lsm_command(2))
+        case('selinux-context-mismatch', lsm_command(2), required_observation='context_rejected_at_exec_stop')
         case('selinux-reload-at-exec-stop', lsm_command(3), reload_at_stop=True,
              required_observation='rejected_at_exec_stop')
         try:

@@ -1,10 +1,10 @@
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use std::process::Command;
 
 #[test]
+#[ignore = "requires cc, timeout, unshare --map-auto, subordinate ID maps and user/mount namespace permissions"]
 fn pinned_root_entry_preserves_the_private_mount_tree() {
-    if std::env::consts::ARCH != "x86_64" {
-        return;
-    }
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     std::fs::create_dir_all(root.join("run")).unwrap();
@@ -49,10 +49,8 @@ fn pinned_root_entry_preserves_the_private_mount_tree() {
 }
 
 #[test]
+#[ignore = "requires cc, timeout and a Linux kernel supporting SO_PEERPIDFD"]
 fn kernel_connector_identity_survives_socket_passing_and_detects_exit() {
-    if std::env::consts::ARCH != "x86_64" {
-        return; // x86-64 register ABI in the experimental acquisition helper.
-    }
     let directory = tempfile::tempdir().unwrap();
     let executable = directory.path().join("probe");
     let build = Command::new("cc")
