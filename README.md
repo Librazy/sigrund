@@ -8,8 +8,9 @@ The daemon verifies the signature and policy, records the authorization,
 executes the command, and returns its output and exit status to the requester.
 
 The local **v2** profile supports client-generated full CSRs and private daemon
-expansion of thin CSRs. The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-defines the protocol and broader target. Thin requests receive only approval or
+expansion of thin CSRs. See [implementation notes](IMPLEMENTATION_NOTES.md) for
+current behavior; the [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
+now defines the draft v3 target. Thin requests receive only approval or
 an admission-based timeout; expanded evidence and refusal reasons stay private.
 Full requests additionally permit explicit rejection after requester-access and
 evidence validation. No authorization response contains a CSR or diagnostic.
@@ -133,6 +134,14 @@ and policy before using them outside the disposable lab.
 
 ## Current scope
 
+The runtime currently implements v2. The
+[security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
+defines a draft v3 target with selectable local execution environments; the
+[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) records implementation and
+release gates. V3 is not implemented, and the rewrite does not change the commands
+or current behavior documented here. It has no v2 compatibility requirement;
+future deployment uses explicit fresh provisioning, not automatic migration.
+
 The local execution profile supports SSH Ed25519 signatures, one-time grants,
 separate stdout/stderr, finite sealed stdin, cancellation, replay prevention,
 authenticated local audit/recovery and bounded job supervision. Security-key
@@ -152,7 +161,7 @@ configured domain; it does not follow requester namespaces or automatically
 cross container boundaries. Root inside a container alone does not supply the
 required delegation and kernel access. These boundaries are discussed in
 [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
-[namespace-aware execution design](docs/NAMESPACE_AWARE_EXECUTION.md).
+[namespace-aware execution roadmap](docs/NAMESPACE_AWARE_EXECUTION.md).
 
 ## Development and verification
 

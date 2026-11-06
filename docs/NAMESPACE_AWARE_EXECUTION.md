@@ -1,351 +1,290 @@
-# Namespace-aware execution
+# Namespace-aware execution: phased v3 roadmap
 
-Design discussion recorded on 2026-10-31; refined on 2026-11-05. This document
-proposes one host daemon serving explicitly selected execution environments.
-It describes follow-on work: the selectors, instance bindings and security
-profiles below are not implemented CLI options or protocol fields. The
-[security specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>)
-continues to define the current local profile.
+Updated 2026-11-05. This is the delivery roadmap for the
+[draft normative v3 security specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>).
+The specification owns the contract; this document owns implementation order,
+feasibility decisions, acceptance evidence and deferred scope. NS-01–NS-16 refer
+to its stable namespace requirements; G-01–G-05 refer to its release-blocking
+design gates. This roadmap does not introduce usable CLI options.
 
-## Current implementation
+## Current state and intended outcome
 
-Jobs execute in the daemon's configured domain. Child setup creates private
-mount/cgroup namespaces for isolation; it does not enter a selected container
-or follow requester namespaces. The requester-access helper resolves files in
-the daemon's filesystem domain under authenticated UID/GID/groups and requires
-initial user-namespace mappings. It does not reproduce requester LSM confinement.
-Direct executable models use an exec-stop checkpoint to verify evidence and
-credentials; that is not currently a general LSM transition verifier.
+The current runtime implements a local **v2** one-time SSH/stdio profile. It runs
+jobs in the daemon's configured domain, creates private namespaces for isolation,
+and uses a requester-access helper limited to the daemon filesystem domain and
+initial userns mappings. Direct-execution checkpoints verify executable evidence
+and credentials; they are not general namespace/LSM verifiers. See
+[implementation notes](../IMPLEMENTATION_NOTES.md#deferred-namespace-aware-executable-evidence)
+for the ComposeFS limitation and current coverage. Namespace-root fixtures do
+not establish container-routing support.
 
-See the [implementation notes](../IMPLEMENTATION_NOTES.md#deferred-namespace-aware-executable-evidence)
-for scope, evidence limitations and existing test coverage. Namespace-root test
-fixtures do not establish support for the workflows proposed here.
+The v3 outcome is one host authority executing in explicitly selected local
+existing environments:
 
-## Goals and deployment
+| Route | Source → destination | Destination identity |
+| --- | --- | --- |
+| 0 | Host → container B | B's account and numeric credentials |
+| 1 | Container A → host | Host account and numeric credentials |
+| 2 | Container A → its supported authenticated environment | That environment's account and credentials |
+| 3 | Container A → container B | B's account and numeric credentials |
 
-Support execution inside existing local OCI containers, including rootful and
-rootless containers owned by the requester or another user. All requests go to
-one host sigrund authority for authentication, policy, root-TTY approval and
-supervision. Containers need a client and socket access, without an internal
-daemon or container creation by sigrund.
+All routes need policy and signer approval, including cross-owner execution.
+Rootful container root, mapped rootless root and host root remain distinct.
+Mapping a source container account into a host account is a separate deferred
+selection mode. Remote hosts, proxy authentication, container creation and socket
+injection are out of scope. Operators expose both client endpoints; the approval
+socket and state remain host-controlled.
 
-| Story | Request origin | Destination | Target account and numeric IDs |
-| --- | --- | --- | --- |
-| 0 | Host | Existing container B | Interpreted in B |
-| 1 | Container A | Host | Interpreted on the host |
-| 2 | Container A | Its own supported execution environment | Interpreted in that environment |
-| 3 | Container A | Existing container B | Interpreted in B |
+V3 replaces v2 contracts without compatibility requirements. Wire formats,
+configuration, CLI, signing domains, storage and collector contracts can change
+together. Use explicit fresh provisioning, with no automatic migration or deletion
+of old state. Keep runnable v2 documentation accurate until implementation changes.
 
-For container-to-host execution, the selected user is a host user. Translating
-a container account through its UID/GID mappings into a host execution identity
-is a separate, deferred selection mode. Root in a rootless container is relative
-to its user namespace and must not be presented as host UID 0.
-
-Operators explicitly expose the host client socket in containers. Sigrund does
-not inject sockets or modify containers to provide access. The current client
-also queries public preparation context on a separate endpoint whose pathname
-is the client socket path plus `.context`; deployments must expose every
-endpoint needed by the client, preserving that path relationship. This proposal
-does not consolidate endpoints. The approval socket and host state remain under
-host administration. Socket DAC and SELinux/AppArmor rules must permit access;
-reachability permits submitting a request, not bypassing authorization.
-
-This design covers local execution, not remote hosts or delegated proxy
-authentication. A privileged container that already controls the host, daemon
-state or management interfaces is outside the daemon's isolation guarantee.
-
-## Architecture and integration choices
+## Architecture and implementation boundaries
 
 ```mermaid
 flowchart LR
-    C[Client] --> H[Host authentication and admission]
-    H --> T[Target resolution]
-    T --> P[Destination preparation]
-    P --> A[Approval]
-    A --> E[Supervised execution]
+    C[Client intent or full request] --> H[Host authentication and admission]
+    H --> T[Validated pinned target]
+    T --> P[Destination preparation helper]
+    P --> A[Approval and durable authorization]
+    A --> E[Namespace executor]
+    E --> S[Host supervision and cleanup]
 ```
 
-The proposed common backend is a native Linux namespace executor. Target
-resolvers supply validated execution resources to that backend. The host
-coordinator retains its original environment; dedicated helpers prepare and
-execute in the destination.
+Use the native Linux executor as the common backend. Carry target resources and
+leases through preparation, approval, authorization and job cleanup; preserve the
+coordinator's namespaces. Separate selector input, retained execution resources,
+signed bindings and optional manager identity. The first implementation slice
+uses host and administrator-validated explicit targets. Self requires its own
+source-attribution gate.
 
-| Approach | Useful capabilities | Integration boundary |
+| Integration | Useful role | Boundary |
 | --- | --- | --- |
-| Manager exec APIs | Manager inventory, lifecycle and execution sessions | Separate Docker/Podman/containerd integration; interfaces may not expose retained executable FDs, job placement or exec-stop verification |
-| Direct runc/crun integration | OCI bundle/state operations and low-level execution | Requires runtime binary, state root, IDs and invocation conventions; bypassing a manager can break its bookkeeping and cleanup assumptions |
-| Native namespace executor | Sigrund-controlled file preparation, child setup and supervision | Must implement and verify mappings, namespace entry, security constraints and lifecycle handling |
+| Docker/Podman/containerd or other manager APIs | Optional names, scoped identity, ownership/configuration metadata and lifecycle evidence | Same target acquisition and host authorization; an exec API may not expose retained-FD execution, placement or checkpoints |
+| runc/crun | Potential specific, explicitly integrated runtime adapter | No universal control plane; bypassing a manager can violate bookkeeping and cleanup |
+| Native Linux helpers | Destination preparation, namespace entry, retained evidence, child setup and supervision | Must demonstrate supported mappings, ordering, placement and confinement |
 
-OCI provides a configuration vocabulary for namespaces, mappings, capabilities,
-seccomp and LSM labels. It supplies neither globally unique container identity
-nor a universal discovery/control API. Direct runc/crun access beneath an
-existing manager is not a supported universal control plane.
+OCI provides configuration vocabulary, not unique container identity or a
+universal discovery interface. No integration may claim manager-exec equivalence
+from namespace membership alone.
 
-Manager resolvers are optional additions for names, ownership metadata,
-configuration and lifecycle events. A manager-confirmed identity is additional
-evidence, distinct from a process environment. Runtime scopes must distinguish
-endpoints, owners/tenants and manager namespaces. User-owned runtime metadata
-cannot independently authorize host privileges or arbitrary namespace entry;
-the daemon validates resources and applies host policy.
+The principal implementation seams are core schemas/crypto/policy; daemon
+transport/admission and request leases; preparation/access/evidence;
+authorization/approval; execution/cgroups/reaper/runtime; and storage/audit.
+Introduce a target resource owner instead of passing bare PIDs or pathname-only
+roots through those boundaries. Existing host child setup is a baseline profile,
+not a ready-made rootless executor.
 
-The native executor provides a defined sigrund execution profile. Exact
-reproduction of a manager's exec policy requires additional configuration
-integration and validation. Namespace entry alone does not reproduce that policy.
+## Delivery phases
 
-## Target selection and identity
+Each phase is a reviewable milestone, not a calendar estimate. Its completion
+record must identify changes, applicable requirements, commands/fixtures, observed
+results, supported combinations and remaining blockers. Failed or partial gates
+remain visible; they cannot be converted into support claims by documentation.
 
-Three conceptual selectors are proposed:
+### Phase 0 — Contract and feasibility
 
-| Selector | Resolution |
-| --- | --- |
-| Host | The host daemon's configured execution environment |
-| Self | The authenticated caller's supported execution environment |
-| Explicit target | An administrator-registered environment or a validated process reference; optional manager resolvers translate names |
+**Dependencies:** None. **Subsystems:** source transport, target acquisition,
+Linux helpers, cgroups/reaping, LSM verification, core policy/schema design.
 
-The following CLI sketches are **unimplemented proposals**, not usable commands
-or a finalized option grammar. Named container targets require a resolver or
-explicit registration.
+**Deliverables:**
 
-```sh
-# Host -> existing container, selected through a configured resolver.
-sigrun --container alice/devbox --user builder -- /usr/bin/id
+- Resolve G-01: define connector versus message-sender attribution for self;
+  specify socket inheritance/passing, connector exit, credential/exec races,
+  context changes and an acquisition mechanism resistant to PID reuse and mixed
+  observations. Repeated procfs reads alone are not a proof of atomic capture.
+- Resolve G-02/G-03: prototype supported userns entry, composed mappings,
+  `setgroups=deny`, root/cwd handling, PID/time child creation, launcher placement,
+  host-visible pidfds, tracing and reaping. Test the candidate launcher-in-job-
+  cgroup approach before prescribing it as the production sequence.
+- Resolve G-04: prototype required LSM transitions and actual-state verification
+  under NNP/ptrace, direct/memfd models and enforcing policies. Define policy
+  reload/version detection and explicit seccomp installation requirements.
+- Resolve G-05: freeze canonical acquisition/constraint records, scoped target
+  and signer policy, registration/revocation interfaces, CLI selection grammar,
+  target FD/helper quotas and supported full-access binding distribution.
+- Update the draft specification with decisions and a supported/rejected matrix.
+  Identify kernel/architecture, namespace ownership, delegation and enforcement
+  prerequisites. Keep unresolved combinations blocked.
 
-# Container -> host, selecting a host account.
-sigrun --host --user alice -- /usr/bin/id
+**Exit gate:** Every prerequisite for the first supported profile has a concrete
+contract and prototype evidence. Other combinations are explicitly unsupported
+or blocked. Self cannot enable without G-01; confinement claims cannot enable
+without G-04. Prototype success is not an integrated-runtime release gate.
 
-# Container -> its authenticated caller environment.
-sigrun --container self --user root -- /usr/bin/id
+### Phase 1 — V3 foundation and host target
 
-# Container -> another existing container.
-sigrun --container bob/database --user postgres -- /usr/bin/id
-```
+**Dependencies:** Phase 0's applicable contract/schema decisions.
+**Subsystems:** core protocol/crypto/configuration, CLI/approver, target ownership,
+storage/audit and collector schemas.
 
-Distinguish a caller-provided selector, a daemon-validated pinned execution
-environment, and an optional manager-confirmed container identity. A name is
-presentation and selection input, not authority. A process reference is an
-input to validation, never authorization by itself; its PID is interpreted in
-an explicitly defined PID namespace rather than guessed from caller input.
+**Deliverables:**
 
-Reuse `host_id` for the authorizing daemon. Propose an opaque, ephemeral
-target-instance binding in signed approval, backed by a retained process
-reference, namespace FDs, root directory FD, verified mappings and lifecycle
-observations. A random token alone provides no binding. Numeric PID lookup
-must be protected against reuse while resources are acquired and cross-checked.
+- Implement strict v3 intent, resolved numeric credentials, target instance and
+  immutable profile bindings. Carry a host-target resource owner through the
+  existing pipeline before introducing container entry.
+- Replace wire/signature/configuration/state contracts coherently; add explicit
+  fresh-state provisioning and incompatible-state rejection. Collector contracts
+  bind the same execution digest even while collector runtime remains deferred.
+- Update approval rendering to show authority, epoch/instance, verified target
+  description, mapping context, numeric identity and complete constraints.
+- Implement bounded target/helper ownership and private diagnostics. Preserve
+  fixed-deadline outcomes, complete approval delivery before workload spawn,
+  replay/revocation, durable consumption and independent cleanup accounting.
 
-Resolve and pin before approval, then revalidate before authorization and spawn.
-Reject if the anchor exits, its relevant context changes, or observations
-cannot be reconciled. Never reopen a matching name/PID and silently substitute
-a new target. Retained namespace FDs can outlive the container and do not prove
-that its instance remains alive. Daemon restart invalidates ephemeral
-registrations and warrants referring to them. Manager integration may strengthen
-restart/teardown detection; without it, the binding identifies the validated
-process environment rather than a universal container generation.
+**Exit gate:** Independent canonicalization/intent/PAE/SSHSIG fixtures, strict
+cross-version rejection, approval-display checks, fresh-state recovery and all
+applicable local V-01–V-20 security cases pass under v3. No namespace capability
+is advertised at this milestone.
 
-| Candidate identity | Why it is insufficient alone |
-| --- | --- |
-| Container name or hostname | Mutable and reusable |
-| PID | Reused and relative to a PID namespace |
-| Namespace inode or set of inodes | Can be shared; unpinned identities can be reused; callers can change their namespace set |
-| Cgroup path | Can be recreated or reorganized and does not describe the entire execution environment |
-| Image digest | Identifies image content shared by many running instances |
-| Native runtime ID | Requires runtime scope and can survive or be reused across execution instances |
+### Phase 2 — Pinned targets and destination preparation
 
-### Authenticating the source and self
+**Dependencies:** Phase 1; G-01 acquisition and G-05 management contracts.
+**Subsystems:** target registry, workers/helpers, account/path/evidence preparation,
+source access, authorization and cancellation.
 
-Use kernel-authenticated Unix peer credentials and groups as the starting
-identity, as observed by the host daemon. Container-supplied usernames, UIDs,
-container IDs and labels are claims. UID/GID mappings and unmapped/overflow
-credentials need explicit validation; container UID 0 is not automatic host
-authority.
+**Deliverables:**
 
-`self` means the authenticated caller's supported environment. A caller may
-have unshared namespaces, so this need not equal its manager's original
-container environment. Shared namespaces do not uniquely identify a container.
-If source attribution or the required context is ambiguous, reject `self`;
-an explicit destination still requires ordinary authentication and policy.
+- Add administrator-registered and validated daemon-PID-scope process targets.
+  Retain pidfd/proc/namespace/root resources, mappings and lifecycle state; scope
+  instances to the daemon epoch and invalidate rather than re-resolve.
+- Revalidate before review/final authorization and retain the same owner for later
+  spawn checks. Add anchor monitoring and resource-exhaustion behavior.
+- Prepare accounts, executable, cwd and environment in bounded destination
+  helpers. Start with numeric credentials or bounded account-file parsing;
+  never execute arbitrary target NSS modules with host privilege.
+- Provide explicit cross-domain thin intent. Keep unsupported full/full-only/
+  export access domains closed; do not turn them into privileged expansion.
+  Select unsigned executable evidence in the destination and preserve signed
+  bytes/model/target exactly.
 
-Before implementation, define whether a request is attributed to the connector
-or an authenticated message sender. `SO_PEERCRED` captures connection-time
-credentials; a socket can subsequently be inherited or passed. Reading procfs
-for that PID later does not establish the request sender's current context.
-Process exit/reuse, credential changes, exec and namespace changes must be
-handled in one race-checked acquisition contract. Per-message authentication
-must not be assumed from the current transport. Socket visibility alone cannot
-prove container origin.
+**Exit gate:** Tests prove stale bindings cannot retarget; private preparation
+cannot disclose target existence/accounts; account/mapping edits do not redirect
+approval; identical paths with different bytes/cwd use the intended destination.
+Target/helper leases remain charged through real cleanup. No container workload
+execution is advertised yet.
 
-## Destination preparation and authorization
+### Phase 3 — Native execution and supervision
 
-Prepare executable evidence, cwd and execution environment in the verified
-destination. Resolve target usernames, numeric UID/GID and supplementary groups
-there, with bounded account lookup and no implicit host NSS lookup for a
-container account. Validate mappings and authority ceilings and reject unmapped
-identities. Account names are display/selection inputs; sign resolved numeric
-credentials and the mapping context so later account changes cannot redirect
-the approved identity.
+**Dependencies:** Phase 2 and validated G-02/G-03 plans; G-01 for self.
+**Subsystems:** launcher/executor, syscall-only child setup, cgroups, reaper,
+checkpoints and runtime lifecycle.
 
-Interpret executable paths, cwd, scripts and other path arguments in the
-destination. Do not automatically copy caller files or inherit a container cwd
-as a host cwd. Construct and bind the approved environment explicitly. Retain
-the selected executable and immutable stdin before review; mutable scripts,
-loaders, libraries and configuration remain outside executable evidence as
-explained in [privileged interpreter guidance](PRIVILEGED_INTERPRETERS.md).
+**Deliverables:**
 
-Cross-domain workflows should provide an explicit thin-intent path for private
-destination preparation. Full CSR support requires trustworthy destination
-evidence and a defined requester-access check in that destination. Existing
-UID/GID impersonation does not establish caller LSM/Landlock restrictions or
-arbitrary namespace access. Unsupported full-request access domains must fail
-closed, rather than using daemon privilege as proof of requester access.
+- Implement validated namespace/root entry with declared private isolation and
+  explicit final-child creation after PID/time namespace entry.
+- Preserve retained executable/stdio inputs, exact destination credentials,
+  capabilities, securebits and NNP; verify the actual final context.
+- Enforce host-controlled job placement/limits, launcher/final-child ownership,
+  cancellation, anchor-death teardown, deadlines and descendant cleanup.
+- Exercise all four routes using supported rootful/rootless targets and
+  same-owner/cross-owner policy. Enable self only when its acquisition and
+  transport semantics are integrated and verified.
 
-Preserve full/thin provenance, intent binding, `--full-only` and CSR-export
-semantics. Neither full-only nor export may silently invoke privileged thin
-expansion. Reconcile unsigned full-CSR trust-model selection against the
-destination before approval. Once signed, executable bytes, trust model and
-target cannot be switched or downgraded on mismatch.
+**Exit gate:** Integrated route, namespace, mapping, placement, setup-fault,
+registration-race and cleanup scenarios pass for declared profiles. Any blocked
+route remains explicitly incomplete; passing explicit targets does not complete
+self. Work at this stage remains experimental until applicable Phase 4 gates pass.
 
-The current [ComposeFS evidence limitation](../IMPLEMENTATION_NOTES.md#deferred-namespace-aware-executable-evidence)
-illustrates the issue: a cloned mount tree can make client selection choose
-memfd while daemon-local selection chooses direct execution. Fixing destination
-resolution and evidence negotiation is required; matching pathnames or forcing
-snapshot selection does not by itself establish cross-domain correctness.
+### Phase 4 — Confinement, full evidence and packaging
 
-Approval must bind and display the authority, target instance, verified target
-description, numeric credentials and mapping context, executable evidence,
-stdin/cwd/environment and execution-security constraints. A friendly name alone
-is insufficient. Named security profiles must resolve to bound constraints or
-an immutable version; changed policy must not silently change an old grant's
-authority. New signed target/profile semantics need explicit protocol and
-signature versioning, not reinterpretation of existing warrants.
+**Dependencies:** Phase 3; G-04 and the applicable full-access G-05 contract.
+**Subsystems:** security profiles, exec verifier, source access, evidence negotiation,
+approval, daemon packaging and privileged acceptance.
 
-Cross-owner execution requires requester policy and signer approval. Container
-ownership neither automatically grants nor forbids it. Possession of a signing
-key and access to the socket do not override host policy. Approval must clearly
-distinguish host root, rootful container root and mapped rootless container root.
+**Deliverables:**
 
-## Execution and lifecycle ownership
+- Implement supported composable SELinux/AppArmor transitions and actual-state
+  verification, policy-change handling and declared seccomp restrictions.
+  Include memfd checkpoints wherever the approved profile requires them.
+- Validate profiles on genuinely enforcing systems. Disabled, unreadable,
+  unconfined and permissive/complain states cannot satisfy required enforcement;
+  never remove NNP/tracing or switch signed executable models to pass a test.
+- Add supported destination full-CSR/export access and binding paths. Reconcile
+  unsigned evidence eligibility across cloned ComposeFS/PrivateMounts while
+  preserving provenance, exact intent and signed-mismatch rejection.
+- Supply daemon LSM packaging policy separately from target confinement policy.
+  Document socket exposure, delegation, explicit fresh provisioning and profile
+  limitations for administrators.
 
-Namespace entry runs in dedicated helpers with bounded IPC and no daemon secrets
-or management FDs leaked to the target. Entry ordering must account for the
-owning user namespace, capabilities needed for subsequent operations, mount/root
-setup and PID/time namespace rules. Joining a PID namespace affects subsequently
-created children, requiring a defined child-creation and reaping sequence.
-Retain destination references and verify the final context before execution.
-The coordinator must never change its own namespaces.
+**Exit gate:** Each candidate production profile passes real enforcing-platform,
+full/thin/export/evidence, public/private-outcome, durable-consumption and lifecycle
+cases. Any unsupported full-access or confinement combination remains rejected
+and listed. No claim of arbitrary requester confinement or manager-exec equivalence.
 
-The future child path must preserve retained executable evidence while setting
-root/cwd, groups, UID/GID, capabilities, NNP and security profiles in a validated
-order. Preserve the syscall-only post-clone setup invariant: prepare storage
-and any library-derived transition data before that critical child path.
-Rootless mappings, restrictions on `setgroups`, idmapped mounts and
-namespaced file capabilities require explicit supported-platform decisions and
-tests. Host root alone does not prove every combination is implementable.
+### Phase 5 — Optional resolvers and release qualification
 
-Namespace membership and cgroup membership are separate. Joining a cgroup
-namespace changes the view, not process placement. Define per-job placement that
-preserves host-enforced memory/PID limits, whole-job termination and compatible
-container lifecycle behavior. Do not blindly move jobs into manager-owned
-cgroups or assume the existing `CLONE_INTO_CGROUP` sequence transfers unchanged
-across user namespaces. Placement/delegation is an implementation prerequisite.
+**Dependencies:** Validated executor/authorization contracts from Phases 1–4.
+**Subsystems:** manager adapters, lifecycle evidence, deployment documentation and
+acceptance/release reporting.
 
-The host daemon owns admission, replay checks, durable grant consumption, audit,
-output, cancellation, deadlines, reaping and cleanup. Container stop/delete,
-anchor death and resolver loss must not redirect execution or leave descendants
-outside supervision. Manager adapters supply lifecycle evidence, without
-transferring authorization ownership. Target resources and helper reservations
-remain bounded and are released after actual completion/cleanup.
+**Deliverables:**
 
-Preserve the existing disclosure boundary: unsuccessful admitted thin requests
-receive the uniform `TIMEOUT` at the fixed deadline. Target existence, account
-lookup, LSM denial and preparation details stay private before approval. Avoid
-adding public diagnostic/lookup endpoints that bypass this rule. `APPROVED`
-means durable authorization, not successful spawn; readiness and execution
-results remain separate, and the complete approval response must precede spawn.
-Explicit rejection remains available only to validated full requests under
-the existing rules. A failure after durable consumption does not refund
-a one-time grant. Pre-authorization failures do not consume it.
+- Add optional manager resolvers scoped by endpoint, owner/tenant and manager
+  namespace. Validate their resources through the existing acquisition path;
+  names and user-owned metadata confer no independent authority.
+- Bind required lifecycle/configuration evidence and handle stop/delete,
+  replacement, name reuse and resolver loss without redirecting a job.
+- Complete the platform/profile matrix and publish reproducible evidence for all
+  advertised routes. Mark unsupported cases, experimental features and optional
+  adapters explicitly. A validated manager-free release does not wait for adapters.
 
-## Security-profile contract
+**Exit gate:** Manager integration passes scoped-name, dishonest/stale metadata,
+replacement and teardown cases without changing host authorization ownership.
+Every shipped profile passes all applicable V/NS requirements; no helper-only
+fixture substitutes for end-to-end evidence.
 
-The executor must specify what it reproduces, explicitly configures and verifies.
-It cannot promise equivalence to a manager's exec operation from namespace
-membership alone.
+## Requirement and acceptance traceability
 
-| Property | Proposed treatment | Required verification or integration |
-| --- | --- | --- |
-| Namespaces and filesystem root | Enter the validated destination environment; apply declared child isolation | Namespace ownership, pinned root, mount behavior and final process context |
-| Accounts, groups, cwd and environment | Resolve/configure explicitly in the destination | Mappings, exact credentials and signed execution inputs |
-| Capabilities, securebits and NNP | Configure under the signed authority ceiling | Before/after-exec sets and compatibility with transitions/file capabilities |
-| Cgroup resources | Explicit host-supervised job placement | Delegation, manager teardown interaction and complete descendant cleanup |
-| SELinux/AppArmor | Explicit supported transitions and expected resulting confinement | Source attributes, effective labels/profiles, enforcement state and policy changes |
-| Seccomp and other task restrictions | Apply a declared supported profile where available | Existing target filters cannot generally be extracted and copied through a simple supported API; manager configuration may be needed |
+The main specification defines required results. This table assigns delivery and
+verification ownership, preserving the original proposal's acceptance coverage.
 
-Collect source LSM attributes through applicable kernel interfaces, such as
-`SO_PEERSEC`, with their documented meaning and observation time. Peer socket
-security attributes are not a complete live process identity. Keep observed
-source identity, approved target constraints and observed execution results
-distinct in private audit. Dropping UID/GID does not reproduce requester LSM
-confinement; entering namespaces does not inherit another task's LSM or seccomp
-state.
+| Requirement | Contract location in main spec | Phases | Required evidence |
+| --- | --- | --- | --- |
+| NS-01 — Routes/deployment | §1.5 | 0, 3–5 | Four routes; rootful/rootless; correct destination account; both client endpoints |
+| NS-02 — Source attribution | §1.5 | 0, 2–3 | Shared/unshared namespaces, inherited/passed sockets, connector exit, exec/credential races |
+| NS-03 — Selector/identity separation | §1.5 | 0–2 | Names/PIDs/inodes/cgroups/images cannot independently authorize or identify a generation |
+| NS-04 — Instance lifetime | §1.5, §4.2 | 0, 2–3 | PID reuse, context/change-and-restore races, anchor death, restart/replacement and daemon restart |
+| NS-05 — Mapped authority/injection | §1.1, §4.2 | 0, 2–4 | Nested/unmapped credentials, groups/setgroups, rootless UID 0, injection authority and mapping composition |
+| NS-06 — Scoped/cross-owner policy | §1.5–1.6, §4.1–4.2 | 0–3 | Requester/signer ceilings, cross-owner approval, equal integers in different domains |
+| NS-07 — Destination/access | §2.2.1 | 2, 4 | Different bytes/cwd at same paths, account changes, mutable roots, bounded lookup and requester-access denial |
+| NS-08 — Evidence/provenance | §2.2.1–2.2.2 | 2, 4 | ComposeFS/PrivateMounts, default/full-only/export/thin, unsigned negotiation and signed substitution rejection |
+| NS-09 — Placement | §5.4 | 0, 3–4 | Userns/delegation, cgroup view versus membership, limits, escape boundary and manager teardown |
+| NS-10 — Executor | §5.4 | 0, 3–4 | Root/cwd, namespace ordering, PID/time children, idmapped mounts, final context and syscall-only setup |
+| NS-11 — Confinement | §5.5 | 0, 4 | Enforcing SELinux/AppArmor, full ranges/stacks, policy reload/reuse, seccomp and NNP/ptrace/direct/memfd |
+| NS-12 — Ownership/privacy | §5.4 | 1–5 | Cancellation/disconnect, target/helper/tracer death, exhaustion, blocked cleanup, TIMEOUT timing and irreversible consumption |
+| NS-13 — Resolvers | §1.5 | 5 | Scoped identity, metadata trust, loss/restart, no direct-runtime bypass of manager assumptions |
+| NS-14 — Approval binding | §3.2–3.2.1, §6.3 | 0–4 | Independent schema/crypto fixtures, identity/profile substitution, complete approval display |
+| NS-15 — Audit/versioning | §7 | 1–5 | Private source/approved/observed distinction, execution digest equality, fresh state and collector binding |
+| NS-16 — Release evidence | §8.3–8.4 | All | Reproducible integrated matrix; truthful current/target/deferred status |
 
-SELinux constraints need the complete context, including MLS/MCS range.
-AppArmor constraints need the applicable policy namespace, profile/stack and
-enforcement mode. Support composable constraints rather than assuming one
-mutually exclusive LSM. Disabled, unreadable, unconfined, permissive/complain
-and enforcing states are distinct; none may substitute for required enforcing
-confinement. Policy reload or profile-name reuse must trigger the defined
-version/revalidation contract, without claiming that a label fixes policy bytes.
+Record exact kernel/architecture, namespace/mapping topology, cgroup delegation,
+LSM enforcement/policy versions and executable model with privileged results.
+Use deterministic clocks for disclosure scheduling and bounded sockets for
+actual delivery. Run raw-socket cases as well as CLI cases; namespace-root and
+ordinary delegated-platform tests supplement rather than replace real-host gates.
 
-The current child enables `no_new_privs`, and direct execution uses ptrace.
-Both can affect LSM transitions. Do not silently remove NNP or tracing to make
-a transition succeed. Verify supported combinations on actual enforcing
-platforms. Setting a requested transition successfully does not prove the
-post-exec state. Extend verification to check actual confinement before releasing
-target/loader instructions, including applicable memfd execution paths. Where
-that cannot be guaranteed, reject the combination. An exec-stop check does not
-undo kernel state changes that already occurred during exec.
+## Scope, decisions and documentation completion
 
-Memfd execution does not preserve the source file's label/path semantics and
-may behave differently for SELinux entrypoints or AppArmor rules. Profiles
-requiring source-file semantics must use a validated executable model; never
-silently switch the signed model. Pinned namespaces/root/executable references
-do not freeze mutable root filesystems, libraries or security policy.
+The former proposal is incorporated as follows: goals/deployment and identity
+move to §1.5; destination preparation to §2.2; signed semantics to §3.2 and §4;
+execution/lifecycle to §5.4; confinement to §5.5; acceptance to §8. The native
+backend rationale remains here. CLI examples are deliberately omitted until
+G-05 fixes the grammar; friendly manager names require Phase 5 integration.
 
-Unsupported or unverifiable combinations fail closed. Daemon packaging also
-needs its own LSM policy for socket access, helpers, state, cgroups and
-verification operations; that policy is separate from target confinement.
+Keep these independent features deferred unless explicitly selected for a
+separate milestone: PTY, hook runtime, remote collector/ACK runtime, reload,
+reusable grants, direct scripts and additional signing adapters. Preserve their
+target contracts in the main spec. Physical FIDO claims need hardware evidence.
+No namespace phase claims interpreter dependency integrity, arbitrary existing
+seccomp extraction, remote execution or automatic account translation to the host.
 
-## Delivery stages and verification gates
-
-These stages describe future implementation work, not features established by
-this document:
-
-1. Define source authentication, target acquisition/registration, instance
-   invalidation and versioned approval contracts. Establish socket-passing and
-   process-race semantics before enabling `self`.
-2. Implement native execution and destination-local preparation, including
-   rootless credentials, cgroup placement and full/thin evidence behavior.
-   Exercise all four routes using explicitly validated targets.
-3. Implement supported LSM transitions, actual-state verification and daemon
-   packaging policy. Validate NNP, tracing, executable models and seccomp
-   constraints on enforcing platforms.
-4. Add optional manager resolvers for friendly names, ownership/configuration
-   metadata and stronger lifecycle tracking, reusing the executor and approval
-   contracts. Expand supported platforms only after their gates pass.
-
-Required acceptance scenarios include:
-
-| Area | Scenarios and required outcome |
-| --- | --- |
-| User stories | All four routes, rootful/rootless targets and same-owner/cross-owner requests; correct destination and numeric user, with explicit policy/approval |
-| Mapping and authority | Nested/unmapped UID/GID, supplementary groups, rootless UID 0 and host users; reject unsupported mappings and never reinterpret container root as host authority |
-| Instance binding | PID reuse, anchor exit, restart/replacement, context changes and daemon restart during approval; reject stale bindings without retargeting |
-| Source attribution | Shared/unshared namespaces, inherited/passed sockets, connector exit and exec/credential races; authenticate according to the defined source contract or reject |
-| Destination evidence | Same paths with different bytes/cwd, account changes and mutable roots; use retained destination evidence and resolved signed credentials |
-| CSR and ComposeFS | Cloned ComposeFS mounts/`PrivateMounts=`, default/full-only/export/thin paths and signed mismatches; preserve intent/provenance and reject signed substitutions without model switching |
-| Confinement | Real SELinux/AppArmor enforcement, permissive/complain/disabled states, policy changes, seccomp limits and NNP/ptrace/direct/memfd combinations; require the declared effective constraints |
-| Lifecycle and privacy | Cancellation/disconnect, container deletion, helper/tracer death and resource exhaustion; bounded whole-job cleanup, private pre-approval failures, durable audit and correct one-time consumption |
-
-Namespace entry ordering, race-resistant source capture, userns/cgroup
-compatibility and enforceable LSM verification remain implementation
-prerequisites. Existing namespace-root fixtures and delegated-platform tests
-supplement, but cannot replace, these acceptance gates.
+For this documentation update, validate relative links/anchors, section references,
+application versus Linux ABI versions, JSON/TOML/SQL examples where concrete,
+PAE lengths/hex and intent hashes. Review wire, approval, policy, consumption,
+audit and collector bindings together. All draft schemas need independent
+fixtures before their runtime release. README and implementation notes must
+continue to describe actual v2 behavior; changing this roadmap does not close a
+runtime gate or enable any CLI option.

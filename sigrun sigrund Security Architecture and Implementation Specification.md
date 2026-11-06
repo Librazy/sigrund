@@ -1,18 +1,26 @@
-# `sigrun` & `sigrund` Security Architecture and Implementation Specification (v2.0)
+# `sigrun` & `sigrund` Security Architecture and Implementation Specification (v3.0)
 
-This is the normative **v2 target contract**, not a description of the current
-runtime. It defines client-generated full CSRs, privately expanded thin CSRs,
-confidential pre-authorization outcomes, all four executable trust models,
-canonical signing, durable authorization, execution, hooks and audit replication.
-The local one-time SSH/stdio implementation and runnable recipes are documented
-in `IMPLEMENTATION_NOTES.md`. Deferred features and incomplete acceptance coverage
-remain explicit; the local implementation does not establish full v2 conformance.
+This is the **draft normative v3 target contract**, not a description of the
+current runtime. One host authority authenticates, prepares, approves and
+supervises execution in explicitly selected local environments. Full/thin
+provenance, confidential outcomes, executable evidence, durable authorization,
+hooks and audit replication remain part of this contract.
 
-V2 is a clean break: reject old clients, request shapes, warrants, signing domains,
-database schemas, audit state and collector contracts. There is no compatibility
-mode, migration, or automatic removal of old state. Fresh provisioning requires
-an explicitly selected empty state/log location (Section 7.1). DSSE itself still
-uses its standard v1 PAE encoding; that is independent of the application's v2.
+The implemented local one-time SSH/stdio runtime is **v2**; see
+[implementation notes](IMPLEMENTATION_NOTES.md). This rewrite does not enable
+v3 or establish conformance. The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md)
+tracks requirements, feasibility gates and release evidence. Requirements marked
+NS-01–NS-16 are normative obligations; unresolved mechanisms in Section 8.4 are
+release blockers, not permission to weaken those obligations. Schema examples
+are draft v3 contracts and must gain independent fixtures before runtime release.
+
+V3 is a clean break. Wire formats, configuration, CLI, signatures, database,
+audit/ratchet state and collector contracts may change together. Reject v2 and
+other unsupported contracts; provide no compatibility negotiation or automatic
+migration. Fresh provisioning requires explicitly selected empty state/log
+locations. Never delete or reinterpret existing state. DSSE still uses its
+standard v1 PAE encoding; Linux cgroup v2 and Linux file-capability ABI versions
+are independent of the application version.
 
 Internal failure names such as `POLICY_VIOLATION`, `REPLAY_DETECTED` and
 `SPAWN_FAILED` identify private diagnostics, not authorization statuses on the
@@ -24,17 +32,27 @@ requester socket. Section 2.1 is the exhaustive public outcome contract.
 
 ### 1.1 Explicit Architectural Guarantee Boundaries
 
-`sigrun` and `sigrund` replace PAM and Polkit with a capability-scoped execution architecture over a Unix domain socket (`/run/sigrund.sock`, `0666`, `SOCK_STREAM`). To ensure security claims match what the Linux kernel and external infrastructure can strictly enforce, v2 establishes the following explicit boundaries:
+`sigrun` and `sigrund` replace PAM and Polkit with a capability-scoped execution architecture over a Unix domain socket (`/run/sigrund.sock`, `0666`, `SOCK_STREAM`). To ensure security claims match what the Linux kernel and external infrastructure can strictly enforce, v3 establishes the following explicit boundaries:
 
 1. **Non-Root vs. Host-Root Cgroup Containment Boundary:**
 * **Guaranteed Containment (Explicit Safe Capability Profile):** This guarantee applies only when `target_uid != 0` and the granted capability set is a subset of the enumerated safe profile `{ CAP_NET_BIND_SERVICE }` (including the empty set). Every other capability, including capabilities added by future kernels, is outside this profile. The target UID, primary GID, and supplementary GIDs must confer no authority to migrate processes through host services: the workload must have no usable access to host management sockets, APIs, credentials, or delegated cgroup controls, including systemd, D-Bus policy methods that move PIDs, Docker/containerd/CRI, and equivalent privileged helpers. This excludes access conveyed by filesystem ownership, ACLs, group membership, service authorization policy, passed FDs, or inherited credentials. Deployment policy must establish these access restrictions; a read-only cgroup mount alone does not establish them. Under these conditions, the child runs in a new cgroup namespace (`CLONE_NEWCGROUP`) and mount namespace (`CLONE_NEWNS`) where `/sys/fs/cgroup` is recursively read-only, cannot migrate processes out of `job-<exec_id>` directly or through a host control plane, and all descendants remaining there are torn down via `cgroup.kill`.
 * **Best-Effort Containment (Any Execution Outside the Safe Profile or Access Restrictions):** A process running as host UID `0` (even with reduced capabilities and a read-only `/sys/fs/cgroup` mount) retains UID `0` ownership authority over the host filesystem and host IPC sockets (such as `/run/systemd/private` and `/run/dbus/system_bus_socket`). Such a process can request the host `systemd` manager to allocate a transient scope and migrate PIDs out of `job-<exec_id>`. Therefore, for `target_uid == 0`, any capability outside the safe profile, or any usable host control-plane access, initial cgroup placement (`CLONE_INTO_CGROUP`) is enforced, but post-spawn containment and descendant cleanup are **best-effort operational lifecycle management**, not a sandbox against a malicious root process.
 
 
-2. **Same-UID Privilege Elevation & Process Injection Boundary (Resolving Finding 1):**
-* Standard Linux `execve()` resets process dumpability to `1` (`SUID_DUMP_USER`) when the effective UID/GID before `execve()` matches the real UID/GID and the executed binary is readable (`MAY_READ`), and the kernel's `__ptrace_may_access()` check does not compare `supplementary_gids`. If a warrant granted `target_uid == requester_uid` with additional privileged `supplementary_gids` and zero capabilities on a system permitting same-UID tracing (e.g., Yama `ptrace_scope == 0`), the unprivileged requester could attach to the child via `ptrace` or `process_vm_writev` after `execveat()` and hijack those supplementary groups.
-* Therefore, **by default (`allow_same_uid_elevation = false`), `sigrund` rejects all warrants where `target_uid == requester_uid`**, requiring elevated commands to transition to a dedicated target UID (`target_uid != requester_uid`). Even when `allow_same_uid_elevation = true` is explicitly configured for a deployment, `sigrund` permits `target_uid == requester_uid` **only** when kernel-enforced post-exec non-dumpability (`exec_memfd` mode `0111` + `/proc/sys/fs/suid_dumpable == 0`) and Yama ancestor-only ptrace restrictions (`/proc/sys/kernel/yama/ptrace_scope` at least `1`) are verified active prior to spawn (Section 4.2 Predicate 3).
-
+2. **Mapped Identity & Process Injection Boundary (NS-05):**
+* Requester IDs are host-observed kernel credentials. Target IDs are interpreted
+  in the selected user namespace. Equal integers in different user namespaces
+  neither prove nor disprove a shared kernel identity or tracing authority.
+* Rootless UID 0 is not host root. Evaluate composed UID/GID mappings, userns
+  ownership, capabilities, dumpability, ancestry and applicable LSM/Yama rules.
+  Reject unmapped/overflow credentials and unsupported nesting; never substitute
+  an overflow value or a host account with the same name.
+* `allow_same_uid_elevation = false` rejects execution sharing the requester's
+  kernel UID. An opt-in requires a verified post-exec process-injection guard
+  for the actual destination and executable model. Section 4.2 describes the
+  restricted host case; it is not a general rootless recipe. Other namespace
+  ownership or capability paths that permit requester injection must also be
+  excluded. Unknown injection authority fails closed.
 
 3. **Storage Rollback vs. Live-Memory VM Snapshot Boundary:**
 * Local SQLite commits (`PRAGMA synchronous = FULL`) prevent replay of `one_time` grants on an intact local filesystem.
@@ -63,6 +81,15 @@ Linux capability (Section 5.3). Local audit protection has the protected-state
 and key-compromise limits in Section 7.2.
 
 
+The containment classification above is the host baseline. For a namespace target,
+classify effective host authority through the verified mapping and access
+context, not `target_uid == 0` alone. Rootful container root and mapped rootless
+root must be displayed separately from host root. Namespace membership does not
+prove inability to escape job placement; the declared profile must establish
+that guarantee or explicitly retain best-effort cleanup. A privileged container
+already controlling the host, daemon state or management interfaces is outside
+the isolation guarantee (NS-01, NS-05, NS-09).
+
 ### 1.1.1 Pre-Authorization File Confidentiality
 
 The daemon is not a public privileged stat, hash, or CSR service. The confidentiality
@@ -88,13 +115,14 @@ claiming to eliminate them. Admission/transport defenses that run before target
 inspection may close a connection immediately. Detailed private audit is not
 exposed through a requester diagnostics endpoint.
 
-Requester-limited access means kernel DAC/POSIX ACL enforcement with the
-socket-authenticated UID/GID/supplementary groups in the daemon's filesystem
-execution domain. It does not reproduce arbitrary caller mount/user namespaces,
-Landlock restrictions, or LSM confinement. Unsupported identity/domain mappings
-fail closed; no client-selected namespace or PID is followed. Readability and
-required directory search permission establish full-CSR eligibility; requester
-execute permission is not required for an elevation request.
+Requester-limited access must be established in the selected destination under
+the supported source-access contract (NS-07). UID/GID impersonation alone does
+not reproduce requester LSM or Landlock restrictions. A privileged destination
+root FD is not proof of requester traversal permission. Unsupported access
+domains fail closed for full requests. Readability and required directory search
+permission establish file eligibility; requester execute permission is not
+required for elevation. Thin expansion is a separate private path, not an access
+proof or a fallback that full-only/export may invoke.
 
 
 ### 1.2 Startup Cgroup v2 Initialization & Supervisor Leaf
@@ -327,7 +355,7 @@ max_ttl_secs = 31536000                  # positive uint64, checked timestamp ar
 
 ```
 
-`csr_allowed_executable_dirs` is a sorted, duplicate-free list of absolute directory paths that are neither `/` nor descendants with `.`/`..`/empty components. Every `[[signers]]` entry must contain an exactly equal canonical list in `allowed_executable_dirs`; a signer list that differs, is broader, or is absent rejects the complete configuration. The daemon pre-opens and pins these roots once per policy generation. `collector_base_url`, TLS files, key ID, and public key are required and validated for every configuration generation, even when remote ACK is disabled; network use is disabled in that mode. Hook UID/GID, all quotas, and job limits are root-controlled configuration and cannot be raised by warrants. The host must expose a writable `memory.swap.max` file in the delegated hierarchy; `job_memory_swap_max_bytes` may be zero or a finite nonnegative value and is written/read back on every startup probe and job cgroup. Missing swap control is a startup failure. `max`/unlimited values are rejected.
+`csr_allowed_executable_dirs` is a sorted, duplicate-free list of absolute directory paths that are neither `/` nor descendants with `.`/`..`/empty components. Every `[[signers]]` entry must contain an exactly equal canonical list in `allowed_executable_dirs`; a signer list that differs, is broader, or is absent rejects the complete configuration. For the host target, the daemon pins these roots per policy generation; for other targets, it pins the same destination-relative policy roots during private preparation against the retained instance. Root FDs are scoped to both target and policy generation, never reused by pathname across destinations. `collector_base_url`, TLS files, key ID, and public key are required and validated for every configuration generation, even when remote ACK is disabled; network use is disabled in that mode. Hook UID/GID, all quotas, and job limits are root-controlled configuration and cannot be raised by warrants. The host must expose a writable `memory.swap.max` file in the delegated hierarchy; `job_memory_swap_max_bytes` may be zero or a finite nonnegative value and is written/read back on every startup probe and job cgroup. Missing swap control is a startup failure. `max`/unlimited values are rejected.
 
 The following are immutable protocol/security ceilings, not freely adjustable limits: frame payload maxima and JSON structural limits in Section 2.1.1; `max_active_sockets_global/per_uid <= 64/4`; `max_io_workers_global/per_uid <= 16/2`; total owned Unix sockets `<= 128` with exactly `2` fixed final-close workers; `request_deadline_ms <= 5000`; `authorization_timeout_ms` in `1000..300000`; `snapshot_ram_global_bytes <= 536870912` and `snapshot_ram_per_uid_bytes <= 134217728`; `max_executable_bytes <= 67108864`; `max_stdin_bytes <= 16777216`; `hook_timeout_ms <= 25000`; `collector_rpc_timeout_ms <= 3000`; control-frame assembly/send deadlines remain the immutable `5000 ms` protocol deadline; `audit_record_max_bytes == 65536`; and finite numeric/identifier bounds in Section 3.5. Admission counters, audit reservations and storage/shutdown controls follow the process-wide rules below; their stated maxima are immutable. All other listed numeric values are captured from the policy generation at request admission and used consistently for that request, hook pipeline, RPC, snapshots, and job cgroup. A lower value may reduce availability or resource consumption; no reload or warrant may exceed a ceiling.
 
@@ -368,13 +396,129 @@ provides the independent disk-pressure gate.
 The optional restricted local approval profile is defined in Section 6.3;
 it disables reload and does not relax the startup, descriptor or execution gates.
 
+### 1.5 Execution Environments, Source Identity, and Target Acquisition
+
+**NS-01 — Local authority and deployment.** All routes use one host daemon for
+policy, root-TTY approval, durable authorization and supervision:
+
+| Route | Source | Destination | Account interpretation |
+| --- | --- | --- | --- |
+| 0 | Host | Existing container B | In B |
+| 1 | Container A | Host | Host account |
+| 2 | Container A | Its own supported environment | In that environment |
+| 3 | Container A | Existing container B | In B |
+
+Execution is local; no remote-host or delegated proxy authentication is implied.
+Operators expose the client socket and its `.context` companion with their path
+relationship intact. No socket injection, container modification or container
+creation is performed. Approval sockets, state and management credentials stay
+host-controlled. DAC and SELinux/AppArmor must permit connection; reachability
+only permits submission. Mapping a source container account into a host account
+is a separate deferred selection mode.
+
+**NS-02 — Authenticated source contract.** The baseline attributes requests to
+kernel-authenticated connection credentials (`SO_PEERCRED`, `SO_PEERGROUPS`) as
+observed by the host daemon. Credentials are captured at connection time; an
+inherited or passed socket does not establish the identity of its later writer.
+This baseline is explicit connector attribution, not per-message authentication.
+Caller usernames, namespace IDs and runtime labels are untrusted claims.
+
+Capture applicable `SO_PEERSEC` and process attributes with their observation
+source/time in private audit; socket security attributes are not complete live
+process confinement. Validate UID/GID mappings and overflow/unmapped results.
+`self` requires a stronger, race-checked acquisition contract tying the selected
+environment to the authenticated source. Before enabling it, Phase 0 must choose
+and specify connector capture or authenticated message-sender attribution,
+including inherited/passed sockets, connector exit, exec, credential and
+namespace changes. Reading procfs for a connection-time PID later is insufficient.
+No undocumented per-message authentication is inferred from the existing stream.
+
+**NS-03 — Selection is not authority.** Distinguish:
+
+| Object | Meaning |
+| --- | --- |
+| Selector | Host, self, administrator registration, or explicitly scoped process reference; optional resolvers supply manager names |
+| Pinned target | Daemon-owned process reference, namespace FDs, root FD, verified mapping/context observations and lifecycle lease |
+| Signed target binding | Daemon epoch and instance ID bound to the retained context and verified display description |
+| Manager identity | Optional additional scoped evidence, never a replacement for resource validation |
+
+Host means the daemon's configured execution environment. Self means the
+supported authenticated caller environment, including allowed unshares; it need
+not be the manager's original container. Explicit process PIDs are interpreted
+in the daemon's PID namespace, never guessed from caller-visible numbers.
+A process reference authorizes nothing. Names, PIDs, namespace inodes, cgroup
+paths, image digests and runtime IDs are each insufficient instance identities.
+Shared namespaces do not identify a unique container.
+
+**NS-04 — Acquisition, revalidation and invalidation.** Resolve and pin before
+review; revalidate before final authorization, before spawn, and before releasing
+execution. Acquire a retained process reference (pidfd where supported), pinned
+proc reference, namespace/root FDs, ownership relationships and mapping evidence
+under one documented race-resistant acquisition contract. Protect lookup against
+PID reuse and mixed observations. Repeated procfs reads alone do not prove an
+atomic capture or detect change-and-restore races. Unsupported acquisitions fail
+closed; the Phase 0 gate must prove the supported mechanism.
+
+Keep a private bounded instance registry scoped to a fresh daemon epoch. IDs
+without retained resources provide no authority. Reject on anchor exit,
+inconsistent or changed relevant context, or lost required lifecycle evidence.
+Never reacquire a matching name/PID to replace an approved target. Namespace FDs
+can outlive an instance and are not liveness proof. Daemon restart invalidates
+all ephemeral bindings, including otherwise unexpired warrants. The host target
+also receives an epoch-scoped binding. Manager-free bindings identify a validated
+process environment, not a universal container generation.
+
+**NS-06 — Destination ownership and policy.** Host policy must authorize the
+requester, target registration/scope, target credentials, security constraints and
+signer independently of container ownership. Cross-owner execution is neither
+implicitly allowed nor categorically forbidden. Signer keys and runtime socket
+access cannot override daemon policy. User-owned manager metadata cannot grant
+host privileges or arbitrary namespace entry. Registration, revocation and
+profile management use host-administrator interfaces; no requester-facing
+existence/lookup service may bypass thin-request confidentiality.
+
+**NS-13 — Optional manager resolvers.** Scope manager identities by endpoint,
+owner/tenant and manager namespace. Validate returned process resources with the
+same acquisition and policy gates as explicit targets. Manager metadata supplies
+additional identity/configuration/lifecycle evidence; it cannot independently
+authorize host privilege. Bind required resolver evidence and define loss/restart
+behavior. Native runtime IDs may outlive execution generations. Exact manager
+exec semantics require separately validated configuration integration; neither
+OCI state nor direct runc/crun invocation supplies that equivalence automatically.
+
+### 1.6 Target and Security Policy Configuration
+
+Target registrations and named security profiles are root-controlled policy,
+validated as a complete generation. Unknown targets/profiles are denied privately.
+Numeric target UID/GID/group ceilings apply within explicitly allowed target
+scopes; never treat a flat numeric allowlist as permission for every namespace.
+Approved constraints are immutable bytes or content-addressed versions, not a
+mutable profile name. Removal/revocation invalidates pending authorization;
+changed policy cannot silently expand an existing grant. Captured generations
+retain resource limits, but do not bypass mandatory revocation or LSM-policy
+revalidation.
+
+The base configuration in Section 1.4 remains applicable. Phase 0 must specify
+bounded registration/profile schemas, management CLI, revocation and dependency
+metadata before those interfaces ship. The syntax is not inferred from the
+conceptual examples in the roadmap. Aggregate quotas must include pinned target
+FDs, registrations, helpers, launcher processes, pending review and cleanup;
+Phase 1 must supply concrete limits and exhaustion tests within the existing
+admission ceilings. Cancellation releases a reservation only after actual cleanup.
+
+The backend is a native Linux namespace executor. Manager APIs are optional
+resolvers, not universal execution backends. Direct runc/crun access underneath
+a manager is not supported as a generic control plane. OCI supplies useful
+configuration vocabulary, not globally unique identity or automatic inheritance
+of manager execution policy (NS-13).
+
 ## 2. Wire Protocol, Request Shapes, and Job Lifecycle
 
 ### 2.1 Binary Framing & Public Outcome Contract
 
 Use the existing five-byte framing: one type byte, then a four-byte unsigned
-big-endian payload length, then exactly that many UTF-8 JSON bytes. V2 request
-objects explicitly contain `version: "2.0"`; legacy shapes are not negotiated.
+big-endian payload length, then exactly that many UTF-8 JSON bytes. V3 request
+objects explicitly contain `version: "3.0"`; legacy shapes are not negotiated.
 Unknown fields, duplicates and extra frames are rejected. Application signing
 and state versions are independently enforced.
 
@@ -400,7 +544,7 @@ A decision has exactly `exec_id` (daemon-generated UUIDv7 at admission) and
 | --- | --- | --- | --- |
 | `full_csr` | Verified, durably authorized | Only explicit refusal by a mandator after successful full validation | All other pre-approval failures/no outcome |
 | `thin_csr` | Verified, durably authorized after private expansion | Never | Every unsuccessful pre-approval path, including explicit refusal |
-| `signed` | Verified v2 client-full warrant, durably authorized | Never (no mandator consulted) | Invalid/expired/revoked/replayed warrant or any other pre-approval failure |
+| `signed` | Verified v3 client-full warrant, durably authorized | Never (no mandator consulted) | Invalid/expired/revoked/replayed warrant or any other pre-approval failure |
 
 `TIMEOUT` is scheduled at the fixed admission-based deadline; no intermediate
 status is sent. A syntactically plausible full CSR does not earn a rejection
@@ -415,7 +559,8 @@ statuses. Never return internal errors as alternative authorization statuses.
 `APPROVED` acknowledges completed authorization and consumption when applicable,
 not setup or exec success. Send it completely before spawning or target output.
 `SERVER_EXEC_READY` has exactly `exec_id` and `exec_outcome`, either `unknown`
-(memfd setup handshake) or `exec_event_observed` (verified direct exec stop).
+(setup handshake without a required checkpoint) or `exec_event_observed`
+(verified and released exec stop, including memfd when required by its profile).
 It does not repeat authorization. Failure before readiness still produces an
 execution result after the original approval.
 
@@ -424,7 +569,7 @@ For `status: "EXITED"`, exactly one of `exit_code` (0..255) and `signal` (1..64)
 is non-null. For `SETUP_FAILED`, `EXEC_FAILED` or `CANCELLED`, both are null;
 private audit retains errno and details. Emit once after owned-job cleanup,
 including when no child was created. Stop/continue notifications are not results.
-Direct checkpoint failures are `EXEC_FAILED`; memfd's unknown-exec distinction
+Checkpoint failures for any model are `EXEC_FAILED`; unchecked memfd's unknown-exec distinction
 is retained (Section 2.4).
 
 `sigrun --status-fd` writes each decision/readiness/result payload as JSONL,
@@ -434,7 +579,7 @@ for EXITED, 254 for non-EXITED execution failure or transport failure, and 64 fo
 local usage errors. Relay output after APPROVED, even before readiness, but send
 signals/resize only after readiness. Drain output through EOF after a result.
 On disconnect restore the terminal and report a local transport error; never
-invent a remote timeout or retry automatically. No v2 decision contains a CSR.
+invent a remote timeout or retry automatically. No v3 decision contains a CSR.
 
 ### 2.1.1 Bounds, Frame Deadlines, and Transport Failure
 
@@ -467,7 +612,7 @@ socket pathname plus `.context` (for example `/run/sigrund.sock.context`). Both
 client and daemon derive it from their configured execution socket path; startup
 checks the resulting Unix-socket path bound and trusted parent. Publish it only
 after the same startup/recovery gates as the execution listener. On this socket
-send exactly `{"version":"2.0"}` as `CLIENT_CONTEXT_QUERY`. The daemon accepts no path, intent or rights and performs
+send exactly `{"version":"3.0"}` as `CLIENT_CONTEXT_QUERY`. The daemon accepts no path, intent or rights and performs
 no request-dependent filesystem inspection. Authenticate the daemon through its
 trusted socket location and root peer credentials. Context queries do not consume
 approval slots or execution-request rate counters. Limit them to 8 active global,
@@ -496,10 +641,13 @@ CSR preparation, but submission always revalidates against current captured poli
 ### 2.2 Full CSR, Thin CSR, and Signed Submissions
 
 A complete canonical **intent** has exactly `command`, `execution_context`,
-`policy`, and `caller_env`. Its command has `allow_interpreted_script`, `argv`,
+`policy`, `caller_env`, `target`, `account`, and `security_profile`. Its command has `allow_interpreted_script`, `argv`,
 `cwd`, `executable_path`, `stdin_policy`, and `tty_mode`. Its execution context
-has `capabilities`, `env_exact`, `caller_env_allowlist`, `supplementary_gids`,
-`target_gid`, `target_uid`, and `umask`. Its policy has `mode` and `ttl_secs`.
+has `capabilities`, `env_exact`, `caller_env_allowlist`, and `umask`.
+`account` selects either destination numeric UID/GID/supplementary groups or a
+destination account name; the resolved credentials belong to the warrant
+execution context. Section 3.2.1 defines these additional selection fields.
+Its policy has `mode` and `ttl_secs`.
 These fields retain Sections 2.3 and 4.2 bounds; requested capabilities are an
 authority ceiling, not a claim about the final kernel sets.
 
@@ -508,19 +656,21 @@ All hello objects have exactly the common keys `version`, `mode`, `tty_mode`,
 
 | `mode` | Additional key | Content |
 | --- | --- | --- |
-| `full_csr` | `csr_payload` | Canonical full v2 CSR as a UTF-8 JSON string |
+| `full_csr` | `csr_payload` | Canonical full v3 CSR as a UTF-8 JSON string |
 | `thin_csr` | `intent` | The complete intent object; no fabricated executable evidence |
-| `signed` | `dsse_envelope` | V2 envelope with a client-full warrant; no unsigned overrides |
+| `signed` | `dsse_envelope` | V3 envelope with a client-full warrant; no unsigned overrides |
 
 Hello `tty_mode` and `caller_env` must exactly equal the corresponding intent or
 warrant values. Thin requests have no complete CSR at submission; full CSRs use
-the complete v2 warrant schema (Section 3.2) without signatures. Full CSR and
+the complete v3 warrant schema (Section 3.2) without signatures. Full CSR and
 signed modes require `request_origin: "client_full"` and `approval_exec_id: null`.
 A standalone signed `daemon_expanded_thin` warrant is always refused without
 lookup; it is valid only as the broker/hook response for its active thin request.
 
-`sigrun` obtains public context, preserves exact intent and finite stdin, and
-attempts unprivileged full preparation. It generates a CSPRNG UUIDv7 grant ID,
+`sigrun` obtains target-independent public context and preserves exact intent
+and finite stdin. In a supported full-access domain it attempts unprivileged
+destination preparation. Cross-domain workflows provide an explicit thin-intent
+path; a client must not hash its local same-named executable as destination evidence. It generates a CSPRNG UUIDv7 grant ID,
 uses local realtime for validity, and binds host identity and its own UID/GID;
 the daemon checks these against authenticated identity and time/policy. Walk the
 enabled trust models in order. Conclusively ineligible models permit the next;
@@ -529,11 +679,14 @@ triggers automatic thin fallback, not invented evidence or guessed eligibility.
 Requester execute permission is not required. Local diagnostics identify fallback
 without reporting any daemon-derived information. `--full-only` forbids fallback.
 
-V2 `sigrun --export-csr PATH -- ...` prepares and exports a full canonical CSR
+V3 `sigrun --export-csr PATH -- ...` prepares and exports a full canonical CSR
 without execution submission (and implies full-only). It may query public context;
 it never requests privileged expansion. Offline `sigrundctl csr-pae --csr PATH`
 and `pack-warrant` consume those bytes, sign/package without rewriting fields,
-and refuse overwrites. Thin requests have no export/redemption path. These options apply to the implemented local v2 profile.
+and refuse overwrites. Thin requests have no export/redemption path. These are
+v3 target semantics; runnable v2 commands remain documented in implementation
+notes. Full preparation/export requires an already trustworthy destination
+binding obtainable without privileged public target discovery (NS-07).
 
 ### 2.2.1 Preparation, Access Validation, and Exact Binding
 
@@ -568,19 +721,24 @@ and refuse overwrites. Thin requests have no export/redemption path. These optio
    A caller running as the helper UID must not be able to fabricate its result.
    Do not replace the requester's authenticated groups with the requested target
    groups, and do not grant the helper authority from the requested capability set.
-   Resolve from the daemon-domain `/` under these credentials, with no symlinks
+   Resolve from the validated destination `/` under the supported requester
+   access contract (NS-07), with no symlinks
    or magic links, including every ancestor of the selected root. Check that the
-   requester-opened root matches the generation's pinned device/inode, then apply
+   requester-opened root matches the target/generation's pinned device/inode, then apply
    the relative no-cross-mount resolution in Section 4.2. A privileged root FD
    alone cannot establish traversal permission. Require a readable regular source
    and retain its opened FD. Do not use an `access()`-then-privileged-reopen pattern.
 4. **Full verification:** Through that retained source independently verify the
    exact proposed model, evidence, stdin commitment, intent hash and expected
-   capability sets, within bounded worker/deadline rules. Kernel execution-support
-   checks may use daemon startup context, but cannot replace failed requester
-   access. Check ordering/eligibility under captured policy. An invalid full CSR
+   capability sets, within bounded worker/deadline rules. Kernel support and
+   trust-model eligibility must hold in the destination; daemon startup context
+   alone cannot establish either destination compatibility or requester access. Check ordering/eligibility under captured policy. An invalid full CSR
    silently times out without mandator delivery or automatic expansion. The
    mandator receives the exact client CSR bytes only after all checks succeed.
+   An unsigned full CSR may select a different eligible model from the daemon
+   default if that exact model and evidence validate under destination policy;
+   preference order alone is not grounds to rewrite the CSR. A change requiring
+   new bytes requires a new request, never silent privileged expansion.
 5. **Thin expansion:** With root authority resolve only beneath the selected
    pinned root using Section 4.2. Choose the first eligible enabled model and
    retain its snapshot/source. Derive the exact post-exec profile. Generate grant
@@ -606,9 +764,40 @@ and refuse overwrites. Thin requests have no export/redemption path. These optio
    retained objects before consumption. No approval refreshes validity or permits
    model substitution. Direct evidence is rechecked at the existing exec stop.
 
-### 2.2.2 Configurable Executable Trust Models (v2)
+**NS-07 — Destination preparation and access domains.** Preparation runs in a
+dedicated bounded helper against the pinned target. Resolve executable roots,
+accounts, cwd and execution inputs there; do not inherit a container cwd for a
+host request or copy caller files implicitly. Numeric identities must map in
+the validated destination. Account lookup is bounded and cannot invoke arbitrary
+destination NSS code with host privilege. Initial support uses explicit numeric
+credentials or bounded destination account-file parsing; other backends require
+a separate validated helper profile. Bind both original account selection and
+resolved numeric credentials/mapping context; later account changes cannot
+redirect an approval.
 
-All four models use the v2 tagged `command.executable_trust` representation.
+The destination helper receives only required resources and bounded IPC, never
+daemon secrets, management sockets or unrelated directory handles. Retain the
+executable and immutable stdin before review. Sign cwd as a destination path;
+a retained cwd FD/final-context check must prevent accidental use of a different
+execution domain, without claiming an immutable directory tree. Full access must
+account for applicable source confinement and mappings. If that cannot be proven,
+reject full/full-only/export; privileged thin expansion is not requester evidence.
+The public context endpoint stays target-independent and returns no instance,
+account or private profile inventory.
+
+**NS-08 — Evidence negotiation.** Eligibility and unsigned-model reconciliation
+are destination-local, including cloned ComposeFS mounts and `PrivateMounts=`.
+An enrolled host mount ID or matching pathname does not identify destination
+bytes. Bind retained evidence, exact model, source-access result and resolved
+credentials together. Preserve submitted intent and full/thin provenance.
+Already signed bytes, model, target and constraints cannot switch or downgrade
+on mismatch. Mutable scripts, loaders, libraries and configuration remain outside
+executable evidence; see [interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md).
+
+
+### 2.2.2 Configurable Executable Trust Models (v3)
+
+All four models use the v3 tagged `command.executable_trust` representation.
 Only `digest_memfd` copies executable bytes into a sealed memfd. Hashed stdin
 retains its separate sealing contract. Legacy warrant formats are rejected.
 
@@ -721,8 +910,11 @@ The administrator must maintain those protections and must not modify active
 backing objects in place. This is an additional trust assumption, not Linux
 executable write exclusion. It includes administrator actions through privileged
 jobs and writable aliases. Discovery failure leaves this exception unavailable.
-Public context advertises the daemon-qualified mount ID; the daemon never
-accepts client enrollment claims. Revalidate the source mount identity,
+Public context advertises only the host daemon-qualified mount ID; the daemon
+never accepts client enrollment claims. This enrollment is a host-only baseline,
+not qualification of a cloned destination mount. Destination support requires
+private validation of its exact backing/mount assumptions; otherwise the exception
+is ineligible there. Never expose target mount inventory through public context. Revalidate the source mount identity,
 read-only status, root ownership and ordinary execution metadata at selection,
 authorization and the exec checkpoint. Initially exclude file capabilities.
 Always hash at preparation, before consumption and at the exec checkpoint;
@@ -754,7 +946,7 @@ reservations remain owned until actual completion/cleanup, even after timeout.
 **Capability authority and signed execution profiles.** Intent supplies
 only authority ceiling `capabilities = C`. Full-CSR clients derive, and the daemon independently verifies,
 `execution_context.post_exec_capabilities`; for thin requests the daemon derives
-these sets before the mandator signs. The field is required for every v2 model, containing sorted unique named
+these sets before the mandator signs. The field is required for every v3 model, containing sorted unique named
 `permitted`, `effective`, `inheritable`, `ambient`, and `bounding` sets. The
 ordinary ELF profile has all five sets equal to C. Each set is sorted/unique,
 contains only supported capabilities within C, I and B equal C, E is a subset
@@ -776,7 +968,7 @@ and exact resulting sets must still match. For such files derive `I = B = C`, `A
 `P = (fP & C) | (fI & C)`, and `E = P` when the file effective flag is set,
 otherwise `E = empty`. Unsupported file-capability semantics can use memfd,
 which intentionally strips those attributes. For memfd all five expected sets equal C.
-There are no implicit legacy capability profiles in v2.
+There are no implicit legacy capability profiles in v3.
 
 **Evidence encoding.** `command.executable_trust` is required and contains exactly
 one of these tagged objects (measurements below are illustrative):
@@ -796,7 +988,8 @@ audit bind evidence, authority, profile and provenance. Checkpoint audit include
 the profile observed by exact comparison. No such evidence appears in a requester
 pre-authorization response.
 
-**Checkpoint and cancellation.** Before any child exec, the coordinator attaches
+**Checkpoint and cancellation.** For direct models and any profile requiring
+post-exec verification, before child exec the coordinator attaches
 using `PTRACE_SEIZE` and `PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL`, registers the
 PID/pidfd and releases a private startup pipe. This works when another thread
 clones the child. The Central Reaper reports exec stops separately from exits;
@@ -812,10 +1005,12 @@ registration after successful detach so ordinary later suspension still works.
 Cancellation during release is pending until detach's result is known. Any
 failure, unexpected stop, timeout or disconnect kills/cleans up without release;
 tracer death before detach kills the child. Readiness is audited only after
-verification and release as `exec_event_observed`. Memfd retains `unknown`.
+verification and release as `exec_event_observed`. Memfd may retain `unknown`
+only when its declared security profile requires no exec checkpoint; NS-11
+requires verified release for every model with post-exec confinement constraints.
 Consumption precedes clone: post-commit failures consume a one-time warrant,
-with no refund, fallback or retry. LSM domain binding and dependency integrity
-remain outside this model.
+with no refund, fallback or retry. Namespace and LSM verification are additional
+NS-10/NS-11 obligations; dependency integrity remains outside executable evidence.
 
 ### 2.3 `tty_mode` and `stdin_policy` Compatibility Matrix
 
@@ -852,7 +1047,11 @@ are forwarded. Child output remains untrusted and never feeds approval prompts.
 
 ### 2.3.1 Normative `recvmsg()` and Descriptor Ownership Rules
 
-The following rules govern all client-to-daemon reads on the `SOCK_STREAM` control socket; the FD matrix alone is insufficient:
+The following rules govern connector-attributed client-to-daemon reads on the
+`SOCK_STREAM` control socket; the FD matrix alone is insufficient. A G-01 decision
+to authenticate message senders must revise this ancillary/framing contract and
+its bounds explicitly before self can use that mode; it cannot be added behind
+these rules or inferred from socket visibility.
 
 1. **Receive Every Byte with Ancillary Inspection:** Use `recvmsg(..., MSG_CMSG_CLOEXEC | MSG_DONTWAIT)` for every receive, including after `CLIENT_HELLO`; do not use `read()`, `recv()`, or `MSG_PEEK` paths that discard or duplicate ancillary delivery. Supply a bounded control buffer of `CMSG_SPACE(3 * sizeof(int))` on every call, reset `msg_controllen` before each call, and inspect returned `msg_flags` and every returned `cmsghdr` before accepting payload bytes. Received descriptors acquire `FD_CLOEXEC` atomically via `MSG_CMSG_CLOEXEC`; setting it afterward with `fcntl()` is insufficient.
 2. **Unambiguous Frame Association:** For `stdio`, the client uses one `sendmsg()` to send exactly the first byte (`0x01 CLIENT_HELLO`) with its complete descriptor set in one `SOL_SOCKET`/`SCM_RIGHTS` message; for `pty`, it sends that byte with no ancillary data. It then sends the four-byte length and JSON payload without ancillary data. The daemon uses a one-byte iovec until its first successful data-bearing `recvmsg()` returns that type byte (retrying `EINTR` and waiting for readiness on `EAGAIN`); this is the only receive eligible to accept descriptors. Subsequent reads are bounded to the remaining header or payload of the current frame, never spanning frame boundaries. Stream fragmentation does not relax the rule: descriptors attached to the length, payload, a later frame, or any later receive are rejected. A second `CLIENT_HELLO` is a protocol error.
@@ -893,8 +1092,16 @@ The following rules govern all client-to-daemon reads on the `SOCK_STREAM` contr
 
 ### 2.4 Two-Frame `sync_pipe` Exec Handshake & Centralized Reaper (Resolving Findings 3 & 4)
 
+The concrete step numbers, direct-child wait calls and process-group signal
+recipe below describe the host baseline. Namespace launchers must preserve the
+same classification, registration and cleanup guarantees through the G-03
+parentage/reaper plan. Do not assume a launcher-created final child is directly
+waitable by the daemon, or that its host-visible PID is its process-group ID.
+G-02/G-03 must define bounded namespace setup error frames and signal routing
+before implementation; silent reuse of host step meanings is not permitted.
+
 1. **Two-Frame Pre-Exec Handshake on `sync_pipe` (Setup Readiness and Reported Failures):**
-* A child killed before writing the readiness frame produces `0` bytes followed by `EOF`. A child killed after writing the frame but before entering `execveat()` produces the same 8-byte frame followed by `EOF` as a successful exec, including a fast `/bin/true` exit. Death after an exec error but before writing its error frame is also indistinguishable. `EOF` means the write end closed; `FD_CLOEXEC` cannot establish why it closed. Direct execution of an arbitrary target cannot provide an exact parent-side exec-success notification in this race window. A stronger contract would require a trusted post-exec trampoline reporting after its own exec transition; the memfd model does not claim target exec success. Direct models instead use the verified ptrace exec checkpoint in Section 2.2.2.
+* A child killed before writing the readiness frame produces `0` bytes followed by `EOF`. A child killed after writing the frame but before entering `execveat()` produces the same 8-byte frame followed by `EOF` as a successful exec, including a fast `/bin/true` exit. Death after an exec error but before writing its error frame is also indistinguishable. `EOF` means the write end closed; `FD_CLOEXEC` cannot establish why it closed. Direct execution of an arbitrary target cannot provide an exact parent-side exec-success notification in this race window. A stronger contract would require a trusted post-exec trampoline reporting after its own exec transition; a memfd profile without a checkpoint does not claim target exec success. Direct models and memfd profiles requiring post-exec verification instead use the verified ptrace exec checkpoint in Section 2.2.2.
 * Accordingly, `sigrund` uses an explicit two-frame protocol over `FD 4` (`sync_pipe[1]`, `O_CLOEXEC`), where each frame is an 8-byte struct `{ u32 step, i32 errno }` in native endianness:
 * If any child setup step `1..=10` fails prior to `execveat()`, the child writes `{ step: 1..10, errno: >0 }` (8 bytes) and calls `_exit(127)`.
 * In Step 10, immediately after the Read-Back Verification Gate passes and immediately before calling `syscall(SYS_execveat, ...)`, the child writes the 8-byte **`READY_TO_EXEC`** frame `{ step: 0, errno: 0 }`.
@@ -907,7 +1114,7 @@ The following rules govern all client-to-daemon reads on the `SOCK_STREAM` contr
 * **`0` bytes read before `EOF`:** No setup-readiness evidence -> classified as `SPAWN_FAILED`. A `2000 ms` timeout before `EOF`, even after a readiness frame, is also `SPAWN_FAILED`.
 * **Exactly `8` bytes read followed by `EOF`, with `step` in `1..=10` and `errno > 0`:** Reported setup failure -> classified as `SPAWN_FAILED`.
 * **Exactly `16` bytes read followed by `EOF` (`{ step: 0, errno: 0 }` then `{ step: 11, errno: >0 }`):** Reported `execveat()` error -> classified as `SPAWN_FAILED`.
-* **Exactly `8` bytes read equal to `{ step: 0, errno: 0 }` followed by `EOF`:** All 10 setup steps passed; exec outcome is unknown -> classified as `READY_TO_EXEC`. `sigrund` appends `EXEC_READY_TO_EXEC` (`child_pid`, `exec_outcome: "unknown"`) to the audit log and sends `0x08 SERVER_EXEC_READY` (`exec_outcome: "unknown"`), after the prior APPROVED. Direct models withhold readiness until their checkpoint verifies and releases the child. This classification also applies to a child killed in the post-token/pre-syscall window. The Central Reaper preserves any already-observed terminal status and sends it afterward in `0x05 SERVER_EXEC_RESULT`; a signal termination or exit code alone does not establish whether exec occurred.
+* **Exactly `8` bytes read equal to `{ step: 0, errno: 0 }` followed by `EOF`:** All 10 setup steps passed; exec outcome is unknown -> classified as `READY_TO_EXEC`. `sigrund` appends `EXEC_READY_TO_EXEC` (`child_pid`, `exec_outcome: "unknown"`) to the audit log and sends `0x08 SERVER_EXEC_READY` (`exec_outcome: "unknown"`), after the prior APPROVED. All models requiring a checkpoint withhold readiness until it verifies and releases the child. This classification also applies to a child killed in the post-token/pre-syscall window. The Central Reaper preserves any already-observed terminal status and sends it afterward in `0x05 SERVER_EXEC_RESULT`; a signal termination or exit code alone does not establish whether exec occurred.
 * **Any other byte sequence, partial frame, or excess bytes:** Protocol fault -> classified as `SPAWN_FAILED`. Reads may split or combine frames; the parent accumulates bytes through `EOF`, with a maximum of 16 bytes, before classifying.
 * On any `SPAWN_FAILED` outcome, `sigrund` tears down `job-<exec_id>` via `cgroup.kill`, appends `EXEC_SPAWN_FAILED` to the audit log, and sends `SERVER_EXEC_RESULT` with `SETUP_FAILED` (setup/clone/handshake failure) or `EXEC_FAILED` (reported exec or checkpoint failure); it never sends a second auth decision.
 
@@ -989,7 +1196,7 @@ instance children are not assumed to be waitable by the new daemon.
 
 Warrants use **DSSE v1.0** wrapping an **RFC 8785 (JCS)** canonical JSON payload.
 
-* **Payload Type (`payloadType`):** `"application/vnd.sigrun.warrant.v2+json"` (exact length: **38** ASCII bytes).
+* **Payload Type (`payloadType`):** `"application/vnd.sigrun.warrant.v3+json"` (exact length: **38** ASCII bytes).
 * **PAE Formula:**
 ```text
 PAE(payloadType, payload) =
@@ -1001,27 +1208,27 @@ PAE(payloadType, payload) =
 
 
 * **Interoperability Test Vector:**
-* `payloadType` (38 bytes): `application/vnd.sigrun.warrant.v2+json`
+* `payloadType` (38 bytes): `application/vnd.sigrun.warrant.v3+json`
 * Sample JCS `payload` (67 bytes):
 ```json
-{"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"2.0"}
+{"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"3.0"}
 
 ```
 
 
 * Exact 119-byte PAE string:
 ```text
-DSSEv1 38 application/vnd.sigrun.warrant.v2+json 67 {"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"2.0"}
+DSSEv1 38 application/vnd.sigrun.warrant.v3+json 67 {"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"3.0"}
 
 ```
 
 
 * Exact PAE Hex Prefix (first 52 bytes):
-`445353457631203338206170706c69636174696f6e2f766e642e73696772756e2e77617272616e742e76322b6a736f6e20363720`
+`445353457631203338206170706c69636174696f6e2f766e642e73696772756e2e77617272616e742e76332b6a736f6e20363720`
 
 The minimal payload above is a PAE interoperability vector, not a valid warrant.
 
-### 3.2 Canonical Warrant and CSR Schema (`2.0`)
+### 3.2 Canonical Warrant and CSR Schema (`3.0`)
 
 A full CSR and a signed warrant payload use the same exact schema. All fields
 are mandatory; nullable fields must be present. A CSR has no signatures. An
@@ -1031,9 +1238,11 @@ Its executable digest is illustrative, not authorization for an installed tool.
 
 Warrant top-level keys are exactly `version`, `request_origin`, `intent_sha256`,
 `approval_exec_id`, `caller_env`, `command`, `execution_context`, `grant_id`,
-`host_id`, `policy`, `requester_uid`, and `requester_gid`. Command adds exactly
+`host_id`, `policy`, `requester_uid`, `requester_gid`, `intent`, `target_binding`,
+and `security_constraints`. Command adds exactly
 `executable_trust` and `stdin_sha256` to the intent command. Execution context
-adds exactly `post_exec_capabilities` to the intent context. Policy has exactly
+adds `target_uid`, `target_gid`, `supplementary_gids`, and
+`post_exec_capabilities` to the intent context. Policy has exactly
 `mode`, `not_before`, `not_after`. Every model requires all five explicit
 post-exec capability sets, validated by Section 2.2.2.
 
@@ -1044,16 +1253,17 @@ CSR; it cannot enter through the signed-redemption endpoint, reconnect or restar
 The client cannot select an origin to bypass access validation. The mandator
 signs provenance with the rest of the warrant.
 
-Compute `intent_sha256 = hex(SHA256(JCS(intent)))`. Reconstruct that intent from
-command without `executable_trust`/`stdin_sha256`, context without
-`post_exec_capabilities`, the signed `caller_env`, and policy `{mode, ttl_secs}`
-where `ttl_secs = not_after - not_before` or zero for permanent grants. Require
-exact equality to the submitted thin intent or the full-CSR projection; verify
-its digest before review and again at final authorization. Permanent intents
-must use zero TTL. All forwarded environment values are therefore bound, even
-for reusable full warrants; different values require a new CSR. The original
-thin request is retained privately through approval; the hash is not permission
-to discard it or alter fields.
+Compute `intent_sha256 = hex(SHA256(JCS(intent)))` over the embedded, complete
+original intent. Require byte-equivalent canonical intent to the submitted thin
+intent or full CSR intent before review and at final authorization. Warrant
+command equals intent command plus measured evidence. Execution context equals
+intent context plus resolved numeric credentials and expected capability sets;
+these must satisfy the account selector, mapping and authority checks. Policy
+TTL equals `not_after - not_before`, or zero for permanent grants. Caller
+environment must equal the intent's values. Target binding must resolve the
+submitted selector and constraints must satisfy the requested profile under
+captured policy. Retain the original intent, not only its digest. No field in
+resolved data may override command, environment or requested authority.
 
 ```json
 {
@@ -1096,7 +1306,44 @@ to discard it or alter fields.
   },
   "grant_id": "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
   "host_id": "sigrun-host:sha256:8f1f0466fc41bb150b4a15c1bc827805b86d72882bf2a2aaea2698dae6018027",
-  "intent_sha256": "4ed982dbc4e44aec38ef1f211e8d9c3472e48f5d619c9e69a16799cd7707b04a",
+  "intent": {
+    "account": {
+      "gid": 0,
+      "kind": "numeric",
+      "supplementary_gids": [],
+      "uid": 0
+    },
+    "caller_env": {},
+    "command": {
+      "allow_interpreted_script": false,
+      "argv": [
+        "/usr/bin/id",
+        "-u"
+      ],
+      "cwd": "/",
+      "executable_path": "/usr/bin/id",
+      "stdin_policy": "null",
+      "tty_mode": "stdio"
+    },
+    "execution_context": {
+      "caller_env_allowlist": [],
+      "capabilities": [],
+      "env_exact": {
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/sbin:/usr/bin"
+      },
+      "umask": 63
+    },
+    "policy": {
+      "mode": "one_time",
+      "ttl_secs": 900
+    },
+    "security_profile": "host-baseline",
+    "target": {
+      "kind": "host"
+    }
+  },
+  "intent_sha256": "17819df45609ee1455c8e2a14799c0f92f15523c44da52cc77463c250ccf1cb2",
   "policy": {
     "mode": "one_time",
     "not_after": 1793372100,
@@ -1105,7 +1352,18 @@ to discard it or alter fields.
   "request_origin": "client_full",
   "requester_gid": 1001,
   "requester_uid": 1001,
-  "version": "2.0"
+  "security_constraints": {
+    "profile_id": "host-baseline",
+    "profile_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "target_binding": {
+    "context_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "daemon_epoch": "0192d8f4-0000-7000-8000-000000000001",
+    "description": "Host execution environment",
+    "instance_id": "0192d8f4-0000-7000-8000-000000000002",
+    "kind": "host"
+  },
+  "version": "3.0"
 }
 ```
 
@@ -1115,6 +1373,54 @@ changed intent fail closed. Full CSR identity is checked against kernel peer
 credentials and local host identity without rewriting client bytes. Thin identity
 and grant fields are assigned by the daemon. No public outcome includes this
 payload, including on timeout or approval.
+
+### 3.2.1 Selection and Signed Execution Bindings (NS-14)
+
+The complete original intent is signed alongside resolved execution fields:
+
+| Intent field | Exact draft shape and interpretation |
+| --- | --- |
+| `target` | `{kind: "host"}` or `{kind: "self"}`; `{kind: "registered", id: string}`; `{kind: "process", pid: positive integer, pid_scope: "daemon"}` |
+| `account` | `{kind: "numeric", uid: u32, gid: u32, supplementary_gids: [u32]}` or `{kind: "name", name: string}` |
+| `security_profile` | Nonempty root-configured profile identifier |
+
+For named accounts, use the captured destination account's primary and
+supplementary groups, then sign the exact sorted numeric result. No host NSS
+fallback. Explicit numeric selection uses exactly its requested groups.
+IDs/groups retain existing numeric bounds; account/profile/registration strings
+are sanitized UTF-8, 1..128 bytes. Reject unknown tags, mixed forms and extra
+fields. Process PID is in `1..=2147483647`; it is never used as a substitute for
+the instance binding on redemption. Manager-name selector syntax is deferred to
+Phase 5 and requires a schema revision before exposure; examples are not aliases
+that an implementation may guess.
+
+`target_binding` has exactly `kind` (`host` or `process_environment`),
+`daemon_epoch` and `instance_id` (UUIDv7), `description` (sanitized UTF-8,
+1..1024 bytes), and `context_sha256` (64 lowercase hex digits). The digest binds
+the canonical private acquisition record: pinned process identity, namespace
+identities/ownership, root identity, composed UID/GID mappings and setgroups
+state, and required lifecycle/resolver scope. Phase 0 must finalize that bounded
+record schema and coherent acquisition procedure before any binding is issued.
+The digest/IDs are not authority without a matching live retained target.
+
+`security_constraints` has exactly `profile_id` (same identifier as the intent)
+and `profile_sha256` (64 lowercase hex digits). The digest is SHA-256 of the
+canonical resolved constraint object, including namespace/isolation rules,
+capability/securebits/NNP rules, cgroup ceilings, LSM requirements, seccomp and
+verification obligations. This immutable object must be available to the daemon
+and trusted approver; missing versions fail closed, never resolve to a current
+same-named profile. Phase 0 must freeze its bounded schema. Display its complete
+meaning before signing; a digest alone is not an adequate approval UI.
+
+All targets, including host, are epoch-bound. Full/offline preparation needs a
+trustworthy existing binding and immutable constraint object through an
+administrator-approved access path; no new public target discovery endpoint is
+implied. If unavailable, full-only/export fails locally or through the defined
+private failure path. Redemption after restart requires fresh preparation and
+approval. Reusable grants, when separately implemented, remain limited to the
+same live instance and epoch; they never follow a registration to its replacement.
+The sample context/profile digests are illustrative, not usable registrations.
+
 
 ### 3.3 Strict JCS Round-Trip & String Sanitization Rules
 
@@ -1133,12 +1439,12 @@ payload, including on timeout or approval.
 
 1. **`raw-ed25519`:** 64-byte Ed25519 signature ($R \parallel S$) verified directly over `PAE` via strict non-malleable verification (`verify_strict`, rejecting small-order points and non-canonical scalars $S \ge L$).
 2. **`ssh-ed25519` and `sk-ssh-ed25519` (`PROTOCOL.sshsig`):**
-* Base64-decoded `sig` is the raw binary `SSHSIG` blob: 6-byte magic `"SSHSIG"`, `uint32(1)` version, `string(publickey)` matching `signers.toml`, `string(namespace)` equal to `"sigrun.warrant.v2"` (17 bytes), empty `string(reserved)`, and `string(hash_algorithm)` equal to `"sha512"`.
+* Base64-decoded `sig` is the raw binary `SSHSIG` blob: 6-byte magic `"SSHSIG"`, `uint32(1)` version, `string(publickey)` matching `signers.toml`, `string(namespace)` equal to `"sigrun.warrant.v3"` (17 bytes), empty `string(reserved)`, and `string(hash_algorithm)` equal to `"sha512"`.
 * Recomputes `signed_data`:
 ```text
 signed_data =
     "SSHSIG"                          // 6 raw bytes: 0x535348534947
-    || uint32_be(17) || "sigrun.warrant.v2"
+    || uint32_be(17) || "sigrun.warrant.v3"
     || uint32_be(0)  || ""
     || uint32_be(6)  || "sha512"
     || uint32_be(64) || SHA512(PAE)
@@ -1205,17 +1511,29 @@ allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]
 
 ```
 
-### 4.2 Unified 8-Part Pre-Consumption Authorization Gate (Resolving Finding 1)
+The numeric ceilings above are scoped to explicitly permitted execution targets
+and immutable security profiles (Section 1.6), never global namespace-independent
+UIDs. The draft entry illustrates the base fields; target-scope/profile policy
+syntax is a Phase 0 schema gate. Requester IDs remain host-observed. A signature
+must satisfy one complete signer policy; ownership and multiple partial signers
+do not combine to authorize cross-owner execution (NS-06).
 
-Before opening the SQLite transaction or spawning a child, `sigrund` verifies that all 8 predicates below hold for the validated `Warrant` $W$, the kernel socket credentials `ucred` (`SO_PEERCRED`), the local `host_id`, the retained model-specific executable, optional sealed `stdin_memfd`, provenance/intent binding, and selected `signer`:
+### 4.2 Unified Pre-Consumption Authorization Gate
 
-1. **Version, Provenance & Host Audience:** $W\text{.version} == \text{"2.0"}$ and $W\text{.host\_id} == \text{local\_host\_id}$. Require Section 3.2 origin, intent digest and active thin-request binding; full requests must retain successful requester-access validation, and standalone signed warrants must have client-full provenance.
+Before opening the SQLite transaction or spawning a child, `sigrund` verifies that all 9 predicates below hold for the validated `Warrant` $W$, the kernel socket credentials `ucred` (`SO_PEERCRED`), the local `host_id`, the retained model-specific executable, optional sealed `stdin_memfd`, provenance/intent binding, and selected `signer`:
+
+1. **Version, Provenance & Host Audience:** $W\text{.version} == \text{"3.0"}$ and $W\text{.host\_id} == \text{local\_host\_id}$. Require Section 3.2 origin, intent digest and active thin-request binding; full requests must retain successful requester-access validation, and standalone signed warrants must have client-full provenance.
 2. **Kernel Peer Credentials:** $W\text{.requester\_uid} == \text{ucred.uid}$, $W\text{.requester\_gid} == \text{ucred.gid}$, and $W\text{.requester\_uid} \in \text{signer.allowed\_requester\_uids}$.
 3. **Target Credentials, Supplementary GID Ceiling, & Same-UID Injection Guard:**
 * $W\text{.execution\_context.target\_uid} \in \text{signer.allowed\_target\_uids}$.
 * $W\text{.execution\_context.target\_gid} \in \text{signer.allowed\_target\_gids}$.
 * $W\text{.execution\_context.supplementary\_gids}$ is sorted in strictly ascending order (no duplicates, max `64` entries), and every GID $g \in W\text{.execution\_context.supplementary\_gids}$ satisfies $g \in \text{signer.allowed\_supplementary\_gids}$.
-* **Same-UID Injection Guard:** If $W\text{.execution\_context.target\_uid} == W\text{.requester\_uid}$, the warrant is **rejected with `POLICY_VIOLATION`** unless **all** of the following hold:
+* **Same-UID Injection Guard:** Resolve kernel identities through NS-05 before
+  comparison. Reject shared-kernel-UID execution unless both daemon and signer
+  explicitly opt in and the supported destination profile proves prevention of
+  requester injection. Unknown mappings or authority fail closed. For the host
+  initial-user-namespace profile only, all conditions below are required; they
+  cannot authorize a rootless/nested mapping by analogy:
 1. Both `/etc/sigrund/config.toml` and the signer's entry in `signers.toml` explicitly set `allow_same_uid_elevation = true`.
 2. $W\text{.execution\_context.target\_uid} \ne 0$, $W\text{.command.allow\_interpreted\_script} == \text{false}$, and neither `CAP_DAC_READ_SEARCH` nor `CAP_DAC_OVERRIDE` is in $W\text{.execution\_context.capabilities}$.
 3. `exec_memfd` (owned by `root:root`) has mode `0111` (`--x--x--x`, no read bits) applied via `fchmod(exec_memfd, 0111)` prior to sealing, and `/proc/sys/fs/suid_dumpable` is read and verified to equal `"0\n"`. Because `target_uid` lacks `MAY_READ` permission on the root-owned mode-`0111` `exec_memfd`, the Linux kernel's `would_dump()` sets `BINPRM_FLAGS_ENFORCE_NONDUMP` during `execveat()`, keeping `mm->dumpable = 0` (`SUID_DUMP_DISABLE`) *after* `execveat()`.
@@ -1234,7 +1552,7 @@ Before opening the SQLite transaction or spawning a child, `sigrund` verifies th
 
 
 6. **Anchored Executable Path, Snapshot Verification, & Digest Match:**
-* The absolute `command.executable_path` must start with `/` and contain no trailing slash, empty component, `.` or `..` component. Configured allowed directories obey the same syntax, cannot be `/`, and have no duplicates. At startup, open `/` once and pre-open each configured root with `openat2(root_fd, root_path_without_leading_slash, ...)`, `O_PATH | O_DIRECTORY | O_CLOEXEC`, and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; retain its FD and `(st_dev, st_ino)`, and fail startup if a configured root cannot be pinned. Root objects are fixed for that policy generation.
+* The absolute `command.executable_path` must start with `/` and contain no trailing slash, empty component, `.` or `..` component. Configured allowed directories obey the same syntax, cannot be `/`, and have no duplicates. For the host target at startup, or within destination preparation for a selected instance, open its validated `/` and pre-open each configured root with `openat2(root_fd, root_path_without_leading_slash, ...)`, `O_PATH | O_DIRECTORY | O_CLOEXEC`, and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; retain its FD and `(st_dev, st_ino)`, and fail the corresponding startup/preparation if a configured root cannot be pinned. Root objects are fixed for that target and policy generation.
 * **Select and strip:** Among the candidate roots for the phase (Section 2.2.1), choose the longest complete-component prefix `D` such that the path starts with `D + "/"` and has a nonempty suffix. No match is `POLICY_VIOLATION`. Strip exactly `D + "/"`; the resulting `relative_path` must be nonempty, not start with `/`, and contain no empty/`.`/`..` components. For example `/usr/bin/systemctl` under `/usr/bin` becomes `systemctl`; `/usr/bin-evil/x` does not match `/usr/bin`. Resolve only `openat2(selected_dir_fd, relative_path, &how, sizeof(how))`:
 ```c
 struct open_how how = {
@@ -1264,13 +1582,23 @@ struct open_how how = {
 * `"permanent"`: `not_before` is an integer and `not_after` is `null`.
 
 
+9. **Target Instance, Mappings and Constraints (NS-04–NS-06, NS-14):**
+Require the signed epoch/instance/context digest to match the same live retained
+target; revalidate namespace/root/mapping observations and required lifecycle
+evidence. Check destination-scoped requester and signer policy, registration and
+profile revocation, original account selection and resolved numeric credentials.
+Require the exact immutable security constraints, current required enforcement,
+and a supported verification plan. No name resolution, account lookup or model
+fallback may replace approved inputs. Apply the same liveness/constraint gates
+before spawn and exec release; post-consumption failure does not refund a grant.
+
 ### 4.3 SQLite State Transaction (`/var/lib/sigrund/state.sqlite`)
 
-Fresh provisioning sets `PRAGMA user_version = 2`. Startup reads and requires
+Fresh provisioning sets `PRAGMA user_version = 3`. Startup reads and requires
 that exact schema version before opening listeners; missing/older/newer versions
 are fatal, never implicitly initialized or migrated. Initialize a fresh database
 with `PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;`.
-The collector database also requires schema version 2. Preserve the existing
+The collector database also requires schema version 3. Preserve the existing
 strict uniqueness/revocation semantics, and bind consumption to provenance:
 
 ```sql
@@ -1282,6 +1610,7 @@ CREATE TABLE consumed_grants (
     exec_id TEXT NOT NULL,
     request_origin TEXT NOT NULL CHECK (request_origin IN ('client_full', 'daemon_expanded_thin')),
     intent_sha256 BLOB NOT NULL CHECK (length(intent_sha256) = 32),
+    execution_binding_sha256 BLOB NOT NULL CHECK (length(execution_binding_sha256) = 32),
     approval_exec_id TEXT,
     not_after INTEGER NOT NULL,
     consumed_at INTEGER NOT NULL
@@ -1296,6 +1625,15 @@ CREATE TABLE revocations (
 ) STRICT;
 
 ```
+
+Define `execution_binding_sha256` as SHA-256 of canonical JCS
+`{"target_binding": W.target_binding, "security_constraints": W.security_constraints}`.
+Store 32 raw bytes locally and 64 lowercase hex digits in audit/collector data.
+The canonical payload digest separately binds the complete resolved credentials,
+command and intent. The execution binding is required in AUTH_COMMIT and its
+collector `target_auth`, compared by strict equality and retained with consumption.
+Collector receipts bind it transitively through the authenticated record hash and
+payload digest; remote ALLOW never substitutes for local instance liveness.
 
 For a consumed thin grant require `approval_exec_id == exec_id`; for client-full
 require null. Store `intent_sha256` as 32 raw bytes; audit/collector use lowercase
@@ -1325,10 +1663,10 @@ Therefore, `sigrund` implements a **Contiguous Ordered Batch Replication and Aut
 
 
 2. **Contiguous Batch Construction (`records[remote_acked_seq + 1 ..= auth_commit_seq]`):**
-* Immediately after `COMMIT;` succeeds in Section 4.3, the Audit & Replication Sequencer appends and ratchets the local `AUTH_COMMIT` event at `seq = N`. Its authenticated event body contains `event_type: "AUTH_COMMIT"`, `seq`, `host_id`, `exec_id`, `grant_id`, `payload_sha256`, `signer_id`, `policy_mode`, `not_before`, `not_after`, `request_origin`, `intent_sha256`, and `approval_exec_id`, populated from the validated warrant and selected signer (with `exec_id` assigned by the daemon). These fields are covered by `entry_hmac`; `seq` identifies the record and is exposed as `auth_commit_seq` in `target_auth`.
+* Immediately after `COMMIT;` succeeds in Section 4.3, the Audit & Replication Sequencer appends and ratchets the local `AUTH_COMMIT` event at `seq = N`. Its authenticated event body contains `event_type: "AUTH_COMMIT"`, `seq`, `host_id`, `exec_id`, `grant_id`, `payload_sha256`, `signer_id`, `policy_mode`, `not_before`, `not_after`, `request_origin`, `intent_sha256`, `execution_binding_sha256`, and `approval_exec_id`, populated from the validated warrant and selected signer (with `exec_id` assigned by the daemon). These fields are covered by `entry_hmac`; `seq` identifies the record and is exposed as `auth_commit_seq` in `target_auth`.
 * When `require_remote_audit_ack = true` is configured, the sequencer streams canonical JCS audit records from `/var/log/sigrund/audit.jsonl` with sequence numbers from `remote_acked_seq + 1` through `N` (inclusive, in strict ascending `seq` order, including all intervening readiness, exit, abort, and recovery records) in bounded `RemoteAuditBatchRequest` chunks over mTLS, with the exact HTTP and signature encoding in Section 4.4.1. The entire authorization replication operation shares the captured policy-generation `collector_rpc_timeout_ms` deadline (default `3000 ms`, immutable ceiling `3000 ms`) (`CLOCK_MONOTONIC`), including all chunks and retries; chunking does not reset it.
 * **RPC Bounds:** Each request contains `1..=256` `records_jcs` entries, whose decoded UTF-8 byte lengths sum to at most `1048576` bytes (1 MiB). The complete serialized UTF-8 JSON RPC body, including JSON escaping and metadata, is also at most `1048576` bytes; no compression is used. Each canonical audit record is at most `65536` UTF-8 bytes. Both peers enforce the body limit before allocation and the count/decoded limits while parsing. All audit appends enforce the per-record limit before writing; oversized records fail closed without spawn rather than being truncated or skipped.
-* **Exact `RemoteAuditBatchRequest` schema:** The request is one canonical JCS object with exactly these top-level keys and no others: `first_seq` (nonnegative integer), `last_seq` (nonnegative integer), `host_id` (nonempty canonical host ID string), `records_jcs` (array of canonical JCS record strings), and `target_auth` (either `null` or the exact object below). Require `first_seq <= last_seq`, `last_seq - first_seq + 1` computed with checked arithmetic, `records_jcs.length == last_seq - first_seq + 1`, and strict ascending record sequence numbers with no gaps. Each record string is a complete canonical audit record without its on-disk newline delimiter, at most `65536` UTF-8 bytes; the array count and aggregate/body limits are in the RPC bounds above. `target_auth: null` is required for ingestion-only/startup chunks and means no authorization or grant write. A non-null `target_auth` is allowed only when the chunk ends at its `auth_commit_seq` and has exactly these keys: `auth_commit_seq`, `exec_id`, `grant_id`, `host_id`, `not_after`, `not_before`, `payload_sha256`, `policy_mode`, `signer_id`, `request_origin`, `intent_sha256`, and `approval_exec_id`; `not_after` is an integer for `one_time`/`time_range` and `null` for `permanent`, while other fields have the Sections 3.2/3.5 bounds and origin-dependent approval_exec_id nullability. The final chunk for a pending execution has `auth_commit_seq == last_seq`; an intermediate chunk must have `target_auth == null`. Unknown fields, missing fields, duplicate keys, a non-null target on an intermediate chunk, or a null target on a final authorization chunk are rejected before ingestion/authorization.
+* **Exact `RemoteAuditBatchRequest` schema:** The request is one canonical JCS object with exactly these top-level keys and no others: `first_seq` (nonnegative integer), `last_seq` (nonnegative integer), `host_id` (nonempty canonical host ID string), `records_jcs` (array of canonical JCS record strings), and `target_auth` (either `null` or the exact object below). Require `first_seq <= last_seq`, `last_seq - first_seq + 1` computed with checked arithmetic, `records_jcs.length == last_seq - first_seq + 1`, and strict ascending record sequence numbers with no gaps. Each record string is a complete canonical audit record without its on-disk newline delimiter, at most `65536` UTF-8 bytes; the array count and aggregate/body limits are in the RPC bounds above. `target_auth: null` is required for ingestion-only/startup chunks and means no authorization or grant write. A non-null `target_auth` is allowed only when the chunk ends at its `auth_commit_seq` and has exactly these keys: `auth_commit_seq`, `exec_id`, `grant_id`, `host_id`, `not_after`, `not_before`, `payload_sha256`, `policy_mode`, `signer_id`, `request_origin`, `intent_sha256`, `execution_binding_sha256`, and `approval_exec_id`; `not_after` is an integer for `one_time`/`time_range` and `null` for `permanent`, while other fields have the Sections 3.2/3.5 bounds and origin-dependent approval_exec_id nullability. The final chunk for a pending execution has `auth_commit_seq == last_seq`; an intermediate chunk must have `target_auth == null`. Unknown fields, missing fields, duplicate keys, a non-null target on an intermediate chunk, or a null target on a final authorization chunk are rejected before ingestion/authorization.
 * **Chunking:** Choose the largest nonempty contiguous prefix fitting all limits; never split a record. Wait for and verify its signed receipt, durably advance `remote_acked_seq`, then send the next prefix. Intermediate chunks set `target_auth: null` and only ingest audit records; they cannot authorize execution or consume grants. Only the final chunk ending at `N` includes non-null `target_auth` for the pending execution. Historical `AUTH_COMMIT` records in intermediate chunks are ingested without authorization. Retry a chunk with identical bytes and bounds after a lost receipt, within the same deadline. On failure, retain the last durably acknowledged cursor and fail the pending authorization; a partial upload never permits spawn.
 * Example final authorization chunk:
 ```json
@@ -1345,6 +1683,7 @@ Therefore, `sigrund` implements a **Contiguous Ordered Batch Replication and Aut
     "auth_commit_seq": 42,
     "request_origin": "client_full",
     "intent_sha256": "<64 lowercase hex digits of canonical intent>",
+    "execution_binding_sha256": "<64 lowercase hex digits of execution binding>",
     "approval_exec_id": null,
     "exec_id": "0192d8f4-9a00-7000-8000-112233445566",
     "grant_id": "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
@@ -1372,6 +1711,7 @@ CREATE TABLE remote_consumed_grants (
     first_exec_id TEXT NOT NULL,
     request_origin TEXT NOT NULL,
     intent_sha256 TEXT NOT NULL,
+    execution_binding_sha256 TEXT NOT NULL,
     approval_exec_id TEXT,
     first_seq INTEGER NOT NULL,
     consumed_at INTEGER NOT NULL,
@@ -1391,12 +1731,12 @@ CREATE TABLE remote_consumed_grants (
 * **Step C2 (Target Execution Authorization & Mode-Specific Deduplication):**
 After ingesting the audit chain through `last_seq` (so the host's audit chain remains contiguous even if the target execution is denied), the collector handles `target_auth` as follows:
 * If `target_auth == null`, skip authorization and all grant-consumption writes, and return an ingestion-only receipt with `decision: "ACK_ONLY"`.
-* Otherwise, require `target_auth.auth_commit_seq == last_seq`, load the parsed authenticated record at that sequence (including on retransmission), and require `event_type == "AUTH_COMMIT"`. Compare **every** target field by strict typed equality to that record: `exec_id`, `grant_id`, `payload_sha256`, `signer_id`, `policy_mode`, `not_before`, `not_after`, `host_id`, `request_origin`, `intent_sha256`, and `approval_exec_id`; also require `target_auth.host_id == request.host_id == authenticated_host_id`. Missing, extra, ill-typed, or unequal target fields fail with `AUTH_RECORD_MISMATCH` without any authorization or grant-consumption write. Matching the sequence alone is insufficient. Require client_full with null approval_exec_id, or daemon_expanded_thin with approval_exec_id equal to exec_id and policy_mode one_time; require a 64-digit lowercase intent_sha256. Collector approval cannot turn a historical thin grant into a new execution. Validity values must be integer timestamps, with a non-null `not_after >= not_before` for `one_time`/`time_range`, and `not_after: null` for `permanent`; unknown policy modes are rejected.
+* Otherwise, require `target_auth.auth_commit_seq == last_seq`, load the parsed authenticated record at that sequence (including on retransmission), and require `event_type == "AUTH_COMMIT"`. Compare **every** target field by strict typed equality to that record: `exec_id`, `grant_id`, `payload_sha256`, `signer_id`, `policy_mode`, `not_before`, `not_after`, `host_id`, `request_origin`, `intent_sha256`, `execution_binding_sha256`, and `approval_exec_id`; also require `target_auth.host_id == request.host_id == authenticated_host_id`. Missing, extra, ill-typed, or unequal target fields fail with `AUTH_RECORD_MISMATCH` without any authorization or grant-consumption write. Matching the sequence alone is insufficient. Require client_full with null approval_exec_id, or daemon_expanded_thin with approval_exec_id equal to exec_id and policy_mode one_time; require 64-digit lowercase intent_sha256 and execution_binding_sha256. Collector approval cannot turn a historical thin grant into a new execution. Validity values must be integer timestamps, with a non-null `not_after >= not_before` for `one_time`/`time_range`, and `not_after: null` for `permanent`; unknown policy modes are rejected.
 * After these comparisons, derive all authorization inputs, deduplication keys, and authorization receipt fields **from the authenticated record**, not from the supplied `target_auth` object:
 1. Verify `not_before <= collector_now` and (if `policy_mode != "permanent"`) `collector_now <= not_after`; on failure return a signed `DENY_EXPIRED` receipt without grant consumption.
 2. Verify `(host_id, grant_id)`, `(host_id, payload_sha256)`, and `signer_id` are not revoked on the collector; on failure return a signed `DENY_REVOKED` receipt without grant consumption.
 3. Branch by the authenticated `policy_mode`:
-* **`"one_time"`:** Attempts `INSERT INTO remote_consumed_grants (host_id, grant_id, payload_sha256, first_exec_id, request_origin, intent_sha256, approval_exec_id, first_seq, consumed_at) VALUES (...)`.
+* **`"one_time"`:** Attempts `INSERT INTO remote_consumed_grants (host_id, grant_id, payload_sha256, first_exec_id, request_origin, intent_sha256, execution_binding_sha256, approval_exec_id, first_seq, consumed_at) VALUES (...)`.
 * If the insert succeeds: sets `decision = "ALLOW"`.
 * If a uniqueness conflict occurs on `(host_id, grant_id)` or `(host_id, payload_sha256)`: if the existing row exactly matches the authenticated record's `grant_id`, `payload_sha256`, `exec_id` (`first_exec_id`), and `seq` (`first_seq`), plus the exact stored provenance/intent/binding fields (indicating an in-window retry of the same authorization), sets `decision = "ALLOW"`; otherwise (e.g., a second redemption attempt after a local SQLite database rollback) sets `decision = "DENY_REPLAY"`.
 
@@ -1405,7 +1745,7 @@ After ingesting the audit chain through `last_seq` (so the host's audit chain re
 
 
 * **Step C3 (Signed Collector Receipt):**
-After durably committing the ingested chain checkpoint and any grant-consumption decision, the collector returns a DSSE/JCS receipt (`payloadType: "application/vnd.sigrun.collector-receipt.v2+json"`) signed with the collector private key corresponding to the configured `collector_public_key`:
+After durably committing the ingested chain checkpoint and any grant-consumption decision, the collector returns a DSSE/JCS receipt (`payloadType: "application/vnd.sigrun.collector-receipt.v3+json"`) signed with the collector private key corresponding to the configured `collector_public_key`:
 ```json
 {
   "acked_through_seq": 42,
@@ -1442,14 +1782,21 @@ After durably committing the ingested chain checkpoint and any grant-consumption
 
 ### 4.4.1 Exact Remote RPC Framing and Collector Signature Encoding
 
-* **Transport and Message Boundaries:** Use HTTPS with TLS 1.3 and the Section 4.4 mTLS/hostname checks, HTTP/1.1 (ALPN `http/1.1`), and no upgrade, HTTP/2, pipelining, or concurrent requests on one connection. `POST /v2/audit/batch` carries the `RemoteAuditBatchRequest`. `POST /v2/audit/checkpoint` carries exactly `{ "host_id": "<local_host_id>" }`. Each request and response has exactly one `Content-Type: application/json` and one `Content-Length` (unsigned decimal body byte count, no sign or leading zero except `0`). Headers are case-insensitive, at most `8192` bytes total including the terminating CRLFCRLF. Reject duplicate length/type headers, `Transfer-Encoding`, non-identity `Content-Encoding`, interim responses, trailers, and body bytes beyond the declared length. Each body consists of exactly that many UTF-8 bytes; read no unbounded EOF-delimited body. Reused connections send the next request only after consuming the complete prior response. The batch request bound is `1048576` body bytes; checkpoint requests and error responses are at most `4096`; signed responses are at most `16384`. Check lengths before body allocation. Header parsing, TLS handshakes, sends, reads, and retries all share the operation's captured policy-generation cumulative `collector_rpc_timeout_ms` deadline; use nonblocking network I/O off or integrated with the control loop, never a blocking RPC on it.
+* **Transport and Message Boundaries:** Use HTTPS with TLS 1.3 and the Section 4.4 mTLS/hostname checks, HTTP/1.1 (ALPN `http/1.1`), and no upgrade, HTTP/2, pipelining, or concurrent requests on one connection. `POST /v3/audit/batch` carries the `RemoteAuditBatchRequest`. `POST /v3/audit/checkpoint` carries exactly `{ "host_id": "<local_host_id>" }`. Each request and response has exactly one `Content-Type: application/json` and one `Content-Length` (unsigned decimal body byte count, no sign or leading zero except `0`). Headers are case-insensitive, at most `8192` bytes total including the terminating CRLFCRLF. Reject duplicate length/type headers, `Transfer-Encoding`, non-identity `Content-Encoding`, interim responses, trailers, and body bytes beyond the declared length. Each body consists of exactly that many UTF-8 bytes; read no unbounded EOF-delimited body. Reused connections send the next request only after consuming the complete prior response. The batch request bound is `1048576` body bytes; checkpoint requests and error responses are at most `4096`; signed responses are at most `16384`. Check lengths before body allocation. Header parsing, TLS handshakes, sends, reads, and retries all share the operation's captured policy-generation cumulative `collector_rpc_timeout_ms` deadline; use nonblocking network I/O off or integrated with the control loop, never a blocking RPC on it.
 * **JSON and HTTP Results:** Successful RPCs, including authorization denials and `ACK_ONLY`, return HTTP `200` with the DSSE envelope below. Batch/checkpoint request bodies and DSSE envelope/payload JSON are canonical JCS with no BOM, whitespace suffix, or newline; reject duplicate/unknown fields, wrong types, invalid UTF-8, or nesting beyond `8`. Checkpoint requests use the same authenticated host mapping as batches. A rejected RPC returns a final non-200 HTTP status (400 for bad input/chain mismatch, 403 for host authorization failure) and exactly `{ "error": "<code>" }` with an ASCII code of `1..=128` bytes; it never authorizes execution or advances the daemon cursor. Unrecognized status/code, malformed framing, TLS failure, and timeout fail closed. Error bodies are diagnostic, not signed receipts. If any record ingestion committed before an error, retry/checkpoint reconciliation still uses the authenticated durable chain state.
 * **Pinned Receipt Key and DSSE Envelope:** Configure `collector_key_id` (nonempty ASCII, maximum `128` bytes) and `collector_public_key` as strict padded RFC 4648 standard Base64 encoding of one raw **32-byte Ed25519 public key**. For both signed response kinds, the outer object has exactly `payload`, `payloadType`, and `signatures`, with exactly one signature object containing exactly `keyid` and `sig`. `keyid` must equal the configured ID. `payload` is strict padded RFC 4648 standard Base64 of the canonical JCS payload bytes (maximum `4096` decoded bytes), with no whitespace or alternate alphabet. `sig` is the same Base64 encoding of the raw **64-byte Ed25519 signature `R || S`**, exactly `88` ASCII characters; it is not an SSH/OpenPGP packet or a signature over the outer JSON. Sign DSSE v1 PAE over the actual UTF-8 `payloadType` and decoded payload bytes, using the decimal byte lengths for that type and payload as in Section 3.1 (not the warrant's fixed type length). Verify via strict Ed25519 verification, rejecting non-canonical scalars and small-order points. For every Base64 string require `encode(decode(value)) == value` to reject non-canonical padding bits. No adapter negotiation or key selection from untrusted `keyid` is allowed.
-* **Receipt Payloads:** Batch response `payloadType` is exactly `application/vnd.sigrun.collector-receipt.v2+json`; its payload has exactly the fields shown in C3. Allowed `decision` values are `ALLOW`, `DENY_REPLAY`, `DENY_EXPIRED`, `DENY_REVOKED`, and `ACK_ONLY`, with C2's mode/nullability rules. `acked_through_seq` and `receipt_timestamp` are nonnegative integers; record/payload digests are exactly 64 lowercase hex digits, and identifiers are the authenticated record values. A checkpoint uses type `application/vnd.sigrun.collector-checkpoint.v2+json` and exactly `host_id`, `collector_last_seq`, `collector_last_record_sha256`, and `receipt_timestamp`; the sequence is a nonnegative integer and digest is 64 lowercase hex digits for its durable last record. Genesis must already be registered; an unknown host has no implicit zero checkpoint. Verify the signature/type, exact local host binding, and field shapes before Section 7.3 reconciliation. Receipt timestamps are collector UTC Unix seconds; they do not replace the daemon's monotonic operation deadline or final warrant-expiry check.
+* **Receipt Payloads:** Batch response `payloadType` is exactly `application/vnd.sigrun.collector-receipt.v3+json`; its payload has exactly the fields shown in C3. Allowed `decision` values are `ALLOW`, `DENY_REPLAY`, `DENY_EXPIRED`, `DENY_REVOKED`, and `ACK_ONLY`, with C2's mode/nullability rules. `acked_through_seq` and `receipt_timestamp` are nonnegative integers; record/payload digests are exactly 64 lowercase hex digits, and identifiers are the authenticated record values. A checkpoint uses type `application/vnd.sigrun.collector-checkpoint.v3+json` and exactly `host_id`, `collector_last_seq`, `collector_last_record_sha256`, and `receipt_timestamp`; the sequence is a nonnegative integer and digest is 64 lowercase hex digits for its durable last record. Genesis must already be registered; an unknown host has no implicit zero checkpoint. Verify the signature/type, exact local host binding, and field shapes before Section 7.3 reconciliation. Receipt timestamps are collector UTC Unix seconds; they do not replace the daemon's monotonic operation deadline or final warrant-expiry check.
 
 ---
 
 ## 5. Child Cgroup Setup, Mount Flags, Descriptor Table, and Credential Transition
+
+The host baseline in Sections 5.1–5.3 remains one execution profile. Namespace
+targets must use the validated entry/placement plan in Section 5.4 and the
+verification contract in Section 5.5. Do not apply the host clone flags,
+credential calls or mount recipe unchanged across user namespaces. The final
+FD layout, syscall-only transition, bounded errors and ownership invariants
+apply to both profiles.
 
 ### 5.1 Per-Invocation Job Cgroup & `clone3()` Flags
 
@@ -1465,8 +1812,8 @@ For each authorized execution `exec_id`, `sigrund` creates `G/jobs/job-<exec_id>
 The daemon config may set other finite values; `max`/unlimited values are rejected and warrants cannot raise these limits. Missing files, failed writes, or unequal read-back fail closed as `SPAWN_FAILED` before any job child exists. The startup probe verifies these interfaces, including swap and group-OOM control, before accepting requests. `memory.max`/`pids.max` cover descendants remaining in the job cgroup; the process count includes threads. Allocation/fork failures and OOM termination are normal workload outcomes, with the primary child's actual wait status reported. These per-job limits supplement, rather than replace, snapshot RAM and active-socket quotas; they do not bound aggregate host usage below the sum of admitted jobs or resources charged elsewhere. Host-root/out-of-profile jobs may evade containment as described in Section 1.1; finite initial cgroup limits do not strengthen that guarantee.
 
 
-* If `CAP_SYS_ADMIN` is **not** in $W\text{.execution\_context.capabilities}$, `sigrund` calls `clone3()` with `CLONE_INTO_CGROUP | CLONE_PIDFD | CLONE_NEWNS | CLONE_NEWCGROUP`.
-* If `CAP_SYS_ADMIN` **is** in $W\text{.execution\_context.capabilities}$, `sigrund` calls `clone3()` with `CLONE_INTO_CGROUP | CLONE_PIDFD`.
+* For the host baseline, if `CAP_SYS_ADMIN` is **not** in $W\text{.execution\_context.capabilities}$, `sigrund` calls `clone3()` with `CLONE_INTO_CGROUP | CLONE_PIDFD | CLONE_NEWNS | CLONE_NEWCGROUP`.
+* For the host baseline, if `CAP_SYS_ADMIN` **is** in $W\text{.execution\_context.capabilities}$, `sigrund` calls `clone3()` with `CLONE_INTO_CGROUP | CLONE_PIDFD`.
 * In both cases, initialize `struct clone_args` with `args.flags` as above, `args.exit_signal = SIGCHLD`, `args.cgroup = cgroup_fd`, and `args.pidfd` pointing to writable parent storage for the returned pidfd; all unused fields are zero. `SIGCHLD` must not be ORed into `args.flags`. This makes every primary job an ordinary waitable `SIGCHLD` child for the Central Reaper.
 
 ### 5.2 Deterministic Child Descriptor Table (`FDs 0..=4`)
@@ -1507,7 +1854,7 @@ If the error write fails or is short, exit without exec; the parent treats
 missing/partial evidence as `SPAWN_FAILED`. Apply the same rule to hook H1,
 using the actual hook sync writer until FD 3 is successfully installed.
 
-The setup sequence is:
+The host-baseline setup sequence is (namespace profiles use Section 5.4):
 
 1. **Descriptors, Recursive Read-Only Cgroup Mount, & Session:**
 * Call `unshare(CLONE_FILES)`.
@@ -1554,6 +1901,106 @@ if ((stv.f_flag & req) != req)
 
 
 ---
+
+### 5.4 Namespace Entry, Placement and Lifecycle (NS-09, NS-10, NS-12)
+
+**NS-09 — Host-supervised placement.** Cgroup namespace membership changes the
+view; it does not move a process. Preserve finite memory/PID limits and lifecycle
+ownership in host-controlled per-job cgroups. Do not blindly migrate into
+manager-owned cgroups or assume `CLONE_INTO_CGROUP` permissions survive userns
+entry. The initial candidate is a trusted launcher placed in the job cgroup
+before namespace entry, with final children inheriting placement. Phase 0 must
+verify this against supported userns ownership/delegation, visible cgroup roots,
+manager teardown and escape paths before it becomes a supported recipe.
+Account for launchers and helpers in process limits. Refuse profiles whose
+required containment/placement cannot be enforced.
+
+**NS-10 — Dedicated executor.** The host coordinator never changes its namespaces.
+Use fresh, dedicated helpers with bounded IPC; prepare all storage, descriptor
+actions and library-derived transition data before the critical syscall-only
+child path. Helper namespace entry must not load untrusted destination libraries
+or leak daemon keys, management FDs or unrelated host roots. Close acquired
+namespace/root FDs before target execution after establishing the intended
+context; retain independent supervising references in the host.
+
+A supported entry plan must explicitly specify:
+
+1. Namespace set, owning user namespaces, required capabilities and entry order;
+   already-shared namespaces and unsupported ancestors/nesting are handled
+   deliberately, not by ignoring `setns()` failures.
+2. Pinned root establishment and declared private mount isolation, propagation,
+   cwd resolution and prevention of host-root escape through inherited FDs.
+3. PID/time namespace entry followed by creation of the actual workload child;
+   entering a PID namespace alone does not move the calling task into it.
+4. Host-visible PID/pidfd acquisition, launcher/final-child parentage, registration
+   barriers, tracer ownership, reaping and launcher-death behavior.
+5. Exact supplementary groups, GID/UID, securebits, capabilities, NNP and security
+   transitions, with before/after readback and mapping-aware host observations.
+
+`setgroups=deny`, nested maps, idmapped mounts and namespaced file capabilities
+need separate supported cases; host root does not make them interchangeable.
+Do not ignore a failed `setgroups()` or silently retain launcher groups. Initial
+file-capability support remains the host ABI case in Section 2.2.2; expansion
+requires its own evidence and transition tests. Setup failures cannot run loader
+or target instructions. Namespace/root/credential checks must reference the
+actual final child, not only the launcher.
+
+**NS-12 — Lifecycle and disclosure.** The host daemon owns replay/consumption,
+audit, output, deadlines, cancellation, reaping and cleanup. Monitor anchor death,
+required resolver loss, container teardown and helper/tracer death. Invalidate
+pending authorization and cancel active jobs on loss of required instance
+liveness; never substitute a replacement. Kill/reap all supervised descendants
+within the declared containment boundary. Retain target/helper/worker leases
+until cleanup actually finishes, including blocked filesystem operations.
+
+Keep existing public outcomes: all unsuccessful admitted thin requests receive
+uniform TIMEOUT at the fixed deadline; target existence, accounts and LSM errors
+stay private. APPROVED means durable authorization and complete response delivery
+must precede workload spawn. Preparation helpers are not authorized workload
+execution. Readiness/results remain separate. Pre-authorization failures do not
+consume grants; post-consumption spawn, liveness or verification failures do not
+refund them. Explicit rejection remains restricted to validated full requests.
+
+### 5.5 Execution Security Profiles and Actual-State Verification (NS-11)
+
+Namespace entry is not manager-exec policy reproduction. Each immutable resolved
+profile declares what is entered, configured, verified, or unsupported:
+
+| Property | Required contract |
+| --- | --- |
+| Namespaces/root | Pinned source context, declared child isolation, verified final membership/root |
+| Credentials/capabilities | Composed mappings; exact groups/UID/GID and before/after capability sets; securebits and NNP |
+| Cgroups | Host-owned limits, placement, lifecycle interaction and containment classification |
+| SELinux | Complete context including MLS/MCS range; supported transition; actual enforcement and post-exec context |
+| AppArmor | Policy namespace, profile/stack, mode and supported transition; actual post-exec confinement |
+| Seccomp/other restrictions | Explicit supported configuration and installation/verification strategy, never inferred from another task's namespace |
+
+Constraints compose across applicable LSMs. Disabled, unreadable, unconfined,
+permissive/complain and enforcing states are distinct; none substitutes for
+required enforcement. A profile name or label does not freeze policy bytes.
+Define observable policy version/reload invalidation and revalidation before
+release; if the required change detection cannot be guaranteed, reject that
+combination. An immutable sigrund profile digest binds requested constraints,
+not the kernel's mutable policy implementation.
+
+Do not silently remove NNP or tracing to make an LSM transition work. Verify
+supported combinations on actual enforcing systems. A successful transition
+request does not prove the resulting confinement. Extend the exec-stop verifier
+to inspect effective confinement before releasing target/loader instructions,
+including memfd paths when the profile requires it. Reject combinations for
+which this guarantee is unavailable. Exec-stop rejection cannot undo kernel
+state changes already performed by exec, so the supported profile must also
+account for those effects.
+
+Memfd does not preserve source-file labels/path semantics. A profile requiring
+those semantics must use a validated compatible executable model, with no
+post-signing switch. Pinned namespaces/root/executable FDs do not freeze mutable
+libraries, root filesystems or LSM policy. Existing target seccomp filters cannot
+generally be extracted and copied; exact manager-policy reproduction requires
+additional configuration integration. Daemon packaging needs separate LSM policy
+for sockets, helpers, state, cgroups and verification; target policy is not a
+substitute for daemon policy.
+
 
 ## 6. Hook Sandbox, `pivot_root` Sequence, and Evaluation Contract (Resolving Finding 5)
 
@@ -1606,8 +2053,9 @@ Hooks are trusted approval components, not requester-controlled plugins. Every
 hook executable/configuration and parent directory is root-controlled and not
 requester-writable. When enabled, require a dedicated non-login UID/GID explicitly
 configured as `sigrun_hook_uid/gid`; UID 65534 or another shared service identity
-is forbidden. Reserve that principal from all requester/target UID, target GID
-and supplementary-group policy lists. Protect process inspection, IPC, files,
+is forbidden. Reserve that host kernel principal from requester and mapped target
+UID/GID/supplementary-group policy; compare composed kernel identities rather
+than unrelated namespace-local numbers. Protect process inspection, IPC, files,
 logs and inherited FDs from ordinary requesters; prevent core dumps and credential
 or CSR exposure across exec. A sandbox does not itself make approval input public.
 All same-principal hooks belong to the trusted computing base. Keep Section 6.1
@@ -1653,7 +2101,8 @@ signature cannot resume evaluation. Details remain in protected audit only.
 The `[mvp]` profile replaces hook dispatch with one authenticated root approver.
 It uses the same full/thin preparation, provenance, deadlines, durable gates and
 public outcomes. Signed client-full warrants bypass review, not authorization.
-The current implementation supports this local v2 profile.
+This is the v3 target for local root-TTY approval. The existing implementation
+supports a v2 local profile; this document does not claim v3 availability.
 
 **Configuration:** Exact fields are `tty_mode = "stdio"`, `hooks_enabled = false`,
 `pty_enabled = false`, `max_active_approval_requests = 1`, and a nonempty
@@ -1662,7 +2111,8 @@ four retain their shown defaults and reject alternatives. No empty-signer CSR
 export/diagnostic mode exists. Require `require_remote_audit_ack = false`; collector
 configuration validation remains mandatory. SIGHUP reload remains disabled here.
 Only one-time, stdio, null/hashed stdin, ELF (no direct scripts), empty caller-env
-allowlist/forwarding, and different requester/target UID are supported. Unsupported
+allowlist/forwarding, and distinct mapped requester/target kernel UIDs are
+supported. Namespace targets additionally require all applicable NS gates. Unsupported
 semantics follow the generic public timeout contract. Deferred features cannot
 be enabled by a warrant or profile override.
 
@@ -1685,7 +2135,7 @@ An approval response has exactly either `status: "approved"`, `exec_id`,
 1..1024-byte sanitized string. Require strict JCS, one signature from the selected
 signer, matching request/connection identity, and payload byte-for-byte equal to
 the retained CSR. A root socket peer's confirmation alone is not authorization.
-Sign the v2 DSSE PAE using the configured SSH adapter and namespace.
+Sign the v3 DSSE PAE using the configured SSH adapter and namespace.
 
 **Lifecycle:** Reserve the single approval slot before unsigned target work.
 No available slot means silent timeout without target lookup; no queue is built.
@@ -1712,7 +2162,11 @@ fingerprint, signer, algorithm, namespace and UP/UV requirements. Display the
 origin prominently (`client_full` or `daemon_expanded_thin`), intent digest,
 active thin binding, all command/environment/input fields, host/peer/target
 identities, evidence, authority ceiling, five expected capability sets, grant and
-validity. Render argv as indexed escaped values; no shell command is constructed.
+validity. Include daemon authority, target epoch/instance, verified description,
+namespace/mapping context, resolved numeric identity and complete immutable
+security constraints. Explicitly distinguish host root, rootful container root
+and mapped rootless root; neither a friendly name nor profile digest alone
+is sufficient review information (NS-14). Render argv as indexed escaped values; no shell command is constructed.
 Do not truncate fields and then permit signing. Confirm with `[y/yes/n/no]`:
 only explicit `y` or `yes` followed by Enter signs; `n` or `no` followed by
 Enter rejects. Flush pending terminal input immediately after displaying each
@@ -1738,9 +2192,9 @@ thin grant, or standalone redemption of thin-derived approval exists.
 ## 7. Hash-Chained Ratcheting Audit Log & Crash Recovery
 
 Every audit record, ratchet-state object and verification anchor includes the
-required integer `schema_version: 2`; this field is covered by canonical hashes
+required integer `schema_version: 3`; this field is covered by canonical hashes
 and HMACs. Startup and collector ingestion reject any other/missing version.
-Ratchet domain separation is `sigrun-ratchet-v2`. No v1 state is accepted as a v2
+Ratchet domain separation is `sigrun-ratchet-v3`. No v1/v2 state is accepted as a v3
 anchor merely because its hashes verify.
 
 All logs, journals/diagnostic sinks, temporary CSR buffers, broker transport and
@@ -1750,7 +2204,8 @@ preparation-status API. Requester-visible output contains only Section 2.1 data.
 Bound and sanitize diagnostics; never dump secret signer/ratchet material.
 
 AUTH_COMMIT binds request origin, intent digest, thin approval execution binding,
-canonical payload digest, selected signer, authority and expected profile alongside
+canonical payload and execution-binding digests, selected signer, authority and
+expected profile alongside
 existing host/peer/grant/policy fields. A bounded PRIVATE_OUTCOME record binds
 exec_id, origin/intent when validated (null if malformed), internal failure reason,
 intended public status, and delivery state (`not_started`, `sent`, `failed`, or
@@ -1761,16 +2216,27 @@ replicated chain; no private rejection disappears from ordering merely because
 it was hidden from the requester. Avoid embedding entire CSRs in every record;
 retain digests and bounded fields within the 65536-byte ceiling.
 
+**NS-15 — Private namespace audit and coherent versions.** Record observed
+source identity/LSM attributes, approved target constraints and observed execution
+results as distinct bounded data. Link target acquisition, invalidation, mapping,
+profile version, placement, checkpoint and cleanup events by exec/instance IDs.
+No source observation is silently relabeled as target enforcement. Preserve the
+existing chain, replay and private-outcome rules. Required evidence too large to
+fit must fail closed; do not truncate approval-critical fields. Instance registry
+entries are ephemeral even though historical audit/consumption remains durable.
+Fresh v3 deployments require matching clients, approvers and collectors where
+enabled; v2 state must not be adopted merely because its hashes verify.
+
 ### 7.1 Provisioning (`sigrundctl init-host`)
 
-1. Requires explicitly selected empty state/log locations and refuses if any prior key, database, WAL/SHM sidecar, ratchet state, temporary state or log exists. No automatic deletion, reset, adoption or migration is provided. Create schema-version-2 database, audit and ratchet objects as one protected provisioning set; incomplete provisioning fails startup and requires explicit operator remediation.
-2. Creates the Section 4.3 schema-version-2 SQLite database with durable initialization, generates the Ed25519 host identity keypair in `/var/lib/sigrund/host_identity.key` (`0400 root:root`), `fsync()`s it, and computes `host_id`.
+1. Requires explicitly selected empty state/log locations and refuses if any prior key, database, WAL/SHM sidecar, ratchet state, temporary state or log exists. No automatic deletion, reset, adoption or migration is provided. Create schema-version-3 database, audit and ratchet objects as one protected provisioning set; incomplete provisioning fails startup and requires explicit operator remediation.
+2. Creates the Section 4.3 schema-version-3 SQLite database with durable initialization, generates the Ed25519 host identity keypair in `/var/lib/sigrund/host_identity.key` (`0400 root:root`), `fsync()`s it, and computes `host_id`.
 3. Generates a 256-bit initial ratchet key $K_0$ via `getrandom(..., GRND_NONBLOCK)`.
-4. Creates `/var/log/sigrund/audit.jsonl` (`0600 root:root`), writes the single-line JCS Genesis Record at `seq = 0` (`schema_version: 2`, `event_type: "AUDIT_INIT"`, `host_id: <local_host_id>`, `prev_record_sha256: "0000000000000000000000000000000000000000000000000000000000000000"`, `entry_hmac = HMAC_SHA256(K_0, genesis_body_jcs)`) terminated by `\n`, and calls `fsync(log_fd)`.
-5. Computes $K_1 = \text{SHA-256}(K_0 \parallel \text{"sigrun-ratchet-v2"})$, writes:
+4. Creates `/var/log/sigrund/audit.jsonl` (`0600 root:root`), writes the single-line JCS Genesis Record at `seq = 0` (`schema_version: 3`, `event_type: "AUDIT_INIT"`, `host_id: <local_host_id>`, `prev_record_sha256: "0000000000000000000000000000000000000000000000000000000000000000"`, `entry_hmac = HMAC_SHA256(K_0, genesis_body_jcs)`) terminated by `\n`, and calls `fsync(log_fd)`.
+5. Computes $K_1 = \text{SHA-256}(K_0 \parallel \text{"sigrun-ratchet-v3"})$, writes:
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "key_hex": "<64-char-hex-K_1>",
   "initial_key_hex": "<64-char-hex-K_0>",
   "last_record_sha256": "<64-char-hex-SHA256-of-record-0-jcs-bytes>",
@@ -1782,22 +2248,22 @@ retain digests and bounded fields within the 65536-byte ceiling.
 
 
 to `/var/lib/sigrund/audit_ratchet.state.tmp` (`0600 root:root`), calls `fsync(tmp_fd)`, closes `tmp_fd`, atomically renames `audit_ratchet.state.tmp` to `/var/lib/sigrund/audit_ratchet.state`, and calls `fsync(var_lib_dir_fd)`.
-6. Outputs the verification anchor `{ "schema_version": 2, "host_id": "...", "initial_seq": 0, "anchor_key_hex": "<hex-of-K_0>", "genesis_record_sha256": "<SHA256(record_0)>" }` to `stdout` (or `--anchor-out <path>`) for registration with external verifiers/collectors together with the authorized TLS client-key-to-host mapping in Section 4.4, and **only after outputting the anchor** zeroes $K_0$ in memory via `explicit_bzero()`.
+6. Outputs the verification anchor `{ "schema_version": 3, "host_id": "...", "initial_seq": 0, "anchor_key_hex": "<hex-of-K_0>", "genesis_record_sha256": "<SHA256(record_0)>" }` to `stdout` (or `--anchor-out <path>`) for registration with external verifiers/collectors together with the authorized TLS client-key-to-host mapping in Section 4.4, and **only after outputting the anchor** zeroes $K_0$ in memory via `explicit_bzero()`.
 
 ### 7.2 Per-Event Append & Atomic Ratchet Protocol
 
 To write event `seq = i` ($i \ge 1$) using current state $S = (\text{seq} = i, K_i, \text{last\_record\_sha256}, \text{remote\_acked\_seq})$:
 
-1. Construct the event object with `schema_version = 2`, `seq = i`, `host_id = local_host_id`, and `prev_record_sha256 = S.last_record_sha256`, compute `entry_hmac = HMAC_SHA256(K_i, event_body_jcs)`, and serialize the complete record as canonical single-line JCS JSON (`record_i_bytes`) **without a trailing newline**. `entry_hmac` is the 64-character lowercase hex encoding of the HMAC result (decode to raw bytes before constant-time verification). `event_body_jcs` is the canonical object with `entry_hmac` omitted; `record_i_bytes` includes that field. HMAC inputs, record hashes, `prev_record_sha256`, and replicated `records_jcs` exclude the on-disk line delimiter. Enforce the Section 4.4 limit of `65536` bytes for `record_i_bytes` before writing; fail closed if it is exceeded.
+1. Construct the event object with `schema_version = 3`, `seq = i`, `host_id = local_host_id`, and `prev_record_sha256 = S.last_record_sha256`, compute `entry_hmac = HMAC_SHA256(K_i, event_body_jcs)`, and serialize the complete record as canonical single-line JCS JSON (`record_i_bytes`) **without a trailing newline**. `entry_hmac` is the 64-character lowercase hex encoding of the HMAC result (decode to raw bytes before constant-time verification). `event_body_jcs` is the canonical object with `entry_hmac` omitted; `record_i_bytes` includes that field. HMAC inputs, record hashes, `prev_record_sha256`, and replicated `records_jcs` exclude the on-disk line delimiter. Enforce the Section 4.4 limit of `65536` bytes for `record_i_bytes` before writing; fail closed if it is exceeded.
 2. Record the current EOF byte offset `eof_before` of `/var/log/sigrund/audit.jsonl`. Write exactly `record_i_bytes || "\n"` (one newline byte, `0x0a`) to `audit.jsonl` and call `fsync(log_fd)`.
 * If `write()` or `fsync(log_fd)` fails, attempt `ftruncate(log_fd, eof_before)` and then `fsync(log_fd)` as compensation. If either rollback operation fails, immediately fail closed: stop accepting requests, close the control socket, emit no further audit record, and require operator recovery after verifying the log/state pair. If both succeed, abort the operation in memory without ratcheting $K_i$; a failed write/flush never advances the ratchet.
 
 
-3. Compute $K_{i+1} = \text{SHA-256}(K_i \parallel \text{"sigrun-ratchet-v2"})$ and `record_i_sha256 = hex(SHA256(record_i_bytes))`.
-4. Write `{ "schema_version": 2, "key_hex": "<K_{i+1}>", "last_record_sha256": "<record_i_sha256>", "remote_acked_seq": S.remote_acked_seq, "seq": i + 1 }` to `/var/lib/sigrund/audit_ratchet.state.tmp` (`0600 root:root`), call `fsync(tmp_fd)`, close `tmp_fd`, call `rename("audit_ratchet.state.tmp", "audit_ratchet.state")`, and call `fsync(var_lib_dir_fd)`.
+3. Compute $K_{i+1} = \text{SHA-256}(K_i \parallel \text{"sigrun-ratchet-v3"})$ and `record_i_sha256 = hex(SHA256(record_i_bytes))`.
+4. Write `{ "schema_version": 3, "key_hex": "<K_{i+1}>", "last_record_sha256": "<record_i_sha256>", "remote_acked_seq": S.remote_acked_seq, "seq": i + 1 }` to `/var/lib/sigrund/audit_ratchet.state.tmp` (`0600 root:root`), call `fsync(tmp_fd)`, close `tmp_fd`, call `rename("audit_ratchet.state.tmp", "audit_ratchet.state")`, and call `fsync(var_lib_dir_fd)`.
 5. Zero $K_i$ in memory (`explicit_bzero`).
 
-Every state replacement preserves `schema_version: 2` and also carries `initial_key_hex`, the protected 64-character
+Every state replacement preserves `schema_version: 3` and also carries `initial_key_hex`, the protected 64-character
 hexadecimal encoding of $K_0$, unchanged for the lifetime of the host. It is
 needed to verify the genesis record and replay the ratchet during startup
 recovery. It is never used as a request-time signing key and remains covered
@@ -1863,7 +2329,7 @@ write rate but cannot bound lifetime log/database growth.
 
 ### 7.3 Startup Crash-Recovery & Integrity Gate
 
-On every daemon startup, before creating any public/broker listener, first require schema version 2 in the database, ratchet state and complete audit records. Never mutate a legacy/unknown state set. Only after this version gate may verified v2 recovery remove a leftover `audit_ratchet.state.tmp`. Load `/var/lib/sigrund/audit_ratchet.state` ($S$), and scan `/var/log/sigrund/audit.jsonl` from byte `0`, verifying each HMAC from the protected initial seed/domain as well as parsing every complete `\n`-terminated line and verifying that `seq` increments strictly from `0` by `1` and that every record $k > 0$ has `prev_record_sha256 == hex(SHA256(record_{k-1}_jcs_bytes))`. Let `last_seq` be the `seq` of the last complete `\n`-terminated record:
+On every daemon startup, before creating any public/broker listener, first require schema version 3 in the database, ratchet state and complete audit records. Never mutate a legacy/unknown state set. Only after this version gate may verified v3 recovery remove a leftover `audit_ratchet.state.tmp`. Load `/var/lib/sigrund/audit_ratchet.state` ($S$), and scan `/var/log/sigrund/audit.jsonl` from byte `0`, verifying each HMAC from the protected initial seed/domain as well as parsing every complete `\n`-terminated line and verifying that `seq` increments strictly from `0` by `1` and that every record $k > 0$ has `prev_record_sha256 == hex(SHA256(record_{k-1}_jcs_bytes))`. Let `last_seq` be the `seq` of the last complete `\n`-terminated record:
 
 1. **Case 1 (Partial Trailing Bytes After Power Loss During Step 2 Write):**
 * If `audit.jsonl` contains trailing bytes after the final `\n` that do not end in `\n` (or fail JSON parsing), `sigrund` checks whether `last_seq == S.seq - 1` **and** `hex(SHA256(record_{last_seq})) == S.last_record_sha256`.
@@ -1894,11 +2360,11 @@ On every daemon startup, before creating any public/broker listener, first requi
 
 ---
 
-## 8. Cumulative Verification & Security Validation Matrix (v2)
+## 8. Cumulative Verification & Security Validation Matrix (v3)
 
 ### 8.1 Isolated Test Fixtures
 
-The rows below are normative v2 acceptance requirements, not claims about current
+The rows below are normative v3 acceptance requirements, not claims about current
 tests. Use disposable Linux hosts with real delegated cgroup v2, controlled
 root-owned fixtures and distinct unprivileged requesters. Exercise actual sockets,
 SCM_RIGHTS, credential helpers, signing, persistence and execution. Use deterministic
@@ -1911,7 +2377,7 @@ expected/public/private outcomes, resource ownership and cleanup for each run.
 
 | Case | Fixtures and actions | Required observations |
 | --- | --- | --- |
-| V-01: Versions and provisioning | Old/missing/future wire, CSR, signature-domain, database, ratchet, audit and collector versions; partial/existing provisioning sets | Fail closed before target work/listening as applicable; no automatic migration/deletion; only explicit fresh v2 state initializes |
+| V-01: Versions and provisioning | Old/missing/future wire, CSR, signature-domain, database, ratchet, audit and collector versions; partial/existing provisioning sets | Fail closed before target work/listening as applicable; no automatic migration/deletion; only explicit fresh v3 state initializes |
 | V-02: Public context | Query every supported profile; inject path/rights/unknown keys; change generation; exhaust context limits independently | Only bounded target-independent context; no filesystem probe, signer secrets, approval occupancy or execution-rate charge; stale context never rewrites CSR |
 | V-03: Client preparation and fallback | Accessible/unreadable/nonexistent executables; unreadable ancestor; uncertain higher-priority eligibility; finite pipe stdin; full-only and export | Unprivileged complete CSR or locally identified unchanged thin intent; no invented evidence, silent model downgrade or second stdin read; full-only/export never expand remotely |
 | V-04: Full-CSR access proof | Forge hashes/ctime/profile/provenance; DAC and ACL denials, supplementary-group access, inaccessible ancestors above pinned root, unmapped groups/domain; rename after check | Access helper uses authenticated credentials/groups and full traversal; privileged FDs cannot bypass ancestors; retained source prevents reopen races; invalid requests never reach mandators |
@@ -1921,15 +2387,15 @@ expected/public/private outcomes, resource ownership and cleanup for each run.
 | V-08: Credentials and exec checkpoint | Ordinary and file-capability ELFs, UID/GID/groups, five sets, NNP, alias replacement, digest mutation, tracer death and cancellation at release | Exact signed profile at authorization and exec stop; no loader/target instruction before direct verification; failure kills/reaps without repair; memfd strips file caps and keeps unknown exec outcome |
 | V-09: Decision and deadline races | Gate each preparation/hash/review/commit boundary; reject then submit late/duplicate/concurrent approval; advance D while work/fsync blocked; vary timeout config | One atomic public winner; thin rejection immediately final internally; no stage extends D; no execution after timeout; late commit remains consumed and audited without execution |
 | V-10: Approval then execution | Gate audit/collector success, partial approval sends, disconnect, clone/setup/exec errors, kill before/after sync token, fast exit | No clone/output before complete APPROVED delivery; optional EXEC_READY then exactly one EXEC_RESULT; no second decision/refund; memfd readiness never claims exact exec success |
-| V-11: Signatures and offline workflow | Independent DSSE/JCS/SSHSIG vectors; key/namespace/UP/UV failures; offline client-full export/sign/package/redeem; different runtime env | Canonical bytes preserved; v2 domain required; one signer independently authorizes; exact environment/intent bound; no TIMEOUT payload or root thin-export API |
+| V-11: Signatures and offline workflow | Independent DSSE/JCS/SSHSIG vectors; key/namespace/UP/UV failures; offline client-full export/sign/package/redeem; different runtime env | Canonical bytes preserved; v3 domain required; one signer independently authorizes; exact environment/intent bound; no TIMEOUT payload or root thin-export API |
 | V-12: Framing and descriptors | Every frame/state and size boundary; duplicate/unknown keys, excessive depth; malformed/truncated/extra/misplaced rights; fragmented traffic; blocked close/read and sink backpressure | Bounded allocation/assembly, no resynchronization; transport failures do no target work; semantic failures hold endpoints until timeout; descriptors disposed exactly once off-loop |
 | V-13: Admission and accounting | Exhaust per-UID/global rates, sockets, workers/helpers, RAM, audits and review slots; reload lower limits; cross windows with retained ownership | Bounded tables/queues; no replacement worker pools or quota refund before actual cleanup; held thin slot hides early refusal; context cannot exhaust execution counters |
 | V-14: Replay, revocation and durable ownership | Concurrent redemption, digest/signature revocation, expiration, locked WAL/fsync, failure around commit and audit publication | One-time uniqueness; all nonapproved submissions publicly timeout; no retry of uncertain commit; late consumed grants remain recorded; bounded private outcome reconciliation |
-| V-15: Collector | mTLS host binding, contiguous chunks, exact provenance/intent/exec target equality, retry/duplicate/replay, malformed receipts, deadline and denied final chunk | Only authenticated v2 chain/ALLOW completes remote authorization; no skipped records or mismatched intent; late ALLOW cannot revive timeout; private denials do not reach requester |
+| V-15: Collector | mTLS host binding, contiguous chunks, exact provenance/intent/exec target equality, retry/duplicate/replay, malformed receipts, deadline and denied final chunk | Only authenticated v3 chain/ALLOW completes remote authorization; no skipped records or mismatched intent; late ALLOW cannot revive timeout; private denials do not reach requester |
 | V-16: Trusted hooks and root TTY | Ordinary user/shared-UID process attempts to inspect CSR/logs/IPC; hook faults/abstention/rejection; root EOF, wrong key, slow signing, broker reconnect | Reserved approval principal; complete sanitized provenance/evidence display; rejection stops chain; thin refusal stays silent; no shared nobody account or untrusted evidence export |
 | V-17: PTY and output | Future PTY profile; rights on auth/rejection/result; missing/extra master; disconnect after type byte; signals/resize before readiness; output before result | PTY transfer only on EXEC_READY after APPROVED; terminal restore/FD cleanup; bounded independent stdio streams; no premature EOF before thin outcome |
 | V-18: Child setup and reaper | Cgroup mount flags/propagation, every credential/FD remap fault, writable sync-FD sentinel, unpublished clone result and concurrent exits | Parent mount state unchanged; exact setup readback; only actual sync pipe receives errors; barrier prevents exit theft; tracked cleanup and safe-profile containment claims preserved |
-| V-19: Audit and recovery | Independently recompute v2 HMAC/ratchet; corrupt/truncate/rollback log/state, poison fsync/rename, high-water/free-space thresholds; restart reconciliation | Exact schema/domain/chain; bounded private records; no authorization without durable audit; fail closed on uncertain recovery, no deletion of consumption; retained-seed/rollback limits explicitly tested |
+| V-19: Audit and recovery | Independently recompute v3 HMAC/ratchet; corrupt/truncate/rollback log/state, poison fsync/rename, high-water/free-space thresholds; restart reconciliation | Exact schema/domain/chain; bounded private records; no authorization without durable audit; fail closed on uncertain recovery, no deletion of consumption; retained-seed/rollback limits explicitly tested |
 | V-20: Shutdown and resource side channels | Shutdown/crash with silent requests, in-flight commit/clone and blocked cleanup; service-manager escalation and restart | No new work after shutdown, all owners reconciled or supervised cleanup; no fictitious timeout delivery or rollback; document observed shared-resource effects outside the protocol guarantee |
 
 ### 8.2.1 Cross-Cutting Acceptance Rules
@@ -1947,24 +2413,57 @@ credential transitions, durable consumption, ptrace behavior or supervised clean
 All new schema examples, PAE lengths/hex, intent hashes, field counts, bounds and
 state diagrams must have independently checkable fixtures before runtime release.
 
-### 8.3 Implementation Status and Release Gate
+### 8.3 Implementation Status and Release Gate (NS-16)
 
-The local one-time SSH/stdio profile implements the v2 full/thin workflow,
-context endpoint, requester access helper, signed provenance, confidential outcomes,
-approval/result split and fresh state formats. `IMPLEMENTATION_NOTES.md` describes
-its supported domain and validation limits. This implementation does not by itself
-establish that every applicable V-01–V-20 acceptance case has passed.
+The current implementation is the **v2 local one-time SSH/stdio profile**, as
+recorded in [implementation notes](IMPLEMENTATION_NOTES.md). No v3 runtime or
+namespace support is established by this specification update. Preserve that
+status until integrated evidence demonstrates each claimed capability.
 
-The first v2 runtime release must implement and pass every applicable row for the
-local one-time SSH/stdin/stdout profile, including real host filesystem permissions,
-all four trust models, hidden thin rejection and commit/deadline races. Maintain
-explicit deferred status for PTY, hooks, remote collector/ACK, policy reload,
-reusable grants, direct scripts and remaining signature adapters until their
-end-to-end cases pass. Updating their target contracts does not enable them.
-Cross-host/container routing and interpreter dependency binding remain separate
-design work. Physical FIDO support additionally requires hardware acceptance.
+The [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) defines six dependency-ordered
+phases, requirement traceability and their acceptance gates. All applicable
+V-01–V-20 cases above remain required under v3; add the namespace matrix below.
+Phases 2–3 can yield experimental execution, not production support. No profile
+ships before its applicable confinement, packaging and lifecycle gates pass.
+Manager resolvers are optional and cannot delay a validated manager-free profile.
 
-A full v2 conformance claim requires all supported target features and V-01–V-20,
-with no helper-only substitutes for integrated runtime behavior. Fresh deployment
-must provision an empty v2 state set and matching clients, approvers and collectors;
-legacy components fail closed rather than negotiate old confidentiality semantics.
+Keep PTY, hooks, collector/remote ACK, reload, reusable grants, scripts and extra
+signing adapters independently deferred until their integrated cases pass. They
+remain target requirements, not mandatory scope for the namespace implementation
+milestones. Hardware FIDO claims still require physical acceptance. Full v3
+conformance requires all claimed target features and applicable V/NS cases;
+a subset must name its supported profile and exclusions explicitly.
+
+| Requirement | Integrated acceptance scenario and required result |
+| --- | --- |
+| NS-01 | All four routes, rootful/rootless, same-owner/cross-owner; destination account and explicit policy/approval are correct; both client endpoints function |
+| NS-02 | Shared/unshared namespaces, inherited/passed sockets, connector exit, exec/credential/context races; adhere to declared attribution or reject |
+| NS-03–NS-04 | PID reuse, anchor death, change-and-restore races, restart/replacement, daemon restart while reviewing; stale binding rejects without retargeting |
+| NS-05–NS-06 | Nested/unmapped IDs, setgroups restrictions, cross-owner requests, equal numeric IDs in different namespaces and different IDs mapping to one kernel UID; no authority confusion or injection bypass |
+| NS-07 | Identical paths with different destination bytes/cwd, account edits, mutable roots and inaccessible ancestors; retained destination evidence and resolved approved credentials prevail |
+| NS-08 | Cloned ComposeFS mounts/PrivateMounts, default/full-only/export/explicit-thin flows, unsigned alternative-model validation and signed mismatch; no privileged full fallback or signed switching |
+| NS-09–NS-10 | Userns entry, PID/time child creation, root/mount isolation, idmapped mounts, cgroup placement and delegation; actual final context and descendant supervision match profile |
+| NS-11 | Real SELinux/AppArmor enforcement including stacks/ranges, disabled/permissive/complain/unreadable states, policy reload/reuse, seccomp, NNP/ptrace/direct/memfd; require declared actual constraints before release |
+| NS-12 | Disconnect/cancel, target deletion, resolver/helper/tracer death, exhausted quotas and blocked cleanup; bounded ownership, correct disclosure timing and consumption |
+| NS-13 | Scoped manager names/owners/endpoints, stale or dishonest metadata and lifecycle loss; validate resources under unchanged host authorization |
+| NS-14–NS-15 | Independent schema/JCS/PAE/signature vectors, altered bindings/intent/profile, approval rendering, fresh-state rejection and audit/collector equality; no downgrade, hidden field or incompatible-state adoption |
+| NS-16 | Reproducible integrated results for each advertised platform/profile; no helper-only or namespace-root fixture substituted for a release gate |
+
+### 8.4 Release-Blocking Design Gates
+
+Phase 0 must produce reviewable decisions, bounded schemas and prototype evidence
+for the following before dependent runtime features are enabled:
+
+| Gate | Required decision/evidence | Blocked capability |
+| --- | --- | --- |
+| G-01 | Source attribution and coherent process-context acquisition; socket passing, credential/exec races and change-and-restore handling | Self selection; any target acquisition without the corresponding proof |
+| G-02 | Namespace/userns entry order, mapping composition, setgroups and root/cwd handling; supported kernel/features and explicit rejection matrix | Each affected rootful/rootless execution profile |
+| G-03 | Host launcher placement, PID/time child creation, host pidfd/tracer/reaper ownership, manager teardown and escape boundaries | Supervised namespace execution |
+| G-04 | Enforceable LSM transitions and policy-change detection with NNP/ptrace/executable models; explicit seccomp strategy | Every profile claiming those constraints |
+| G-05 | Canonical acquisition/constraint records, target-scoped policy/registration schemas, CLI grammar, full-access binding distribution and quotas | Issuing bindings, enabling management/full/export interfaces |
+
+A failed gate yields an explicit unsupported combination, not a fallback or an
+unqualified support claim. An unresolved gate stays visibly blocked. Record kernel,
+architecture, userns/delegation, LSM enforcement and exact executable profile in
+evidence. Tests on disposable real hosts complement unit tests; privileged
+namespace-root fixtures and delegated-platform smoke tests cannot replace them.

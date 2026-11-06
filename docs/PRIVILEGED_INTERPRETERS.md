@@ -57,8 +57,9 @@ claim or a substitute for reviewing the complete request.
 
 The current local profile executes in the daemon's configured domain; it does
 not automatically follow requester namespaces or cross container boundaries.
-The proposed [namespace-aware execution design](NAMESPACE_AWARE_EXECUTION.md)
-uses one host daemon to authorize execution in explicitly selected environments.
+The draft v3 specification and its [namespace roadmap](NAMESPACE_AWARE_EXECUTION.md)
+plan one host daemon authorizing execution in explicitly selected environments;
+this is not implemented by the current v2 runtime.
 The destination and security constraints determine the authority delegated to
 an interpreter. Container root and host root must be distinguished at approval.
 

@@ -1,9 +1,12 @@
 # sigrun/sigrund implementation notes
 
 The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-is the normative **v2 target**. These notes describe the implemented local
-one-time SSH/stdio profile. Deferred features and acceptance limits below remain
-part of the release assessment; implementation alone is not full v2 conformance.
+now defines the **draft v3 target**, including namespace-aware execution. These
+notes describe the implemented **v2 local one-time SSH/stdio profile**; the
+specification rewrite does not change runtime contracts or establish v3 support.
+The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) tracks v3 delivery and
+release gates. Deferred features and acceptance limits below remain part of the
+current implementation assessment.
 
 ## V2 implementation and validation
 
@@ -97,11 +100,13 @@ credentials. An executable digest does not bind mutable script files, libraries
 or imports. Jobs execute in the daemon's configured domain; requester namespaces
 are not followed automatically. Cross-container/host routing is unimplemented.
 See [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
-[namespace-aware execution design](docs/NAMESPACE_AWARE_EXECUTION.md).
+[namespace-aware execution roadmap](docs/NAMESPACE_AWARE_EXECUTION.md).
 
 ### Deferred namespace-aware executable evidence
 
-Namespace-aware workflows are not implemented. The requester-access helper
+Namespace-aware workflows are not implemented. Their target requirements are now
+in the draft v3 specification, with implementation phases and acceptance ownership
+in the [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md). The requester-access helper
 resolves paths in the daemon's mount namespace using authenticated requester
 credentials; jobs execute in that daemon's domain. Neither follows the
 requester's namespace set. The private mount namespace used for child isolation
@@ -512,8 +517,10 @@ installation/upgrade/removal tests validate packaging; they do not replace the
 native privileged execution gates. Packages never provision or automatically
 start the daemon, and preserve operator state on removal.
 
-The normative v2 matrix requires integrated evidence across the supported local
-profile before release. Beyond the implemented workflow, the broader target requires:
+The existing local profile still needs integrated acceptance evidence; the
+replacement v3 specification retains the V-01–V-20 obligations and adds NS-01–NS-16.
+Those v3 gates are future requirements, not claims about current v2 test results.
+Beyond the implemented workflow, independent deferred features include:
 
 - PTY transfer, window relaying, terminal cleanup and unrestricted input.
 - Trusted hook execution and strict deadline/output/confidentiality integration.
@@ -525,5 +532,9 @@ profile before release. Beyond the implemented workflow, the broader target requ
 - Complete applicable v2 V-01–V-20 end-to-end cases and real hardware
   signing acceptance before claiming physical security-key support.
 
-Interpreter artifact binding and selectable host/container execution domains
-need separate protocol and policy design before implementation.
+Selectable host/container execution domains now have a draft v3 contract and
+[gated roadmap](docs/NAMESPACE_AWARE_EXECUTION.md). Source capture, namespace entry,
+cgroup placement and enforceable confinement remain release-blocking design gates.
+No v2 compatibility layer or automatic state migration is planned; explicit fresh
+v3 provisioning must preserve existing state. Interpreter artifact binding remains
+separate deferred work.
