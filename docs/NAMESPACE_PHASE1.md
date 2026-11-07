@@ -228,3 +228,10 @@ enrollment in private bundles, rejects numeric groups with named accounts and
 runs privileged Rust gates through the normal acceptance entry point. The
 qualification above records the original source snapshot. Follow-up regression
 results are recorded separately and do not replace that snapshot's hashes.
+
+The review corrections passed all eleven ordinary checks, including 175 Rust
+and 25 Python harness tests. Full acceptance on the same Fedora 44 enforcing
+SELinux platform passed 23 scenarios, including all nine privileged Rust gates,
+all seven trust gates and 26 execution gates. The final CLI test refinement
+changed no production or privileged-test binaries. Commands, source hashes and
+individual outcomes are in the [review validation record](evidence/namespace-phase1-review-20261107.json).
