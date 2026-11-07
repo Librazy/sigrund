@@ -21,6 +21,7 @@ use std::{
 };
 
 pub struct HostTarget {
+    admin_trusted_composefs_mounts: Vec<u64>,
     root: File,
     roots: BTreeMap<PathBuf, Arc<File>>,
     namespaces: BTreeMap<String, File>,
@@ -137,18 +138,20 @@ impl HostTarget {
     /// Every FD is reserved before opening. This startup owner uses host UID 0;
     /// request leases and transient duplicates need their own UID reservations.
     pub fn acquire(paths: &[PathBuf], budget: &Budget) -> io::Result<Arc<Self>> {
-        Self::acquire_with(paths, None, budget)
+        Self::acquire_with(paths, None, Vec::new(), budget)
     }
     pub(crate) fn acquire_pinned(
         paths: &[PathBuf],
         roots: PinnedRoots,
+        admin_trusted_composefs_mounts: Vec<u64>,
         budget: &Budget,
     ) -> io::Result<Arc<Self>> {
-        Self::acquire_with(paths, Some(roots), budget)
+        Self::acquire_with(paths, Some(roots), admin_trusted_composefs_mounts, budget)
     }
     fn acquire_with(
         paths: &[PathBuf],
         mut pinned: Option<PinnedRoots>,
+        admin_trusted_composefs_mounts: Vec<u64>,
         budget: &Budget,
     ) -> io::Result<Arc<Self>> {
         if paths.is_empty() || paths.len() > 64 || paths.windows(2).any(|p| p[0] >= p[1]) {
@@ -227,6 +230,7 @@ impl HostTarget {
         };
         acquisition.validate().map_err(invalid)?;
         let target = Arc::new(Self {
+            admin_trusted_composefs_mounts,
             root,
             roots,
             namespaces,
@@ -243,6 +247,7 @@ impl HostTarget {
     pub fn bundle(&self, host_id: String, constraints: Constraints) -> io::Result<BindingBundle> {
         self.revalidate()?;
         let bundle = BindingBundle {
+            admin_trusted_composefs_mounts: self.admin_trusted_composefs_mounts.clone(),
             schema: "sigrund.host-binding-bundle.v1".into(),
             host_id,
             target_binding: TargetBinding {

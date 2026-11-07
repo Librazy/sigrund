@@ -547,6 +547,7 @@ fn full_csr(
     {
         return Err(transport::invalid("bound executable model unavailable"));
     }
+    public.features.admin_trusted_composefs_mounts = bundle.admin_trusted_composefs_mounts.clone();
     public.executable_trust_models = vec![bundle.constraints.executable_model];
     let intent = hello
         .intent()

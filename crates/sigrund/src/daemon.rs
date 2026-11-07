@@ -1023,6 +1023,12 @@ impl ForegroundDaemon {
         let host_target = crate::host_target::HostTarget::acquire_pinned(
             &config.csr_allowed_executable_dirs,
             resources.roots.take().expect("startup pinned roots"),
+            resources
+                .composefs
+                .as_ref()
+                .map(|e| e.mount_id)
+                .into_iter()
+                .collect(),
             &target_budget,
         )?;
         let bundles = config

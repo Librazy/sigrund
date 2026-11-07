@@ -314,6 +314,8 @@ impl Record for ExecutionBinding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingBundle {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admin_trusted_composefs_mounts: Vec<u64>,
     pub schema: String,
     pub host_id: String,
     pub target_binding: TargetBinding,
@@ -323,7 +325,10 @@ pub struct BindingBundle {
 }
 impl Record for BindingBundle {
     fn validate(&self) -> Result<()> {
-        if self.schema != "sigrund.host-binding-bundle.v1" {
+        if self.schema != "sigrund.host-binding-bundle.v1"
+            || self.admin_trusted_composefs_mounts.len() > 1
+            || self.admin_trusted_composefs_mounts.contains(&0)
+        {
             return Err(invalid("invalid host bundle version"));
         }
         host_id(&self.host_id)?;

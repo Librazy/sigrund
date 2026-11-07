@@ -245,3 +245,15 @@ fn host_scope_and_cross_owner_permission_are_independent_of_numeric_ceilings() {
         .is_err()
     );
 }
+
+#[test]
+fn private_binding_retains_bounded_composefs_enrollment() {
+    let mut bundle = BindingBundle::parse(BUNDLE).unwrap();
+    bundle.admin_trusted_composefs_mounts = vec![1234];
+    let parsed = BindingBundle::parse(&bundle.canonical().unwrap()).unwrap();
+    assert_eq!(parsed.admin_trusted_composefs_mounts, vec![1234]);
+    bundle.admin_trusted_composefs_mounts = vec![0];
+    assert!(bundle.validate().is_err());
+    bundle.admin_trusted_composefs_mounts = vec![1234, 5678];
+    assert!(bundle.validate().is_err());
+}
