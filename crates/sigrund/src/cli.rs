@@ -226,12 +226,14 @@ impl ClientArgs {
             return Err(invalid("--target host and --security-profile are required"));
         }
         if options.account.is_some() {
-            if seen.iter().any(|f| {
-                matches!(
-                    f.as_str(),
-                    "--target-uid" | "--target-gid" | "--supplementary-gid"
-                )
-            }) {
+            if !options.supplementary_gids.is_empty()
+                || seen.iter().any(|f| {
+                    matches!(
+                        f.as_str(),
+                        "--target-uid" | "--target-gid" | "--supplementary-gid"
+                    )
+                })
+            {
                 return Err(invalid(
                     "named and numeric account options are mutually exclusive",
                 ));

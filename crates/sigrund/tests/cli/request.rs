@@ -201,3 +201,21 @@ fn client_args(values: &[&str]) -> Vec<String> {
     result.extend(args(values));
     result
 }
+
+#[test]
+fn named_account_rejects_explicit_supplementary_groups() {
+    let base = [
+        "--target",
+        "host",
+        "--security-profile",
+        "host-baseline",
+        "--account",
+        "nobody",
+    ];
+    let mut valid = args(&base);
+    valid.extend(args(&["--", "/usr/bin/id"]));
+    ClientArgs::parse(&valid).unwrap();
+    let mut invalid = args(&base);
+    invalid.extend(args(&["--supplementary-gid", "42", "--", "/usr/bin/id"]));
+    assert!(ClientArgs::parse(&invalid).is_err());
+}
