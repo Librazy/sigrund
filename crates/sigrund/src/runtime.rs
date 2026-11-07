@@ -168,7 +168,7 @@ impl Execution {
                         let job = self.jobs.get_mut(&token).expect("exec checkpoint owner");
                         job.task = false;
                         let result = result
-                            .and_then(|()| crate::jobs::eligible(&owner.job))
+                            .and_then(|()| crate::jobs::eligible_for_release(&owner.job))
                             .and_then(|()| {
                                 if job.failure.is_some()
                                     || Instant::now()

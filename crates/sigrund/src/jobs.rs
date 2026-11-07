@@ -113,35 +113,39 @@ impl JobSupervisor {
                             match task {
                                 Task::VerifyExec(owner, pid, deadline) => {
                                     let request = owner.job.lease.request();
-                                    let result = request
-                                        .snapshots
-                                        .as_ref()
-                                        .expect("executable owner")
-                                        .executable
-                                        .verify_exec_checked(
-                                            pid,
-                                            &owner
-                                                .job
-                                                .authorized
-                                                .warrant
-                                                .warrant()
-                                                .execution_context,
-                                            || {
-                                                request.check()?;
-                                                if owner
+                                    let result = eligible(&owner.job).and_then(|()| {
+                                        request
+                                            .snapshots
+                                            .as_ref()
+                                            .expect("executable owner")
+                                            .executable
+                                            .verify_exec_checked(
+                                                pid,
+                                                &owner
                                                     .job
-                                                    .lifecycle
-                                                    .cancelled
-                                                    .load(std::sync::atomic::Ordering::Acquire)
-                                                {
-                                                    return Err(io::ErrorKind::Interrupted.into());
-                                                }
-                                                if std::time::Instant::now() >= deadline {
-                                                    return Err(io::ErrorKind::TimedOut.into());
-                                                }
-                                                Ok(())
-                                            },
-                                        );
+                                                    .authorized
+                                                    .warrant
+                                                    .warrant()
+                                                    .execution_context,
+                                                || {
+                                                    request.check()?;
+                                                    if owner
+                                                        .job
+                                                        .lifecycle
+                                                        .cancelled
+                                                        .load(std::sync::atomic::Ordering::Acquire)
+                                                    {
+                                                        return Err(
+                                                            io::ErrorKind::Interrupted.into()
+                                                        );
+                                                    }
+                                                    if std::time::Instant::now() >= deadline {
+                                                        return Err(io::ErrorKind::TimedOut.into());
+                                                    }
+                                                    Ok(())
+                                                },
+                                            )
+                                    });
                                     notifier.send(SpawnOutcome::ExecVerified {
                                         owner: Box::new(owner),
                                         result,
@@ -236,13 +240,7 @@ fn wake_coordinator(fd: RawFd) {
     }
 }
 pub(crate) fn eligible(job: &CommittedJob) -> io::Result<()> {
-    use std::sync::atomic::Ordering;
-    if job.lifecycle.cancelled.load(Ordering::Acquire)
-        || !crate::sequencer::connection_live(job.control)
-    {
-        return Err(io::Error::other("committed job cancelled before spawn"));
-    }
-    job.lease.request().check()?;
+    eligible_for_release(job)?;
     let request = job.lease.request();
     let bundle = request
         .host_bundle
@@ -253,8 +251,23 @@ pub(crate) fn eligible(job: &CommittedJob) -> io::Result<()> {
         .as_ref()
         .ok_or_else(|| io::Error::other("missing committed target lease"))?
         .verify(bundle)?;
+    job.authorized
+        .warrant
+        .warrant()
+        .verify_bundle(bundle)
+        .map_err(io::Error::other)
+}
+
+/// Coordinator checks must never acquire the target budget or inspect files.
+pub(crate) fn eligible_for_release(job: &CommittedJob) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if job.lifecycle.cancelled.load(Ordering::Acquire)
+        || !crate::sequencer::connection_live(job.control)
+    {
+        return Err(io::Error::other("committed job cancelled before spawn"));
+    }
+    job.lease.request().check()?;
     let w = job.authorized.warrant.warrant();
-    w.verify_bundle(bundle).map_err(io::Error::other)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
