@@ -31,8 +31,10 @@ Thin expansion uses pinned roots privately. Canonical intent, signed origin and
 active execution ID bind the complete evidence and exact capability profile.
 Thin approvals cannot be exported or redeemed through the signed endpoint.
 The daemon retains observable endpoints and thin review capacity until the public
-outcome, hiding preparation failures and mandator refusal behind the configurable
-admission-based deadline. Full and signed failures also time out. Decisions contain only `exec_id` and `status`.
+outcome, hiding preparation failures and thin mandator refusal behind the configurable
+admission-based deadline. Full and signed failures also time out, except that explicit mandator refusal
+of a validated full CSR returns immediate `REJECTED`. Decisions contain only
+`exec_id` and `status`.
 
 Durable authorization precedes `APPROVED`; complete delivery precedes spawn.
 Readiness and results are separate frames. Late durable commits remain consumed
@@ -68,7 +70,9 @@ configuration is still mandatory and validated. The approval capacity is one;
 busy requests silently time out. Absent approvers, invalid requests, broker
 loss and thin refusal remain silent until `authorization_timeout_ms` from
 admission (120 seconds by default; configurable from 1 to 300 seconds).
-Mandator refusal remains private and produces only the generic public TIMEOUT.
+Thin mandator refusal produces the generic public TIMEOUT. Explicit refusal
+of a validated full CSR produces immediate REJECTED, with the refusal reason
+kept private.
 No unsuccessful pre-commit outcome consumes a grant.
 
 The client requires `--target host`, `--security-profile ID` and either
@@ -437,7 +441,8 @@ python3 /absolute/sigrund/scripts/verify-acceptance.py \
   --requester requester --artifacts /tmp/sigrund-acceptance
 ```
 
-The entry point supervises `verify-platform.py`, `verify-runtime.py`,
+The entry point first runs `verify-phase1-rust.py` using the exact test
+executables and hashes recorded by ordinary checks, then supervises `verify-platform.py`, `verify-runtime.py`,
 `verify-trust.py`, `verify-execution.py` and the native `verify-v3.py` gate. It
 then exercises offline signing, live binding/substitution/concurrent replay,
 blocked host-resource cleanup, independent context limits, input privacy,

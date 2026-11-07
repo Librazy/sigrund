@@ -50,8 +50,9 @@ input never falls back. The root approver verifies acquisition/profile records
 from the locked root-controlled live epoch before rendering the complete intent,
 resolved fields and host evidence with escaped strings and indexed arguments.
 
-All public authorization denials retain the admission-based deadline and generic
-TIMEOUT response. Committed grants remain consumed after every later failure;
+Thin refusal and authorization failures retain the admission-based deadline and
+generic TIMEOUT response. Explicit mandator refusal of a validated full CSR
+returns immediate REJECTED, with its reason kept private. Committed grants remain consumed after every later failure;
 spawn requires complete APPROVED delivery. Authenticated requester facts,
 approved target facts and observed execution facts remain separate in private
 audit records.
@@ -217,3 +218,13 @@ As documented, a local retained seed cannot detect coordinated rollback of all
 state/log/ratchet files without an external checkpoint. The test demonstrates
 that limit explicitly and verifies that the new epoch still rejects the old
 warrant. It does not claim external rollback protection.
+
+## Review corrections
+
+The review follow-up verifies full-CSR named accounts against bounded host
+account data before review, moves host checkpoint verification to workers,
+excludes sibling-only FD copies from fork accounting, carries ComposeFS
+enrollment in private bundles, rejects numeric groups with named accounts and
+runs privileged Rust gates through the normal acceptance entry point. The
+qualification above records the original source snapshot. Follow-up regression
+results are recorded separately and do not replace that snapshot's hashes.

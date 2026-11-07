@@ -13,7 +13,8 @@ immutable security profile. Container execution remains disabled. See the
 [Phase 1 implementation and qualification record](docs/NAMESPACE_PHASE1.md),
 [implementation notes](IMPLEMENTATION_NOTES.md) and
 [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>).
-Unsuccessful authorization produces only an admission-based TIMEOUT; expanded
+Thin refusal and authorization failures produce an admission-based TIMEOUT.
+Explicit refusal of a validated full CSR produces immediate REJECTED. Expanded
 evidence and refusal reasons stay private.
 
 V3 breaks v2 wire, warrant, signature, configuration and durable-state formats.
@@ -37,7 +38,8 @@ there is no automatic migration or deletion.
    signs after confirmation on its own controlling TTY.
 4. The daemon revalidates the retained owner and policy, consumes the one-time
    grant and persists audit. Complete APPROVED delivery precedes workload spawn.
-   Every unsuccessful authorization waits for the admission-based TIMEOUT.
+   Explicit full-CSR refusal returns REJECTED. Other authorization failures
+   wait for the admission-based TIMEOUT.
 5. Separate readiness/results accompany stdout/stderr. `sigrun` returns the
    primary child's status and drains remaining output. Restart invalidates old
    warrants and binding bundles, including unexpired, unused grants.
