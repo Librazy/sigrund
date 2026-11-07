@@ -234,6 +234,7 @@ impl Intent {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(try_from = "WireHello", into = "WireHello")]
 pub struct ClientHello {
+    pub original_intent: Option<crate::v3::Intent>,
     pub caller_env: BTreeMap<String, String>,
     pub mode: String,
     pub tty_mode: String,
@@ -251,7 +252,7 @@ enum WireHello {
         version: String,
         tty_mode: String,
         caller_env: BTreeMap<String, String>,
-        intent: Box<Intent>,
+        intent: Box<crate::v3::Intent>,
     },
     #[serde(rename = "full_csr")]
     Full {
@@ -284,13 +285,27 @@ impl TryFrom<WireHello> for ClientHello {
                 (
                     version,
                     Self {
+                        original_intent: Some((*intent).clone()),
                         caller_env,
                         tty_mode,
                         mode: "thin_csr".into(),
                         csr_payload: None,
                         dsse_envelope: None,
-                        requested_command: Some(intent.command),
-                        requested_execution_context: Some(intent.execution_context),
+                        requested_command: Some(intent.command.clone()),
+                        requested_execution_context: Some(match &intent.account {
+                            crate::host::Account::Numeric {
+                                uid,
+                                gid,
+                                supplementary_gids,
+                            } => intent.execution_context.resolve(
+                                *uid,
+                                *gid,
+                                supplementary_gids.clone(),
+                            ),
+                            crate::host::Account::Name { .. } => {
+                                intent.execution_context.resolve(0, 0, vec![])
+                            }
+                        }),
                         requested_policy: Some(intent.policy),
                     },
                 )
@@ -308,6 +323,7 @@ impl TryFrom<WireHello> for ClientHello {
                     mode: "full_csr".into(),
                     csr_payload: Some(csr_payload),
                     dsse_envelope: None,
+                    original_intent: None,
                     requested_command: None,
                     requested_execution_context: None,
                     requested_policy: None,
@@ -326,17 +342,19 @@ impl TryFrom<WireHello> for ClientHello {
                     mode: "signed".into(),
                     csr_payload: None,
                     dsse_envelope: Some(dsse_envelope),
+                    original_intent: None,
                     requested_command: None,
                     requested_execution_context: None,
                     requested_policy: None,
                 },
             ),
         };
-        if version != "2.0" {
+        if version != "3.0" {
             return Err(CoreError::Protocol("unsupported wire version".into()));
         }
         if let Some(payload) = &hello.csr_payload {
             let csr = crate::warrant::Csr::parse(payload.as_bytes())?;
+            hello.original_intent = Some(csr.warrant().intent.clone());
             let intent = csr.warrant().intent()?;
             hello.requested_command = Some(intent.command);
             hello.requested_execution_context = Some(intent.execution_context);
@@ -348,7 +366,7 @@ impl TryFrom<WireHello> for ClientHello {
 }
 impl From<ClientHello> for WireHello {
     fn from(hello: ClientHello) -> Self {
-        let version = "2.0".into();
+        let version = "3.0".into();
         if let Some(dsse_envelope) = hello.dsse_envelope {
             Self::Signed {
                 version,
@@ -364,7 +382,10 @@ impl From<ClientHello> for WireHello {
                 csr_payload,
             }
         } else {
-            let intent = hello.intent().expect("validated thin request");
+            let intent = hello
+                .original_intent
+                .clone()
+                .expect("validated v3 thin request");
             Self::Thin {
                 version,
                 tty_mode: hello.tty_mode,
@@ -423,6 +444,13 @@ impl ClientHello {
         crate::json::preflight_with_string_limits(&bytes, 8, &Self::string_limit)
     }
     pub fn validate_shape(&self) -> Result<()> {
+        if self.mode == "thin_csr" {
+            use crate::host::Record;
+            self.original_intent
+                .as_ref()
+                .ok_or_else(|| CoreError::Protocol("missing explicit v3 intent".into()))?
+                .validate()?;
+        }
         let intent = self.intent()?;
         if self.tty_mode != intent.command.tty_mode || self.caller_env != intent.caller_env {
             return Err(CoreError::Protocol("hello intent mismatch".into()));
@@ -483,11 +511,9 @@ pub struct ContextLimits {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextFeatures {
-    /// Mount IDs qualified by the daemon in its execution namespace. A client
-    /// mount-ID mismatch cannot qualify ComposeFS direct evidence; differing
-    /// full-CSR evidence is rejected, without guaranteed thin/snapshot fallback.
-    /// Namespace-aware evidence negotiation is deferred; see IMPLEMENTATION_NOTES.md.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Private local eligibility input. V3 public context carries only the
+    /// specified feature keys; target evidence is supplied in trusted bundles.
+    #[serde(skip)]
     pub admin_trusted_composefs_mounts: Vec<u64>,
     pub direct_exec_checkpoint: bool,
     pub host_file_capabilities: bool,
@@ -670,7 +696,7 @@ fn is_denied_env_name(name: &str) -> bool {
     PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || EXACT.contains(&name)
 }
 
-fn valid_capability(capability: &str) -> bool {
+pub(crate) fn valid_capability(capability: &str) -> bool {
     const CAPS: &[&str] = &[
         "CAP_AUDIT_CONTROL",
         "CAP_AUDIT_READ",
@@ -720,6 +746,7 @@ fn valid_capability(capability: &str) -> bool {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetAuth {
+    pub execution_binding_sha256: String,
     pub request_origin: String,
     pub intent_sha256: String,
     #[serde(deserialize_with = "crate::warrant::required_nullable")]
@@ -797,10 +824,10 @@ impl RemoteAuditBatchRequest {
             if value
                 .get("schema_version")
                 .and_then(serde_json::Value::as_u64)
-                != Some(2)
+                != Some(3)
             {
                 return Err(CoreError::Protocol(
-                    "collector requires v2 audit records".into(),
+                    "collector requires v3 audit records".into(),
                 ));
             }
             if seq != expected_seq
@@ -814,6 +841,11 @@ impl RemoteAuditBatchRequest {
             parsed_records.push(value);
         }
         if let Some(target) = &self.target_auth {
+            if !crate::warrant::valid_digest(&target.execution_binding_sha256) {
+                return Err(CoreError::Protocol(
+                    "invalid execution binding digest".into(),
+                ));
+            }
             if target.auth_commit_seq != self.last_seq || target.host_id != self.host_id {
                 return Err(CoreError::Protocol(
                     "target_auth must bind to the final batch sequence and host".into(),
@@ -844,6 +876,10 @@ impl RemoteAuditBatchRequest {
                         .approval_exec_id
                         .clone()
                         .map_or(serde_json::Value::Null, serde_json::Value::String),
+                ),
+                (
+                    "execution_binding_sha256",
+                    serde_json::Value::String(target.execution_binding_sha256.clone()),
                 ),
                 ("exec_id", serde_json::Value::String(target.exec_id.clone())),
                 (
@@ -1110,10 +1146,10 @@ mod tests {
     #[test]
     fn hello_accepts_outer_envelope_limits_and_rejects_oversized_fields() {
         let mut hello = serde_json::json!({
-            "version":"2.0", "mode": "signed", "tty_mode": "stdio", "caller_env": {},
+            "version":"3.0", "mode": "signed", "tty_mode": "stdio", "caller_env": {},
             "dsse_envelope": {
                 "payloadType": WARRANT_PAYLOAD_TYPE,
-                "payload": STANDARD.encode(include_bytes!("../tests/fixtures/v2-warrant.json")),
+                "payload": STANDARD.encode(include_bytes!("../tests/fixtures/v3-host/warrant.json")),
                 "signatures": [{"keyid": "k".repeat(128), "sig": STANDARD.encode(vec![0; 24_576])}],
             },
         });
@@ -1137,9 +1173,10 @@ mod tests {
 
     #[test]
     fn unsigned_hello_accepts_absolute_executable_and_root_cwd() {
-        let w = crate::warrant::Csr::parse(include_bytes!("../tests/fixtures/v2-warrant.json"))
-            .unwrap();
-        let hello = serde_json::json!({"version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent": w.warrant().intent().unwrap()});
+        let w =
+            crate::warrant::Csr::parse(include_bytes!("../tests/fixtures/v3-host/warrant.json"))
+                .unwrap();
+        let hello = serde_json::json!({"version":"3.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent": w.warrant().intent});
         parse_strict::<ClientHello>(&serde_json::to_vec(&hello).unwrap())
             .unwrap()
             .validate_shape()
@@ -1156,7 +1193,7 @@ mod tests {
         let grant_id = "0192d8f4-9a00-7000-8000-112233445566";
         let digest = "00".repeat(32);
         let record = serde_json::json!({
-            "schema_version":2,"request_origin":"client_full","intent_sha256":digest,"approval_exec_id":null,
+            "schema_version":3,"execution_binding_sha256":"a".repeat(64),"request_origin":"client_full","intent_sha256":digest,"approval_exec_id":null,
             "event_type": "AUTH_COMMIT",
             "exec_id": exec_id,
             "grant_id": grant_id,
@@ -1169,6 +1206,7 @@ mod tests {
             "signer_id": "signer"
         });
         let target = TargetAuth {
+            execution_binding_sha256: "a".repeat(64),
             request_origin: "client_full".into(),
             intent_sha256: digest.clone(),
             approval_exec_id: None,
@@ -1205,7 +1243,7 @@ mod tests {
             assert!(parse_strict::<Decision>(&serde_json::to_vec(&invalid).unwrap()).is_err());
         }
         let prefix = "{\"data\":\"";
-        let suffix = "\",\"host_id\":\"host\",\"schema_version\":2,\"seq\":1}";
+        let suffix = "\",\"host_id\":\"host\",\"schema_version\":3,\"seq\":1}";
         let record = format!(
             "{prefix}{}{suffix}",
             "x".repeat(65_536 - prefix.len() - suffix.len())

@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CoreError, Result,
-    crypto::{WARRANT_PAYLOAD_TYPE, strict_base64, validate_uuidv7},
+    crypto::{WARRANT_PAYLOAD_TYPE, strict_base64},
     json::canonical_bytes,
     protocol::{
         ClientHello, DsseEnvelope, ProtocolSchema, RequestedCommand, RequestedExecutionContext,
-        RequestedPolicy, parse_strict, validate_unsigned_request,
+        parse_strict,
     },
 };
 
@@ -102,129 +102,22 @@ pub struct GrantPolicy {
     pub not_before: i64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Warrant {
-    pub request_origin: String,
-    pub intent_sha256: String,
-    #[serde(deserialize_with = "required_nullable")]
-    pub approval_exec_id: Option<String>,
-    pub caller_env: std::collections::BTreeMap<String, String>,
-    pub command: Command,
-    pub execution_context: ExecutionContext,
-    pub grant_id: String,
-    pub host_id: String,
-    pub policy: GrantPolicy,
-    pub requester_gid: u32,
-    pub requester_uid: u32,
-    pub version: String,
-}
-
+pub use crate::v3::Warrant;
 impl ProtocolSchema for Warrant {}
 impl ProtocolSchema for Command {}
 impl ProtocolSchema for GrantPolicy {}
-
 impl Warrant {
-    pub fn require_client_full(&self) -> Result<()> {
-        if self.request_origin != "client_full" || self.approval_exec_id.is_some() {
-            return Err(invalid(
-                "standalone warrant must have client-full provenance",
-            ));
-        }
-        Ok(())
-    }
+    /// Resolved internal view. The complete original selection remains signed
+    /// in `intent`, including a named account before numeric resolution.
     pub fn intent(&self) -> Result<crate::protocol::Intent> {
-        let ttl_secs = match self.policy.not_after {
-            Some(end) => u64::try_from(
-                end.checked_sub(self.policy.not_before)
-                    .ok_or_else(|| invalid("TTL overflow"))?,
-            )
-            .map_err(|_| invalid("negative TTL"))?,
-            None if self.policy.mode == "permanent" => 0,
-            _ => return Err(invalid("missing validity")),
-        };
-        let intent = crate::protocol::Intent {
-            command: self.command.requested(),
+        use crate::host::Record;
+        self.intent.validate()?;
+        Ok(crate::protocol::Intent {
+            command: self.intent.command.clone(),
             execution_context: self.execution_context.requested(),
-            policy: RequestedPolicy {
-                mode: self.policy.mode.clone(),
-                ttl_secs,
-            },
-            caller_env: self.caller_env.clone(),
-        };
-        intent.validate()?;
-        Ok(intent)
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        let bytes = canonical_bytes(self)?;
-        if bytes.len() > MAX_WARRANT_BYTES {
-            return Err(invalid("warrant exceeds 65536 bytes"));
-        }
-        crate::json::preflight(&bytes, 8, 4096)?;
-        validate_uuidv7(&self.grant_id)?;
-        let valid_host = self
-            .host_id
-            .strip_prefix("sigrun-host:sha256:")
-            .is_some_and(valid_digest);
-        let executable_valid = self.version == "2.0"
-            && self.command.executable_sha256.is_none()
-            && self
-                .command
-                .executable_trust
-                .as_ref()
-                .is_some_and(|t| t.valid())
-            && self
-                .execution_context
-                .post_exec_capabilities
-                .as_ref()
-                .is_some_and(|sets| sets.valid(&self.execution_context.capabilities));
-        match (self.request_origin.as_str(), &self.approval_exec_id) {
-            ("client_full", None) => (),
-            ("daemon_expanded_thin", Some(id)) if self.policy.mode == "one_time" => {
-                validate_uuidv7(id)?;
-            }
-            _ => return Err(invalid("invalid CSR provenance")),
-        }
-        if !valid_digest(&self.intent_sha256) || self.intent()?.sha256()? != self.intent_sha256 {
-            return Err(invalid("intent digest mismatch"));
-        }
-        if !executable_valid
-            || !valid_host
-            || self.requester_uid == u32::MAX
-            || self.requester_gid == u32::MAX
-        {
-            return Err(invalid(
-                "invalid warrant identity, version, or executable digest",
-            ));
-        }
-        match (
-            self.command.stdin_policy.as_str(),
-            &self.command.stdin_sha256,
-        ) {
-            ("sha256", Some(digest)) if valid_digest(digest) => (),
-            ("null" | "unrestricted_interactive", None) => (),
-            _ => return Err(invalid("stdin digest does not match stdin policy")),
-        }
-        validate_unsigned_request(
-            &self.command.requested(),
-            &self.execution_context.requested(),
-            &RequestedPolicy {
-                mode: self.policy.mode.clone(),
-                ttl_secs: 0,
-            },
-            &self.caller_env,
-        )?;
-        if !(0..=MAX_TIMESTAMP).contains(&self.policy.not_before) {
-            return Err(invalid("not_before outside timestamp bounds"));
-        }
-        match (self.policy.mode.as_str(), self.policy.not_after) {
-            ("permanent", None) => (),
-            ("one_time" | "time_range", Some(end))
-                if (self.policy.not_before..=MAX_TIMESTAMP).contains(&end) => {}
-            _ => return Err(invalid("invalid policy validity bounds")),
-        }
-        Ok(())
+            policy: self.intent.policy.clone(),
+            caller_env: self.intent.caller_env.clone(),
+        })
     }
 }
 
@@ -237,8 +130,8 @@ pub struct CanonicalWarrant {
 
 impl CanonicalWarrant {
     pub fn new(warrant: Warrant) -> Result<Self> {
-        warrant.validate()?;
-        let bytes = canonical_bytes(&warrant)?;
+        crate::host::Record::validate(&warrant)?;
+        let bytes = crate::host::Record::canonical(&warrant)?;
         Ok(Self { warrant, bytes })
     }
 
@@ -272,6 +165,7 @@ pub struct CsrIdentity {
     pub requester_uid: u32,
     pub requester_gid: u32,
     pub now: i64,
+    pub binding: Option<crate::host::BindingBundle>,
 }
 
 pub struct SnapshotDigests {
@@ -329,7 +223,12 @@ impl Csr {
                     .ok_or_else(|| invalid("timestamp overflow"))?,
             )
         };
-        let version = "2.0";
+        let version = "3.0";
+        let bundle = identity
+            .binding
+            .ok_or_else(|| invalid("live v3 host binding required"))?;
+        use crate::host::Record;
+        bundle.validate()?;
         let mut execution_context: ExecutionContext = hello
             .requested_execution_context
             .clone()
@@ -339,9 +238,23 @@ impl Csr {
             Some(snapshots.post_exec_capabilities.unwrap_or_else(|| {
                 crate::executable::CapabilitySets::ordinary(&execution_context.capabilities)
             }));
+        let resolved = hello.intent()?;
+        let original = hello
+            .original_intent
+            .clone()
+            .ok_or_else(|| invalid("explicit v3 intent required"))?;
+        if original.command != resolved.command
+            || original.policy != resolved.policy
+            || original.caller_env != resolved.caller_env
+        {
+            return Err(invalid("resolved intent differs from original"));
+        }
         Self::new(Warrant {
+            intent: original.clone(),
+            target_binding: bundle.target_binding.clone(),
+            security_constraints: bundle.binding()?.security_constraints,
             request_origin: "client_full".into(),
-            intent_sha256: hello.intent()?.sha256()?,
+            intent_sha256: original.sha256()?,
             approval_exec_id: None,
             caller_env: hello.caller_env.clone(),
             command: Command {

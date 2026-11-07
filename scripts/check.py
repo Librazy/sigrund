@@ -44,6 +44,7 @@ def main():
         ('diff', ['git', 'diff', '--check']),
         ('python', [sys.executable, '-c', "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').glob('*.py')]"]),
         ('harness-tests', [sys.executable, '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-v']),
+        ('host-vectors', [sys.executable, 'scripts/verify-host-vectors.py']),
         ('namespace-vectors', [sys.executable, 'scripts/namespace-phase0/verify-vectors.py']),
         ('platform-build', ['cargo', 'test', '-p', 'sigrund', '--test', 'cgroup', '--locked', '--no-run', '--message-format=json']),
     ]
@@ -66,7 +67,7 @@ def main():
         if source_digest() != manifest['source_sha256']:
             raise RuntimeError('source changed during verification; repeat against a stable snapshot')
         manifest['binaries'] = {name: hashlib.sha256((REPO / 'target/debug' / name).read_bytes()).hexdigest()
-                                for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve')}
+                                for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-collector')}
         manifest['result'] = 'passed'
         print('Checks passed: ' + str(args.artifacts / 'checks.json'), flush=True)
     except BaseException:

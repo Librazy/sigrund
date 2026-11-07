@@ -40,7 +40,7 @@ fn dsse_rejects_invalid_outer_schema_base64_and_inner_structure() {
 #[test]
 fn signed_hello_validates_canonical_inner_payload_and_caller_environment() {
     let mut hello: ClientHello = parse_strict(&serde_json::to_vec(&json!({
-        "caller_env": {}, "version":"2.0", "mode": "signed", "tty_mode": "stdio", "dsse_envelope": signed(fixture()),
+        "caller_env": {}, "version":"3.0", "mode": "signed", "tty_mode": "stdio", "dsse_envelope": signed(fixture()),
     })).unwrap()).unwrap();
     hello.validate_request().unwrap();
     hello.caller_env.insert("TERM".into(), "xterm".into());
@@ -67,6 +67,7 @@ fn hello_wire_limits_use_original_bytes_and_preserve_omitted_fields() {
     // must not add absent mode-specific keys when validating it again.
     let mut hello = unsigned();
     hello.requested_command.as_mut().unwrap().argv = vec!["x".repeat(4096); 15];
+    hello.original_intent.as_mut().unwrap().command = hello.requested_command.clone().unwrap();
     let remaining = 65_536 - serde_json::to_vec(&hello).unwrap().len() - 3;
     assert!(remaining <= 4096);
     hello
@@ -75,12 +76,13 @@ fn hello_wire_limits_use_original_bytes_and_preserve_omitted_fields() {
         .unwrap()
         .argv
         .push("x".repeat(remaining));
+    hello.original_intent.as_mut().unwrap().command = hello.requested_command.clone().unwrap();
     let bytes = serde_json::to_vec(&hello).unwrap();
     assert_eq!(bytes.len(), 65_536);
     ClientHello::parse_request(&bytes).unwrap();
 
     let mut signed_bytes =
-        serde_json::to_vec(&json!({"caller_env": {}, "version":"2.0", "mode": "signed",
+        serde_json::to_vec(&json!({"caller_env": {}, "version":"3.0", "mode": "signed",
         "tty_mode": "stdio", "dsse_envelope": signed(fixture())}))
         .unwrap();
     signed_bytes.resize(524_288, b' ');

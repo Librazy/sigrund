@@ -81,10 +81,11 @@ fn read_root_descriptor(mut file: fs::File, mode: Option<u32>, max: u64) -> io::
 /// Retained startup resources. Recovery and all filesystem checks finish before
 /// either listener is published. No filesystem I/O is needed on the event loop.
 pub struct StartupResources {
+    pub(crate) state_directory: fs::File,
     pub host_id: String,
     pub audit: AuditLog,
     pub store: StateStore,
-    pub roots: Vec<fs::File>,
+    pub(crate) roots: Option<crate::host_target::PinnedRoots>,
     pub(crate) storage: crate::storage::StoragePressure,
     pub(crate) execution: Option<CgroupLayout>,
     pub(crate) composefs: Option<crate::composefs::Enrollment>,
@@ -98,6 +99,16 @@ impl StartupResources {
     }
 
     pub fn prepare(config: &DaemonConfig, state_dir: &Path, log_path: &Path) -> io::Result<Self> {
+        let budget =
+            sigrund_core::host_budget::Budget::new(config.host_limits).map_err(io::Error::other)?;
+        Self::prepare_with_host_budget(config, state_dir, log_path, &budget)
+    }
+    pub(crate) fn prepare_with_host_budget(
+        config: &DaemonConfig,
+        state_dir: &Path,
+        log_path: &Path,
+        budget: &sigrund_core::host_budget::Budget,
+    ) -> io::Result<Self> {
         if unsafe { libc::geteuid() } != 0 || unsafe { libc::getegid() } != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -187,12 +198,8 @@ impl StartupResources {
         );
         let log_file: fs::File = openat2_audit_log(log_directory.as_raw_fd(), log_name)?.into();
         check_root_metadata(&log_file, false, Some(0o600))?;
-        let mut roots = Vec::new();
-        for path in &config.csr_allowed_executable_dirs {
-            let root = pin_directory(path)?;
-            check_root_metadata(&root, true, None)?;
-            roots.push(root);
-        }
+        let roots =
+            crate::host_target::PinnedRoots::acquire(&config.csr_allowed_executable_dirs, budget)?;
         let mut collector_files = Vec::new();
         for path in [
             &config.collector_ca_file,
@@ -277,13 +284,14 @@ impl StartupResources {
             ));
         }
         Ok(Self {
+            state_directory,
             storage,
             execution: None,
             composefs: None,
             host_id,
             audit,
             store,
-            roots,
+            roots: Some(roots),
             _collector_files: collector_files,
             _lock: lock,
         })

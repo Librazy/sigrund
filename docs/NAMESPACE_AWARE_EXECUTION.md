@@ -1,16 +1,18 @@
 # Namespace-aware execution: phased v3 roadmap
 
-Updated 2026-11-05. This is the delivery roadmap for the
+Updated 2026-11-07. This is the delivery roadmap for the
 [draft normative v3 security specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>).
 The specification owns the contract; this document owns implementation order,
 feasibility decisions, acceptance evidence and deferred scope. NS-01–NS-16 refer
 to its stable namespace requirements; G-01–G-05 refer to its release-blocking
-design gates. This roadmap does not introduce usable CLI options.
+design gates. Supported host CLI options are documented in the
+[Phase 1 record](NAMESPACE_PHASE1.md); later-phase selectors remain planned.
 
 ## Current state and intended outcome
 
-The current runtime implements a local **v2** one-time SSH/stdio profile. It runs
-jobs in the daemon's configured domain, creates private namespaces for isolation,
+The current runtime implements the local **v3 host** one-time SSH/stdio profile,
+with explicit host/account/profile selection and a retained epoch-bound owner.
+It runs jobs in the daemon's configured domain, creates private namespaces for isolation,
 and uses a requester-access helper limited to the daemon filesystem domain and
 initial userns mappings. Direct-execution checkpoints verify executable evidence
 and credentials; they are not general namespace/LSM verifiers. See
@@ -38,7 +40,8 @@ socket and state remain host-controlled.
 V3 replaces v2 contracts without compatibility requirements. Wire formats,
 configuration, CLI, signing domains, storage and collector contracts can change
 together. Use explicit fresh provisioning, with no automatic migration or deletion
-of old state. Keep runnable v2 documentation accurate until implementation changes.
+of old state. Runnable documentation now describes the v3 cutover; historical
+Phase 0 experiment records remain independent.
 
 ## Architecture and implementation boundaries
 
@@ -56,8 +59,8 @@ Use the native Linux executor as the common backend. Carry target resources and
 leases through preparation, approval, authorization and job cleanup; preserve the
 coordinator's namespaces. Separate selector input, retained execution resources,
 signed bindings and optional manager identity. The first implementation slice
-uses host and administrator-validated explicit targets. Self requires its own
-source-attribution gate.
+uses only the host target; later slices add administrator-validated explicit
+targets. Self requires its own source-attribution gate.
 
 | Integration | Useful role | Boundary |
 | --- | --- | --- |
@@ -121,6 +124,11 @@ without G-04. Prototype success is not an integrated-runtime release gate.
 
 ### Phase 1 — V3 foundation and host target
 
+**Status:** Complete for the qualified v3 host profile (2026-11-07); see the
+[implementation and evidence record](NAMESPACE_PHASE1.md). The local one-time
+stdio workflow passed the integrated host qualification below. Container
+execution remains disabled.
+
 **Dependencies:** Phase 0's applicable contract/schema decisions.
 **Subsystems:** core protocol/crypto/configuration, CLI/approver, target ownership,
 storage/audit and collector schemas.
@@ -143,6 +151,78 @@ storage/audit and collector schemas.
 cross-version rejection, approval-display checks, fresh-state recovery and all
 applicable local V-01–V-20 security cases pass under v3. No namespace capability
 is advertised at this milestone.
+
+#### Phase 1 host qualification: V-01–V-20
+
+Qualified 2026-11-07 on Fedora 44 x86_64, kernel
+`6.19.10-300.fc44.x86_64`, glibc 2.43, enforcing SELinux with an explicitly
+administrative unconfined supervisor, initial identity maps and delegated
+cgroup v2 memory/pids. Fs-verity used ext4 with 4-KiB blocks. This is a host-only
+qualification; it makes no container-entry or target LSM-confinement claim.
+
+Commands and hashes are recorded in the
+[implementation record](NAMESPACE_PHASE1.md#completed-qualification) and
+[sanitized evidence](evidence/namespace-phase1-host-20261107.json). The final
+`scripts/check.py` run passed all ten checks. The full
+`scripts/verify-acceptance.py` entry point passed platform, runtime, v3 privacy,
+all seven trust gates, 26 execution gates and integrated host scenarios;
+`scripts/verify-phase1-rust.py` passed all nine selected privileged gates.
+Two additional privileged ComposeFS store/metacopy tests also passed. Each
+privileged supervisor finished successfully and removed its cgroup. These
+results use matching binaries from the recorded source snapshot. Ignored Cargo
+labels for privileged/child-only fixtures do not serve as passing evidence.
+
+The ordinary command ran as the unprivileged workspace user; the privileged
+commands ran from `/home/lab/sigrund-phase1` inside independently bounded
+systemd supervisors, with the recorded administrative SELinux context:
+
+```sh
+python3 scripts/check.py --artifacts /tmp/sigrund-phase1-checks-candidate9-20261107
+python3 scripts/verify-acceptance.py \
+  --binaries /home/lab/sigrund-phase1/target/debug \
+  --checks /home/lab/sigrund-phase1/checks-candidate9.json \
+  --artifacts /home/lab/sigrund-phase1/acceptance-final11-artifacts --requester lab
+python3 scripts/verify-phase1-rust.py \
+  --daemon-tests /home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676 \
+  --library-tests /home/lab/sigrund-phase1/target/debug/deps/sigrund-51ba23e59c78f6b4 \
+  --artifacts /home/lab/sigrund-phase1/rust-final10-artifacts
+```
+
+The final checked source SHA-256 is
+`84bdd0dffddbd8cde12dbffe8414b41efc45c2444677ca9745dc0f91aa9271ed`.
+The evidence record defines its path/content algorithm, identifies matching
+production and test binaries, and records the script-only rollback-fixture
+correction after the Rust run. The disposable qualification VM was removed
+after private artifact preservation.
+
+| Case | Phase 1 applicability and observed result |
+| --- | --- |
+| V-01 | **Passed, host scope.** Strict wire/context/CSR/signature/config/state/ratchet/audit/collector version tests; real root fresh provisioning, prior/partial sets and sidecars, missing/v2/future/mixed startup rejection before listeners, with existing bytes preserved. |
+| V-02 | **Passed.** Strict target-independent context, malformed/rights rejection, bounded pools, generation checks. Integrated occupation of 2 per-UID/8 global context slots still permits a real signed job with execution admission allowance 1. |
+| V-03 | **Passed.** Native v3 local preparation, accessible/missing/unreadable sources and ancestors, unchanged thin fallback, local full-only/export refusal, finite stdin captured once. |
+| V-04 | **Passed, host identity domain.** DAC/ACL/supplementary-group/ancestor checks, forged evidence rejection, retained-source/path replacement. Unavailable or mismatched preparation domains fail locally or fall back unchanged; destination namespace-domain support is deferred. |
+| V-05 | **Passed.** Raw sockets compare generic scheduled TIMEOUT for silent denials; root broker tests cover refusal, absent/disconnected broker, malformed/expired approval. The account-existence test consumes the same 13,824 stdin bytes, produces no workload output and reaches the same 2.5-second deadline. |
+| V-06 | **Passed.** Canonical original-intent and signed field substitutions; live epoch/instance/acquisition/profile/authority/credential/origin/model substitutions all return scheduled TIMEOUT. Restart invalidates old warrants/bundles; stale offline bytes are preserved then denied. Account/profile changes after preparation preserve the approved resolved credentials/profile. Thin standalone/reconnect redemption is rejected. |
+| V-07 | **Passed on the recorded filesystems.** All four models, fs-verity SHA-256/SHA-512, direct streaming/bounds, memfd seals, ctime lease, mutation, noexec, metadata/file capabilities, tracer death. Additional root store-protection and real overlay-metacopy rehash tests pass. Arbitrary filesystems or mutable administrator stores are not qualified. |
+| V-08 | **Passed.** Actual root/service credentials and exact groups, five capability sets, securebits 47, NNP, cwd/umask and cgroup mount flags; direct checkpoints enforce before target instructions. Memfd reports unknown exact exec outcome. Unavailable checkpoint/kernel capabilities and unsupported isolation requirements are rejected. |
+| V-09 | **Passed.** Production preparation/review/commit boundaries, late/duplicate approvals and fsync/commit races under deterministic deadlines. One public winner, no deadline extension or spawn after timeout; late committed consumption survives. |
+| V-10 | **Passed.** Partial/blocked APPROVED delivery and disconnect, syscall/setup/clone/exec failures, pre-spawn cancellation, release/reaper races and fast exits. Complete delivery precedes workload spawn/output; later failures retain consumption and one terminal outcome. Remote collector authorization is deferred. |
+| V-11 | **Passed for software-key host workflow.** Independent JCS/intent/DSSE-PAE/OpenSSH/two-digest vectors and real unprivileged export/offline sign/package/redeem preserve canonical bytes and environment. Wrong key/domain/payload and authenticated SK UP/UV flag failures are tested. Physical FIDO device interaction remains unqualified and is not claimed by this milestone. |
+| V-12 | **Passed.** Ordinary transport tests plus production privileged raw-socket framing, fragmentation, deadlines, rights, bounds, blocked read/close, output backpressure and actual descriptor cleanup. |
+| V-13 | **Passed for fixed configuration.** Existing rates/sockets/workers/RAM/audit/review limits compose with host ceilings. Integrated target/review/FD/helper exhaustion keeps ownership through timeout and blocked cleanup, then allows reacquisition only after disposal. Context pool is independent. Reload remains deferred. |
+| V-14 | **Passed.** Concurrent redemption yields one commit; replay after restart, revocation and expiration, locked/failed durable work and late commits retain uniqueness/consumption and private reconciliation. |
+| V-15 | **Passed, schema/validator milestone only.** Actual consumption stores 32 raw binding bytes equal to AUTH_COMMIT and collector target_auth lowercase hex. Mismatched/uppercase digests and old/future record schemas are rejected. Remote mTLS, ACK, receipts and retry runtime are deferred and disabled. |
+| V-16 | **Passed for root TTY.** Exact live private review/CSR records are verified before complete escaped evidence display. Refusal, EOF, wrong key, slow/encrypted signing, cancellation, reconnect and revocation pass. Private records require the reserved root principal. Hook execution remains deferred. |
+| V-17 | **Passed for stdio.** Independent 2-MiB stdout/stderr, blocked-output cancellation, retained endpoints and cleanup. PTY rights/resize/terminal workflow remains deferred and rejected. |
+| V-18 | **Passed.** Real platform and child/reaper fault gates: cgroup mount flags/propagation, credential and FD remap failures, sync-FD sentinel, unpublished clone results and concurrent exits. Parent mount state and cleanup ownership are preserved. |
+| V-19 | **Passed within the stated local-audit boundary.** Independent v3 HMAC/ratchet recomputation; corrupted/partial/forward recovery, storage poison/threshold and startup cases; consumption survives recovery. A deliberate complete authentic rollback demonstrates the need for an external checkpoint, while the fresh epoch rejects the old warrant. External rollback protection is deferred. |
+| V-20 | **Passed.** Real systemd shutdown/crash/restart with silent requests, commits/clones and blocked cleanup; escalation and supervisor cgroup removal. CPU, disk, admission and other shared-resource effects remain outside the protocol-only confidentiality guarantee. |
+
+There are no skipped privileged cases within the qualified Phase 1 host scope.
+Physical FIDO interaction, additional deployment platforms and later-phase
+features above remain explicitly unqualified; Phase 0 prototypes do not close
+their gates.
+
 
 ### Phase 2 — Pinned targets and destination preparation
 

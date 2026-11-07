@@ -137,6 +137,7 @@ impl Execution {
         if let Err(job) = self.supervisor.submit(job) {
             let active = self.jobs.get_mut(&token).unwrap();
             active.owner = Some(PreparedJob {
+                inherited_target_fds: None,
                 job: *job,
                 cgroup: None,
             });

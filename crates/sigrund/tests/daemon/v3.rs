@@ -3,18 +3,19 @@ use super::*;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 #[test]
+#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
 fn confidentiality_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")
-        .args(["--user", "--map-auto", "--map-root-user"])
+        .args(["--mount"])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "v2::namespace_fixture",
+            "v3::namespace_fixture",
             "--ignored",
             "--nocapture",
         ])
-        .env("SIGRUND_V2_NAMESPACE", "1")
+        .env("SIGRUND_V3_NAMESPACE", "1")
         .output()
         .unwrap();
     assert!(
@@ -34,9 +35,9 @@ fn broker_request(socket: &mut UnixStream) -> sigrund_core::approval::ApprovalRe
 }
 
 #[test]
-#[ignore = "invoked by the v2 namespace gate"]
+#[ignore = "invoked by the v3 host gate"]
 fn namespace_fixture() {
-    assert_eq!(std::env::var("SIGRUND_V2_NAMESPACE").unwrap(), "1");
+    assert_eq!(std::env::var("SIGRUND_V3_NAMESPACE").unwrap(), "1");
     let f = Fixture::new();
     fs::write(
         &f.signers,
@@ -50,7 +51,7 @@ fn namespace_fixture() {
     let context_path = PathBuf::from(format!("{}.context", f.socket.display()));
     let mut context = connect(&context_path);
     context
-        .write_all(&encode_frame(FrameType::ClientContextQuery, br#"{"version":"2.0"}"#).unwrap())
+        .write_all(&encode_frame(FrameType::ClientContextQuery, br#"{"version":"3.0"}"#).unwrap())
         .unwrap();
     let mut header = [0; 5];
     context.read_exact(&mut header).unwrap();
@@ -58,7 +59,7 @@ fn namespace_fixture() {
     let mut bytes = vec![0; u32::from_be_bytes(header[1..].try_into().unwrap()) as usize];
     context.read_exact(&mut bytes).unwrap();
     let public: sigrund_core::protocol::PublicContext = parse_strict(&bytes).unwrap();
-    assert_eq!(public.version, "2.0");
+    assert_eq!(public.version, "3.0");
     assert!(
         !String::from_utf8(bytes)
             .unwrap()
@@ -66,8 +67,8 @@ fn namespace_fixture() {
     );
     expect_closed(&mut context);
     for query in [
-        br#"{"version":"2.0","path":"/root/private"}"#.as_slice(),
-        br#"{"version":"2.0","version":"2.0"}"#,
+        br#"{"version":"3.0","path":"/root/private"}"#.as_slice(),
+        br#"{"version":"3.0","version":"3.0"}"#,
     ] {
         let mut socket = connect(&context_path);
         socket
@@ -113,6 +114,13 @@ fn namespace_fixture() {
             let csr = sigrund_core::warrant::Csr::from_unsigned(
                 &hello,
                 sigrund_core::warrant::CsrIdentity {
+                    binding: Some(
+                        sigrund::host_registry::live_bundle(
+                            &f.state.join("host-epoch.json"),
+                            "host-baseline",
+                        )
+                        .unwrap(),
+                    ),
                     grant_id: new_uuidv7().to_string(),
                     host_id: public.host_id.clone(),
                     requester_uid: 0,
@@ -129,15 +137,20 @@ fn namespace_fixture() {
             )
             .unwrap();
             let mut w = csr.warrant().clone();
-            // Exact evidence is insufficient without requester access proof. This
-            // namespace is deliberately unsupported by the access helper.
+            // A full request with forged evidence must fail before review,
+            // even when requester access succeeds in the initial user namespace.
             if case == "standalone_thin" {
                 w.request_origin = "daemon_expanded_thin".into();
                 w.approval_exec_id = Some(new_uuidv7().to_string());
                 let envelope = authorization::envelope(w, 7);
-                body = serde_json::json!({"version":"2.0","mode":"signed","tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope});
+                body = serde_json::json!({"version":"3.0","mode":"signed","tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope});
             } else {
-                body = serde_json::json!({"version":"2.0","mode":"full_csr","tty_mode":"stdio","caller_env":{},"csr_payload":String::from_utf8(csr.as_bytes().to_vec()).unwrap()});
+                w.command.executable_trust =
+                    Some(sigrund_core::executable::ExecutableTrust::DigestMemfd {
+                        sha256: "ff".repeat(32),
+                    });
+                let csr = sigrund_core::warrant::Csr::new(w).unwrap();
+                body = serde_json::json!({"version":"3.0","mode":"full_csr","tty_mode":"stdio","caller_env":{},"csr_payload":String::from_utf8(csr.as_bytes().to_vec()).unwrap()});
             }
         }
         let mut pipe = [-1; 2];

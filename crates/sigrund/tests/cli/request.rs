@@ -5,7 +5,11 @@ fn args(values: &[&str]) -> Vec<String> {
 }
 #[test]
 fn defaults_overrides_and_canonical_collections_are_exact() {
-    let options = RequestOptions::default();
+    let options = RequestOptions {
+        target: Some("host".into()),
+        security_profile: Some("host-baseline".into()),
+        ..RequestOptions::default()
+    };
     let hello = options
         .hello(
             &args(&["/usr/bin/printf", "two words", ""]),
@@ -25,7 +29,7 @@ fn defaults_overrides_and_canonical_collections_are_exact() {
             ("PATH".into(), "/usr/sbin:/usr/bin".into())
         ])
     );
-    let ClientArgs::Run { options, .. } = ClientArgs::parse(&args(&[
+    let ClientArgs::Run { options, .. } = ClientArgs::parse(&client_args(&[
         "--target-uid",
         "33",
         "--target-gid",
@@ -173,4 +177,27 @@ fn invalid_client_values_fail_before_connecting() {
         });
     }
     assert_eq!(alias.output().unwrap().status.code(), Some(64));
+}
+
+fn client_args(values: &[&str]) -> Vec<String> {
+    let mut result = Vec::new();
+    let end = values
+        .iter()
+        .position(|v| *v == "--")
+        .unwrap_or(values.len());
+    let flags = &values[..end];
+    if !flags.contains(&"--warrant") {
+        for (flag, value) in [
+            ("--target", "host"),
+            ("--security-profile", "host-baseline"),
+            ("--target-uid", "0"),
+            ("--target-gid", "0"),
+        ] {
+            if !flags.contains(&flag) {
+                result.extend([flag.to_owned(), value.to_owned()]);
+            }
+        }
+    }
+    result.extend(args(values));
+    result
 }

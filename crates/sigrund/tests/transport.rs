@@ -61,11 +61,11 @@ fn fd_count() -> usize {
 
 fn hello(policy: &str) -> ClientHello {
     ClientHello::parse_request(serde_json::json!({
-        "version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},
+        "version":"3.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},"target":{"kind":"host"},"account":{"kind":"numeric","uid":0,"gid":0,"supplementary_gids":[]},"security_profile":"host-baseline",
         "command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
             "executable_path":"/usr/bin/id","stdin_policy":policy,"tty_mode":"stdio"},
         "execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
-            "supplementary_gids":[],"target_gid":0,"target_uid":0,"umask":18},
+            "umask":18},
         "policy":{"mode":"one_time","ttl_secs":60}}
     }).to_string().as_bytes()).unwrap()
 }

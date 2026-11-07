@@ -50,6 +50,9 @@ pub(crate) struct ValidatedRequest {
     pub deadline: Instant,
     pub deadline_active: bool,
     pub cancelled: Arc<AtomicBool>,
+    pub host_profile: Option<sigrund_core::host::Constraints>,
+    pub host_bundle: Option<sigrund_core::host::BindingBundle>,
+    pub host_lease: Option<crate::host_target::HostLease>,
 }
 pub(crate) struct MeasuredSnapshots {
     pub executable: crate::executable::Executable,
@@ -279,7 +282,7 @@ fn read_request(
     };
     // Unsupported versions are transport faults; bounded semantic failures retain rights.
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame.payload)
-        && value.get("version").is_some_and(|v| v != "2.0")
+        && value.get("version").is_some_and(|v| v != "3.0")
     {
         return Err(invalid("unsupported wire version"));
     }
@@ -288,6 +291,7 @@ fn read_request(
         Ok(hello) => (hello, None),
         Err(e) => (
             ClientHello {
+                original_intent: None,
                 caller_env: Default::default(),
                 mode: "invalid".into(),
                 tty_mode: "stdio".into(),
@@ -312,6 +316,9 @@ fn read_request(
             .err();
     }
     let mut request = ValidatedRequest {
+        host_profile: None,
+        host_bundle: None,
+        host_lease: None,
         deferred_cleanup: vec![],
         failure,
         exec_id: String::new(),
@@ -574,11 +581,11 @@ mod tests {
     }
     fn send(socket: &mut UnixStream, fd: i32) {
         let body=serde_json::to_vec(&serde_json::json!({
-            "version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},
+            "version":"3.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},"target":{"kind":"host"},"account":{"kind":"numeric","uid":0,"gid":0,"supplementary_gids":[]},"security_profile":"host-baseline",
             "command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
                 "executable_path":"/usr/bin/id","stdin_policy":"null","tty_mode":"stdio"},
             "execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
-                "supplementary_gids":[],"target_gid":0,"target_uid":0,"umask":63},
+                "umask":63},
             "policy":{"mode":"one_time","ttl_secs":60}}
         })).unwrap();
         let encoded = encode_frame(FrameType::ClientHello, &body).unwrap();
@@ -848,6 +855,13 @@ mod tests {
         let csr = Csr::from_unsigned(
             request.hello(),
             CsrIdentity {
+                binding: Some({
+                    use sigrund_core::host::Record;
+                    sigrund_core::host::BindingBundle::parse(include_bytes!(
+                        "../../sigrund-core/tests/fixtures/v3-host/bundle.json"
+                    ))
+                    .unwrap()
+                }),
                 grant_id: new_uuidv7().to_string(),
                 host_id: format!("sigrun-host:sha256:{}", "0".repeat(64)),
                 requester_uid: 1001,

@@ -2,10 +2,11 @@
 use super::*;
 
 #[test]
+#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
 fn exit_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")
-        .args(["--user", "--map-auto", "--map-root-user"])
+        .args(["--mount"])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -57,7 +58,7 @@ fn namespace_fixture() {
         "event_type": "PRESSURE_FIXTURE",
         "host_id": genesis["host_id"],
         "padding": "",
-        "schema_version":2,
+        "schema_version":3,
         "prev_record_sha256": audit.state().last_record_sha256,
         "seq": audit.state().seq,
     }))

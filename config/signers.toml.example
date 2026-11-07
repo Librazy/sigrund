@@ -16,3 +16,12 @@ allow_unrestricted_stdin = false
 allow_pty = false
 allow_interpreted_scripts = false
 allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]
+
+[[signers.host_rules]]
+requester_uids = [1001]
+target_scope = "host"
+target_uids = [0, 33]
+target_gids = [0, 33]
+supplementary_gids = [33, 104]
+profile_sha256 = "6135f3b7915f316b816bc26eed46aaa0d2028966850bc769cb69ab169981ffb5"
+cross_owner = true

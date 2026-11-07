@@ -17,6 +17,7 @@ use std::{
 pub(crate) struct PreparedJob {
     pub job: CommittedJob,
     pub cgroup: Option<JobCgroup>,
+    pub(crate) inherited_target_fds: Option<sigrund_core::host_budget::Reservation>,
 }
 pub(crate) enum Task {
     Prepare(CommittedJob),
@@ -150,7 +151,11 @@ impl JobSupervisor {
                                     let (cgroup, message) = operation(layout.as_ref(), &job);
                                     let failure = (!message.is_empty()).then_some(message);
                                     notifier.send(SpawnOutcome::Prepared {
-                                        owner: Box::new(PreparedJob { job, cgroup }),
+                                        owner: Box::new(PreparedJob {
+                                            job,
+                                            cgroup,
+                                            inherited_target_fds: None,
+                                        }),
                                         failure,
                                     });
                                 }
@@ -238,7 +243,18 @@ pub(crate) fn eligible(job: &CommittedJob) -> io::Result<()> {
         return Err(io::Error::other("committed job cancelled before spawn"));
     }
     job.lease.request().check()?;
+    let request = job.lease.request();
+    let bundle = request
+        .host_bundle
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing committed binding"))?;
+    request
+        .host_lease
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing committed target lease"))?
+        .verify(bundle)?;
     let w = job.authorized.warrant.warrant();
+    w.verify_bundle(bundle).map_err(io::Error::other)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -275,16 +291,34 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<ChildProcess> {
         return Err(io::Error::other("missing output rights"));
     }
     eligible(&owner.job)?;
-    command.spawn_checkpoint(
-        owner.cgroup.as_ref().expect("prepared cgroup").fd(),
-        [
-            input,
-            request.rights[n - 2].as_raw_fd(),
-            request.rights[n - 1].as_raw_fd(),
-            snapshot.executable.as_fd().as_raw_fd(),
-        ],
-        snapshot.executable.needs_checkpoint(),
-    )
+    let (child, copies) = request
+        .host_lease
+        .as_ref()
+        .expect("validated target owner")
+        .with_retained_fd_copies(|| {
+            if owner
+                .job
+                .lifecycle
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+                || !crate::sequencer::connection_live(owner.job.control)
+            {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            request.check()?;
+            command.spawn_checkpoint(
+                owner.cgroup.as_ref().expect("prepared cgroup").fd(),
+                [
+                    input,
+                    request.rights[n - 2].as_raw_fd(),
+                    request.rights[n - 1].as_raw_fd(),
+                    snapshot.executable.as_fd().as_raw_fd(),
+                ],
+                snapshot.executable.needs_checkpoint(),
+            )
+        })?;
+    owner.inherited_target_fds = Some(copies);
+    Ok(child)
 }
 pub(crate) fn prepare_job(
     layout: Option<&CgroupLayout>,

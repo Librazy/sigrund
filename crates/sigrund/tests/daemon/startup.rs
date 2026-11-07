@@ -132,7 +132,7 @@ fn append_recovery_tail(fixture: &Fixture, recovery: &str) -> serde_json::Value 
         for (index, byte) in key.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
         }
-        let mut record = serde_json::json!({"schema_version":2,"event_type":"TEST_CRASH_WINDOW",
+        let mut record = serde_json::json!({"schema_version":3,"event_type":"TEST_CRASH_WINDOW",
             "host_id":genesis["host_id"],"seq":state["seq"],
             "prev_record_sha256":state["last_record_sha256"]});
         record["entry_hmac"] = entry_hmac(&key, &serde_json::to_vec(&record).unwrap()).into();
@@ -217,6 +217,8 @@ pub(super) fn verify_audit_directory_replacement() {
         });
         fixture.peer(65534, "client");
         daemon.stop();
+        assert!(original_state.join("host-epoch.json").is_file());
+        assert!(!fixture.state.join("host-epoch.json").exists());
         for path in [&state_path, &fixture.log] {
             assert_eq!(fs::read(path).unwrap(), b"untrusted replacement");
         }
@@ -242,10 +244,11 @@ pub(super) fn verify_audit_directory_replacement() {
 }
 
 #[test]
+#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
 fn stale_audit_temporary_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")
-        .args(["--user", "--map-auto", "--map-root-user"])
+        .args(["--mount"])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -332,5 +335,130 @@ fn stale_audit_temporary_namespace_fixture() {
             (0, 0, 0o600)
         );
         assert_ne!(state.ino(), retained.metadata().unwrap().ino());
+    }
+}
+
+#[test]
+#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
+fn v3_provisioning_set_gate() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    for (role, sidecar) in [
+        ("state", "state.sqlite-wal"),
+        ("state", "state.sqlite-shm"),
+        ("state", "audit_ratchet.state.tmp"),
+        ("state", "host-epoch.json"),
+        ("state", "unrecognized-prior-set"),
+        ("log", "audit.jsonl.tmp"),
+        ("log", "audit.jsonl.1"),
+        ("log", "unrecognized-prior-log"),
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().join("state");
+        let log_dir = base.path().join("log");
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&log_dir).unwrap();
+        let sentinel = if role == "state" { &state } else { &log_dir }.join(sidecar);
+        fs::write(&sentinel, b"prior provisioning sentinel").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_sigrundctl"))
+            .arg("init-host")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--log-path")
+            .arg(log_dir.join("audit.jsonl"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "{role}/{sidecar}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"prior provisioning sentinel");
+        assert!(!state.join("host_identity.key").exists());
+        assert!(!state.join("state.sqlite").exists());
+        assert!(!log_dir.join("audit.jsonl").exists());
+    }
+    // Every component is checked before the public, context or broker listener
+    // is published. Failed checks preserve the exact supplied state/log bytes.
+    for component in ["database", "ratchet", "audit", "configuration", "all"] {
+        for version in [0, 2, 4] {
+            let f = Fixture::new();
+            if component == "database" || component == "all" {
+                rusqlite::Connection::open(f.state.join("state.sqlite"))
+                    .unwrap()
+                    .execute_batch(&format!("PRAGMA user_version={version};"))
+                    .unwrap();
+            }
+            for (role, path) in [
+                ("ratchet", f.state.join("audit_ratchet.state")),
+                ("audit", f.log.clone()),
+            ] {
+                if component == role || component == "all" {
+                    let raw = fs::read(&path).unwrap();
+                    let mut record: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                    if version == 0 {
+                        record.as_object_mut().unwrap().remove("schema_version");
+                    } else {
+                        record["schema_version"] = version.into();
+                    }
+                    let mut bytes = serde_json::to_vec(&record).unwrap();
+                    if role == "audit" {
+                        bytes.push(b'\n');
+                    }
+                    fs::write(path, bytes).unwrap();
+                }
+            }
+            if component == "configuration" || component == "all" {
+                let config = fs::read_to_string(&f.config).unwrap();
+                fs::write(
+                    &f.config,
+                    if version == 0 {
+                        config.replace("version = \"3.0\"\n", "")
+                    } else {
+                        config.replace("version = \"3.0\"", &format!("version = \"{version}.0\""))
+                    },
+                )
+                .unwrap();
+            }
+            let log_before = fs::read(&f.log).unwrap();
+            let ratchet_before = fs::read(f.state.join("audit_ratchet.state")).unwrap();
+            let db_before = fs::read(f.state.join("state.sqlite")).unwrap();
+            let result = f.command().output().unwrap();
+            assert!(
+                !result.status.success(),
+                "accepted {component} version {version}"
+            );
+            assert!(!f.socket.exists() && !f.broker.exists());
+            assert!(!PathBuf::from(format!("{}.context", f.socket.display())).exists());
+            assert!(!f.state.join("host-epoch.json").exists());
+            assert_eq!(fs::read(&f.log).unwrap(), log_before);
+            assert_eq!(
+                fs::read(f.state.join("audit_ratchet.state")).unwrap(),
+                ratchet_before
+            );
+            assert_eq!(fs::read(f.state.join("state.sqlite")).unwrap(), db_before);
+        }
+    }
+    for component in [
+        "host_identity.key",
+        "audit_ratchet.state",
+        "state.sqlite",
+        "log",
+    ] {
+        let f = Fixture::new();
+        let missing = if component == "log" {
+            f.log.clone()
+        } else {
+            f.state.join(component)
+        };
+        fs::remove_file(&missing).unwrap();
+        let result = f.command().output().unwrap();
+        assert!(
+            !result.status.success(),
+            "reinitialized missing {component}"
+        );
+        assert!(!missing.exists());
+        assert!(!f.socket.exists() && !f.broker.exists());
+        assert!(!f.state.join("host-epoch.json").exists());
     }
 }

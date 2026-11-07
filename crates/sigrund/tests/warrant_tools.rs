@@ -8,12 +8,23 @@ use sigrund_core::{
 use std::{fs, path::Path, process::Command};
 
 fn csr() -> Csr {
-    let hello = RequestOptions::default()
-        .hello(&["/usr/bin/id".into(), "-u".into()], Path::new("/"))
-        .unwrap();
+    let hello = RequestOptions {
+        target: Some("host".into()),
+        security_profile: Some("host-baseline".into()),
+        ..RequestOptions::default()
+    }
+    .hello(&["/usr/bin/id".into(), "-u".into()], Path::new("/"))
+    .unwrap();
     Csr::from_unsigned(
         &hello,
         CsrIdentity {
+            binding: Some({
+                use sigrund_core::host::Record;
+                sigrund_core::host::BindingBundle::parse(include_bytes!(
+                    "../../sigrund-core/tests/fixtures/v3-host/bundle.json"
+                ))
+                .unwrap()
+            }),
             grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into(),
             host_id: format!("sigrun-host:sha256:{}", "0".repeat(64)),
             requester_uid: 1001,
@@ -71,7 +82,7 @@ fn offline_cli_preserves_client_csr_and_openssh_signature_bytes() {
                 "-Y",
                 "sign",
                 "-n",
-                "sigrun.warrant.v2",
+                "sigrun.warrant.v3",
                 "-O",
                 "hashalg=sha512",
                 "-f"
@@ -138,7 +149,11 @@ fn offline_cli_preserves_client_csr_and_openssh_signature_bytes() {
     );
     let mut changed = csr.warrant().clone();
     changed.command.argv.push("extra".into());
-    changed.intent_sha256 = changed.intent().unwrap().sha256().unwrap();
+    changed.intent.command = changed.command.requested();
+    changed.intent_sha256 = {
+        use sigrund_core::host::Record;
+        changed.intent.sha256().unwrap()
+    };
     let changed = Csr::new(changed).unwrap();
     assert!(
         pack_warrant(

@@ -1,3 +1,4 @@
+version = "3.0"
 # Ordered executable trust models. Omit a model to disable it.
 # Only digest_memfd uses max_executable_bytes and executable snapshot RAM.
 executable_trust_models = ["fs_verity", "ctime", "digest_direct", "digest_memfd"]
@@ -44,7 +45,7 @@ collector_server_name = "collector.example.invalid"
 collector_ca_file = "/etc/sigrund/collector-ca.pem"
 collector_client_cert_file = "/etc/sigrund/collector-client.crt"
 collector_client_key_file = "/etc/sigrund/collector-client.key"
-collector_key_id = "collector-v2"
+collector_key_id = "collector-v3"
 collector_public_key = "<strict-padded-base64-32-byte-ed25519-key>"
 collector_rpc_timeout_ms = 3000
 
@@ -68,3 +69,29 @@ max_ttl_secs = 31536000
 # Set false to retain sealed snapshots for ComposeFS executables.
 # [digest_direct]
 # allow_admin_trusted_composefs = false
+
+[[host_profiles]]
+capabilities = []
+executable_model = "digest_memfd"
+join_namespaces = []
+lsm = "no_transition_required"
+memory_max = 268435456
+memory_swap_max = 0
+no_new_privs = true
+pids_max = 128
+private_cgroup = true
+private_mount = true
+profile_id = "host-baseline"
+schema = "sigrund.host-constraints.v1"
+seccomp = "no_filter_required"
+securebits = 47
+verify_exec_stop = false
+
+[[host_rules]]
+requester_uids = [1001]
+target_scope = "host"
+target_uids = [0, 33]
+target_gids = [0, 33]
+supplementary_gids = [33, 104]
+profile_sha256 = "6135f3b7915f316b816bc26eed46aaa0d2028966850bc769cb69ab169981ffb5"
+cross_owner = true

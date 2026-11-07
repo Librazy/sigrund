@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::ExitCode,
@@ -21,7 +21,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "--help") {
         println!(
-            "Usage: sigrundctl init-host [--state-dir PATH] [--log-path PATH]\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
+            "Usage: sigrundctl init-host --state-dir PATH --log-path PATH\n       sigrundctl target export-binding host --security-profile ID [--epoch-file PATH] --output PATH\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
         );
         return ExitCode::SUCCESS;
     }
@@ -30,6 +30,15 @@ fn main() -> ExitCode {
         .is_some_and(|arg| matches!(arg.as_str(), "csr-pae" | "pack-warrant"))
     {
         return match offline_warrant(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("sigrundctl: {error}");
+                ExitCode::from(65)
+            }
+        };
+    }
+    if args.get(1).is_some_and(|arg| arg == "target") {
+        return match export_binding(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("sigrundctl: {error}");
@@ -59,6 +68,52 @@ fn main() -> ExitCode {
     }
     eprintln!("sigrundctl: provisioning commands are not enabled in this build");
     ExitCode::from(78)
+}
+
+fn export_binding(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use sigrund_core::host::Record;
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("binding export requires effective UID 0".into());
+    }
+    if args.len() < 3 || args[1] != "export-binding" || args[2] != "host" {
+        return Err("expected target export-binding host".into());
+    }
+    let mut options = BTreeMap::new();
+    for pair in args[3..].chunks(2) {
+        if pair.len() != 2
+            || !["--security-profile", "--epoch-file", "--output"].contains(&pair[0].as_str())
+            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return Err("invalid or duplicate binding export option".into());
+        }
+    }
+    let profile = options
+        .get("--security-profile")
+        .ok_or("--security-profile is required")?;
+    let output = Path::new(options.get("--output").ok_or("--output is required")?);
+    sigrund::linux::validate_absolute_path(output)?;
+    let epoch = Path::new(
+        options
+            .get("--epoch-file")
+            .copied()
+            .unwrap_or(sigrund::host_registry::DEFAULT_EPOCH_FILE),
+    );
+    let bundle = sigrund::host_registry::live_bundle(epoch, profile)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(output)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(&bundle.canonical()?)?;
+    file.sync_all()?;
+    File::open(
+        output
+            .parent()
+            .ok_or("output requires a parent directory")?,
+    )?
+    .sync_all()?;
+    Ok(())
 }
 
 fn offline_warrant(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -124,10 +179,33 @@ fn init_host(args: &[String]) -> ExitCode {
         eprintln!("sigrundctl: init-host requires effective UID 0");
         return ExitCode::from(77);
     }
-    let state_dir =
-        option_path(args, "--state-dir").unwrap_or_else(|| PathBuf::from("/var/lib/sigrund"));
-    let log_path = option_path(args, "--log-path")
-        .unwrap_or_else(|| PathBuf::from("/var/log/sigrund/audit.jsonl"));
+    let mut options = BTreeMap::new();
+    for pair in args[2..].chunks(2) {
+        if pair.len() != 2
+            || !["--state-dir", "--log-path"].contains(&pair[0].as_str())
+            || options
+                .insert(pair[0].as_str(), PathBuf::from(&pair[1]))
+                .is_some()
+        {
+            eprintln!("sigrundctl: invalid, duplicate or incomplete provisioning option");
+            return ExitCode::from(64);
+        }
+    }
+    let Some(state_dir) = options.remove("--state-dir") else {
+        eprintln!("sigrundctl: init-host requires explicit --state-dir");
+        return ExitCode::from(64);
+    };
+    let Some(log_path) = options.remove("--log-path") else {
+        eprintln!("sigrundctl: init-host requires explicit --log-path");
+        return ExitCode::from(64);
+    };
+    if [&state_dir, &log_path]
+        .iter()
+        .any(|path| sigrund::linux::validate_absolute_path(path).is_err())
+    {
+        eprintln!("sigrundctl: provisioning paths must be canonical absolute paths");
+        return ExitCode::from(64);
+    }
     let key_path = state_dir.join("host_identity.key");
     let state_path = state_dir.join("audit_ratchet.state");
     if key_path.exists()
@@ -135,6 +213,9 @@ fn init_host(args: &[String]) -> ExitCode {
         || log_path.exists()
         || state_dir.join("state.sqlite").exists()
         || state_dir.read_dir().is_ok_and(|mut d| d.next().is_some())
+        || log_path
+            .parent()
+            .is_some_and(|parent| parent.read_dir().is_ok_and(|mut d| d.next().is_some()))
     {
         eprintln!("sigrundctl: refusing to overwrite existing host identity, state, or log");
         return ExitCode::from(73);
@@ -177,6 +258,17 @@ fn init_host(args: &[String]) -> ExitCode {
     };
     // Keep checked directories alive and address their entries through those
     // descriptors, even if an ancestor is renamed during provisioning.
+    for directory in [&state_directory, &log_directory] {
+        match fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+            .map(|mut entries| entries.next().is_none())
+        {
+            Ok(true) => (),
+            _ => {
+                eprintln!("sigrundctl: provisioning requires empty state and log directories");
+                return ExitCode::from(73);
+            }
+        }
+    }
     let state_dir = PathBuf::from(format!("/proc/self/fd/{}", state_directory.as_raw_fd()));
     let log_path = PathBuf::from(format!("/proc/self/fd/{}", log_directory.as_raw_fd()))
         .join(log_path.file_name().expect("log path has a filename"));
@@ -195,7 +287,7 @@ fn init_host(args: &[String]) -> ExitCode {
     let host_id = format!("sigrun-host:sha256:{}", sha256_hex(&public_key));
     let zero_digest = "0".repeat(64);
     let mut body = BTreeMap::new();
-    body.insert("schema_version", serde_json::json!(2));
+    body.insert("schema_version", serde_json::json!(3));
     body.insert("event_type", serde_json::Value::String("AUDIT_INIT".into()));
     body.insert("host_id", serde_json::Value::String(host_id.clone()));
     body.insert("prev_record_sha256", serde_json::Value::String(zero_digest));
@@ -221,7 +313,7 @@ fn init_host(args: &[String]) -> ExitCode {
     };
     let next_key = next_ratchet_key(&ratchet_key);
     let state = serde_json::json!({
-        "schema_version":2,
+        "schema_version":3,
         "key_hex": next_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "initial_key_hex": ratchet_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "last_record_sha256": sha256_hex(&record_bytes),
@@ -254,7 +346,7 @@ fn init_host(args: &[String]) -> ExitCode {
             println!(
                 "{}",
                 serde_json::json!({
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "host_id": host_id,
                     "initial_seq": 0,
                     "anchor_key_hex": ratchet_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
@@ -355,13 +447,6 @@ fn trusted_directory(path: &Path) -> std::io::Result<File> {
     let directory = sigrund::startup::open_pinned(path)?;
     sigrund::startup::check_root_metadata(&directory, true, None)?;
     Ok(directory)
-}
-
-fn option_path(args: &[String], name: &str) -> Option<PathBuf> {
-    args.iter()
-        .position(|arg| arg == name)
-        .and_then(|index| args.get(index + 1))
-        .map(PathBuf::from)
 }
 
 #[cfg(test)]

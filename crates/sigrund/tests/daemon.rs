@@ -1,5 +1,5 @@
-//! Real daemon exit gate, run as namespace root with a mapped non-root UID.
-//! No host-root privilege, cgroup mutation, or production paths are required.
+//! Daemon gates run as initial-userns root inside private mount namespaces.
+//! The privileged Phase 1 supervisor owns their bounded lifetime and cleanup.
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sigrund_core::{
     audit::entry_hmac,
@@ -166,11 +166,11 @@ fn send_fds(socket: &UnixStream, bytes: &[u8], rights: &[RawFd]) {
 
 fn hello(executable: &Path) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "version":"2.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},
+        "version":"3.0", "mode":"thin_csr", "tty_mode":"stdio", "caller_env":{}, "intent":{"caller_env":{},"target":{"kind":"host"},"account":{"kind":"numeric","uid":33,"gid":0,"supplementary_gids":[]},"security_profile":"host-baseline",
         "command":{"allow_interpreted_script":false,"argv":["id"],"cwd":"/",
             "executable_path":executable,"stdin_policy":"null","tty_mode":"stdio"},
         "execution_context":{"capabilities":[],"env_exact":{},"caller_env_allowlist":[],
-            "supplementary_gids":[],"target_gid":0,"target_uid":33,"umask":18},
+            "umask":18},
         "policy":{"mode":"one_time","ttl_secs":60}}
     }))
     .unwrap()
@@ -262,6 +262,7 @@ impl Fixture {
         }
         let executable = root.join("id");
         fs::write(&executable, b"\x7fELFsnapshot-fixture").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let mut configuration = include_str!("../../../config/sigrund.toml.example")
             .replace(
                 "<strict-padded-base64-32-byte-ed25519-key>",
@@ -305,6 +306,33 @@ impl Fixture {
             configuration =
                 configuration.replace(&format!("/etc/sigrund/{name}"), path.to_str().unwrap());
         }
+        configuration = configuration.replace(
+            "\nrequester_uids = [1001]",
+            "\nrequester_uids = [0, 1001, 65534]",
+        );
+        // The capability-bearing prompt case must select a distinct immutable
+        // profile; a request cannot add capabilities to host-baseline.
+        use sigrund_core::host::Record;
+        let mut cap_profile: sigrund_core::host::Constraints = serde_json::from_str(include_str!(
+            "../../sigrund-core/tests/fixtures/v3-host/constraints.json"
+        ))
+        .unwrap();
+        cap_profile.profile_id = "host-baseline-cap".into();
+        cap_profile.capabilities = vec!["CAP_NET_BIND_SERVICE".into()];
+        let cap_rule = sigrund_core::host::ScopedRule {
+            requester_uids: vec![0, 1001, 65534],
+            target_scope: "host".into(),
+            target_uids: vec![0, 33],
+            target_gids: vec![0, 33],
+            supplementary_gids: vec![33, 104],
+            profile_sha256: cap_profile.sha256().unwrap(),
+            cross_owner: true,
+        };
+        configuration.push_str(&format!(
+            "\n[[host_profiles]]\n{}\n[[host_rules]]\n{}",
+            toml::to_string(&cap_profile).unwrap(),
+            toml::to_string(&cap_rule).unwrap()
+        ));
         configuration.push_str("\n[mvp]\napproval_signer_id = \"mandator-alice-yubikey\"\n");
         fs::write(&config, configuration).unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
@@ -316,7 +344,7 @@ impl Fixture {
         key.extend_from_slice(b"ssh-ed25519");
         key.extend_from_slice(&32u32.to_be_bytes());
         key.extend_from_slice(&public);
-        let signer = include_str!("../../../config/signers.toml.example")
+        let mut signer = include_str!("../../../config/signers.toml.example")
             .replace("type = \"sk-ssh-ed25519\"", "type = \"ssh-ed25519\"")
             .replace(
                 "require_user_presence = true",
@@ -330,7 +358,18 @@ impl Fixture {
                 "[\"/usr/bin\", \"/usr/sbin\"]",
                 &format!("[\"{}\"]", root.display()),
             );
-        fs::write(&signers, signer).unwrap();
+        signer.push_str(&format!(
+            "\n[[signers.host_rules]]\n{}",
+            toml::to_string(&cap_rule).unwrap()
+        ));
+        fs::write(
+            &signers,
+            signer.replace(
+                "\nrequester_uids = [1001]",
+                "\nrequester_uids = [0, 1001, 65534]",
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&signers, fs::Permissions::from_mode(0o600)).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_sigrundctl"))
             .args(["init-host", "--state-dir"])
@@ -356,6 +395,35 @@ impl Fixture {
             executable,
             directory,
         }
+    }
+
+    fn export_binding(&self, profile: &str, uid: u32) -> PathBuf {
+        let output = self
+            .directory
+            .path()
+            .join(format!("binding-{}.json", new_uuidv7()));
+        let result = Command::new(env!("CARGO_BIN_EXE_sigrundctl"))
+            .args([
+                "target",
+                "export-binding",
+                "host",
+                "--security-profile",
+                profile,
+                "--epoch-file",
+            ])
+            .arg(self.state.join("host-epoch.json"))
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let name = std::ffi::CString::new(output.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), uid, uid) }, 0);
+        output
     }
 
     fn command(&self) -> Command {
@@ -502,10 +570,11 @@ impl Drop for DaemonChild {
 }
 
 #[test]
+#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
 fn daemon_gate_in_user_namespace() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")
-        .args(["--user", "--map-auto", "--map-root-user"])
+        .args(["--mount"])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -519,14 +588,14 @@ fn daemon_gate_in_user_namespace() {
         .unwrap();
     assert!(
         output.status.success(),
-        "namespace exit gate failed (requires unshare, subordinate UID/GID ranges, and newuidmap/newgidmap):\n{}\n{}",
+        "host exit gate failed (requires initial-userns root and a private mount namespace):\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
-#[ignore = "invoked by the user-namespace exit gate"]
+#[ignore = "invoked by the host exit gate"]
 fn daemon_namespace_fixture() {
     assert_eq!(
         std::env::var("SIGRUND_DAEMON_NAMESPACE").as_deref(),
@@ -536,7 +605,7 @@ fn daemon_namespace_fixture() {
     service::verify_short_watchdog();
     workers::verify_blocked_socket_disposal();
     let fixture = Fixture::new();
-    // This unprivileged user namespace has no dedicated delegated execution
+    // This mount namespace has no dedicated delegated execution
     // service. Normal startup must fail before either listener is published;
     // only the explicit authorization diagnostic may continue below.
     let diagnostic = fixture.command();
@@ -660,6 +729,13 @@ fn daemon_namespace_fixture() {
         }
         line.clear();
     }
+    wait_for(|| {
+        read_diagnostic_events(&fixture.diagnostics)
+            .iter()
+            .any(|event| {
+                event["event"] == "SOCKET_ADMITTED" && event["requester_pid"] == holder.id()
+            })
+    });
     fixture.peer(65533, "quota");
     // Removing any admitted socket releases capacity immediately.
     drop(second);
@@ -726,7 +802,7 @@ fn daemon_namespace_fixture() {
     }
     let genesis: serde_json::Value =
         serde_json::from_slice(original.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
-    let mut record = serde_json::json!({"schema_version":2,"event_type":"TEST_CRASH_WINDOW","host_id":genesis["host_id"],
+    let mut record = serde_json::json!({"schema_version":3,"event_type":"TEST_CRASH_WINDOW","host_id":genesis["host_id"],
         "seq":state["seq"],"prev_record_sha256":state["last_record_sha256"]});
     let hmac = entry_hmac(&key, &serde_json::to_vec(&record).unwrap());
     record["entry_hmac"] = hmac.into();
@@ -938,19 +1014,6 @@ fn daemon_peer_probe() {
         }
         "hold" => {
             let _socket = connect(&client);
-            let diagnostics =
-                PathBuf::from(std::env::var_os("SIGRUND_DAEMON_DIAGNOSTICS").unwrap());
-            wait_for(|| {
-                fs::read_to_string(&diagnostics)
-                    .unwrap()
-                    .lines()
-                    .any(|line| {
-                        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|event| {
-                            event["event"] == "SOCKET_ADMITTED"
-                                && event["requester_pid"] == std::process::id()
-                        })
-                    })
-            });
             println!("PEER_READY");
             io::stdout().flush().unwrap();
             io::stdin().read_exact(&mut [0u8]).unwrap();
@@ -979,5 +1042,5 @@ mod workers;
 #[path = "daemon/service.rs"]
 mod service;
 
-#[path = "daemon/v2.rs"]
-mod v2;
+#[path = "daemon/v3.rs"]
+mod v3;

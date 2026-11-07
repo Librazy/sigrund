@@ -1,19 +1,15 @@
 # sigrun/sigrund implementation notes
 
-The [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-now defines the **draft v3 target**, including namespace-aware execution. These
-notes describe the implemented **v2 local one-time SSH/stdio profile**; the
-specification rewrite does not change runtime contracts or establish v3 support.
-The [Phase 0 supplement](docs/NAMESPACE_PHASE0.md) records isolated namespace
-experiments and draft schema fixtures in the non-production `sigrund-phase0`
-crate. Passing experiments do not establish integrated namespace support; strict
-concurrent SELinux policy-replacement safety remains blocked.
+The production local one-time SSH/stdio workflow now uses **v3 host bindings**.
+See the [Phase 1 record](docs/NAMESPACE_PHASE1.md) for exact scope, fresh
+provisioning, binding export and current qualification evidence. Container,
+process, registered and `self` targets remain unavailable. The
+[security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
+and [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) retain later namespace and
+confinement requirements. The independent [Phase 0 experiments](docs/NAMESPACE_PHASE0.md)
+do not establish integrated runtime support.
 
-The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) tracks v3 delivery and
-release gates. Deferred features and acceptance limits below remain part of the
-current implementation assessment.
-
-## V2 implementation and validation
+## V3 implementation and validation
 
 Clients prepare canonical full CSRs from bounded public context or submit unchanged
 thin intent. Full-only/export never request privileged expansion. Finite stdin is
@@ -36,24 +32,23 @@ active execution ID bind the complete evidence and exact capability profile.
 Thin approvals cannot be exported or redeemed through the signed endpoint.
 The daemon retains observable endpoints and thin review capacity until the public
 outcome, hiding preparation failures and mandator refusal behind the configurable
-admission-based deadline. Validated full requests may receive explicit refusal;
-signed failures time out. Decisions contain only `exec_id` and `status`.
+admission-based deadline. Full and signed failures also time out. Decisions contain only `exec_id` and `status`.
 
 Durable authorization precedes `APPROVED`; complete delivery precedes spawn.
 Readiness and results are separate frames. Late durable commits remain consumed
 and are reconciled/audited without execution. Private outcome audit distinguishes
 scheduled outcomes from completed frame writes and undelivered responses.
 
-Wire/warrant version 2.0, v2 signature/ratchet domains, and versioned database,
+Wire/warrant version 3.0, v3 signature/ratchet domains, and versioned database,
 audit and ratchet state reject legacy formats. Explicitly provision a fresh,
 coherent state set; startup never migrates or deletes old records.
 
-The regression suites cover v2 schemas, local preparation, deadlines, provenance,
-state rejection and the existing execution profile. `scripts/verify-v2.py` adds
+The regression suites cover v3 schemas, local preparation, deadlines, provenance,
+state rejection and the existing execution profile. `scripts/verify-v3.py` adds
 native raw-socket DAC/ACL/ancestor/supplementary-group checks and compares hidden
 thin failures, output endpoint behavior, exact outcomes and private audit.
 The complete applicable V-01–V-20 acceptance matrix remains the release gate;
-passing a subset does not establish full v2 conformance.
+passing a subset does not establish full v3 conformance.
 
 ## Supported workflow and limits
 
@@ -73,11 +68,13 @@ configuration is still mandatory and validated. The approval capacity is one;
 busy requests silently time out. Absent approvers, invalid requests, broker
 loss and thin refusal remain silent until `authorization_timeout_ms` from
 admission (120 seconds by default; configurable from 1 to 300 seconds).
-An explicit mandator refusal of a validated full CSR returns `REJECTED`.
+Mandator refusal remains private and produces only the generic public TIMEOUT.
 No unsuccessful pre-commit outcome consumes a grant.
 
-The client defaults to UID/GID `0:0`, no supplementary groups or capabilities,
-its captured absolute cwd, exact environment `LANG=C.UTF-8` and
+The client requires `--target host`, `--security-profile ID` and either
+`--account NAME` or both `--target-uid UID --target-gid GID`. Numeric selection
+preserves exactly the requested supplementary groups. The remaining defaults are
+no capabilities, its captured absolute cwd, exact environment `LANG=C.UTF-8` and
 `PATH=/usr/sbin:/usr/bin`, umask `077`, null stdin and a 900-second TTL subject
 to daemon/signer bounds. Executables require absolute canonical paths beneath
 configured roots. Arguments are exact values without shell evaluation or PATH
@@ -94,7 +91,7 @@ Timeout or broker disconnect aborts that exchange and reconnects the watcher
 for future requests, discarding unfinished confirmation. Local signals, TTY
 loss and trust/protocol failures still stop it. The root-owned identity may
 be a private key or a public key backed by root's SSH agent. Signing uses
-OpenSSH SSHSIG over DSSE PAE, with namespace `sigrun.warrant.v2` and SHA-512.
+OpenSSH SSHSIG over DSSE PAE, with namespace `sigrun.warrant.v3` and SHA-512.
 Passphrases stay on the verified TTY; askpass is disabled, and terminal settings
 are restored after helper cancellation. Software, encrypted-key and agent paths
 have fixtures; simulated security-key signatures do not prove physical FIDO
@@ -107,47 +104,16 @@ are not followed automatically. Cross-container/host routing is unimplemented.
 See [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
 [namespace-aware execution roadmap](docs/NAMESPACE_AWARE_EXECUTION.md).
 
-### Deferred namespace-aware executable evidence
+### Host binding and later namespace execution
 
-Namespace-aware workflows are not implemented. Their target requirements are now
-in the draft v3 specification, with implementation phases and acceptance ownership
-in the [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md). The requester-access helper
-resolves paths in the daemon's mount namespace using authenticated requester
-credentials; jobs execute in that daemon's domain. Neither follows the
-requester's namespace set. The private mount namespace used for child isolation
-and namespace-root test fixtures do not establish container routing or
-cross-namespace workflow support.
-
-A known ComposeFS limitation occurs when a client sees a cloned mount tree,
-such as `systemd` `PrivateMounts=` or a container exposing the host socket.
-Public context advertises the daemon-enrolled mount ID. A different mount ID
-on the client's executable cannot qualify against that enrollment, so local
-evidence selection can choose `digest_memfd` while daemon-local selection chooses
-`digest_direct`. Unsigned `full_csr` preparation independently chooses the
-daemon's preferred eligible model and rejects evidence that differs from the
-client's CSR before approval. Local full-CSR preparation can succeed in this
-case, so the client's fallback on local preparation errors does not trigger a
-thin request. Cross-namespace snapshot fallback is therefore not guaranteed.
-
-Run the requester in the daemon's execution domain (for example, use host
-execution for a host daemon). For a recognized ComposeFS root, setting
-`[digest_direct].allow_admin_trusted_composefs = false` removes this ComposeFS
-selection difference; `executable_trust_models = ["digest_memfd"]` explicitly
-selects snapshots on both sides. These settings do not implement namespace
-routing or reconcile different executable bytes, credentials or cwd paths.
-
-The namespace-aware implementation must resolve this limitation as part of its
-destination contract. It must bind executable and cwd resolution, requester
-identity and evidence to the verified destination, then reconcile unsigned
-full-CSR model selection there. Any deliberate thin fallback must preserve
-intent and approval provenance; `--full-only` and CSR export must never silently
-request privileged expansion. Already signed warrants must retain their signed
-model and bytes, with no downgrade on a mismatch. Acceptance must cover cloned
-ComposeFS mount trees, `PrivateMounts=`, supported container routes, identical
-paths with different destination bytes, default/full-only/export/thin requests,
-and signed-request rejection without consumption or model switching. This work
-is deferred to namespace-aware workflows; the current evidence checks continue
-to fail closed.
+Full preparation/export requires an explicitly supplied administrator-distributed
+binding bundle. `.context` contains no target records. The immutable profile
+fixes the executable model; insufficient local evidence preserves the same thin
+intent for ordinary submission, while full-only/export fail locally. A signed
+model/profile mismatch is rejected without fallback or consumption. Host roots,
+identity mappings and namespace FDs belong to one retained generation; strings
+and signed IDs cannot reacquire it. Namespace-entry and cloned-mount destination
+workflows remain later-phase requirements.
 
 ## Code ownership and security boundaries
 
@@ -206,7 +172,8 @@ against whole-state rollback without an external checkpoint.
 
 `executable_trust_models` defaults to `["fs_verity", "ctime", "digest_direct",
 "digest_memfd"]`. Selection precedes approval; a signed warrant never switches
-models. Set `["digest_memfd"]` for snapshot-only operation.
+models. Each host profile selects exactly one enabled model. Use the shipped
+`host-baseline` sealed-memfd profile for snapshot-only requests.
 
 Ctime is online-only. Unprivileged clients submit a tentative version fingerprint;
 matching their earlier byte observation is best effort. Before requesting the
@@ -214,7 +181,7 @@ mandator's signature, the daemon acquires `F_SETLEASE(F_RDLCK)` on the retained
 source and establishes a protected baseline. Existing writable FDs and surviving
 shared writable mappings prevent acquisition. Contention is retried every 10 ms
 for at most 250 ms, within the request deadline. Unsupported leasing or exhausted
-contention permits selection of another model before approval; a completed full
+contention rejects that fixed ctime profile; a completed full
 CSR naming ctime is rejected if that model cannot be established.
 
 Under the lease, two `statx(AT_EMPTY_PATH | AT_STATX_FORCE_SYNC)` observations
@@ -284,13 +251,13 @@ Digest_direct signs a full-file SHA-256 and
 executes the retained source, then hashes again at `PTRACE_EVENT_EXEC` before any
 loader/target instruction. All direct models revalidate execution metadata and
 exact credentials at authorization and at the exec stop. Supported direct files
-preserve `/proc/self/exe` identity and ordinary host v2 file-capability semantics
+preserve `/proc/self/exe` identity and ordinary host file-capability semantics
 within the requested authority ceiling. File-capability transitions use an
 inode-checked alias in the child's private mount namespace; an unavailable or
 replaced path fails closed while the original FD stays pinned. Set-ID files, extended ACLs and noexec
 mounts require fallback; unknown/namespaced/idmapped file capabilities do too.
 
-All v2 warrants sign origin, canonical intent hash and all five expected post-exec
+All v3 warrants sign origin, canonical intent hash and all five expected post-exec
 capability sets for every trust model, in addition to the requested authority
 ceiling. Legacy warrant versions and signature domains fail closed. See normative
 Section 2.2.2 for the evidence and credential table.
@@ -363,30 +330,35 @@ In root's separate controlling terminal:
 ```sh
 source /var/lib/sigrund-demo/environment.sh
 "$TEST_BIN/sigrund-approve" --socket "$TEST_APPROVAL_SOCKET" --tty /dev/tty \
-  --signers "$TEST_SIGNERS" --identity "$TEST_SSH_IDENTITY"
+  --signers "$TEST_SIGNERS" --identity "$TEST_SSH_IDENTITY" --epoch-file "$TEST_EPOCH"
 ```
 
 In the requester login:
 
 ```sh
 source /var/lib/sigrund-demo/environment.sh
-"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --cwd / --status-fd 3 \
+"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --target host --security-profile host-baseline \
+  --target-uid 0 --target-gid 0 --cwd / --status-fd 3 \
   -- "$TEST_COMMANDS/id" -u 3>request.status.jsonl
 ```
 
 Approval prints the target UID and returns the child's status. A service-user
-request can add `--target-uid 33 --target-gid 33`; `--stdin sha256` binds piped
+request uses `--target-uid 33 --target-gid 33` instead; `--stdin sha256` binds piped
 or redirected input. Keep status in its own file and inspect it separately.
 
-For offline signing, run full export as the **requester** into a new file in a
-writable directory:
+For offline signing, root first exports a live binding and deliberately distributes
+it to the requester as described in the [Phase 1 procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export).
+Set `TRUSTED_BINDING` to that distributed file. Run full export as the **requester**
+into a new file in a writable directory:
 
 ```sh
-"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --cwd / \
-  --export-csr request.csr -- "$TEST_COMMANDS/id" -u
+"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --target host --security-profile host-baseline \
+  --target-uid 0 --target-gid 0 --cwd / \
+  --binding-bundle "$TRUSTED_BINDING" --export-csr request.csr -- "$TEST_COMMANDS/id" -u
 ```
 
-Export queries only public context and skips the online-only ctime model;
+Export uses the supplied binding and target-independent public context. A
+profile requiring online-only ctime cannot be exported;
 unreadable, incomplete or unavailable offline evidence fails locally.
 Have root obtain the exact file, review every field, then sign and package it.
 Choose new output paths; the helpers refuse overwrites. The example below assumes
@@ -397,7 +369,7 @@ root has copied that requester file to `$TEST_BASE/request.csr`:
   --pae "$TEST_BASE/request.pae"
 python3 -m json.tool "$TEST_BASE/request.csr"
 # Review every field before signing.
-ssh-keygen -Y sign -n sigrun.warrant.v2 -O hashalg=sha512 \
+ssh-keygen -Y sign -n sigrun.warrant.v3 -O hashalg=sha512 \
   -f "$TEST_SSH_IDENTITY" "$TEST_BASE/request.pae"
 "$TEST_BIN/sigrundctl" pack-warrant --csr "$TEST_BASE/request.csr" \
   --signature "$TEST_BASE/request.pae.sig" --signer-id "$TEST_SIGNER_ID" \
@@ -465,9 +437,12 @@ python3 /absolute/sigrund/scripts/verify-acceptance.py \
   --requester requester --artifacts /tmp/sigrund-acceptance
 ```
 
-The entry point supervises `verify-platform.py`, `verify-runtime.py` and
-`verify-execution.py`, plus the native `verify-v2.py` gate, then exercises offline signing, binding/concurrent replay,
-output/limits, post-commit failure, local recovery and both operator recipes.
+The entry point supervises `verify-platform.py`, `verify-runtime.py`,
+`verify-trust.py`, `verify-execution.py` and the native `verify-v3.py` gate. It
+then exercises offline signing, live binding/substitution/concurrent replay,
+blocked host-resource cleanup, independent context limits, input privacy,
+account/profile changes, output/limits, post-commit failure, local recovery,
+coordinated-rollback limits and both operator recipes.
 Checks include real root/service credentials, setup and registration races,
 shutdown/restart/escalation, and cancellation while output stays blocked.
 Operator units bind their lifetime to the acceptance service; deadlines and
@@ -475,6 +450,18 @@ whole-service cleanup apply even if Python is killed. Require both suite
 success and supervisor cgroup removal. Namespace fixtures alone do not establish
 privileged runtime behavior. Generated manifests, logs and traces are disposable
 run output; historical results are available through Git history.
+
+The separately supervised initial-userns root Rust gates use
+`scripts/verify-phase1-rust.py`. Obtain the daemon integration-test and library
+test executable paths from Cargo's `--no-run --message-format=json` output,
+then pass them as `--daemon-tests` and `--library-tests` with a fresh
+`--artifacts` directory. Run the script inside a dedicated systemd service with
+`Delegate=yes`, `KillMode=control-group` and `RuntimeMaxSec=900s`; the script
+also limits each selected test to 300 seconds and requires one actual pass.
+On enforcing SELinux, use the approved administrative supervisor context for
+the test deployment. The [Phase 1 record](docs/NAMESPACE_PHASE1.md#completed-qualification)
+contains the observed commands, matching executable hashes and additional
+privileged ComposeFS test names.
 
 ## Continuous integration
 
@@ -522,9 +509,11 @@ installation/upgrade/removal tests validate packaging; they do not replace the
 native privileged execution gates. Packages never provision or automatically
 start the daemon, and preserve operator state on removal.
 
-The existing local profile still needs integrated acceptance evidence; the
-replacement v3 specification retains the V-01–V-20 obligations and adds NS-01–NS-16.
-Those v3 gates are future requirements, not claims about current v2 test results.
+The local v3 host profile passed Phase 1 integrated acceptance on the platform
+recorded in the [Phase 1 evidence](docs/NAMESPACE_PHASE1.md#completed-qualification).
+The v3 specification retains the V-01–V-20 obligations and adds NS-01–NS-16;
+the roadmap records every host applicability disposition separately from later
+namespace requirements.
 Beyond the implemented workflow, independent deferred features include:
 
 - PTY transfer, window relaying, terminal cleanup and unrestricted input.
@@ -534,10 +523,10 @@ Beyond the implemented workflow, independent deferred features include:
   collector binary currently supplies validation diagnostics only.
 - Policy reload with aggregate generation quotas, scripts/reusable grants,
   OpenPGP/Sigstore adapters and safe administrative revocation tooling.
-- Complete applicable v2 V-01–V-20 end-to-end cases and real hardware
-  signing acceptance before claiming physical security-key support.
+- Real hardware signing acceptance before claiming physical security-key
+  interaction, plus qualification of additional deployment platforms.
 
-Selectable host/container execution domains now have a draft v3 contract and
+Additional namespace/container execution domains have a v3 contract and
 [gated roadmap](docs/NAMESPACE_AWARE_EXECUTION.md). Source capture, namespace entry,
 cgroup placement and enforceable confinement remain release-blocking design gates.
 No v2 compatibility layer or automatic state migration is planned; explicit fresh

@@ -580,11 +580,6 @@ impl Connection {
                     };
                     let mut approval = ApprovalRequest::new(self.exec_id.clone(), signer_id, csr)
                         .map_err(|e| invalid(e.to_string()))?;
-                    approval.admin_trusted_composefs = lease
-                        .request()
-                        .snapshots
-                        .as_ref()
-                        .is_some_and(|s| s.executable.admin_trusted_composefs());
                     approval.remaining_ms = u32::try_from(
                         self.auth_deadline
                             .saturating_duration_since(now)
@@ -900,6 +895,8 @@ pub struct ForegroundDaemon {
     approval: BoundSocket,
     context_listener: BoundSocket,
     _resources: StartupResources,
+    host_target: Arc<crate::host_target::HostTarget>,
+    _epoch_owner: Arc<crate::host_registry::EpochOwner>,
     config: Arc<DaemonConfig>,
     _signers: SignerPolicyFile,
     signals: SignalSource,
@@ -940,7 +937,14 @@ impl ForegroundDaemon {
             .validate_against(&config)
             .map_err(|e| invalid(e.to_string()))?;
         let signals = SignalSource::new()?;
-        let mut resources = StartupResources::prepare(&config, state_dir, log_path)?;
+        let target_budget =
+            sigrund_core::host_budget::Budget::new(config.host_limits).map_err(io::Error::other)?;
+        let mut resources = StartupResources::prepare_with_host_budget(
+            &config,
+            state_dir,
+            log_path,
+            &target_budget,
+        )?;
         // Runtime enrollment is never trusted from callers/configuration.
         config.admin_trusted_composefs_mounts.clear();
         if config.digest_direct.allow_admin_trusted_composefs
@@ -978,9 +982,30 @@ impl ForegroundDaemon {
                     )
                     .map_err(|e| invalid(e.to_string()))?;
             }
-            crate::execution::startup_probe(&layout)?;
+            let _probe = target_budget
+                .reserve(
+                    0,
+                    sigrund_core::host_budget::Charge {
+                        helpers: 1,
+                        target_fds: 16,
+                        ..Default::default()
+                    },
+                )
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            target_budget
+                .with_transient_fd_copies(0, || crate::execution::startup_probe(&layout))
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))??;
             resources.execution = Some(layout);
         }
+        let last_cap: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+            .trim()
+            .parse()
+            .map_err(|_| invalid("invalid kernel capability bound"))?;
+        crate::host_target::qualify_profiles(
+            &config.host_profiles,
+            crate::execution::trace_available(),
+            last_cap,
+        )?;
         // Startup recovery/orphan records may themselves cross high water.
         // Recheck before publishing either listener, retaining those records.
         if !resources.storage.check(&config)? {
@@ -993,8 +1018,20 @@ impl ForegroundDaemon {
             .as_ref()
             .is_none_or(|p| p.approval_signer_id.is_empty())
         {
-            return Err(invalid("local v2 profile requires an approval signer"));
+            return Err(invalid("local v3 profile requires an approval signer"));
         }
+        let host_target = crate::host_target::HostTarget::acquire_pinned(
+            &config.csr_allowed_executable_dirs,
+            resources.roots.take().expect("startup pinned roots"),
+            &target_budget,
+        )?;
+        let bundles = config
+            .host_profiles
+            .iter()
+            .map(|profile| host_target.bundle(resources.host_id.clone(), profile.clone()))
+            .collect::<io::Result<Vec<_>>>()?;
+        let epoch_owner =
+            crate::host_registry::EpochOwner::publish(&resources.state_directory, bundles)?;
         let context_path = crate::client::context_path(socket);
         if context_path == approval_socket {
             return Err(invalid("context and approval sockets must differ"));
@@ -1015,6 +1052,8 @@ impl ForegroundDaemon {
             client,
             approval,
             _resources: resources,
+            host_target,
+            _epoch_owner: epoch_owner,
             config: Arc::new(config),
             _signers: signers,
             signals,
@@ -1024,12 +1063,12 @@ impl ForegroundDaemon {
 
     pub fn run(mut self) -> io::Result<()> {
         let context = Arc::new(Context {
+            epoch: Some(self._epoch_owner.clone()),
+            host_target: Some(self.host_target.clone()),
             roots: self
-                .config
-                .csr_allowed_executable_dirs
-                .iter()
-                .cloned()
-                .zip(std::mem::take(&mut self._resources.roots))
+                .host_target
+                .pinned_roots()
+                .into_iter()
                 .map(|(path, directory)| PinnedRoot { path, directory })
                 .collect(),
             host_id: self._resources.host_id.clone(),
@@ -1037,7 +1076,7 @@ impl ForegroundDaemon {
         });
         use sigrund_core::protocol::{ContextFeatures, ContextLimits, PublicContext};
         let public_context = Arc::new(serde_json::to_vec(&PublicContext {
-            version: "2.0".into(),
+            version: "3.0".into(),
             host_id: context.host_id.clone(),
             policy_generation: 1,
             executable_trust_models: self.config.executable_trust_models.clone(),
@@ -1916,12 +1955,23 @@ mod approval_tests {
             )
             .unwrap(),
         );
-        let hello = crate::cli::RequestOptions::default()
-            .hello(&["/usr/bin/id".into()], Path::new("/"))
-            .unwrap();
+        let hello = crate::cli::RequestOptions {
+            target: Some("host".into()),
+            security_profile: Some("host-baseline".into()),
+            ..crate::cli::RequestOptions::default()
+        }
+        .hello(&["/usr/bin/id".into()], Path::new("/"))
+        .unwrap();
         let csr = Csr::from_unsigned(
             &hello,
             CsrIdentity {
+                binding: Some({
+                    use sigrund_core::host::Record;
+                    sigrund_core::host::BindingBundle::parse(include_bytes!(
+                        "../../sigrund-core/tests/fixtures/v3-host/bundle.json"
+                    ))
+                    .unwrap()
+                }),
                 grant_id: new_uuidv7().to_string(),
                 host_id: format!("sigrun-host:sha256:{}", "0".repeat(64)),
                 requester_uid: 1001,
@@ -1938,6 +1988,8 @@ mod approval_tests {
         )
         .unwrap();
         let context = Arc::new(Context {
+            epoch: None,
+            host_target: None,
             roots: vec![],
             host_id: csr.warrant().host_id.clone(),
             signers: SignerPolicyFile::from_toml(include_bytes!(

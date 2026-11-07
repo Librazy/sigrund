@@ -330,7 +330,7 @@ pub(super) fn verify_blocked_cleanup() {
     assert_eq!(thread_count(), threads);
     let mut public = connect(&context_path);
     public
-        .write_all(&encode_frame(FrameType::ClientContextQuery, br#"{"version":"2.0"}"#).unwrap())
+        .write_all(&encode_frame(FrameType::ClientContextQuery, br#"{"version":"3.0"}"#).unwrap())
         .unwrap();
     let mut header = [0; 5];
     public.read_exact(&mut header).unwrap();

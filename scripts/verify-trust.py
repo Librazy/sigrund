@@ -7,6 +7,8 @@ import mmap
 import socket
 import json
 import os
+import platform
+import sys
 import re
 from pathlib import Path
 import runpy
@@ -38,14 +40,17 @@ class Fixture(SHARED['Fixture']):
 ready, authorized, exited, exit_fields = (SHARED[k] for k in ('ready','authorized','exited','exit_fields'))
 
 
-def request(f, *, warrant=None, command=None, target=0, args=(), capabilities=()):
+def request(f, *, warrant=None, command=None, target=0, args=(), capabilities=(), model=None):
     status = f.base / ('trust-status-' + str(time.monotonic_ns()))
     output = open(status, 'w+b')
     argv = [str(f.client_binary), '--socket', str(f.client), '--status-fd', str(output.fileno())]
     if warrant is not None:
         argv += ['--warrant', str(warrant)]
     else:
-        argv += ['--target-uid', str(target), '--target-gid', str(target), '--cwd', '/']
+        model = model or ('ctime' if 'ctime' in f.models else f.models[0])
+        binding = f.export_binding(model, capabilities)
+        argv += ['--target','host','--security-profile',f.profile_id(model,capabilities), '--binding-bundle',str(binding),
+                 '--target-uid', str(target), '--target-gid', str(target), '--cwd', '/']
         for capability in capabilities:
             argv += ['--capability', capability]
         argv += ['--', str(command), *map(str, args)]
@@ -68,6 +73,7 @@ def finish(child, output):
 
 
 def csr(f, program, **kwargs):
+    kwargs.setdefault('model', 'digest_direct')
     payload = f.export(program, **kwargs).read_bytes()
     return payload, json.loads(payload)
 
@@ -195,8 +201,15 @@ def configure(f, models=None):
     text = path.read_text().replace('max_executable_bytes = 67108864',
                                     f'max_executable_bytes = {SNAPSHOT_MAX_BYTES}')
     if models is not None:
+        f.models = list(models)
         text = re.sub(r'^executable_trust_models = .*$',
                       'executable_trust_models = ' + json.dumps(models), text, flags=re.MULTILINE)
+    if models is not None:
+        main, mvp = text.split('\n[[host_profiles]]', 1)[0], text.split('\n[mvp]', 1)[1]
+        profiles, rules = f.profile_config()
+        text = main + profiles + rules + '\n[mvp]' + mvp
+        signer = f.base / 'signers'
+        signer.write_text(signer.read_text().split('\n[[signers.host_rules]]', 1)[0] + f.profile_config(signer=True)[1])
     path.write_text(text)
 
 
@@ -219,7 +232,7 @@ def ctime_gate(parent, binaries):
         for target, caps in [(0, ()), (33, ()), (33, ('CAP_NET_BIND_SERVICE',))]:
             value, records = online_approved(f, native, f'{target}\n'.encode(),
                                              target=target, capabilities=caps)
-            assert value['version'] == '2.0' and 'executable_sha256' not in value['command']
+            assert value['version'] == '3.0' and 'executable_sha256' not in value['command']
             trust = value['command']['executable_trust']
             assert trust['model'] == 'ctime' and int(trust['size']) == 67_108_865, trust
             assert records[1]['exec_outcome'] == 'exec_event_observed', records
@@ -328,13 +341,13 @@ def ctime_gate(parent, binaries):
         unsafe = program(f, 'unsafe', size=None)
         unsafe.chmod(0o777)
         payload, value = csr(f, unsafe)
-        assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_direct'
+        assert value['version'] == '3.0' and value['command']['executable_trust']['model'] == 'digest_direct'
         approved(f, payload, b'0\n')
         # UID 0 is capability-stripped and must satisfy its owner execute bit.
         owner_noexec = program(f, 'owner-noexec', size=None)
         owner_noexec.chmod(0o655)
-        payload, value = csr(f, owner_noexec)
-        assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
+        payload, value = csr(f, owner_noexec, model='digest_memfd')
+        assert value['version'] == '3.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
         approved(f, payload, b'0\n')
         # Removing a model rejects outstanding warrants instead of downgrading.
         payload, _ = csr(f, offline)
@@ -348,7 +361,8 @@ def ctime_gate(parent, binaries):
         f.launch()
         export = f.base / 'ctime-only.csr'
         result = subprocess.run([str(f.client_binary), '--socket', str(f.client), '--cwd', '/',
-                                 '--export-csr', str(export), '--', str(native)],
+                                 '--target','host','--security-profile',f.profile_id('ctime'), '--binding-bundle',str(f.export_binding('ctime')),
+                                 '--target-uid','0','--target-gid','0','--export-csr', str(export), '--', str(native)],
                                 preexec_fn=unprivileged, capture_output=True, timeout=6)
         assert result.returncode != 0 and b'no enabled executable model' in result.stderr, result
         assert not export.exists()
@@ -410,7 +424,7 @@ def digest_direct_gate(parent, binaries):
         configure(f)
         gate = Gate(f, 'clone-after')
         payload, value = csr(f, native, target=33)
-        assert value['version'] == '2.0'
+        assert value['version'] == '3.0'
         with native.open('rb') as source:
             digest = hashlib.file_digest(source, 'sha256').hexdigest()
         assert value['command']['executable_trust'] == {'model': 'digest_direct', 'sha256': digest}
@@ -448,8 +462,8 @@ def digest_direct_gate(parent, binaries):
         config.write_text(config.read_text().replace('max_direct_digest_bytes = 268435456', 'max_direct_digest_bytes = 4'))
         f.launch()
         small = program(f, 'small', size=None)
-        payload, value = csr(f, small)
-        assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
+        payload, value = csr(f, small, model='digest_memfd')
+        assert value['version'] == '3.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
         approved(f, payload, b'0\n')
         code, out, err, events = finish(*request(f, command=native))
         assert code == 255 and not out and events[0]['status'] == 'TIMEOUT', (code, out, err, events)
@@ -514,8 +528,8 @@ def file_capabilities_gate(parent, binaries):
         wait_for(f.empty, 'file capability alias replacement cleanup')
         subprocess.run(['setcap', 'cap_net_bind_service=ep', str(native)], check=True)
         # Capabilities outside explicitly requested authority must use memfd.
-        payload, value = csr(f, native, target=33)
-        assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd', value
+        payload, value = csr(f, native, target=33, model='digest_memfd')
+        assert value['version'] == '3.0' and value['command']['executable_trust']['model'] == 'digest_memfd', value
         # The snapshot strips file capabilities, preserving the legacy contract.
         subprocess.run(['setcap', '-r', str(native)], check=True)
         f.stop()
@@ -545,7 +559,7 @@ def metadata_approval_gate(f, native):
             before = f.diagnostics.read_text().count('"broker":true')
             broker.connect(str(f.approval))
             wait_for(lambda: f.diagnostics.read_text().count('"broker":true') > before, 'metadata broker registered')
-            child, output = request(f, command=native, target=33, capabilities=caps)
+            child, output = request(f, command=native, target=33, capabilities=caps, model='fs_verity')
             def exact(n):
                 result = b''
                 while len(result) < n:
@@ -584,8 +598,8 @@ def noexec_gate(parent, binaries):
         f.launch()
         # Previously signed direct evidence cannot be executed or downgraded.
         denied(f, payload)
-        payload, value = csr(f, native)
-        assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
+        payload, value = csr(f, native, model='digest_memfd')
+        assert value['version'] == '3.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
         approved(f, payload, b'0\n')
         f.stop()
     finally:
@@ -648,7 +662,7 @@ def verity_gate(parent, binaries):
         image = f.base / 'verity.img'
         with image.open('wb') as output:
             output.truncate(268_435_456)
-        subprocess.run(['mkfs.ext4', '-q', '-F', '-O', 'verity', str(image)], check=True)
+        subprocess.run(['mkfs.ext4', '-q', '-F', '-b', '4096', '-O', 'verity', str(image)], check=True)
         subprocess.run(['mount', '-o', 'loop', str(image), str(f.commands)], check=True)
         mounted = True
         for algorithm in ['sha256', 'sha512']:
@@ -666,30 +680,30 @@ def verity_gate(parent, binaries):
         f.launch()
         for algorithm in ['sha256', 'sha512']:
             native = f.commands / algorithm
-            payload, value = csr(f, native)
+            payload, value = csr(f, native, model='fs_verity')
             evidence = value['command']['executable_trust']
             measured = subprocess.check_output(['fsverity', 'measure', str(native)], text=True).split()[0]
             assert evidence == {'model': 'fs_verity', 'algorithm': algorithm, 'digest': measured.split(':')[1]}, evidence
-            assert value['version'] == '2.0' and 'executable_sha256' not in value['command']
+            assert value['version'] == '3.0' and 'executable_sha256' not in value['command']
             approved(f, payload, b'0\n')
-            payload, value = csr(f, native)
+            payload, value = csr(f, native, model='fs_verity')
             value['command']['executable_trust']['digest'] = '00' * (32 if algorithm == 'sha256' else 64)
             denied(f, canonical(value))
         f.stop()
         subprocess.run(['mount', '-o', 'remount,noexec', str(f.commands)], check=True)
         f.launch()
-        payload, value = csr(f, small)
-        assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
+        payload, value = csr(f, small, model='digest_memfd')
+        assert value['version'] == '3.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
         approved(f, payload, b'0\n')
         f.stop()
         subprocess.run(['mount', '-o', 'remount,exec', str(f.commands)], check=True)
         small.chmod(0o655)
         f.launch()
-        payload, value = csr(f, small)
-        assert value['version'] == '2.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
+        payload, value = csr(f, small, model='digest_memfd')
+        assert value['version'] == '3.0' and value['command']['executable_trust']['model'] == 'digest_memfd'
         approved(f, payload, b'0\n')
         small.chmod(0o755)
-        payload, value = csr(f, small)
+        payload, value = csr(f, small, model='fs_verity')
         assert value['command']['executable_trust']['model'] == 'fs_verity'
         approved(f, payload, b'0\n')
         f.stop()
@@ -703,16 +717,34 @@ def main():
     parser.add_argument('--cgroup-parent', type=Path, required=True)
     parser.add_argument('--binaries', type=Path, required=True)
     parser.add_argument('--artifacts', type=Path, required=True)
+    gates = [('digest-direct', digest_direct_gate), ('file-capabilities', file_capabilities_gate), ('ctime', ctime_gate), ('mutation', mutation_gate), ('noexec', noexec_gate), ('tracer-death', tracer_death_gate), ('fs-verity', verity_gate)]
+    parser.add_argument('--gate', action='append', choices=[name for name,_ in gates], help='run selected gates for a targeted retry; default runs all')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run in the dedicated root acceptance service')
+    os.umask(0o077)
     args.artifacts.mkdir(parents=True, exist_ok=True)
+    selected = [(name, gate) for name, gate in gates if args.gate is None or name in args.gate]
     results = []
-    for name, gate in [('digest-direct', digest_direct_gate), ('file-capabilities', file_capabilities_gate), ('ctime', ctime_gate), ('mutation', mutation_gate), ('noexec', noexec_gate), ('tracer-death', tracer_death_gate), ('fs-verity', verity_gate)]:
-        gate(args.cgroup_parent, args.binaries)
-        results.append({'gate': name, 'result': 'passed'})
-        print(json.dumps(results[-1]), flush=True)
-        (args.artifacts / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+    manifest = {'suite':'trust', 'result':'incomplete', 'kernel':platform.release(), 'machine':platform.machine(),
+                'command':sys.argv, 'requested_gates':[name for name,_ in selected], 'gates':results,
+                'binaries':{name:hashlib.sha256((args.binaries/name).read_bytes()).hexdigest() for name in ('sigrund','sigrun','sigrundctl')}}
+    def save():
+        (args.artifacts / 'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+        (args.artifacts / 'results.json').write_text(json.dumps(results,indent=2)+'\n')
+    save()
+    try:
+        for name, gate in selected:
+            gate(args.cgroup_parent, args.binaries)
+            results.append({'gate':name,'result':'passed'})
+            print(json.dumps(results[-1]),flush=True)
+            save()
+        manifest['result'] = 'passed'
+    except BaseException:
+        manifest['result'] = 'failed'
+        raise
+    finally:
+        save()
 
 
 if __name__ == '__main__':

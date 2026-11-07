@@ -7,36 +7,40 @@ a root operator reviews it on their own terminal and signs it with an SSH key.
 The daemon verifies the signature and policy, records the authorization,
 executes the command, and returns its output and exit status to the requester.
 
-The local **v2** profile supports client-generated full CSRs and private daemon
-expansion of thin CSRs. See [implementation notes](IMPLEMENTATION_NOTES.md) for
-current behavior; the [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-now defines the draft v3 target. Thin requests receive only approval or
-an admission-based timeout; expanded evidence and refusal reasons stay private.
-Full requests additionally permit explicit rejection after requester-access and
-evidence validation. No authorization response contains a CSR or diagnostic.
+The local **v3 host** profile supports private thin intent and client-generated
+full CSRs, bound to a live daemon epoch, exact numeric credentials and an
+immutable security profile. Container execution remains disabled. See the
+[Phase 1 implementation and qualification record](docs/NAMESPACE_PHASE1.md),
+[implementation notes](IMPLEMENTATION_NOTES.md) and
+[security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>).
+Unsuccessful authorization produces only an admission-based TIMEOUT; expanded
+evidence and refusal reasons stay private.
 
-V2 retains all four executable trust models and separates durable authorization
-from execution readiness/results. It breaks old protocol, warrant, signature and
-state formats. Provision fresh state and use matching components; there is no
-migration or automatic deletion. See [implementation status](IMPLEMENTATION_NOTES.md#v2-implementation-and-validation).
+V3 breaks v2 wire, warrant, signature, configuration and durable-state formats.
+Provision an explicitly selected fresh state/log set with matching components;
+there is no automatic migration or deletion.
 
 ## How the current implementation works
 
-1. `sigrun` queries public preparation context on a separate socket, captures finite
-   stdin once, and tries to prepare a full CSR with its own file access. If it
-   cannot, it submits the same intent as a thin CSR. `--full-only` forbids fallback;
-   `--export-csr PATH` exports a full CSR without requesting execution.
-2. `sigrund` independently verifies full requests through a process using the
-   requester's authenticated UID/GID/groups, or privately expands thin requests.
-   It retains exact executable evidence and immutable input before review.
-3. `sigrund-approve`, running as root on a controlling TTY, displays the complete
-   request, including origin and intent hash, and signs after confirmation.
-4. The daemon verifies policy/signature, consumes the one-time grant and persists
-   audit, then completely sends `APPROVED` before spawning. Unsuccessful requests
-   receive `TIMEOUT` at the fixed deadline; only validated full requests may
-   receive an explicit mandator `REJECTED`.
-5. Separate readiness and execution-result frames accompany stdout/stderr.
-   `sigrun` returns the primary child's exit status and drains remaining output.
+1. `sigrun` requires `--target host`, an explicit account or numeric credentials,
+   and `--security-profile ID`. With an administrator-distributed live binding
+   bundle it queries target-independent context and prepares a full CSR using
+   its own file access. Otherwise it submits the unchanged thin intent.
+   `--full-only` forbids fallback; `--export-csr PATH` exports locally without
+   requesting execution. Finite stdin is captured once.
+2. `sigrund` checks the same live target owner, immutable profile and independent
+   daemon/signer rules. It verifies full-request access with authenticated
+   requester credentials, or privately expands thin intent. It retains exact
+   executable evidence and immutable input before review.
+3. Root's `sigrund-approve` verifies private epoch acquisition/constraint records,
+   displays the complete original intent and resolved execution evidence, then
+   signs after confirmation on its own controlling TTY.
+4. The daemon revalidates the retained owner and policy, consumes the one-time
+   grant and persists audit. Complete APPROVED delivery precedes workload spawn.
+   Every unsuccessful authorization waits for the admission-based TIMEOUT.
+5. Separate readiness/results accompany stdout/stderr. `sigrun` returns the
+   primary child's status and drains remaining output. Restart invalidates old
+   warrants and binding bundles, including unexpired, unused grants.
 
 `sigrundctl` provisions host state and packages offline warrants. The
 `sigrund-collector` binary currently provides validation diagnostics only.
@@ -97,14 +101,15 @@ In a **root terminal**, start the foreground approver:
 ```sh
 source /var/lib/sigrund-demo/environment.sh
 "$TEST_BIN/sigrund-approve" --socket "$TEST_APPROVAL_SOCKET" --tty /dev/tty \
-  --signers "$TEST_SIGNERS" --identity "$TEST_SSH_IDENTITY"
+  --signers "$TEST_SIGNERS" --identity "$TEST_SSH_IDENTITY" --epoch-file "$TEST_EPOCH"
 ```
 
 In the **requester's terminal**, from a writable directory:
 
 ```sh
 source /var/lib/sigrund-demo/environment.sh
-"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --cwd / --status-fd 3 \
+"$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --target host --security-profile host-baseline \
+  --target-uid 0 --target-gid 0 --cwd / --status-fd 3 \
   -- "$TEST_COMMANDS/id" -u 3>request.status.jsonl
 echo "$?"
 ```
@@ -134,13 +139,11 @@ and policy before using them outside the disposable lab.
 
 ## Current scope
 
-The runtime currently implements v2. The
-[security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-defines a draft v3 target with selectable local execution environments; the
-[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) records implementation and
-release gates. V3 is not implemented, and the rewrite does not change the commands
-or current behavior documented here. It has no v2 compatibility requirement;
-future deployment uses explicit fresh provisioning, not automatic migration.
+The runtime implements the host portion of v3. The
+[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) records the completed Phase 1
+host qualification and tracks later namespace work. `self`, process and registered targets
+are rejected. The [fresh provisioning and binding export procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export)
+explains the cutover, private bundle distribution and offline signing.
 
 The local execution profile supports SSH Ed25519 signatures, one-time grants,
 separate stdout/stderr, finite sealed stdin, cancellation, replay prevention,
@@ -173,8 +176,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked -- --test-threads=1
 ```
 
-Namespace tests need `uidmap`, subordinate UID/GID mappings and permitted user
-namespaces. For the complete check harness and real privileged acceptance,
+Production host integration gates run separately as initial-userns root on a
+disposable supervised host. Phase 0 namespace experiments additionally need
+`uidmap`, subordinate mappings and permitted user namespaces. For the complete check harness and real privileged acceptance,
 including dependencies and cleanup requirements, see
 [tests and reproduction](IMPLEMENTATION_NOTES.md#tests-and-reproduction).
 
@@ -189,35 +193,18 @@ Acceptance exercises actual approval/execution, replay denial,
 cancellation, recovery and service shutdown; ordinary unit tests alone do not
 validate those kernel and service-manager boundaries.
 
-Executable trust models are configurable with `executable_trust_models`, defaulting
-to `["fs_verity", "ctime", "digest_direct", "digest_memfd"]`. Direct models
-execute retained source FDs and verify evidence and credentials at an exec stop,
-preserving `/proc/self/exe` and eligible file capabilities. Digest_direct uses
-bounded streaming SHA-256 with independent size/time limits; verity and ctime
-avoid executable hashing. Other files use digest+sealed memfd. Set
-`["digest_memfd"]` for snapshot-only operation; see the executable trust section
-in [implementation notes](IMPLEMENTATION_NOTES.md) for guarantees and compatibility.
+Executable models are enabled with `executable_trust_models`; each immutable
+host profile fixes one exact model and its checkpoint obligations. The example
+`host-baseline` profile uses `digest_memfd`. Configure a distinct, digest-bound
+profile and scoped rules for each additional permitted model. Signed inputs
+never switch models. Direct models execute retained source FDs and verify evidence
+and credentials at an exec stop, preserving eligible host file capabilities.
+Memfd snapshots strip file capabilities and report unknown exact exec outcome.
 
-Ctime is available only for online approval. The daemon holds a read lease from
-before signing through the verified exec stop; a lease break invalidates the
-request even if no bytes changed. Administrative writers can therefore interrupt
-an approval. Offline CSR export skips ctime, and pre-signed ctime warrants are
-rejected. Client evidence is tentative; the daemon establishes the protected
-baseline before requesting approval.
-
-Recognized OSTree ComposeFS roots use `digest_direct` by default after daemon
-startup checks the administrator-protected backing object store. This trusts
-administrators to preserve object protection and never modify active objects in
-place; it does not provide fs-verity or executable write exclusion. Writable
-`usroverlay`, unrecognized overlays and failed eligibility checks retain snapshot
-fallback. To opt out:
-
-```toml
-[digest_direct]
-allow_admin_trusted_composefs = false
-```
-
-The initial adapter supports the booted OSTree ComposeFS root in the host mount
-namespace with its data-only store at `/sysroot/ostree/repo/objects`. It does not
-assume every read-only overlay is ComposeFS. Client, daemon and approver versions
-must match for the new public-context and approval fields.
+Ctime requires online approval with an uninterrupted read lease through the
+exec stop; export and pre-signed ctime redemption are rejected. Recognized
+administrator-maintained ComposeFS roots can qualify for direct digest after
+startup enrollment. This assumes administrators preserve active backing objects.
+The exception can be disabled with `[digest_direct] allow_admin_trusted_composefs = false`.
+Neither a cloned mount ID nor a matching pathname supplies target authority.
+See [executable trust details](IMPLEMENTATION_NOTES.md#executable-trust-selection).

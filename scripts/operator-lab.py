@@ -62,6 +62,9 @@ def foreground_command(manifest):
                '--property=SendSIGKILL=yes', '--property=TimeoutStartSec=30s', '--property=TimeoutStopSec=15s',
                '--property=WatchdogSec=3s', '--property=RuntimeDirectory=' + Path(manifest['runtime']).name,
                '--property=RuntimeDirectoryMode=0755', '--property=UMask=0077']
+    if Path('/sys/fs/selinux/enforce').exists():
+        context = Path('/proc/self/attr/current').read_text().strip('\0\n')
+        command.append('--property=SELinuxContext=' + context)
     command.extend('--property=' + key + '=' + value
                    for key, value in supervisor_properties(manifest.get('supervisor_unit')))
     return command + manifest['command']
@@ -101,6 +104,7 @@ def prepare(base, binaries, requester, supervisor=None):
         path = base / name
         write(path, 'INACTIVE local-audit MVP fixture; not TLS credentials\n')
         config = config.replace('/etc/sigrund/' + name, str(path))
+    config = config.replace('\nrequester_uids = [1001]', f'\nrequester_uids = [{account.pw_uid}]')
     config += '\n[mvp]\napproval_signer_id = "mvp-root"\n'
     write(base / 'config.toml', config)
     signer = (REPO / 'config/signers.toml.example').read_text()
@@ -110,6 +114,7 @@ def prepare(base, binaries, requester, supervisor=None):
         ('sk-ssh-ed25519@openssh.com AAAA...', key.with_suffix('.pub').read_text().strip()),
         ('require_user_presence = true', 'require_user_presence = false'),
         ('allowed_requester_uids = [1001]', f'allowed_requester_uids = [{account.pw_uid}]'),
+        ('\nrequester_uids = [1001]', f'\nrequester_uids = [{account.pw_uid}]'),
         ('allowed_modes = ["one_time", "time_range"]', 'allowed_modes = ["one_time"]'),
         ('["/usr/bin", "/usr/sbin"]', json.dumps([str(commands)])),
     ):
@@ -128,19 +133,29 @@ def prepare(base, binaries, requester, supervisor=None):
                '--signers', str(base / 'signers.toml'), '--state-dir', str(base / 'state'),
                '--log-path', str(base / 'log/audit.jsonl'), '--socket', str(runtime / 'client.sock'),
                '--approval-socket', str(runtime / 'approve.sock')]
+    if Path('/sys/fs/selinux/enforce').exists():
+        # PID 1 cannot execute a disposable var_lib_t binary even with an
+        # explicit administrative exec context. Enter through the installed
+        # shell's label, then exec the private lab binary in that context.
+        launcher = base / 'launch.sh'
+        write(launcher, 'exec ' + shlex.join(command) + '\n')
+        command = ['/bin/bash', str(launcher)]
     unit = (REPO / 'packaging/sigrund.service').read_text()
     unit = unit.replace('/etc/sigrund/config.toml', str(base / 'config.toml'))
     unit = unit.replace('/etc/sigrund/signers.toml', str(base / 'signers.toml'))
     unit = re.sub(r'^ExecStart=.*$', 'ExecStart=' + ' '.join(command), unit, flags=re.M)
     unit = unit.replace('RuntimeDirectory=sigrund', 'RuntimeDirectory=' + label)
-    unit = unit.replace('StateDirectory=sigrund\n', '').replace('LogsDirectory=sigrund\n', '')
+    unit = re.sub(r'^(?:StateDirectory|LogsDirectory)=.*\n', '', unit, flags=re.M)
+    if Path('/sys/fs/selinux/enforce').exists():
+        context = Path('/proc/self/attr/current').read_text().strip('\0\n')
+        unit = unit.replace('[Service]\n', '[Service]\nSELinuxContext=' + context + '\n', 1)
     write(base / 'daemon.service', bind_supervisor(unit, supervisor), 0o644)
     manifest = {'version': 1, 'base': str(base), 'unit': label + '.service', 'runtime': str(runtime),
                 'command': command, 'requester': requester, 'requester_uid': account.pw_uid,
                 'requester_gid': account.pw_gid, 'signer_id': 'mvp-root', 'supervisor_unit': supervisor}
     write(base / 'lab.json', json.dumps(manifest, indent=2) + '\n', 0o644)
     variables = {'TEST_BASE': base, 'TEST_CONFIG': base / 'config.toml', 'TEST_SIGNERS': base / 'signers.toml',
-                 'TEST_STATE': base / 'state', 'TEST_LOG': base / 'log/audit.jsonl',
+                 'TEST_STATE': base / 'state', 'TEST_EPOCH': base / 'state/host-epoch.json', 'TEST_LOG': base / 'log/audit.jsonl',
                  'TEST_SOCKET': runtime / 'client.sock', 'TEST_APPROVAL_SOCKET': runtime / 'approve.sock',
                  'TEST_SSH_IDENTITY': key, 'TEST_SIGNER_ID': 'mvp-root', 'TEST_UNIT': manifest['unit'],
                  'TEST_RUNTIME': runtime, 'TEST_BIN': tools, 'TEST_COMMANDS': commands,

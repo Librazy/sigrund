@@ -61,7 +61,8 @@ install -m 0600 /usr/share/doc/sigrund/examples/signers.toml.example /etc/sigrun
 ```
 
 Edit both files before proceeding. Set real SSH signer keys, allowed requester
-and target IDs, matching executable roots, and the `[mvp]` profile with its
+and target IDs, matching executable roots, immutable host profiles and independent
+daemon/signer host rules (including cross-owner permission), and the `[mvp]` profile with its
 `approval_signer_id`. Collector configuration and referenced credential files
 remain required even with remote acknowledgements disabled; the supplied
 placeholders must be replaced. For a disposable local-only demonstration, use
@@ -71,11 +72,13 @@ fixtures explicitly. See the
 for the supported profile and full setup workflow.
 
 Validate configuration, then provision a **new** host exactly once. Retain the
-provisioning output privately; it includes audit anchor material.
+provisioning output privately; it includes audit anchor material. The shipped
+service explicitly uses the new v3 state/log paths below; existing or partial
+sets, including sidecars, are refused. Preserve older state as a separate set.
 
 ```sh
 /usr/libexec/sigrund/sigrund --check-config
-(umask 077; set -C; sigrundctl init-host > /root/sigrund-initial-anchor.json)
+(umask 077; set -C; sigrundctl init-host --state-dir /var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl > /root/sigrund-initial-anchor.json)
 systemctl enable --now sigrund.service
 ```
 
@@ -85,10 +88,11 @@ their default paths. The context endpoint is the client socket plus `.context`:
 ```sh
 # Root's controlling terminal; choose your actual SSH identity.
 sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
-  --identity /root/.ssh/id_ed25519
+  --identity /root/.ssh/id_ed25519 --epoch-file /var/lib/sigrund-v3/host-epoch.json
 
 # Ordinary requester's terminal; command must be allowed by configured policy.
-sigrun --socket /run/sigrund/client.sock --cwd / -- /usr/bin/id -u
+sigrun --socket /run/sigrund/client.sock --target host --security-profile host-baseline \
+  --target-uid 0 --target-gid 0 --cwd / -- /usr/bin/id -u
 ```
 
 Execution needs a compatible kernel, delegated cgroup v2 memory/PID controls
@@ -98,8 +102,8 @@ delegation, a systemd manager or host/container routing.
 
 ## Upgrade and removal
 
-The v2 workflow requires matching client/daemon/approver components and a freshly
-provisioned v2 database, audit log and ratchet state. V1 state is rejected and is
+The v3 host workflow requires matching client/daemon/approver components and a freshly
+provisioned v3 database, audit log and ratchet state. V2, missing, future or mixed state is rejected and is
 never migrated or deleted automatically. Preserve any old state as a complete
 private archive; explicitly choose fresh provisioning paths before startup.
 

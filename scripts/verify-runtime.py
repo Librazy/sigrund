@@ -131,6 +131,7 @@ class Fixture:
     def __init__(self, parent, binaries, models=None, authorization_timeout_ms=2500):
         self.parent = parent
         self.binaries = binaries
+        self.models = list(models or ["digest_memfd"])
         self.directory = tempfile.TemporaryDirectory(prefix='sigrund-runtime-')
         self.base = Path(self.directory.name)
         self.base.chmod(0o755)
@@ -152,13 +153,14 @@ class Fixture:
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.key)], check=True)
         root = self.base / 'commands'
         root.mkdir()
+        root.chmod(0o755)
         self.commands = root
         for name in ('id', 'true', 'sleep', 'false', 'cat'):
             shutil.copyfile(command_source(name), root / name)
             (root / name).chmod(0o755)
         roots = json.dumps(sorted(['/usr/bin', str(root)]))
         config = (REPO / 'config/sigrund.toml.example').read_text()
-        # Default fault fixtures use the v2 sealed-byte model explicitly.
+        # Default fault fixtures use the v3 sealed-byte model explicitly.
         config = config.replace('executable_trust_models = ["fs_verity", "ctime", "digest_direct", "digest_memfd"]',
                                 'executable_trust_models = ' + json.dumps(models if models is not None else ['digest_memfd']))
         config = config.replace('["/usr/bin", "/usr/sbin"]', roots)
@@ -171,6 +173,9 @@ class Fixture:
             config = config.replace('/etc/sigrund/' + name, str(path))
         config = config.replace('authorization_timeout_ms = 120000',
                                 'authorization_timeout_ms = ' + str(authorization_timeout_ms))
+        config = config.split('\n[[host_profiles]]', 1)[0]
+        profiles, rules = self.profile_config()
+        config += profiles + rules
         config += '\n[mvp]\napproval_signer_id = "' + SIGNER + '"\n'
         (self.base / 'config').write_text(config)
         signer = (REPO / 'config/signers.toml.example').read_text()
@@ -179,10 +184,39 @@ class Fixture:
         signer = signer.replace('require_user_presence = true', 'require_user_presence = false')
         signer = signer.replace('allowed_requester_uids = [1001]', 'allowed_requester_uids = [0, 65534]')
         signer = signer.replace('["/usr/bin", "/usr/sbin"]', roots)
+        signer = signer.split('\n[[signers.host_rules]]', 1)[0] + self.profile_config(signer=True)[1]
         (self.base / 'signers').write_text(signer)
         subprocess.run([str(binaries / 'sigrund'), '--check-config', '--config', str(self.base / 'config'),
                         '--signers', str(self.base / 'signers')], check=True)
         subprocess.run([str(binaries / 'sigrundctl'), 'init-host', '--state-dir', str(self.state), '--log-path', str(self.log)], check=True, capture_output=True)
+
+    @staticmethod
+    def profile_id(model, capabilities=()):
+        return 'host-' + model + ('-cap' if capabilities else '')
+
+    def profile_config(self, signer=False):
+        profiles, rules = '', ''
+        def table(name, fields):
+            return '\n[[' + name + ']]\n' + '\n'.join(k + ' = ' + (str(v).lower() if isinstance(v, bool) else json.dumps(v)) for k,v in fields.items()) + '\n'
+        for model in self.models:
+            for caps in ([], ['CAP_NET_BIND_SERVICE']):
+                profile = {'schema':'sigrund.host-constraints.v1', 'profile_id':self.profile_id(model, caps),
+                           'join_namespaces':[], 'private_mount':True, 'private_cgroup':True,
+                           'capabilities':caps, 'securebits':47, 'no_new_privs':True,
+                           'memory_max':268435456, 'memory_swap_max':0, 'pids_max':128,
+                           'lsm':'no_transition_required', 'seccomp':'no_filter_required',
+                           'executable_model':model, 'verify_exec_stop':model != 'digest_memfd'}
+                digest = hashlib.sha256(canonical(profile)).hexdigest()
+                rule = {'requester_uids':[0,65534], 'target_scope':'host', 'target_uids':[0,33],
+                        'target_gids':[0,33], 'supplementary_gids':[33,104], 'profile_sha256':digest, 'cross_owner':True}
+                profiles += table('host_profiles', profile)
+                rules += table('signers.host_rules' if signer else 'host_rules', rule)
+        return profiles, rules
+
+    def binding(self, model='digest_memfd', capabilities=()):
+        epoch = json.loads((self.state / 'host-epoch.json').read_bytes())
+        name = self.profile_id(model, capabilities)
+        return next(b for b in epoch['bundles'] if b['constraints']['profile_id'] == name)
 
     def launch(self, env=None, pass_fds=(), expect_ready=True):
         # Stale socket entries are an operator/supervisor responsibility after
@@ -217,7 +251,7 @@ class Fixture:
                supplementary_gids=(33,), executable_trust=None):
         genesis = json.loads(self.log.read_text().splitlines()[0])
         value = {
-            'version': '2.0', 'grant_id': uuid7(), 'host_id': genesis['host_id'],
+            'version': '3.0', 'grant_id': uuid7(), 'host_id': genesis['host_id'],
             'requester_uid': uid, 'requester_gid': uid, 'request_origin': 'client_full',
             'approval_exec_id': None, 'caller_env': {},
             'command': {'allow_interpreted_script': False, 'argv': [str(command), *args], 'cwd': '/',
@@ -233,19 +267,37 @@ class Fixture:
                                   'post_exec_capabilities': {k: list(capabilities) for k in ('ambient','bounding','effective','inheritable','permitted')}},
             'policy': {'mode': 'one_time', 'not_before': int(time.time()) - 1, 'not_after': int(time.time()) + 120},
         }
-        intent = {'command': {k: v for k,v in value['command'].items() if k not in ('executable_trust', 'stdin_sha256')},
-                  'execution_context': {k: v for k,v in value['execution_context'].items() if k != 'post_exec_capabilities'},
-                  'policy': {'mode':'one_time','ttl_secs':value['policy']['not_after']-value['policy']['not_before']}, 'caller_env':{}}
+        model = value['command']['executable_trust']['model']
+        bundle = self.binding(model, capabilities)
+        intent = {'command': {k:v for k,v in value['command'].items() if k not in ('executable_trust','stdin_sha256')},
+                  'execution_context': {k:v for k,v in value['execution_context'].items() if k not in ('post_exec_capabilities','target_uid','target_gid','supplementary_gids')},
+                  'policy': {'mode':'one_time','ttl_secs':value['policy']['not_after']-value['policy']['not_before']}, 'caller_env':{},
+                  'target':{'kind':'host'}, 'account':{'kind':'numeric','uid':target_uid,'gid':target_uid,'supplementary_gids':list(supplementary_gids)},
+                  'security_profile':bundle['constraints']['profile_id']}
+        value['intent'] = intent
         value['intent_sha256'] = hashlib.sha256(canonical(intent)).hexdigest()
+        value['target_binding'] = bundle['target_binding']
+        value['security_constraints'] = {'profile_id':intent['security_profile'], 'profile_sha256':bundle['profile_sha256']}
         payload = canonical(value)
         return self.sign_payload(payload)
 
-    def export(self, command, args=(), *, target=0, capabilities=()):
+    def export_binding(self, model='digest_memfd', capabilities=()):
+        profile = self.profile_id(model, capabilities)
+        path = self.base / ('bundle-' + uuid.uuid4().hex + '.json')
+        subprocess.run([str(self.binaries / 'sigrundctl'), 'target', 'export-binding', 'host', '--security-profile', profile,
+                        '--epoch-file', str(self.state / 'host-epoch.json'), '--output', str(path)], check=True, capture_output=True)
+        os.chown(path, 65534, 65534)
+        return path
+
+    def export(self, command, args=(), *, target=0, capabilities=(), model=None):
         directory = self.base / 'exports'
         directory.mkdir(exist_ok=True)
         os.chown(directory, 65534, 65534)
         path = directory / (uuid.uuid4().hex + '.csr')
-        argv = [str(self.client_binary), '--socket', str(self.client), '--export-csr', str(path),
+        model = model or next((model for model in self.models if model != 'ctime'), self.models[0])
+        profile = self.profile_id(model, capabilities)
+        binding = self.export_binding(model, capabilities)
+        argv = [str(self.client_binary), '--target', 'host', '--security-profile', profile, '--binding-bundle', str(binding), '--socket', str(self.client), '--export-csr', str(path),
                 '--target-uid', str(target), '--target-gid', str(target), '--cwd', '/']
         for capability in capabilities:
             argv += ['--capability', capability]
@@ -255,9 +307,9 @@ class Fixture:
         return path
 
     def sign_payload(self, payload):
-        kind = b'application/vnd.sigrun.warrant.v2+json'
+        kind = b'application/vnd.sigrun.warrant.v3+json'
         pae = b'DSSEv1 ' + str(len(kind)).encode() + b' ' + kind + b' ' + str(len(payload)).encode() + b' ' + payload
-        signed = subprocess.run(['ssh-keygen', '-Y', 'sign', '-n', 'sigrun.warrant.v2', '-O', 'hashalg=sha512', '-f', str(self.key)], input=pae, capture_output=True, check=True).stdout
+        signed = subprocess.run(['ssh-keygen', '-Y', 'sign', '-n', 'sigrun.warrant.v3', '-O', 'hashalg=sha512', '-f', str(self.key)], input=pae, capture_output=True, check=True).stdout
         signature = base64.b64decode(b''.join(signed.splitlines()[1:-1]))
         envelope = {'payloadType': kind.decode(), 'payload': base64.b64encode(payload).decode(),
                     'signatures': [{'keyid': SIGNER, 'sig': base64.b64encode(signature).decode()}]}
@@ -276,7 +328,7 @@ class Fixture:
         stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(6)
         stream.connect(str(self.client))
-        hello = frame(1, {'version': '2.0', 'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
+        hello = frame(1, {'version': '3.0', 'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
         with open('/dev/null', 'r+b') as null:
             import array
             stream.sendmsg([hello[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [null.fileno(), null.fileno()]))])
@@ -648,7 +700,10 @@ class SystemService:
                  ('StandardErrorFileDescriptor', variant('h', output)),
                  ('Environment', variant('as', ['PATH=/usr/sbin:/usr/bin:/sbin:/bin'] + [k + '=' + v for k, v in (env or {}).items()])),
                  ('ExecStart', variant('a(sasb)', [(command[0], command, False)]))]
-        self.bus.call_with_unix_fd_list_sync('org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+        if Path('/sys/fs/selinux/enforce').exists():
+            context = Path('/proc/self/attr/current').read_text().strip('\0\n')
+            props.append(('SELinuxContext', variant('s', context)))
+        self.bus.call_with_unix_fd_list_sync('org.freedesktop.systemd1' , '/org/freedesktop/systemd1',
             'org.freedesktop.systemd1.Manager', 'StartTransientUnit',
             variant('(ssa(sv)a(sa(sv)))', (self.unit, 'fail', props, [])), None,
             Gio.DBusCallFlags.NONE, 10000, descriptors, None)

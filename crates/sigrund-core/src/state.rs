@@ -24,6 +24,7 @@ pub enum AuthorizationResult {
 pub struct AuthorizationRequest<'a> {
     pub exec_id: &'a str,
     pub request_origin: &'a str,
+    pub execution_binding_sha256: &'a str,
     pub intent_sha256: &'a str,
     pub approval_exec_id: Option<&'a str>,
     pub grant_id: &'a str,
@@ -126,10 +127,10 @@ impl StateStore {
         file.read_exact_at(&mut header, 0)
             .map_err(|e| CoreError::Database(e.to_string()))?;
         if &header[..16] != b"SQLite format 3\0"
-            || u32::from_be_bytes(header[60..64].try_into().unwrap()) != 2
+            || u32::from_be_bytes(header[60..64].try_into().unwrap()) != 3
         {
             return Err(CoreError::Database(
-                "database requires schema version 2; provision fresh state".into(),
+                "database requires schema version 3; provision fresh state".into(),
             ));
         }
         Ok(())
@@ -140,7 +141,8 @@ impl StateStore {
                 grant_id TEXT PRIMARY KEY, payload_sha256 BLOB NOT NULL UNIQUE,
                 signer_id TEXT NOT NULL, requester_uid INTEGER NOT NULL, exec_id TEXT NOT NULL,
                 request_origin TEXT NOT NULL CHECK(request_origin IN ('client_full','daemon_expanded_thin')),
-                intent_sha256 BLOB NOT NULL CHECK(length(intent_sha256)=32), approval_exec_id TEXT,
+                intent_sha256 BLOB NOT NULL CHECK(length(intent_sha256)=32),
+                execution_binding_sha256 BLOB NOT NULL CHECK(length(execution_binding_sha256)=32), approval_exec_id TEXT,
                 not_after INTEGER NOT NULL, consumed_at INTEGER NOT NULL,
                 CHECK((request_origin='client_full' AND approval_exec_id IS NULL) OR
                     (request_origin='daemon_expanded_thin' AND approval_exec_id IS NOT NULL AND approval_exec_id=exec_id))
@@ -150,15 +152,15 @@ impl StateStore {
                 target_value TEXT NOT NULL, revoked_at INTEGER NOT NULL, reason TEXT NOT NULL,
                 PRIMARY KEY(target_type,target_value)
             ) STRICT;
-            PRAGMA user_version=2;").map_err(db)
+            PRAGMA user_version=3;").map_err(db)
     }
     fn initialize(connection: Connection, directory: Option<File>) -> Result<Self> {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(db)?;
-        if version != 2 {
+        if version != 3 {
             return Err(CoreError::Database(
-                "database requires schema version 2".into(),
+                "database requires schema version 3".into(),
             ));
         }
         connection
@@ -175,6 +177,53 @@ impl StateStore {
     pub fn authorize(&mut self, request: AuthorizationRequest<'_>) -> Result<AuthorizationResult> {
         let now = request.now;
         self.authorize_guarded(request, || Ok(now), || Ok(true), || Ok(true))
+    }
+
+    pub fn authorize_warrant_candidates_guarded(
+        &mut self,
+        exec_id: &str,
+        warrant: &crate::warrant::CanonicalWarrant,
+        candidates: &[&str],
+        clock: impl FnOnce() -> Result<i64>,
+        reserve_commit: impl FnOnce() -> Result<bool>,
+        permit_commit: impl FnOnce() -> Result<bool>,
+    ) -> Result<(AuthorizationResult, Option<String>)> {
+        use crate::host::Record;
+        if candidates.is_empty() || candidates.len() > 4 {
+            return Err(CoreError::Value(
+                "expected 1..=4 independently authorized signers".into(),
+            ));
+        }
+        let w = warrant.warrant();
+        let binding = w.execution_binding()?.sha256()?;
+        let mode = match w.policy.mode.as_str() {
+            "one_time" => GrantMode::OneTime,
+            "time_range" => GrantMode::TimeRange,
+            "permanent" => GrantMode::Permanent,
+            _ => return Err(CoreError::Value("unsupported grant mode".into())),
+        };
+        let result = self.authorize_candidates_guarded(
+            AuthorizationRequest {
+                exec_id,
+                execution_binding_sha256: &binding,
+                request_origin: &w.request_origin,
+                intent_sha256: &w.intent_sha256,
+                approval_exec_id: w.approval_exec_id.as_deref(),
+                grant_id: &w.grant_id,
+                payload: warrant.as_bytes(),
+                signer_id: candidates[0],
+                requester_uid: w.requester_uid,
+                mode,
+                not_before: w.policy.not_before,
+                not_after: w.policy.not_after,
+                now: 0,
+            },
+            &candidates[1..],
+            clock,
+            reserve_commit,
+            permit_commit,
+        )?;
+        Ok((result.0, result.1.map(str::to_owned)))
     }
 
     /// The daemon supplies a fresh realtime sample after BEGIN IMMEDIATE has
@@ -206,6 +255,7 @@ impl StateStore {
         reserve_commit: impl FnOnce() -> Result<bool>,
         permit_commit: impl FnOnce() -> Result<bool>,
     ) -> Result<(AuthorizationResult, Option<&'a str>)> {
+        let execution_digest = hex_digest(request.execution_binding_sha256)?;
         let intent_digest = hex_digest(request.intent_sha256)?;
         if !(matches!(
             (request.request_origin, request.approval_exec_id),
@@ -278,15 +328,15 @@ impl StateStore {
         if request.mode == GrantMode::OneTime {
             let inserted = transaction.execute(
                 "INSERT INTO consumed_grants
-                 (grant_id,payload_sha256,signer_id,requester_uid,not_after,consumed_at,exec_id,request_origin,intent_sha256,approval_exec_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                 (grant_id,payload_sha256,signer_id,requester_uid,not_after,consumed_at,exec_id,request_origin,intent_sha256,approval_exec_id,execution_binding_sha256)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     request.grant_id,
                     digest_bytes.as_slice(),
                     signer_id,
                     request.requester_uid,
                     request.not_after.unwrap_or(0),
-                    now,request.exec_id,request.request_origin,&intent_digest[..],request.approval_exec_id
+                    now,request.exec_id,request.request_origin,&intent_digest[..],request.approval_exec_id,&execution_digest[..]
                 ],
             );
             if let Err(error) = inserted {
@@ -363,6 +413,7 @@ mod tests {
 
     fn request(grant_id: &str) -> AuthorizationRequest<'_> {
         AuthorizationRequest {
+            execution_binding_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
             request_origin: "client_full",
             intent_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
@@ -376,6 +427,46 @@ mod tests {
             not_after: Some(10),
             now: 2,
         }
+    }
+
+    #[test]
+    fn v3_consumption_derives_both_binding_and_payload_digests_from_the_warrant() {
+        use crate::host::Record;
+        let canonical = crate::warrant::CanonicalWarrant::parse(include_bytes!(
+            "../tests/fixtures/v3-host/warrant.json"
+        ))
+        .unwrap();
+        let w = canonical.warrant();
+        let mut store = StateStore::open(":memory:").unwrap();
+        let result = store
+            .authorize_warrant_candidates_guarded(
+                &w.grant_id,
+                &canonical,
+                &["signer"],
+                || Ok(w.policy.not_before),
+                || Ok(true),
+                || Ok(true),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            (AuthorizationResult::Allowed, Some("signer".into()))
+        );
+        let (execution, intent, payload): (Vec<u8>, Vec<u8>, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT execution_binding_sha256,intent_sha256,payload_sha256 FROM consumed_grants",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            execution,
+            hex_digest(&w.execution_binding().unwrap().sha256().unwrap()).unwrap()
+        );
+        assert_eq!(intent, hex_digest(&w.intent_sha256).unwrap());
+        assert_eq!(payload, Sha256::digest(canonical.as_bytes()).as_slice());
+        assert_ne!(execution, payload);
     }
 
     #[test]
@@ -672,6 +763,7 @@ mod tests {
         let mut store = StateStore::open(":memory:").unwrap();
         let first = store
             .authorize(AuthorizationRequest {
+                execution_binding_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
                 request_origin: "client_full",
                 intent_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
@@ -688,6 +780,7 @@ mod tests {
             .unwrap();
         let second = store
             .authorize(AuthorizationRequest {
+                execution_binding_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
                 request_origin: "client_full",
                 intent_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
@@ -716,6 +809,7 @@ mod tests {
         assert_eq!(
             store
                 .authorize(AuthorizationRequest {
+                execution_binding_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     exec_id:"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",request_origin:"client_full",intent_sha256:"0000000000000000000000000000000000000000000000000000000000000000",approval_exec_id:None,
                     grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f",
                     payload: b"payload",

@@ -146,7 +146,15 @@ pub fn run(args: &ApprovalArgs) -> io::Result<u8> {
     let signals = Signals::new()?;
     let mut socket = connect_broker(&args.socket, &signals)?;
     loop {
-        let error = match watch_broker(&tty, &identity_file, &signers, &public, &socket, &signals) {
+        let error = match watch_broker(
+            &tty,
+            &identity_file,
+            &signers,
+            &public,
+            &socket,
+            &signals,
+            &args.epoch_file,
+        ) {
             Ok(()) => return Ok(0),
             Err(error) if recoverable_connection_error(&error) => error,
             Err(error) => return Err(error),
@@ -209,6 +217,7 @@ fn watch_broker(
     public: &PublicKey,
     socket: &UnixStream,
     signals: &Signals,
+    epoch_file: &Path,
 ) -> io::Result<()> {
     loop {
         let mut reader = ApprovalReader::default();
@@ -238,11 +247,17 @@ fn watch_broker(
         if configured.key_data() != public.key_data() {
             return Err(invalid("explicit identity does not match requested signer"));
         }
+        let csr = Csr::parse(request.csr_payload.as_bytes()).map_err(io::Error::other)?;
+        let (bundle, admin_trusted_composefs) =
+            crate::host_registry::live_review(epoch_file, &request.exec_id, &csr)?;
+        csr.warrant()
+            .verify_bundle(&bundle)
+            .map_err(io::Error::other)?;
         let response = approve(
             tty,
             identity_file,
             signer,
-            &request,
+            (&request, &bundle, admin_trusted_composefs),
             socket,
             signals,
             deadline,
@@ -411,11 +426,12 @@ fn approve(
     tty: &File,
     identity: &File,
     signer: &SignerConfig,
-    request: &ApprovalRequest,
+    review: (&ApprovalRequest, &sigrund_core::host::BindingBundle, bool),
     socket: &UnixStream,
     signals: &Signals,
     deadline: Instant,
 ) -> io::Result<ApprovalResponse> {
+    let (request, bundle, admin_trusted_composefs) = review;
     let csr = Csr::parse(request.csr_payload.as_bytes()).map_err(|e| invalid(e.to_string()))?;
     let refused = |reason: &str| ApprovalResponse::Rejected {
         exec_id: request.exec_id.clone(),
@@ -423,7 +439,7 @@ fn approve(
     };
     write_tty(
         tty,
-        render_request(request, &csr, signer)?.as_bytes(),
+        render_request(request, &csr, signer, bundle, admin_trusted_composefs)?.as_bytes(),
         socket,
         signals,
         deadline,
@@ -541,6 +557,8 @@ fn render_request(
     request: &ApprovalRequest,
     csr: &Csr,
     signer: &SignerConfig,
+    bundle: &sigrund_core::host::BindingBundle,
+    admin_trusted_composefs: bool,
 ) -> io::Result<String> {
     fn walk(path: String, value: &serde_json::Value, out: &mut String) {
         match value {
@@ -575,7 +593,14 @@ fn render_request(
             .map_err(|e| invalid(e.to_string()))?,
         &mut out,
     );
-    if request.admin_trusted_composefs {
+    let evidence =
+        sigrund_core::v3::approval_evidence(csr.warrant(), bundle).map_err(io::Error::other)?;
+    walk(
+        "verified_host".into(),
+        &serde_json::from_str(&evidence).map_err(io::Error::other)?,
+        &mut out,
+    );
+    if admin_trusted_composefs {
         out.push_str("executable_storage = administrator-maintained ComposeFS; backing objects must remain unchanged during execution\n");
     }
     out.push_str(&format!(
@@ -680,7 +705,7 @@ fn sign_with_helper(
             "-Y",
             "sign",
             "-n",
-            "sigrun.warrant.v2",
+            "sigrun.warrant.v3",
             "-O",
             "hashalg=sha512",
             "-f",
@@ -1026,7 +1051,7 @@ mod tests {
         // Independently invoke OpenSSH with the wrong domain or without PAE.
         for (namespace, input) in [
             ("wrong.namespace", pae(WARRANT_PAYLOAD_TYPE, payload)),
-            ("sigrun.warrant.v2", payload.to_vec()),
+            ("sigrun.warrant.v3", payload.to_vec()),
         ] {
             let mut child = Command::new("/usr/bin/ssh-keygen")
                 .args(["-Y", "sign", "-n", namespace, "-O", "hashalg=sha512", "-f"])
