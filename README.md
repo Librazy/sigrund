@@ -179,7 +179,9 @@ cargo test --workspace --locked -- --test-threads=1
 ```
 
 Production host integration gates run separately as initial-userns root on a
-disposable supervised host. Phase 0 namespace experiments additionally need
+disposable supervised host. The [Phase 1.5 operator fixture](docs/NAMESPACE_PHASE15.md)
+exercises rootless anchor acquisition, private review and registration lifecycle.
+Phase 0 namespace experiments additionally need
 `uidmap`, subordinate mappings and permitted user namespaces. For the complete check harness and real privileged acceptance,
 including dependencies and cleanup requirements, see
 [tests and reproduction](IMPLEMENTATION_NOTES.md#tests-and-reproduction).

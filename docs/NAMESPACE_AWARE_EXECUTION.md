@@ -226,9 +226,14 @@ their gates.
 
 ### Phase 1.5 — Operator workflow for an existing rootless container
 
-**Status:** Planned for a separate implementation PR. Phase 1 supplies the v3
-host workflow. The [Phase 0 record](NAMESPACE_PHASE0.md#g-05-bounded-records-and-administration)
-supplies the registration grammar and evidence contracts.
+**Status:** Complete for the recorded native rootless fixture and production
+host schema consolidation (2026-11-07). The [operator recipe and implementation
+record](NAMESPACE_PHASE15.md) and [sanitized qualification evidence](evidence/namespace-phase15-20261107.json)
+record eight fixture gates, all 11 ordinary checks and all 23 Phase 1 host
+acceptance gates. The [Phase 0 record](NAMESPACE_PHASE0.md#g-05-bounded-records-and-administration)
+supplies the frozen registration grammar and evidence contracts. Production
+registry integration, destination preparation and workload spawn retain their
+Phase 2 and Phase 3 ownership.
 
 **User story:** A host operator wants a one-time command to run as a service
 account inside an already-running rootless container B. The operator must be
@@ -270,6 +275,18 @@ consolidation. This milestone exercises registration and review semantics in
 the fixture. Production registry integration and destination preparation belong
 to Phase 2, workload spawn to Phase 3. Record any unsupported anchor topology
 and keep its dependent route gated.
+
+The qualified fixture uses Fedora 44 x86_64, kernel
+`6.19.10-300.fc44.x86_64`, enforcing SELinux with an administrative unconfined
+supervisor, and one child user namespace whose parent is the initial namespace.
+All selected non-user namespaces belong to that child. Automatic subordinate
+mappings have observed `setgroups=allow` and empty inherited supplementary
+groups. Missing host ptrace permission and mixed namespace ownership were
+rejected. The original and replacement anchors were killed and reaped, retained
+FD counts returned to baseline, fixture paths were removed, and both external
+supervisors finished with empty or removed cgroups. Nested and manager-created
+topologies require their own qualification. G-04's later confinement gates remain
+open for their declared combinations.
 
 ### Phase 2 — Pinned targets and destination preparation
 
