@@ -930,7 +930,11 @@ def inside(args):
         strace = shutil.which('strace')
         if strace is None:
             raise RuntimeError('strace disappeared after prerequisite validation')
+        tests = evidence.manifest['ordinary_checks']['privileged_test_binaries']
         for label, command in (
+            ('privileged-rust', [sys.executable, REPO / 'scripts/verify-phase1-rust.py',
+                                 '--daemon-tests', tests['daemon'], '--library-tests', tests['library'],
+                                 '--artifacts', args.artifacts / 'privileged-rust']),
             ('platform', [sys.executable, REPO / 'scripts/verify-platform.py', args.platform_binary, '--cgroup-parent', parent]),
             ('runtime', [sys.executable, REPO / 'scripts/verify-runtime.py', '--cgroup-parent', parent,
                          '--binaries', args.binaries, '--systemd']),
@@ -983,6 +987,10 @@ def main():
     for name, expected in checks['binaries'].items():
         if hashlib.sha256((args.binaries / name).read_bytes()).hexdigest() != expected:
             parser.error('binary changed after ordinary checks: ' + name)
+    for label in ('daemon', 'library'):
+        path = Path(checks['privileged_test_binaries'][label]).resolve(strict=True)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != checks['privileged_test_sha256'][label]:
+            parser.error('privileged test binary changed after ordinary checks: ' + label)
     args.artifacts = args.artifacts.absolute()
     prerequisites(args.binaries, args.platform_binary)
     if args.inside:
