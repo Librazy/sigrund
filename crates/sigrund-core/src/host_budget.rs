@@ -91,6 +91,7 @@ impl Limits {
 #[derive(Default)]
 struct Used {
     global: Charge,
+    parent_target_fds: u32,
     per_uid: BTreeMap<u32, Charge>,
 }
 impl Used {
@@ -138,6 +139,7 @@ pub struct Reservation {
     budget: Budget,
     uid: u32,
     charge: Charge,
+    inherited: bool,
 }
 impl Budget {
     pub fn new(limits: Limits) -> Result<Self> {
@@ -155,10 +157,12 @@ impl Budget {
         }
         let mut used = self.used.lock().expect("host budget poisoned");
         used.reserve(self.limits, uid, charge)?;
+        used.parent_target_fds += charge.target_fds;
         Some(Reservation {
             budget: self.clone(),
             uid,
             charge,
+            inherited: false,
         })
     }
     /// Transfer the inherited-copy reservation to a child owner. Callers keep
@@ -175,7 +179,7 @@ impl Budget {
         }
         let mut used = self.used.lock().expect("host budget poisoned");
         let charge = Charge {
-            target_fds: used.global.target_fds,
+            target_fds: used.parent_target_fds,
             ..Default::default()
         };
         if charge.target_fds == 0 {
@@ -200,11 +204,12 @@ impl Budget {
                 budget: self.clone(),
                 uid,
                 charge,
+                inherited: true,
             },
         ))
     }
     /// A fresh-exec helper temporarily inherits the whole parent's descriptor
-    /// table. Charge a conservative copy of every reserved target FD before
+    /// table. Charge a conservative copy of every reserved parent target FD before
     /// fork, keeping the accounting lock through the exec handshake so another
     /// reservation cannot expand that table between counting and copying it.
     /// `operation` must return only after those inherited copies close/reap,
@@ -219,7 +224,7 @@ impl Budget {
         }
         let mut used = self.used.lock().expect("host budget poisoned");
         let charge = Charge {
-            target_fds: used.global.target_fds,
+            target_fds: used.parent_target_fds,
             ..Default::default()
         };
         if charge.target_fds == 0 {
@@ -241,6 +246,9 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         let mut used = self.budget.used.lock().expect("host budget poisoned");
         used.release(self.uid, self.charge);
+        if !self.inherited {
+            used.parent_target_fds -= self.charge.target_fds;
+        }
     }
 }
 
@@ -383,5 +391,34 @@ mod tests {
         let mut limits = Limits::default();
         limits.per_uid.helpers = 3;
         assert!(Budget::new(limits).is_err());
+    }
+}
+
+#[cfg(test)]
+mod inheritance_regression {
+    use super::*;
+    #[test]
+    fn sibling_copies_do_not_inflate_the_parent_table() {
+        let budget = Budget::new(Default::default()).unwrap();
+        let parent = budget
+            .reserve(
+                1,
+                Charge {
+                    target_fds: 16,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut children = Vec::new();
+        for uid in 2..10 {
+            let (_, copies) = budget.with_retained_fd_copies(uid, || ()).unwrap();
+            assert_eq!(copies.charge.target_fds, 16);
+            children.push(copies);
+        }
+        budget.with_transient_fd_copies(10, || ()).unwrap();
+        assert_eq!(budget.used.lock().unwrap().global.target_fds, 144);
+        drop(children);
+        drop(parent);
+        assert_eq!(budget.used.lock().unwrap().parent_target_fds, 0);
     }
 }
