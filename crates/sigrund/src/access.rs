@@ -77,8 +77,9 @@ pub(crate) fn open(
     uid: u32,
     gid: u32,
     groups: &[u32],
-    check: impl Fn() -> io::Result<()>,
+    scope: (impl Fn() -> io::Result<()>, &crate::host_target::HostLease),
 ) -> io::Result<File> {
+    let (check, target) = scope;
     check()?;
     domain()?;
     if groups.len() > 256 {
@@ -130,7 +131,10 @@ pub(crate) fn open(
             Ok(())
         });
     }
-    let mut helper = command.spawn()?;
+    let mut helper = target.with_transient_fd_copies(|| {
+        check()?;
+        command.spawn()
+    })?;
     drop(inherited);
     drop(child);
     let result = (|| {

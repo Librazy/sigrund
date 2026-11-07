@@ -1,0 +1,543 @@
+{
+  "schema": "sigrund.phase1-review-validation.v1",
+  "date": "2026-11-07",
+  "result": "passed",
+  "branch": "codex/namespace-phase1-review",
+  "final_source_sha256": "9091b631bfeab65efb7e4755feb31868e2087c571c7971dce604c7f17032b242",
+  "acceptance_source_sha256": "275354cac52b00afb817ff676707b82b632b641f5b23ed4dd8ea198ca683c556",
+  "source_difference": "Only the CLI integration regression test was strengthened after acceptance started. Final ordinary checks passed. All five production binaries and both privileged test binaries have identical hashes in both builds.",
+  "platform": {
+    "distribution": "Fedora 44 Cloud",
+    "kernel": "6.19.10-300.fc44.x86_64",
+    "architecture": "x86_64",
+    "glibc": "2.43",
+    "selinux": "enforcing",
+    "supervisor_context": "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023"
+  },
+  "ordinary_checks": {
+    "command": [
+      "python3",
+      "scripts/check.py",
+      "--artifacts",
+      "/tmp/sigrund-review-fixes-final-checks-20261107"
+    ],
+    "result": "passed",
+    "checks": [
+      {
+        "name": "build",
+        "command": [
+          "cargo",
+          "build",
+          "--workspace",
+          "--locked"
+        ],
+        "exit": 0,
+        "log": "build.log"
+      },
+      {
+        "name": "tests",
+        "command": [
+          "cargo",
+          "test",
+          "--workspace",
+          "--locked",
+          "--",
+          "--test-threads=1"
+        ],
+        "exit": 0,
+        "log": "tests.log"
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--locked",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 0,
+        "log": "clippy.log"
+      },
+      {
+        "name": "format",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "exit": 0,
+        "log": "format.log"
+      },
+      {
+        "name": "diff",
+        "command": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "exit": 0,
+        "log": "diff.log"
+      },
+      {
+        "name": "python",
+        "command": [
+          "/usr/bin/python3",
+          "-c",
+          "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').glob('*.py')]"
+        ],
+        "exit": 0,
+        "log": "python.log"
+      },
+      {
+        "name": "harness-tests",
+        "command": [
+          "/usr/bin/python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-v"
+        ],
+        "exit": 0,
+        "log": "harness-tests.log"
+      },
+      {
+        "name": "host-vectors",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/verify-host-vectors.py"
+        ],
+        "exit": 0,
+        "log": "host-vectors.log"
+      },
+      {
+        "name": "namespace-vectors",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/namespace-phase0/verify-vectors.py"
+        ],
+        "exit": 0,
+        "log": "namespace-vectors.log"
+      },
+      {
+        "name": "privileged-build",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "sigrund",
+          "--lib",
+          "--test",
+          "daemon",
+          "--locked",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "exit": 0,
+        "log": "privileged-build.log"
+      },
+      {
+        "name": "platform-build",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "sigrund",
+          "--test",
+          "cgroup",
+          "--locked",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "exit": 0,
+        "log": "platform-build.log"
+      }
+    ],
+    "rust_tests_passed": 175,
+    "python_harness_tests_passed": 25
+  },
+  "production_binary_sha256": {
+    "sigrund": "055adf01fef4efb90e10ed3094972b8fb16dab149843ca539e82d64fcf519880",
+    "sigrun": "7a30158ea086259b7487ea13ee92703475ca607fdaa88de0421fac03027278f2",
+    "sigrundctl": "5953f896d59e3f23a09ec8ca6cae2badda03b48d74924b8eab0551b3808ca9db",
+    "sigrund-approve": "2a8850e98fb5e9f1ecccd1b0be78b27d43eba17f400103360c1110f69f2c80fc",
+    "sigrund-collector": "c9820640fac83299afe06536849772c136d8b02a760c2a928c8911a904d457b2"
+  },
+  "privileged_test_sha256": {
+    "library": "7ea483e491d1ca29cecd798ef9f885930fd68f8439511effb0befc61153ad347",
+    "daemon": "a855605b6bf952b844e459c393df68d1f39e06386b548589c47931f68a84b1a8"
+  },
+  "acceptance": {
+    "command": [
+      "python3",
+      "scripts/verify-acceptance.py",
+      "--binaries",
+      "/home/lab/sigrund-review/target/debug",
+      "--checks",
+      "/home/lab/sigrund-review/checks.json",
+      "--artifacts",
+      "/home/lab/sigrund-review/acceptance-artifacts",
+      "--requester",
+      "lab"
+    ],
+    "gates": [
+      {
+        "gate": "privileged-rust",
+        "result": "passed"
+      },
+      {
+        "gate": "platform",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime",
+        "result": "passed"
+      },
+      {
+        "gate": "v3",
+        "result": "passed"
+      },
+      {
+        "gate": "trust",
+        "result": "passed"
+      },
+      {
+        "gate": "failures",
+        "result": "passed"
+      },
+      {
+        "gate": "execution-binding-digest-equality",
+        "result": "passed"
+      },
+      {
+        "gate": "offline-workflow",
+        "result": "passed"
+      },
+      {
+        "gate": "independent-v3-audit-ratchet",
+        "result": "passed"
+      },
+      {
+        "gate": "binding-and-concurrent-replay",
+        "result": "passed"
+      },
+      {
+        "gate": "live-host-binding-substitutions",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-targets",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-reviews",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-target_fds",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-helpers",
+        "result": "passed"
+      },
+      {
+        "gate": "public-context-capacity-independent",
+        "result": "passed"
+      },
+      {
+        "gate": "thin-input-before-private-account-lookup",
+        "result": "passed"
+      },
+      {
+        "gate": "host-account-profile-after-preparation",
+        "result": "passed"
+      },
+      {
+        "gate": "output-and-enforced-limits",
+        "result": "passed"
+      },
+      {
+        "gate": "failed-job-limit",
+        "result": "passed"
+      },
+      {
+        "gate": "synchronized-partial-tail-recovery",
+        "result": "passed"
+      },
+      {
+        "gate": "coherent-rollback-local-audit-limit",
+        "result": "passed"
+      },
+      {
+        "gate": "operator-workflow",
+        "result": "passed"
+      }
+    ],
+    "supervisor": {
+      "unit": "sigrund-mvp-gate-fe3313192c724479986d325711ebd66c",
+      "command": [
+        "systemd-run",
+        "--unit=sigrund-mvp-gate-fe3313192c724479986d325711ebd66c",
+        "--property=SELinuxContext=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023",
+        "--wait",
+        "--collect",
+        "--service-type=exec",
+        "--property=Delegate=yes",
+        "--property=KillMode=control-group",
+        "--property=SendSIGKILL=yes",
+        "--property=RuntimeMaxSec=1200s",
+        "--property=TimeoutStopSec=15s",
+        "/usr/bin/python3",
+        "/home/lab/sigrund-review/scripts/verify-acceptance.py",
+        "--inside",
+        "--binaries",
+        "/home/lab/sigrund-review/target/debug",
+        "--checks",
+        "/home/lab/sigrund-review/checks.json",
+        "--artifacts",
+        "/home/lab/sigrund-review/acceptance-artifacts",
+        "--requester",
+        "lab"
+      ],
+      "cgroup_removed": true,
+      "unit_query": ""
+    }
+  },
+  "review_resolutions": [
+    {
+      "issue": "Full CSR named account mismatch",
+      "change": "Resolve account before unsigned full review and reject numeric mismatch",
+      "test": "preparation::full_account_tests::full_named_account_must_match_host_credentials"
+    },
+    {
+      "issue": "Blocking coordinator host verification",
+      "change": "Host verification runs on VerifyExec worker. Coordinator uses bounded cancellation, expiry and release checks.",
+      "verification": "Full runtime, trust, execution and privileged Rust gates passed."
+    },
+    {
+      "issue": "Repeated charging of sibling FD copies",
+      "change": "Track parent target FDs separately from total outstanding FD reservations.",
+      "test": "host_budget::inheritance_regression::sibling_copies_do_not_inflate_the_parent_table"
+    },
+    {
+      "issue": "Missing ComposeFS client eligibility",
+      "change": "Bounded private bundle enrollment comes from retained startup enrollment and is applied after local domain validation.",
+      "test": "private_binding_retains_bounded_composefs_enrollment"
+    },
+    {
+      "issue": "Named account drops explicit numeric groups",
+      "change": "Reject explicit supplementary groups with named selection.",
+      "test": "request::named_account_rejects_explicit_supplementary_groups"
+    },
+    {
+      "issue": "CI omits privileged Rust gates",
+      "change": "Cargo JSON records both executable paths and SHA256 values. Acceptance verifies those hashes and executes all nine gates under its supervisor.",
+      "verification": "privileged-rust acceptance gate passed all nine tests."
+    },
+    {
+      "issue": "Documentation promises TIMEOUT for full refusal",
+      "change": "README, implementation notes and Phase 1 record describe immediate REJECTED for explicit full-CSR refusal.",
+      "verification": "Existing v3 and root TTY acceptance cases passed."
+    }
+  ],
+  "raw_artifacts_private_directory": "/tmp/sigrund-review-fixes-evidence",
+  "manifest_sha256": {
+    "manifest.json": "22c25e2fb5ef0ab67ea2b19686cdaf638917066ad98c8e1d13bff8003d30362c",
+    "supervisor.json": "a058bac225da6eef51dece7c80579c68957f122d8c122d62a1a4fe1f02aa2164",
+    "privileged-rust/manifest.json": "171000b40f3e372e7098816838d25c51cb3656156d8d801fd80b7328cf033a60",
+    "trust/manifest.json": "b1b3f292dd5094cd1b13577c1ba0547e6c28b6e0e810bdf2a7548e3f72316c14",
+    "execution/manifest.json": "e443b748a4304939b9d51472a4691564124cfab38183895056b11bd5ee746e09"
+  },
+  "cleanup": {
+    "supervisor_cgroup_removed": true,
+    "disposable_vm_removed": true,
+    "command": [
+      "pvem",
+      "destroy",
+      "sigrund-review-fixes",
+      "--yes"
+    ]
+  },
+  "privileged-rust_gates": [
+    {
+      "gate": "authorization::exit_gate",
+      "result": "passed"
+    },
+    {
+      "gate": "approver::exit_gate",
+      "result": "passed"
+    },
+    {
+      "gate": "daemon_gate_in_user_namespace",
+      "result": "passed"
+    },
+    {
+      "gate": "startup::stale_audit_temporary_gate",
+      "result": "passed"
+    },
+    {
+      "gate": "startup::v3_provisioning_set_gate",
+      "result": "passed"
+    },
+    {
+      "gate": "storage::exit_gate",
+      "result": "passed"
+    },
+    {
+      "gate": "v3::confidentiality_gate",
+      "result": "passed"
+    },
+    {
+      "gate": "preparation::tests::final_authorization_rechecks_retained_policy_and_identity",
+      "result": "passed"
+    },
+    {
+      "gate": "host_registry::tests::epoch_registry_requires_live_owner_and_exact_private_review",
+      "result": "passed"
+    }
+  ],
+  "trust_gates": [
+    {
+      "gate": "digest-direct",
+      "result": "passed"
+    },
+    {
+      "gate": "file-capabilities",
+      "result": "passed"
+    },
+    {
+      "gate": "ctime",
+      "result": "passed"
+    },
+    {
+      "gate": "mutation",
+      "result": "passed"
+    },
+    {
+      "gate": "noexec",
+      "result": "passed"
+    },
+    {
+      "gate": "tracer-death",
+      "result": "passed"
+    },
+    {
+      "gate": "fs-verity",
+      "result": "passed"
+    }
+  ],
+  "execution_gates": [
+    {
+      "gate": "startup-swap-unavailable",
+      "result": "passed"
+    },
+    {
+      "gate": "startup-clone-fail",
+      "result": "passed"
+    },
+    {
+      "gate": "startup-mount-unavailable",
+      "result": "passed"
+    },
+    {
+      "gate": "step-1",
+      "result": "passed"
+    },
+    {
+      "gate": "step-2",
+      "result": "passed"
+    },
+    {
+      "gate": "step-3",
+      "result": "passed"
+    },
+    {
+      "gate": "step-4",
+      "result": "passed"
+    },
+    {
+      "gate": "step-5",
+      "result": "passed"
+    },
+    {
+      "gate": "step-6",
+      "result": "passed"
+    },
+    {
+      "gate": "step-7",
+      "result": "passed"
+    },
+    {
+      "gate": "step-8",
+      "result": "passed"
+    },
+    {
+      "gate": "step-9",
+      "result": "passed"
+    },
+    {
+      "gate": "step-10",
+      "result": "passed"
+    },
+    {
+      "gate": "step-11",
+      "result": "passed"
+    },
+    {
+      "gate": "fd-exhaust",
+      "result": "passed"
+    },
+    {
+      "gate": "clone-fail",
+      "result": "passed"
+    },
+    {
+      "gate": "kill-before-ready",
+      "result": "passed"
+    },
+    {
+      "gate": "partial-ready",
+      "result": "passed"
+    },
+    {
+      "gate": "excess-ready",
+      "result": "passed"
+    },
+    {
+      "gate": "stop-before-ready",
+      "result": "passed"
+    },
+    {
+      "gate": "stop-after-ready",
+      "result": "passed"
+    },
+    {
+      "gate": "kernel-exec-error",
+      "result": "passed"
+    },
+    {
+      "gate": "post-token-pre-exec-death",
+      "result": "passed"
+    },
+    {
+      "gate": "root-tty-workflow",
+      "result": "passed"
+    },
+    {
+      "gate": "control-and-exit-races",
+      "result": "passed"
+    },
+    {
+      "gate": "post-exec-observations",
+      "result": "passed"
+    }
+  ]
+}

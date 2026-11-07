@@ -1,24 +1,19 @@
 use super::support::*;
 
 #[test]
-fn composefs_notice_requires_direct_digest_and_round_trips() {
-    let mut warrant = fixture();
-    warrant.command.executable_trust =
-        Some(sigrund_core::executable::ExecutableTrust::DigestDirect {
-            sha256: "00".repeat(32),
-        });
-    warrant.command.executable_sha256 = None;
-    let csr = Csr::new(warrant).unwrap();
-    let mut request = ApprovalRequest::new(EXEC_ID.into(), "test".into(), &csr).unwrap();
-    request.admin_trusted_composefs = true;
+fn broker_has_exactly_four_keys_and_rejects_private_evidence_extensions() {
+    let csr = Csr::new(fixture()).unwrap();
+    let request = ApprovalRequest::new(EXEC_ID.into(), "test".into(), &csr).unwrap();
+    let mut value: Value = serde_json::from_slice(&request.to_jcs().unwrap()).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 4);
     assert_eq!(
         ApprovalRequest::parse_jcs(&request.to_jcs().unwrap()).unwrap(),
         request
     );
-    let mut request =
-        ApprovalRequest::new(EXEC_ID.into(), "test".into(), &Csr::new(fixture()).unwrap()).unwrap();
-    request.admin_trusted_composefs = true;
-    assert!(request.validate().is_err());
+    value["admin_trusted_composefs"] = json!(true);
+    assert!(
+        ApprovalRequest::parse_jcs(&sigrund_core::json::canonical_bytes(&value).unwrap()).is_err()
+    );
 }
 
 #[test]
@@ -30,7 +25,7 @@ fn every_warrant_field_is_bound_to_the_csr_even_with_a_valid_signature() {
         ("/command/argv", json!(["/usr/bin/id", "-u"])),
         ("/command/cwd", json!("/tmp")),
         ("/command/executable_path", json!("/usr/bin/true")),
-        ("/command/executable_trust/sha256", json!("11".repeat(32))),
+        ("/command/executable_trust/sha256", json!("22".repeat(32))),
         ("/execution_context/caller_env_allowlist", json!(["TERM"])),
         ("/execution_context/env_exact", json!({"PATH": "/usr/bin"})),
         ("/execution_context/supplementary_gids", json!([33])),
@@ -40,7 +35,7 @@ fn every_warrant_field_is_bound_to_the_csr_even_with_a_valid_signature() {
         ("/grant_id", json!("0192d8f4-7c1b-7000-8a01-9f8b3c4d5e60")),
         (
             "/host_id",
-            json!(format!("sigrun-host:sha256:{}", "11".repeat(32))),
+            json!(format!("sigrun-host:sha256:{}", "22".repeat(32))),
         ),
         ("/policy/mode", json!("time_range")),
         ("/policy/not_before", json!(1001)),
@@ -55,7 +50,7 @@ fn every_warrant_field_is_bound_to_the_csr_even_with_a_valid_signature() {
     }
     // These coupled fields must change together to remain schema-valid.
     for (tty, stdin, digest) in [
-        ("stdio", "sha256", Some("11".repeat(32))),
+        ("stdio", "sha256", Some("22".repeat(32))),
         ("stdio", "unrestricted_interactive", None),
         ("pty", "unrestricted_interactive", None),
     ] {

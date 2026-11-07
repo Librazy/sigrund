@@ -137,6 +137,7 @@ impl Execution {
         if let Err(job) = self.supervisor.submit(job) {
             let active = self.jobs.get_mut(&token).unwrap();
             active.owner = Some(PreparedJob {
+                inherited_target_fds: None,
                 job: *job,
                 cgroup: None,
             });
@@ -167,7 +168,7 @@ impl Execution {
                         let job = self.jobs.get_mut(&token).expect("exec checkpoint owner");
                         job.task = false;
                         let result = result
-                            .and_then(|()| crate::jobs::eligible(&owner.job))
+                            .and_then(|()| crate::jobs::eligible_for_release(&owner.job))
                             .and_then(|()| {
                                 if job.failure.is_some()
                                     || Instant::now()

@@ -3,15 +3,18 @@ use sigrund_core::{crypto::sha256_hex, protocol::Decision, state::StateStore};
 
 #[test]
 fn normative_pae_vector_and_intent_hash_match_independent_bytes() {
-    let payload = br#"{"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"2.0"}"#;
-    let expected = br#"DSSEv1 38 application/vnd.sigrun.warrant.v2+json 67 {"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"2.0"}"#;
+    let payload = br#"{"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"3.0"}"#;
+    let expected = br#"DSSEv1 38 application/vnd.sigrun.warrant.v3+json 67 {"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"3.0"}"#;
     assert_eq!(WARRANT_PAYLOAD_TYPE.len(), 38);
     assert_eq!(payload.len(), 67);
     assert_eq!(pae(WARRANT_PAYLOAD_TYPE, payload), expected);
     assert_eq!(expected.len(), 119);
     assert_eq!(
-        fixture().intent().unwrap().sha256().unwrap(),
-        "2d1cada5c6ec46f372fe237b22c330488e9b706cf5c37716e28b614f2b3007ec"
+        {
+            use sigrund_core::host::Record;
+            fixture().intent.sha256().unwrap()
+        },
+        "4ef88db2456d8730ebe668c2927a0d20dde8a665d8b419cfd1cb479ce060aa46"
     );
 }
 
@@ -39,9 +42,9 @@ fn provenance_is_immutable_and_thin_approvals_are_not_standalone_warrants() {
     );
     for mode in ["full_csr", "signed"] {
         let value = if mode == "full_csr" {
-            json!({"version":"2.0","mode":mode,"tty_mode":"stdio","caller_env":{},"csr_payload":String::from_utf8(csr.as_bytes().to_vec()).unwrap()})
+            json!({"version":"3.0","mode":mode,"tty_mode":"stdio","caller_env":{},"csr_payload":String::from_utf8(csr.as_bytes().to_vec()).unwrap()})
         } else {
-            json!({"version":"2.0","mode":mode,"tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope})
+            json!({"version":"3.0","mode":mode,"tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope})
         };
         assert!(ClientHello::parse_request(&serde_json::to_vec(&value).unwrap()).is_err());
     }
@@ -60,7 +63,7 @@ fn v2_versions_and_decision_schemas_never_negotiate_legacy_behavior() {
         Value::Null,
         json!("1.0"),
         json!("1.2"),
-        json!("3.0"),
+        json!("2.0"),
         json!(2),
     ] {
         let mut value = hello.clone();
@@ -90,7 +93,7 @@ fn v2_versions_and_decision_schemas_never_negotiate_legacy_behavior() {
             .is_err()
         );
     }
-    for version in ["1.0", "1.1", "1.2", "3.0"] {
+    for version in ["1.0", "1.1", "1.2", "2.0", "4.0"] {
         let mut w = fixture();
         w.version = version.into();
         assert!(CanonicalWarrant::new(w).is_err());
@@ -99,7 +102,7 @@ fn v2_versions_and_decision_schemas_never_negotiate_legacy_behavior() {
 
 #[test]
 fn legacy_and_unknown_database_versions_remain_untouched() {
-    for version in [0, 1, 3] {
+    for version in [0, 1, 2, 4] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let db = rusqlite::Connection::open(&path).unwrap();

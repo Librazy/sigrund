@@ -17,6 +17,7 @@ use std::{
 pub(crate) struct PreparedJob {
     pub job: CommittedJob,
     pub cgroup: Option<JobCgroup>,
+    pub(crate) inherited_target_fds: Option<sigrund_core::host_budget::Reservation>,
 }
 pub(crate) enum Task {
     Prepare(CommittedJob),
@@ -112,35 +113,39 @@ impl JobSupervisor {
                             match task {
                                 Task::VerifyExec(owner, pid, deadline) => {
                                     let request = owner.job.lease.request();
-                                    let result = request
-                                        .snapshots
-                                        .as_ref()
-                                        .expect("executable owner")
-                                        .executable
-                                        .verify_exec_checked(
-                                            pid,
-                                            &owner
-                                                .job
-                                                .authorized
-                                                .warrant
-                                                .warrant()
-                                                .execution_context,
-                                            || {
-                                                request.check()?;
-                                                if owner
+                                    let result = eligible(&owner.job).and_then(|()| {
+                                        request
+                                            .snapshots
+                                            .as_ref()
+                                            .expect("executable owner")
+                                            .executable
+                                            .verify_exec_checked(
+                                                pid,
+                                                &owner
                                                     .job
-                                                    .lifecycle
-                                                    .cancelled
-                                                    .load(std::sync::atomic::Ordering::Acquire)
-                                                {
-                                                    return Err(io::ErrorKind::Interrupted.into());
-                                                }
-                                                if std::time::Instant::now() >= deadline {
-                                                    return Err(io::ErrorKind::TimedOut.into());
-                                                }
-                                                Ok(())
-                                            },
-                                        );
+                                                    .authorized
+                                                    .warrant
+                                                    .warrant()
+                                                    .execution_context,
+                                                || {
+                                                    request.check()?;
+                                                    if owner
+                                                        .job
+                                                        .lifecycle
+                                                        .cancelled
+                                                        .load(std::sync::atomic::Ordering::Acquire)
+                                                    {
+                                                        return Err(
+                                                            io::ErrorKind::Interrupted.into()
+                                                        );
+                                                    }
+                                                    if std::time::Instant::now() >= deadline {
+                                                        return Err(io::ErrorKind::TimedOut.into());
+                                                    }
+                                                    Ok(())
+                                                },
+                                            )
+                                    });
                                     notifier.send(SpawnOutcome::ExecVerified {
                                         owner: Box::new(owner),
                                         result,
@@ -150,7 +155,11 @@ impl JobSupervisor {
                                     let (cgroup, message) = operation(layout.as_ref(), &job);
                                     let failure = (!message.is_empty()).then_some(message);
                                     notifier.send(SpawnOutcome::Prepared {
-                                        owner: Box::new(PreparedJob { job, cgroup }),
+                                        owner: Box::new(PreparedJob {
+                                            job,
+                                            cgroup,
+                                            inherited_target_fds: None,
+                                        }),
                                         failure,
                                     });
                                 }
@@ -231,6 +240,26 @@ fn wake_coordinator(fd: RawFd) {
     }
 }
 pub(crate) fn eligible(job: &CommittedJob) -> io::Result<()> {
+    eligible_for_release(job)?;
+    let request = job.lease.request();
+    let bundle = request
+        .host_bundle
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing committed binding"))?;
+    request
+        .host_lease
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing committed target lease"))?
+        .verify(bundle)?;
+    job.authorized
+        .warrant
+        .warrant()
+        .verify_bundle(bundle)
+        .map_err(io::Error::other)
+}
+
+/// Coordinator checks must never acquire the target budget or inspect files.
+pub(crate) fn eligible_for_release(job: &CommittedJob) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     if job.lifecycle.cancelled.load(Ordering::Acquire)
         || !crate::sequencer::connection_live(job.control)
@@ -275,16 +304,34 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<ChildProcess> {
         return Err(io::Error::other("missing output rights"));
     }
     eligible(&owner.job)?;
-    command.spawn_checkpoint(
-        owner.cgroup.as_ref().expect("prepared cgroup").fd(),
-        [
-            input,
-            request.rights[n - 2].as_raw_fd(),
-            request.rights[n - 1].as_raw_fd(),
-            snapshot.executable.as_fd().as_raw_fd(),
-        ],
-        snapshot.executable.needs_checkpoint(),
-    )
+    let (child, copies) = request
+        .host_lease
+        .as_ref()
+        .expect("validated target owner")
+        .with_retained_fd_copies(|| {
+            if owner
+                .job
+                .lifecycle
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+                || !crate::sequencer::connection_live(owner.job.control)
+            {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            request.check()?;
+            command.spawn_checkpoint(
+                owner.cgroup.as_ref().expect("prepared cgroup").fd(),
+                [
+                    input,
+                    request.rights[n - 2].as_raw_fd(),
+                    request.rights[n - 1].as_raw_fd(),
+                    snapshot.executable.as_fd().as_raw_fd(),
+                ],
+                snapshot.executable.needs_checkpoint(),
+            )
+        })?;
+    owner.inherited_target_fds = Some(copies);
+    Ok(child)
 }
 pub(crate) fn prepare_job(
     layout: Option<&CgroupLayout>,

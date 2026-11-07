@@ -26,9 +26,11 @@ use subtle::ConstantTimeEq;
 
 pub(crate) struct PinnedRoot {
     pub path: PathBuf,
-    pub directory: File,
+    pub directory: std::sync::Arc<File>,
 }
 pub(crate) struct Context {
+    pub epoch: Option<std::sync::Arc<crate::host_registry::EpochOwner>>,
+    pub host_target: Option<std::sync::Arc<crate::host_target::HostTarget>>,
     pub roots: Vec<PinnedRoot>,
     pub host_id: String,
     pub signers: SignerPolicyFile,
@@ -95,11 +97,95 @@ pub(crate) struct Pending {
     null_stdin: Option<OwnedFd>,
 }
 
+fn verify_full_account(csr: &Csr) -> io::Result<()> {
+    let w = csr.warrant();
+    let (uid, gid, groups) = crate::accounts::resolve(&w.intent.account)?;
+    let c = &w.execution_context;
+    if (uid, gid, &groups) != (c.target_uid, c.target_gid, &c.supplementary_gids) {
+        return Err(fail(
+            "POLICY_VIOLATION",
+            "resolved account differs from full CSR",
+        ));
+    }
+    Ok(())
+}
+
+fn capture_target(request: &mut ValidatedRequest, context: &Context) -> io::Result<()> {
+    if request.host_lease.is_none() {
+        request.host_lease = Some(
+            context
+                .host_target
+                .as_ref()
+                .ok_or_else(|| fail("INVALID_REQUEST", "host target unavailable"))?
+                .lease_for_review(request.requester_uid, request.hello.mode != "signed")
+                .map_err(|e| {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        fail(
+                            "RESOURCE_EXHAUSTED",
+                            "host target/review/FD capacity exhausted",
+                        )
+                    } else {
+                        e
+                    }
+                })?,
+        );
+
+        if request.hello.mode == "thin_csr" {
+            let original = request
+                .hello
+                .original_intent
+                .as_ref()
+                .ok_or_else(|| fail("INVALID_REQUEST", "missing explicit intent"))?;
+            let (uid, gid, groups) = crate::accounts::resolve(&original.account)?;
+            request.hello.requested_execution_context =
+                Some(original.execution_context.resolve(uid, gid, groups));
+        }
+        if request.hello.mode == "full_csr" {
+            let csr = Csr::parse(
+                request
+                    .hello
+                    .csr_payload
+                    .as_ref()
+                    .expect("validated full CSR")
+                    .as_bytes(),
+            )
+            .map_err(io::Error::other)?;
+            verify_full_account(&csr)?;
+        }
+        let original = if let Some(intent) = &request.hello.original_intent {
+            intent.clone()
+        } else {
+            request
+                .hello
+                .dsse_envelope
+                .as_ref()
+                .ok_or_else(|| fail("INVALID_REQUEST", "missing intent"))?
+                .warrant()
+                .map_err(io::Error::other)?
+                .warrant()
+                .intent
+                .clone()
+        };
+        let profile = request
+            .policy
+            .host_profiles
+            .iter()
+            .find(|p| p.profile_id == original.security_profile)
+            .ok_or_else(|| fail("POLICY_VIOLATION", "unavailable security profile"))?;
+        if profile.capabilities != original.execution_context.capabilities {
+            return Err(fail("POLICY_VIOLATION", "profile capability mismatch"));
+        }
+        request.host_profile = Some(profile.clone());
+    }
+    Ok(())
+}
+
 pub(crate) fn check_unsigned_policy(
     request: &mut ValidatedRequest,
     context: &Context,
     gid: u32,
 ) -> io::Result<()> {
+    capture_target(request, context)?;
     request.check()?;
     let intent = request
         .hello
@@ -118,6 +204,32 @@ pub(crate) fn check_unsigned_policy(
                 .is_some_and(|p| p.approval_signer_id == s.signer_id)
         })
         .ok_or_else(|| fail("POLICY_VIOLATION", "approval signer unavailable"))?;
+    use sigrund_core::host::Record;
+    let profile = request
+        .policy
+        .host_profiles
+        .iter()
+        .find(|p| {
+            request
+                .hello
+                .original_intent
+                .as_ref()
+                .is_some_and(|i| i.security_profile == p.profile_id)
+        })
+        .ok_or_else(|| fail("POLICY_VIOLATION", "profile unavailable"))?;
+    let profile_hash = profile.sha256().map_err(io::Error::other)?;
+    let permits = |rule: &sigrund_core::host::ScopedRule| {
+        rule.permits(
+            request.requester_uid,
+            c.target_uid,
+            c.target_gid,
+            &c.supplementary_gids,
+            &profile_hash,
+        )
+    };
+    if !request.policy.host_rules.iter().any(permits) || !signer.host_rules.iter().any(permits) {
+        return Err(fail("POLICY_VIOLATION", "scoped host policy denied"));
+    }
     let ttl = intent.policy.ttl_secs;
     if intent.policy.mode != "one_time"
         || ttl > request.policy.max_ttl_secs
@@ -176,6 +288,36 @@ pub(crate) fn prepare(
 ) -> io::Result<()> {
     request.check()?;
     crate::transport::validate_stdio_checked(&request.hello, &request.rights, || request.check())?;
+    // Complete finite input before the first private target observation. Never
+    // remove the original endpoint from the outcome owner's descriptor table.
+    let stdin = if request
+        .hello
+        .intent()
+        .map_err(|e| fail("INVALID_REQUEST", e.to_string()))?
+        .command
+        .stdin_policy
+        == "sha256"
+    {
+        let source: File = request
+            .rights
+            .first()
+            .ok_or_else(|| fail("INVALID_REQUEST", "missing stdin"))?
+            .try_clone()?
+            .into();
+        Some(
+            snapshot::stdin(
+                source,
+                budget,
+                request.requester_uid,
+                &request.policy,
+                || request.check(),
+            )
+            .map_err(|e| snapshot_error(e, "STDIN_HASH_MISMATCH"))?,
+        )
+    } else {
+        None
+    };
+    capture_target(request, context)?;
     if request.hello.mode != "signed" && !request.unsigned_policy_checked {
         check_unsigned_policy(request, context, gid)?;
     }
@@ -259,28 +401,6 @@ pub(crate) fn prepare(
         &request.policy.csr_allowed_executable_dirs,
     )
     .map_err(|_| fail("POLICY_VIOLATION", "executable is outside configured roots"))?;
-    // Complete finite input before the first private target observation. Never
-    // remove the original endpoint from the outcome owner's descriptor table.
-    let stdin = if command.stdin_policy == "sha256" {
-        let source: File = request
-            .rights
-            .first()
-            .ok_or_else(|| fail("INVALID_REQUEST", "missing stdin"))?
-            .try_clone()?
-            .into();
-        Some(
-            snapshot::stdin(
-                source,
-                budget,
-                request.requester_uid,
-                &request.policy,
-                || request.check(),
-            )
-            .map_err(|e| snapshot_error(e, "STDIN_HASH_MISMATCH"))?,
-        )
-    } else {
-        None
-    };
     if let Some((warrant, _)) = &signed {
         let observed = stdin.as_ref().map(|input| &input.digest.sha256);
         if observed != warrant.warrant().command.stdin_sha256.as_ref() {
@@ -301,6 +421,24 @@ pub(crate) fn prepare(
                 "authenticated supplementary groups unavailable",
             )
         })?;
+        // Bound the fresh-exec helper and its IPC/stdio/transient duplicates
+        // through the synchronous kill/reap path, including cancellation.
+        let _helper = request
+            .host_lease
+            .as_ref()
+            .ok_or_else(|| fail("INVALID_REQUEST", "missing target owner"))?
+            .reserve_resources(sigrund_core::host_budget::Charge {
+                helpers: 1,
+                target_fds: 16,
+                ..Default::default()
+            })
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    fail("RESOURCE_EXHAUSTED", "host helper/FD capacity exhausted")
+                } else {
+                    e
+                }
+            })?;
         crate::access::open(
             &selected.root,
             &selected.relative_path,
@@ -308,8 +446,18 @@ pub(crate) fn prepare(
             request.requester_uid,
             gid,
             groups,
-            || request.check(),
-        )?
+            (|| request.check(), request.host_lease.as_ref().unwrap()),
+        )
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                fail(
+                    "RESOURCE_EXHAUSTED",
+                    "host helper transient FD capacity exhausted",
+                )
+            } else {
+                e
+            }
+        })?
     } else {
         openat2_executable(root.directory.as_raw_fd(), &selected.relative_path)?.into()
     };
@@ -321,6 +469,14 @@ pub(crate) fn prepare(
         .map(|(w, _)| w.warrant().execution_context.requested())
         .or_else(|| request.hello.requested_execution_context.clone())
         .expect("execution context");
+    let mut executable_policy = (*request.policy).clone();
+    executable_policy.executable_trust_models = vec![
+        request
+            .host_profile
+            .as_ref()
+            .ok_or_else(|| fail("INVALID_REQUEST", "missing captured host profile"))?
+            .executable_model,
+    ];
     let executable = crate::executable::prepare(
         source,
         crate::executable::Selection {
@@ -334,7 +490,7 @@ pub(crate) fn prepare(
         },
         budget,
         request.requester_uid,
-        &request.policy,
+        &executable_policy,
         || request.check(),
     )
     .map_err(|e| snapshot_error(e, "EXECUTABLE_MUTATED_OR_TOO_LARGE"))?;
@@ -387,6 +543,48 @@ pub(crate) fn hash_and_finish(
 
 fn finish_document(request: &mut ValidatedRequest, context: &Context, gid: u32) -> io::Result<()> {
     request.check()?;
+    use sigrund_core::host::Record;
+    let original = match &request.hello.original_intent {
+        Some(intent) => intent.clone(),
+        None => request
+            .hello
+            .dsse_envelope
+            .as_ref()
+            .ok_or_else(|| fail("INVALID_REQUEST", "missing v3 intent"))?
+            .warrant()
+            .map_err(io::Error::other)?
+            .warrant()
+            .intent
+            .clone(),
+    };
+    let model = request
+        .snapshots
+        .as_ref()
+        .ok_or_else(|| fail("INVALID_REQUEST", "missing executable"))?
+        .executable
+        .model();
+    let constraints = request
+        .policy
+        .host_profiles
+        .iter()
+        .find(|p| p.profile_id == original.security_profile)
+        .ok_or_else(|| fail("POLICY_VIOLATION", "unavailable security profile"))?
+        .clone();
+    if constraints.executable_model != model
+        || constraints.capabilities != original.execution_context.capabilities
+    {
+        return Err(fail("POLICY_VIOLATION", "measured profile differs"));
+    }
+    constraints.validate().map_err(io::Error::other)?;
+    let lease = request
+        .host_lease
+        .as_ref()
+        .ok_or_else(|| fail("INVALID_REQUEST", "missing host lease"))?;
+    request.host_bundle = Some(
+        lease
+            .target()
+            .bundle(context.host_id.clone(), constraints)?,
+    );
     let Pending {
         signed,
         root_path,
@@ -439,6 +637,7 @@ fn finish_document(request: &mut ValidatedRequest, context: &Context, gid: u32) 
         let csr = Csr::from_unsigned(
             &request.hello,
             CsrIdentity {
+                binding: request.host_bundle.clone(),
                 grant_id: new_uuidv7().to_string(),
                 host_id: context.host_id.clone(),
                 requester_uid: request.requester_uid,
@@ -468,12 +667,24 @@ fn finish_document(request: &mut ValidatedRequest, context: &Context, gid: u32) 
         Document::Unsigned(csr) => csr.warrant(),
         Document::Signed { warrant, .. } => warrant.warrant(),
     };
+    let bundle = request.host_bundle.as_ref().unwrap();
+    canonical.verify_bundle(bundle).map_err(io::Error::other)?;
+    request.host_lease.as_ref().unwrap().verify(bundle)?;
     let now = realtime()?;
     if now < canonical.policy.not_before || canonical.policy.not_after.is_none_or(|end| now > end) {
         return Err(fail(
             "EXPIRED_OR_NOT_YET_VALID",
             "prepared request expired before review",
         ));
+    }
+    if let (Document::Unsigned(csr), Some(epoch)) = (&document, &context.epoch) {
+        request.check()?;
+        epoch.publish_review(
+            &request.exec_id,
+            csr,
+            snapshots.executable.admin_trusted_composefs(),
+        )?;
+        request.check()?;
     }
     request.prepared = Some(Prepared {
         document,
@@ -493,6 +704,19 @@ pub(crate) fn static_policy(
     host: &str,
     config: &sigrund_core::config::DaemonConfig,
 ) -> bool {
+    let permits = |rule: &sigrund_core::host::ScopedRule| {
+        rule.permits(
+            uid,
+            warrant.execution_context.target_uid,
+            warrant.execution_context.target_gid,
+            &warrant.execution_context.supplementary_gids,
+            &warrant.security_constraints.profile_sha256,
+        )
+    };
+    if !config.host_rules.iter().any(permits) || !signer.host_rules.iter().any(permits) {
+        return false;
+    }
+
     let context = &warrant.execution_context;
     let window = warrant
         .policy
@@ -710,7 +934,7 @@ mod tests {
             string(bytes, &mut envelope);
         }
         ClientHello::parse_request(&serde_json::to_vec(&serde_json::json!({
-            "version":"2.0","mode":"signed", "tty_mode":"stdio", "caller_env":{},
+            "version":"3.0","mode":"signed", "tty_mode":"stdio", "caller_env":{},
             "dsse_envelope":{"payloadType":WARRANT_PAYLOAD_TYPE,
                 "payload":STANDARD.encode(warrant.as_bytes()),
                 "signatures":[{"keyid":"mandator-alice-yubikey", "sig":STANDARD.encode(envelope)}]}
@@ -774,19 +998,33 @@ mod tests {
             .unwrap();
             signers.validate_against(&config).unwrap();
             let context = Context {
+                epoch: None,
+                host_target: Some(
+                    crate::host_target::HostTarget::acquire(
+                        &[dir.path().to_owned()],
+                        &sigrund_core::host_budget::Budget::new(Default::default()).unwrap(),
+                    )
+                    .unwrap(),
+                ),
                 roots: vec![PinnedRoot {
                     path: dir.path().to_owned(),
-                    directory: crate::startup::pin_directory(dir.path()).unwrap(),
+                    directory: std::sync::Arc::new(
+                        crate::startup::pin_directory(dir.path()).unwrap(),
+                    ),
                 }],
                 host_id: format!("sigrun-host:sha256:{}", "a".repeat(64)),
                 signers,
             };
-            let hello = crate::cli::RequestOptions::default()
-                .hello(
-                    &[path.to_str().unwrap().to_owned(), "".into()],
-                    std::path::Path::new("/"),
-                )
-                .unwrap();
+            let hello = crate::cli::RequestOptions {
+                target: Some("host".into()),
+                security_profile: Some("host-baseline".into()),
+                ..crate::cli::RequestOptions::default()
+            }
+            .hello(
+                &[path.to_str().unwrap().to_owned(), "".into()],
+                std::path::Path::new("/"),
+            )
+            .unwrap();
             Self {
                 dir,
                 context,
@@ -815,6 +1053,9 @@ mod tests {
                 );
             }
             ValidatedRequest {
+                host_profile: None,
+                host_bundle: None,
+                host_lease: None,
                 failure: None,
                 exec_id: new_uuidv7().to_string(),
                 requester_gid: 1001,
@@ -847,12 +1088,38 @@ mod tests {
     }
 
     #[test]
+    fn finite_input_precedes_private_account_and_profile_failures() {
+        let fixture = Fixture::new();
+        let input = b"finite input before any private target observation";
+        for failure in ["account", "profile"] {
+            let mut hello = fixture.hello.clone();
+            hello.requested_command.as_mut().unwrap().stdin_policy = "sha256".into();
+            let original = hello.original_intent.as_mut().unwrap();
+            original.command.stdin_policy = "sha256".into();
+            if failure == "account" {
+                original.account = sigrund_core::host::Account::Name {
+                    name: format!("missing-{}", new_uuidv7()),
+                };
+            } else {
+                original.security_profile = "missing-profile".into();
+            }
+            let mut request = fixture.request(hello, Some(input));
+            assert!(prepare(&mut request, &fixture.context, &fixture.budget, 1001).is_err());
+            assert_eq!(
+                unsafe { libc::lseek(request.rights[0].as_raw_fd(), 0, libc::SEEK_CUR) },
+                input.len() as i64,
+                "{failure}"
+            );
+        }
+    }
+    #[test]
     fn common_preparation_retains_sealed_bytes_identities_and_stdin_bindings() {
         let fixture = Fixture::new();
         for input in [None, Some(b"".as_slice()), Some(b"input\0\xff".as_slice())] {
             let mut hello = fixture.hello.clone();
             if input.is_some() {
                 hello.requested_command.as_mut().unwrap().stdin_policy = "sha256".into();
+                hello.original_intent.as_mut().unwrap().command.stdin_policy = "sha256".into();
             }
             let mut request = fixture.request(hello, input);
             prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap();
@@ -912,30 +1179,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires root in the initial user namespace; included in the privileged Phase 1 gate"]
     fn final_authorization_rechecks_retained_policy_and_identity() {
-        let output = std::process::Command::new("unshare")
-            .args(["--user", "--map-auto", "--map-root-user"])
-            .arg(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "preparation::tests::final_authorization_namespace_fixture",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("SIGRUND_FINAL_GATE", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    #[test]
-    #[ignore = "invoked by the namespace gate"]
-    fn final_authorization_namespace_fixture() {
-        assert_eq!(std::env::var("SIGRUND_FINAL_GATE").unwrap(), "1");
         let mut fixture = Fixture::new();
         Arc::make_mut(&mut fixture.config)
             .mvp
@@ -956,7 +1201,7 @@ mod tests {
             "same_uid",
         ] {
             let mut request =
-                fixture.request(signed_hello(&canonical, "sigrun.warrant.v2", 7), None);
+                fixture.request(signed_hello(&canonical, "sigrun.warrant.v3", 7), None);
             prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap();
             let prepared = request.prepared.as_mut().unwrap();
             match case {
@@ -979,7 +1224,7 @@ mod tests {
                         Some(sigrund_core::executable::ExecutableTrust::DigestMemfd {
                             sha256: "0".repeat(64),
                         });
-                    changed.intent_sha256 = changed.intent().unwrap().sha256().unwrap();
+                    crate::synchronize_test_intent(&mut changed);
                     *warrant = CanonicalWarrant::new(changed).unwrap();
                     request.snapshots.as_mut().unwrap().executable.digest.sha256 = "0".repeat(64);
                 }
@@ -999,7 +1244,7 @@ mod tests {
                     };
                     let mut changed = warrant.warrant().clone();
                     changed.execution_context.target_uid = 1001;
-                    changed.intent_sha256 = changed.intent().unwrap().sha256().unwrap();
+                    crate::synchronize_test_intent(&mut changed);
                     *warrant = CanonicalWarrant::new(changed).unwrap();
                 }
                 _ => unreachable!(),
@@ -1023,7 +1268,7 @@ mod tests {
     fn signed_preparation_verifies_candidate_before_open_and_binds_both_digests() {
         let fixture = Fixture::new();
         let warrant = fixture.warrant();
-        let mut request = fixture.request(signed_hello(&warrant, "sigrun.warrant.v2", 7), None);
+        let mut request = fixture.request(signed_hello(&warrant, "sigrun.warrant.v3", 7), None);
         prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap();
         assert!(
             matches!(&request.prepared.as_ref().unwrap().document, Document::Signed { signer_ids, .. } if signer_ids==&["mandator-alice-yubikey"])
@@ -1040,7 +1285,7 @@ mod tests {
             ctime_nsec: 0,
         });
         let ctime = CanonicalWarrant::new(ctime).unwrap();
-        let mut request = fixture.request(signed_hello(&ctime, "sigrun.warrant.v2", 7), None);
+        let mut request = fixture.request(signed_hello(&ctime, "sigrun.warrant.v3", 7), None);
         let error = prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap_err();
         assert!(
             error
@@ -1060,10 +1305,10 @@ mod tests {
                         sha256: "0".repeat(64),
                     });
             }
-            w.intent_sha256 = w.intent().unwrap().sha256().unwrap();
+            crate::synchronize_test_intent(&mut w);
             let w = CanonicalWarrant::new(w).unwrap();
             let mut request = fixture.request(
-                signed_hello(&w, "sigrun.warrant.v2", 7),
+                signed_hello(&w, "sigrun.warrant.v3", 7),
                 stdin.then_some(b"input".as_slice()),
             );
             let error = prepare(&mut request, &fixture.context, &fixture.budget, 1001).unwrap_err();
@@ -1086,7 +1331,7 @@ mod tests {
         std::fs::remove_file(fixture.dir.path().join("program")).unwrap();
         let mut bad = Vec::new();
         bad.push(signed_hello(&warrant, "wrong-namespace", 7));
-        bad.push(signed_hello(&warrant, "sigrun.warrant.v2", 8));
+        bad.push(signed_hello(&warrant, "sigrun.warrant.v3", 8));
         for field in ["host", "uid", "gid", "target", "ttl", "capability", "root"] {
             let mut w = warrant.warrant().clone();
             match field {
@@ -1105,10 +1350,10 @@ mod tests {
                 "root" => w.command.executable_path = "/outside/program".into(),
                 _ => unreachable!(),
             }
-            w.intent_sha256 = w.intent().unwrap().sha256().unwrap();
+            crate::synchronize_test_intent(&mut w);
             bad.push(signed_hello(
                 &CanonicalWarrant::new(w).unwrap(),
-                "sigrun.warrant.v2",
+                "sigrun.warrant.v3",
                 7,
             ));
         }
@@ -1128,5 +1373,30 @@ mod tests {
             drop(request);
             assert_eq!(fixture.budget.usage(1001), (0, 0));
         }
+    }
+}
+
+#[cfg(test)]
+mod full_account_tests {
+    use super::*;
+    #[test]
+    fn full_named_account_must_match_host_credentials() {
+        let mut w = Csr::parse(include_bytes!(
+            "../../sigrund-core/tests/fixtures/v3-host/warrant.json"
+        ))
+        .unwrap()
+        .warrant()
+        .clone();
+        w.intent.account = sigrund_core::host::Account::Name {
+            name: "root".into(),
+        };
+        use sigrund_core::host::Record;
+        w.intent_sha256 = w.intent.sha256().unwrap();
+        assert!(verify_full_account(&Csr::new(w.clone()).unwrap()).is_err());
+        let (uid, gid, groups) = crate::accounts::resolve(&w.intent.account).unwrap();
+        w.execution_context.target_uid = uid;
+        w.execution_context.target_gid = gid;
+        w.execution_context.supplementary_gids = groups;
+        verify_full_account(&Csr::new(w).unwrap()).unwrap();
     }
 }

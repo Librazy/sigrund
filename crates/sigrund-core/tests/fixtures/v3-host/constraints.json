@@ -1,0 +1,1 @@
+{"capabilities":[],"executable_model":"digest_memfd","join_namespaces":[],"lsm":"no_transition_required","memory_max":268435456,"memory_swap_max":0,"no_new_privs":true,"pids_max":128,"private_cgroup":true,"private_mount":true,"profile_id":"host-baseline","schema":"sigrund.host-constraints.v1","seccomp":"no_filter_required","securebits":47,"verify_exec_stop":false}

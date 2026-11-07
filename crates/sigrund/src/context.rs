@@ -145,7 +145,7 @@ fn serve(task: &Task, payload: &[u8], stopping: &AtomicBool) -> io::Result<()> {
             if let Some(frame) = reader.read(task.socket.as_raw_fd(), now)? {
                 let query: ContextQuery = sigrund_core::protocol::parse_strict(&frame.payload)
                     .map_err(|e| transport::invalid(e.to_string()))?;
-                if query.version != "2.0" {
+                if query.version != "3.0" {
                     return Err(transport::invalid("unsupported context version"));
                 }
                 writer = Some(FrameWriter::control(

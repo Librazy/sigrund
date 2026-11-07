@@ -74,6 +74,8 @@ fn delegated_platform_gate() {
                 );
             }
             let options = RequestOptions {
+                target: Some("host".into()),
+                security_profile: Some("host-baseline".into()),
                 target_uid: uid,
                 target_gid: uid,
                 supplementary_gids: vec![uid],
@@ -95,6 +97,16 @@ fn delegated_platform_gate() {
             let csr = Csr::from_unsigned(
                 &hello,
                 CsrIdentity {
+                    binding: Some({
+                        use sigrund_core::host::Record;
+                        let mut bundle = sigrund_core::host::BindingBundle::parse(include_bytes!(
+                            "../../sigrund-core/tests/fixtures/v3-host/bundle.json"
+                        ))
+                        .unwrap();
+                        bundle.constraints.capabilities = options.capabilities.clone();
+                        bundle.profile_sha256 = bundle.constraints.sha256().unwrap();
+                        bundle
+                    }),
                     grant_id: id.clone(),
                     host_id: format!("sigrun-host:sha256:{}", "0".repeat(64)),
                     requester_uid: 1001,

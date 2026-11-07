@@ -44,7 +44,9 @@ def main():
         ('diff', ['git', 'diff', '--check']),
         ('python', [sys.executable, '-c', "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').glob('*.py')]"]),
         ('harness-tests', [sys.executable, '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-v']),
+        ('host-vectors', [sys.executable, 'scripts/verify-host-vectors.py']),
         ('namespace-vectors', [sys.executable, 'scripts/namespace-phase0/verify-vectors.py']),
+        ('privileged-build', ['cargo', 'test', '-p', 'sigrund', '--lib', '--test', 'daemon', '--locked', '--no-run', '--message-format=json']),
         ('platform-build', ['cargo', 'test', '-p', 'sigrund', '--test', 'cgroup', '--locked', '--no-run', '--message-format=json']),
     ]
     try:
@@ -61,12 +63,29 @@ def main():
                 value = json.loads(line)
                 if value.get('reason') == 'compiler-artifact' and value['target']['name'] == 'cgroup' and value.get('executable'):
                     manifest['platform_binary'] = value['executable']
+        manifest['privileged_test_binaries'] = {}
+        manifest['privileged_test_sha256'] = {}
+        for line in (args.artifacts / 'privileged-build.log').read_text().splitlines():
+            if not line.startswith('{'):
+                continue
+            value = json.loads(line)
+            if value.get('reason') != 'compiler-artifact' or not value.get('executable') or not value.get('profile', {}).get('test'):
+                continue
+            name = value['target']['name']
+            if name not in ('daemon', 'sigrund'):
+                continue
+            label = 'daemon' if name == 'daemon' else 'library'
+            path = Path(value['executable'])
+            manifest['privileged_test_binaries'][label] = str(path)
+            manifest['privileged_test_sha256'][label] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if set(manifest['privileged_test_binaries']) != {'daemon', 'library'}:
+            raise RuntimeError('Cargo did not report both privileged test executables')
         if 'platform_binary' not in manifest:
             raise RuntimeError('Cargo did not report the cgroup executable')
         if source_digest() != manifest['source_sha256']:
             raise RuntimeError('source changed during verification; repeat against a stable snapshot')
         manifest['binaries'] = {name: hashlib.sha256((REPO / 'target/debug' / name).read_bytes()).hexdigest()
-                                for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve')}
+                                for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-collector')}
         manifest['result'] = 'passed'
         print('Checks passed: ' + str(args.artifacts / 'checks.json'), flush=True)
     except BaseException:

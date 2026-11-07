@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn verify_preparation_requests() {
     let fixture = Fixture::new();
     let daemon = fixture.launch();
+    let binding = fixture.export_binding("host-baseline", 65534);
     let baseline = fs::read_dir(format!("/proc/{}/fd", daemon.0.id()))
         .unwrap()
         .count();
@@ -19,6 +20,14 @@ pub(super) fn verify_preparation_requests() {
         command
             .arg("--socket")
             .arg(&fixture.socket)
+            .args([
+                "--target",
+                "host",
+                "--security-profile",
+                "host-baseline",
+                "--binding-bundle",
+            ])
+            .arg(&binding)
             .arg("--export-csr")
             .arg(&export)
             .args([

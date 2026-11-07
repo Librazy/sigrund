@@ -9,10 +9,11 @@ use sigrund_core::{
 };
 
 #[test]
+#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
 fn exit_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")
-        .args(["--user", "--map-auto", "--map-root-user"])
+        .args(["--mount"])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -57,6 +58,13 @@ fn warrant(f: &Fixture, uid: u32) -> Warrant {
     Csr::from_unsigned(
         &hello,
         CsrIdentity {
+            binding: Some(
+                sigrund::host_registry::live_bundle(
+                    &f.state.join("host-epoch.json"),
+                    "host-baseline",
+                )
+                .unwrap(),
+            ),
             grant_id: new_uuidv7().to_string(),
             host_id: genesis["host_id"].as_str().unwrap().into(),
             requester_uid: uid,
@@ -86,14 +94,37 @@ fn envelope_for(mut w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
     w.execution_context.post_exec_capabilities = Some(
         sigrund_core::executable::CapabilitySets::ordinary(&w.execution_context.capabilities),
     );
-    w.intent_sha256 = w.intent().unwrap().sha256().unwrap();
+    use sigrund_core::host::Record;
+    w.intent.command = w.command.requested();
+    let c = &w.execution_context;
+    w.intent.execution_context = sigrund_core::v3::IntentContext {
+        capabilities: c.capabilities.clone(),
+        env_exact: c.env_exact.clone(),
+        caller_env_allowlist: c.caller_env_allowlist.clone(),
+        umask: c.umask,
+    };
+    w.intent.account = sigrund_core::host::Account::Numeric {
+        uid: c.target_uid,
+        gid: c.target_gid,
+        supplementary_gids: c.supplementary_gids.clone(),
+    };
+    w.intent.policy = sigrund_core::protocol::RequestedPolicy {
+        mode: w.policy.mode.clone(),
+        ttl_secs: w
+            .policy
+            .not_after
+            .map(|end| (end - w.policy.not_before) as u64)
+            .unwrap_or(0),
+    };
+    w.intent.caller_env = w.caller_env.clone();
+    w.intent_sha256 = w.intent.sha256().unwrap();
     let w = CanonicalWarrant::new(w).unwrap();
     let signing = ed25519_dalek::SigningKey::from_bytes(&[key; 32]);
     let mut public = Vec::new();
     ssh_string(b"ssh-ed25519", &mut public);
     ssh_string(&signing.verifying_key().to_bytes(), &mut public);
     let mut message = b"SSHSIG".to_vec();
-    ssh_string(b"sigrun.warrant.v2", &mut message);
+    ssh_string(b"sigrun.warrant.v3", &mut message);
     ssh_string(b"", &mut message);
     ssh_string(b"sha512", &mut message);
     ssh_string(
@@ -106,7 +137,7 @@ fn envelope_for(mut w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
     let mut packet = b"SSHSIG".to_vec();
     packet.extend_from_slice(&1u32.to_be_bytes());
     ssh_string(&public, &mut packet);
-    ssh_string(b"sigrun.warrant.v2", &mut packet);
+    ssh_string(b"sigrun.warrant.v3", &mut packet);
     ssh_string(b"", &mut packet);
     ssh_string(b"sha512", &mut packet);
     ssh_string(&signature, &mut packet);
@@ -120,7 +151,7 @@ fn envelope_for(mut w: Warrant, key: u8, signer_id: &str) -> DsseEnvelope {
     .unwrap()
 }
 fn send_signed(socket: &UnixStream, envelope: &DsseEnvelope) {
-    let hello = serde_json::json!({"version":"2.0","mode":"signed","tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope});
+    let hello = serde_json::json!({"version":"3.0","mode":"signed","tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope});
     send_rights(
         socket,
         &encode_frame(FrameType::ClientHello, &serde_json::to_vec(&hello).unwrap()).unwrap(),
@@ -454,6 +485,7 @@ fn signed_cli_and_restart() {
         let signed = envelope(w, 7);
         let input = f.directory.path().join("warrant.json");
         fs::write(&input, signed.to_jcs().unwrap()).unwrap();
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o644)).unwrap();
         for expected in ["APPROVED", "TIMEOUT"] {
             let status_path = f.directory.path().join(format!("{expected}.status"));
             let status = File::create(&status_path).unwrap();
@@ -673,8 +705,15 @@ fn cancellation_and_durable_failures() {
     let daemon = f.launch();
     let consumed = count(&f);
     assert!(consumed <= 1);
+    // The old epoch cannot redeem, regardless of whether an uncertain write
+    // survived. Fresh preparation and explicit signing bind the new instance.
+    assert_eq!(redeem(&f, &signed).status, "TIMEOUT");
+    assert_eq!(count(&f), consumed);
+    let mut freshly_prepared = warrant(&f, 0);
+    freshly_prepared.grant_id = signed.warrant().unwrap().warrant().grant_id.clone();
+    let newly_approved = envelope(freshly_prepared, 7);
     assert_eq!(
-        redeem(&f, &signed).status,
+        redeem(&f, &newly_approved).status,
         if consumed == 1 { "TIMEOUT" } else { "APPROVED" }
     );
     assert_eq!(count(&f), 1);

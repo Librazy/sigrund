@@ -1,0 +1,983 @@
+{
+  "schema": "sigrund.phase1-qualification.v1",
+  "date_utc": "2026-11-07",
+  "result": "passed",
+  "scope": "v3 host target, local one-time SSH approval, stdio; collector schema and validator only",
+  "platform": {
+    "distribution": "Fedora Linux 44 (Cloud Edition)",
+    "kernel": "6.19.10-300.fc44.x86_64",
+    "architecture": "x86_64",
+    "glibc": "2.43",
+    "uid_map": "0          0 4294967295",
+    "gid_map": "0          0 4294967295",
+    "selinux": "enforcing",
+    "supervisor_selinux_context": "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023",
+    "target_lsm_confinement_claimed": false,
+    "cgroup": "unified v2, delegated memory and pids, swap controls",
+    "verity_filesystem": "ext4, 4096-byte blocks, verity enabled; SHA-256 and SHA-512"
+  },
+  "source": {
+    "sha256": "84bdd0dffddbd8cde12dbffe8414b41efc45c2444677ca9745dc0f91aa9271ed",
+    "algorithm": "scripts/check.py source_digest: sorted repository-relative path + NUL + bytes + NUL for Cargo inputs, crates, scripts, config and packaging; excludes documentation",
+    "rust_inputs_sha256": "873106caf1a5af83ef637a1802270d4a1de0dcbd5e947f982a9c035002244d95",
+    "rust_inputs_algorithm": "same path/NUL/content/NUL algorithm for Cargo.toml, Cargo.lock, rust-toolchain.toml and crates only",
+    "historical_phase0_vectors": "unchanged; independent verifier passed"
+  },
+  "ordinary": {
+    "result": "passed",
+    "command": [
+      "python3",
+      "scripts/check.py",
+      "--artifacts",
+      "/tmp/sigrund-phase1-checks-candidate9-20261107"
+    ],
+    "kernel": "7.2.15-300.fc45.x86_64",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+    "checks": [
+      {
+        "name": "build",
+        "command": [
+          "cargo",
+          "build",
+          "--workspace",
+          "--locked"
+        ],
+        "exit": 0,
+        "log": "build.log"
+      },
+      {
+        "name": "tests",
+        "command": [
+          "cargo",
+          "test",
+          "--workspace",
+          "--locked",
+          "--",
+          "--test-threads=1"
+        ],
+        "exit": 0,
+        "log": "tests.log"
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--locked",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 0,
+        "log": "clippy.log"
+      },
+      {
+        "name": "format",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "exit": 0,
+        "log": "format.log"
+      },
+      {
+        "name": "diff",
+        "command": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "exit": 0,
+        "log": "diff.log"
+      },
+      {
+        "name": "python",
+        "command": [
+          "/usr/bin/python3",
+          "-c",
+          "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').glob('*.py')]"
+        ],
+        "exit": 0,
+        "log": "python.log"
+      },
+      {
+        "name": "harness-tests",
+        "command": [
+          "/usr/bin/python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-v"
+        ],
+        "exit": 0,
+        "log": "harness-tests.log"
+      },
+      {
+        "name": "host-vectors",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/verify-host-vectors.py"
+        ],
+        "exit": 0,
+        "log": "host-vectors.log"
+      },
+      {
+        "name": "namespace-vectors",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/namespace-phase0/verify-vectors.py"
+        ],
+        "exit": 0,
+        "log": "namespace-vectors.log"
+      },
+      {
+        "name": "platform-build",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "sigrund",
+          "--test",
+          "cgroup",
+          "--locked",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "exit": 0,
+        "log": "platform-build.log"
+      }
+    ],
+    "ordinary_rust_test_passes": 171,
+    "python_harness_test_passes": 25,
+    "privileged_cases_qualified_separately": true
+  },
+  "production_binary_sha256": {
+    "sigrund": "fcf7734dcdf1e8bcbf0a8a658ac104717a2f312c914680603bc68a103d3179df",
+    "sigrun": "ebf814ad15e64b210840cd967d7f893e019e9fef567dcfe25bbb6e845d9aff93",
+    "sigrundctl": "af7062ef0041ddc143854015a433aaee195941201fa0ae548078aa7dd3344915",
+    "sigrund-approve": "01f35ebe8ffabd7bb31b6999666f719159034af7e9784ffc904f1554b2857f3f",
+    "sigrund-collector": "d1f637c4d83bff6dd507828667aa5ee5fc91067bcbb8376fb491fcda736a3b0d"
+  },
+  "acceptance": {
+    "result": "passed",
+    "command": [
+      "python3",
+      "scripts/verify-acceptance.py",
+      "--binaries",
+      "/home/lab/sigrund-phase1/target/debug",
+      "--checks",
+      "/home/lab/sigrund-phase1/checks-candidate9.json",
+      "--artifacts",
+      "/home/lab/sigrund-phase1/acceptance-final11-artifacts",
+      "--requester",
+      "lab"
+    ],
+    "gates": [
+      {
+        "gate": "platform",
+        "result": "passed",
+        "log": "platform.log",
+        "command": [
+          "/usr/bin/python3",
+          "/home/lab/sigrund-phase1/scripts/verify-platform.py",
+          "/home/lab/sigrund-phase1/target/debug/deps/cgroup-a4ef8b94a126f89a",
+          "--cgroup-parent",
+          "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb.service"
+        ]
+      },
+      {
+        "gate": "runtime",
+        "result": "passed",
+        "log": "runtime.log",
+        "command": [
+          "/usr/bin/python3",
+          "/home/lab/sigrund-phase1/scripts/verify-runtime.py",
+          "--cgroup-parent",
+          "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb.service",
+          "--binaries",
+          "/home/lab/sigrund-phase1/target/debug",
+          "--systemd"
+        ]
+      },
+      {
+        "gate": "v3",
+        "result": "passed",
+        "log": "v3.log",
+        "command": [
+          "/usr/bin/python3",
+          "/home/lab/sigrund-phase1/scripts/verify-v3.py",
+          "--cgroup-parent",
+          "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb.service",
+          "--binaries",
+          "/home/lab/sigrund-phase1/target/debug"
+        ]
+      },
+      {
+        "gate": "trust",
+        "result": "passed",
+        "log": "trust.log",
+        "command": [
+          "/usr/bin/python3",
+          "/home/lab/sigrund-phase1/scripts/verify-trust.py",
+          "--cgroup-parent",
+          "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb.service",
+          "--binaries",
+          "/home/lab/sigrund-phase1/target/debug",
+          "--artifacts",
+          "/home/lab/sigrund-phase1/acceptance-final11-artifacts/trust"
+        ]
+      },
+      {
+        "gate": "failures",
+        "result": "passed",
+        "log": "failures.log",
+        "command": [
+          "/usr/bin/python3",
+          "/home/lab/sigrund-phase1/scripts/verify-execution.py",
+          "--cgroup-parent",
+          "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb.service",
+          "--binaries",
+          "/home/lab/sigrund-phase1/target/debug",
+          "--artifacts",
+          "/home/lab/sigrund-phase1/acceptance-final11-artifacts/execution",
+          "--strace",
+          "/usr/bin/strace"
+        ]
+      },
+      {
+        "gate": "execution-binding-digest-equality",
+        "result": "passed",
+        "database_bytes": 32,
+        "execution_binding_sha256": "59ae89c04471d560b99799305e6efda413b070e1f9b00234b7ddc6a4784549e5",
+        "payload_sha256": "d4845288ca9210d74992d0dee91c37f209a4602460c2d9fc9556de9b8740736f",
+        "collector_schema_only": true,
+        "mismatches_rejected": 4
+      },
+      {
+        "gate": "offline-workflow",
+        "result": "passed",
+        "csr_sha256": "d4845288ca9210d74992d0dee91c37f209a4602460c2d9fc9556de9b8740736f",
+        "output": "0\n",
+        "replay": "REPLAY_DETECTED"
+      },
+      {
+        "gate": "independent-v3-audit-ratchet",
+        "result": "passed",
+        "records": 6,
+        "last_record_sha256": "88654b5578a48cd22a9e5047091bcca7103cbab4d4a0f41da2b1840faea1e563",
+        "domain": "sigrun-ratchet-v3",
+        "retained_seed_verification": true,
+        "external_rollback_protection": false
+      },
+      {
+        "gate": "binding-and-concurrent-replay",
+        "result": "passed",
+        "mutation": "TIMEOUT",
+        "commits": 1,
+        "replay_after_restart": true,
+        "stdin_mismatch": "STDIN_HASH_MISMATCH",
+        "wrong_uid": "POLICY_VIOLATION"
+      },
+      {
+        "gate": "live-host-binding-substitutions",
+        "result": "passed",
+        "substitutions": [
+          {
+            "substitution": "epoch",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.5010983840038534
+          },
+          {
+            "substitution": "instance",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.5015403969955514
+          },
+          {
+            "substitution": "acquisition",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.501650020996749
+          },
+          {
+            "substitution": "profile",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.5018960640009027
+          },
+          {
+            "substitution": "authority",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.5009567349989084
+          },
+          {
+            "substitution": "credentials",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.502453280998452
+          },
+          {
+            "substitution": "origin",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.5025189029984176
+          },
+          {
+            "substitution": "model",
+            "public_status": "TIMEOUT",
+            "elapsed_secs": 2.5019462769996608
+          }
+        ],
+        "stale_warrant_rejected": true,
+        "stale_bundle_full_only_rejected": true,
+        "stale_export_preserved_and_redemption_rejected": true,
+        "no_consumption": true
+      },
+      {
+        "gate": "host-owned-targets",
+        "result": "passed",
+        "blocked_through_timeout": true,
+        "no_early_refund": true,
+        "reacquired_after_disposal": true,
+        "consumed": 0
+      },
+      {
+        "gate": "host-owned-reviews",
+        "result": "passed",
+        "blocked_through_timeout": true,
+        "no_early_refund": true,
+        "reacquired_after_disposal": true,
+        "consumed": 0
+      },
+      {
+        "gate": "host-owned-target_fds",
+        "result": "passed",
+        "blocked_through_timeout": true,
+        "no_early_refund": true,
+        "reacquired_after_disposal": true,
+        "consumed": 0
+      },
+      {
+        "gate": "host-owned-helpers",
+        "result": "passed",
+        "blocked_through_timeout": true,
+        "no_early_refund": true,
+        "reacquired_after_disposal": true,
+        "consumed": 0
+      },
+      {
+        "gate": "public-context-capacity-independent",
+        "result": "passed",
+        "per_uid_context_slots": 2,
+        "global_context_slots": 8,
+        "execution_admission_allowance": 1,
+        "context_exhaustion_did_not_charge_execution": true,
+        "real_child_exit": 0
+      },
+      {
+        "gate": "thin-input-before-private-account-lookup",
+        "result": "passed",
+        "cases": [
+          {
+            "account_exists": true,
+            "stdin_consumed": 13824,
+            "status": "TIMEOUT",
+            "elapsed_secs": 2.5015954299960868
+          },
+          {
+            "account_exists": false,
+            "stdin_consumed": 13824,
+            "status": "TIMEOUT",
+            "elapsed_secs": 2.5008988350018626
+          }
+        ],
+        "no_workload_output": true,
+        "no_consumption": true
+      },
+      {
+        "gate": "host-account-profile-after-preparation",
+        "result": "passed",
+        "command": [
+          "unshare",
+          "--mount",
+          "--propagation",
+          "private",
+          "/usr/bin/python3",
+          "-c",
+          "import runpy,sys; from pathlib import Path; a=runpy.run_path(sys.argv[1]); a['_host_account_profile_child'](*map(Path,sys.argv[2:]))",
+          "/home/lab/sigrund-phase1/scripts/verify-acceptance.py",
+          "/sys/fs/cgroup/system.slice/sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb.service",
+          "/home/lab/sigrund-phase1/target/debug",
+          "/home/lab/sigrund-phase1/acceptance-final11-artifacts/host-account-profile"
+        ],
+        "child_manifest": "/home/lab/sigrund-phase1/acceptance-final11-artifacts/host-account-profile/manifest.json",
+        "original_name_preserved": true,
+        "resolved_credentials_preserved": true,
+        "immutable_profile_preserved": true
+      },
+      {
+        "gate": "output-and-enforced-limits",
+        "result": "passed",
+        "stdout_bytes": 2097152,
+        "stderr_bytes": 2097152,
+        "blocked_output_cancellation": {
+          "signal": 2,
+          "exit_code": 130,
+          "cleanup_before_drain": true
+        },
+        "oom_signal": 9,
+        "fork_denied_after": 127,
+        "descendants_cleaned": true,
+        "memory_events": {
+          "low": "0",
+          "high": "0",
+          "max": "35",
+          "oom": "1",
+          "oom_kill": "2",
+          "oom_group_kill": "1",
+          "sock_throttled": "0"
+        },
+        "pids_events": {
+          "max": "1"
+        }
+      },
+      {
+        "gate": "failed-job-limit",
+        "result": "passed",
+        "no_readiness": true,
+        "consumed": true,
+        "replay": "REPLAY_DETECTED"
+      },
+      {
+        "gate": "synchronized-partial-tail-recovery",
+        "result": "passed",
+        "identity_preserved": true,
+        "consumption_preserved": true,
+        "independent_audit": {
+          "records": 6,
+          "last_record_sha256": "93c2a2e375933836c0c0e4a4a75d39b7430fdaa5df3af3aec1937132acda2cf7",
+          "domain": "sigrun-ratchet-v3",
+          "retained_seed_verification": true,
+          "external_rollback_protection": false
+        }
+      },
+      {
+        "gate": "coherent-rollback-local-audit-limit",
+        "result": "passed",
+        "coherent_rollback_detected": false,
+        "external_checkpoint_required": true,
+        "old_epoch_redemption_rejected": true,
+        "independent_audit": {
+          "records": 2,
+          "last_record_sha256": "fcc1021ba11c454069e8d521a227b42cb1034a6e06aea1fc770b7d2b71c30030",
+          "domain": "sigrun-ratchet-v3",
+          "retained_seed_verification": true,
+          "external_rollback_protection": false
+        }
+      },
+      {
+        "gate": "operator-workflow",
+        "result": "passed",
+        "requester_uid": 1000,
+        "root_uid": 0,
+        "service_uid": 33,
+        "requester_tty": true,
+        "root_tty": true,
+        "explicit_refusal": "TIMEOUT",
+        "hashed_stdin": true,
+        "packaged_and_foreground": true,
+        "group": "/system.slice/sigrund-mvp-e8255679fbbf.service",
+        "daemon_pid": 38146
+      }
+    ],
+    "runtime_gates": [
+      {
+        "gate": "runtime-runtime",
+        "result": "passed",
+        "observed_uid": 33,
+        "fd_baseline": 45
+      },
+      {
+        "gate": "runtime-registration-shutdown",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-commit-shutdown",
+        "point": "predicate-before",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-commit-shutdown",
+        "point": "wal-before",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-commit-shutdown",
+        "point": "wal-after",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-pre-spawn-readiness-shutdown",
+        "point": "prepare-before",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-pre-spawn-readiness-shutdown",
+        "point": "stop-before-ready",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-blocked-cleanup-shutdown",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-poisoned-shutdown",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-prior-instance-orphan-recovery",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-retained-layout-trust",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-systemd-stop-restart-death",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime-systemd-fatal-escalation",
+        "result": "passed"
+      }
+    ],
+    "trust_gates": [
+      {
+        "gate": "digest-direct",
+        "result": "passed"
+      },
+      {
+        "gate": "file-capabilities",
+        "result": "passed"
+      },
+      {
+        "gate": "ctime",
+        "result": "passed"
+      },
+      {
+        "gate": "mutation",
+        "result": "passed"
+      },
+      {
+        "gate": "noexec",
+        "result": "passed"
+      },
+      {
+        "gate": "tracer-death",
+        "result": "passed"
+      },
+      {
+        "gate": "fs-verity",
+        "result": "passed"
+      }
+    ],
+    "execution_gates": [
+      {
+        "gate": "startup-swap-unavailable",
+        "result": "passed"
+      },
+      {
+        "gate": "startup-clone-fail",
+        "result": "passed"
+      },
+      {
+        "gate": "startup-mount-unavailable",
+        "result": "passed"
+      },
+      {
+        "gate": "step-1",
+        "result": "passed",
+        "duration_secs": 2.548
+      },
+      {
+        "gate": "step-2",
+        "result": "passed",
+        "duration_secs": 2.546
+      },
+      {
+        "gate": "step-3",
+        "result": "passed",
+        "duration_secs": 2.556
+      },
+      {
+        "gate": "step-4",
+        "result": "passed",
+        "duration_secs": 2.545
+      },
+      {
+        "gate": "step-5",
+        "result": "passed",
+        "duration_secs": 2.546
+      },
+      {
+        "gate": "step-6",
+        "result": "passed",
+        "duration_secs": 2.548
+      },
+      {
+        "gate": "step-7",
+        "result": "passed",
+        "duration_secs": 2.546
+      },
+      {
+        "gate": "step-8",
+        "result": "passed",
+        "duration_secs": 2.547
+      },
+      {
+        "gate": "step-9",
+        "result": "passed",
+        "duration_secs": 2.55
+      },
+      {
+        "gate": "step-10",
+        "result": "passed",
+        "duration_secs": 2.547
+      },
+      {
+        "gate": "step-11",
+        "result": "passed",
+        "duration_secs": 2.547
+      },
+      {
+        "gate": "fd-exhaust",
+        "result": "passed",
+        "duration_secs": 2.546
+      },
+      {
+        "gate": "clone-fail",
+        "result": "passed",
+        "duration_secs": 2.545
+      },
+      {
+        "gate": "kill-before-ready",
+        "result": "passed",
+        "duration_secs": 2.548
+      },
+      {
+        "gate": "partial-ready",
+        "result": "passed",
+        "duration_secs": 2.547
+      },
+      {
+        "gate": "excess-ready",
+        "result": "passed",
+        "duration_secs": 2.567
+      },
+      {
+        "gate": "stop-before-ready",
+        "result": "passed",
+        "duration_secs": 4.567
+      },
+      {
+        "gate": "stop-after-ready",
+        "result": "passed",
+        "duration_secs": 4.565
+      },
+      {
+        "gate": "kernel-exec-error",
+        "result": "passed",
+        "duration_secs": 2.555
+      },
+      {
+        "gate": "post-token-pre-exec-death",
+        "result": "passed"
+      },
+      {
+        "gate": "root-tty-workflow",
+        "result": "passed"
+      },
+      {
+        "gate": "control-and-exit-races",
+        "result": "passed"
+      },
+      {
+        "gate": "post-exec-observations",
+        "result": "passed"
+      }
+    ],
+    "syscall_trace_files": 47,
+    "supervisor": {
+      "unit": "sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb",
+      "command": [
+        "systemd-run",
+        "--unit=sigrund-mvp-gate-304f230bbf1847cca73d1f7967e0a1eb",
+        "--property=SELinuxContext=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023",
+        "--wait",
+        "--collect",
+        "--service-type=exec",
+        "--property=Delegate=yes",
+        "--property=KillMode=control-group",
+        "--property=SendSIGKILL=yes",
+        "--property=RuntimeMaxSec=1200s",
+        "--property=TimeoutStopSec=15s",
+        "/usr/bin/python3",
+        "/home/lab/sigrund-phase1/scripts/verify-acceptance.py",
+        "--inside",
+        "--binaries",
+        "/home/lab/sigrund-phase1/target/debug",
+        "--checks",
+        "/home/lab/sigrund-phase1/checks-candidate9.json",
+        "--artifacts",
+        "/home/lab/sigrund-phase1/acceptance-final11-artifacts",
+        "--requester",
+        "lab"
+      ],
+      "cgroup_removed": true,
+      "unit_query": ""
+    }
+  },
+  "privileged_rust": {
+    "result": "passed",
+    "command": [
+      "python3",
+      "/home/lab/sigrund-phase1/scripts/verify-phase1-rust.py",
+      "--daemon-tests",
+      "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+      "--library-tests",
+      "/home/lab/sigrund-phase1/target/debug/deps/sigrund-51ba23e59c78f6b4",
+      "--artifacts",
+      "/home/lab/sigrund-phase1/rust-final10-artifacts"
+    ],
+    "binaries": {
+      "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676": "3867fc78a0e26377c065a3fcda5101b165645b18553177352ee99360b9942887",
+      "/home/lab/sigrund-phase1/target/debug/deps/sigrund-51ba23e59c78f6b4": "03456d464aa6765e411d83a0f2e22a663d6f16febb63dfe8435c939449e1df11"
+    },
+    "gates": [
+      {
+        "gate": "authorization::exit_gate",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+          "--exact",
+          "authorization::exit_gate",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "authorization-exit_gate.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "approver::exit_gate",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+          "--exact",
+          "approver::exit_gate",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "approver-exit_gate.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "daemon_gate_in_user_namespace",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+          "--exact",
+          "daemon_gate_in_user_namespace",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "daemon_gate_in_user_namespace.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "startup::stale_audit_temporary_gate",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+          "--exact",
+          "startup::stale_audit_temporary_gate",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "startup-stale_audit_temporary_gate.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "startup::v3_provisioning_set_gate",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+          "--exact",
+          "startup::v3_provisioning_set_gate",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "startup-v3_provisioning_set_gate.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "storage::exit_gate",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+          "--exact",
+          "storage::exit_gate",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "storage-exit_gate.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "v3::confidentiality_gate",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/daemon-d3a936486236a676",
+          "--exact",
+          "v3::confidentiality_gate",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "v3-confidentiality_gate.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "preparation::tests::final_authorization_rechecks_retained_policy_and_identity",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/sigrund-51ba23e59c78f6b4",
+          "--exact",
+          "preparation::tests::final_authorization_rechecks_retained_policy_and_identity",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "preparation-tests-final_authorization_rechecks_retained_policy_and_identity.log",
+        "result": "passed",
+        "exit_code": 0
+      },
+      {
+        "gate": "host_registry::tests::epoch_registry_requires_live_owner_and_exact_private_review",
+        "command": [
+          "/home/lab/sigrund-phase1/target/debug/deps/sigrund-51ba23e59c78f6b4",
+          "--exact",
+          "host_registry::tests::epoch_registry_requires_live_owner_and_exact_private_review",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "log": "host_registry-tests-epoch_registry_requires_live_owner_and_exact_private_review.log",
+        "result": "passed",
+        "exit_code": 0
+      }
+    ],
+    "source_sha256_at_run": "02d059d4ac050d60c75fc39f837be5a662475504bc654f25dcc4f41358199d75",
+    "final_rust_inputs_and_binaries_unchanged": true,
+    "later_source_change": "Acceptance fixture closes Python SQLite readers and restores SQLite sidecars with a deliberate complete-dataset rollback. No Rust or production binary changes.",
+    "supervisor_runtime_limit_secs": 900,
+    "supervisor_cgroup_removed": true,
+    "supervisor_command": [
+      "systemd-run",
+      "--unit=sigrund-phase1-rust-final10",
+      "--wait",
+      "--collect",
+      "--property=Delegate=yes",
+      "--property=RuntimeMaxSec=900",
+      "--property=KillMode=control-group",
+      "--property=SELinuxContext=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023",
+      "/bin/bash",
+      "/home/lab/sigrund-phase1/sigrund-phase1-rust-final10.sh"
+    ]
+  },
+  "additional_privileged_rust": {
+    "result": "passed",
+    "binary_sha256": "03456d464aa6765e411d83a0f2e22a663d6f16febb63dfe8435c939449e1df11",
+    "gates": [
+      {
+        "gate": "composefs::tests::privileged_store_protection_and_bounds",
+        "command": [
+          "unshare",
+          "--mount",
+          "--propagation",
+          "private",
+          "/home/lab/sigrund-phase1/target/debug/deps/sigrund-51ba23e59c78f6b4",
+          "--exact",
+          "composefs::tests::privileged_store_protection_and_bounds",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "result": "passed",
+        "log": "composefs-tests-privileged_store_protection_and_bounds.log"
+      },
+      {
+        "gate": "executable::tests::composefs_rehash_detects_data_changes_hidden_by_metacopy",
+        "command": [
+          "unshare",
+          "--mount",
+          "--propagation",
+          "private",
+          "/home/lab/sigrund-phase1/target/debug/deps/sigrund-51ba23e59c78f6b4",
+          "--exact",
+          "executable::tests::composefs_rehash_detects_data_changes_hidden_by_metacopy",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "result": "passed",
+        "log": "executable-tests-composefs_rehash_detects_data_changes_hidden_by_metacopy.log"
+      }
+    ],
+    "supervisor_runtime_limit_secs": 150,
+    "supervisor_cgroup_removed": true
+  },
+  "raw_manifest_sha256": {
+    "ordinary-final/checks.json": "edf4268f3b6a92f6bfedc0dd6277ede4000f600dc87a0c21c4a34cc05a19c3b9",
+    "acceptance-final11-artifacts/manifest.json": "4b2a7925fd1cd5dda73c3233e417f26dede0d19a552ec21a3b9443acd12b712e",
+    "acceptance-final11-artifacts/supervisor.json": "91cc29c47bacc4c985126697161fa275eecafd562372817cb1e36869ea515825",
+    "acceptance-final11-artifacts/trust/manifest.json": "5dc12dc6cae15a863bc19ce4fbb8472fb7489dfa5e6d1deb58f153fe4df12624",
+    "acceptance-final11-artifacts/execution/manifest.json": "0b7cb854d969f5f4c9518c110d1c28de6840d680ddee66c0f27d38b385fa0a64",
+    "acceptance-final11-artifacts/host-account-profile/manifest.json": "1f6559646add2cdd13d6ea61b9b4d09d0a3ce5f311a50725e6a394802a69e63a",
+    "rust-final10-artifacts/manifest.json": "ee184f92984a76e3e945fb8c7a99691c5fbcd05a5ae02c03810ae4123ed2af5e",
+    "extra-rust-artifacts/manifest.json": "a202606d732fdbf1d0165a76d87faf595bcb3734a80629564d3c36b9c64a3e54"
+  },
+  "raw_artifacts_private_directory": "/tmp/sigrund-phase1-evidence",
+  "v_case_dispositions": "docs/NAMESPACE_AWARE_EXECUTION.md, Phase 1 host qualification: V-01-V-20",
+  "skipped_privileged_cases_in_qualified_host_scope": [],
+  "not_qualified": [
+    "container/self/process/registered target execution",
+    "target LSM transitions and inherited seccomp equivalence",
+    "remote mTLS/ACK/receipt runtime",
+    "trusted hook execution",
+    "PTY workflow",
+    "policy reload and reusable grants",
+    "physical FIDO device interaction",
+    "additional architectures and arbitrary filesystems",
+    "external coordinated-rollback protection"
+  ],
+  "cleanup": {
+    "supervised_jobs_and_cgroups_removed": true,
+    "disposable_vm_removed": true,
+    "disposable_vm_id": 9033,
+    "command": [
+      "pvem",
+      "destroy",
+      "9033",
+      "--yes"
+    ],
+    "raw_artifacts_preserved_privately": true
+  }
+}

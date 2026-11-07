@@ -26,7 +26,7 @@ fn v3_openssh_fixture_binds_intent_target_and_profile_and_rejects_v2() {
     assert!(
         key.verify(
             "sigrun.warrant.v3",
-            &pae(sigrund_core::crypto::WARRANT_PAYLOAD_TYPE, payload),
+            &pae("application/vnd.sigrun.warrant.v2+json", payload),
             &signature
         )
         .is_err()
@@ -41,7 +41,7 @@ fn v3_openssh_fixture_binds_intent_target_and_profile_and_rejects_v2() {
             false,
             false
         )
-        .is_err()
+        .is_ok()
     );
     assert!(sigrund_core::warrant::CanonicalWarrant::parse(payload).is_err());
 

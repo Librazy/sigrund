@@ -54,10 +54,11 @@ impl Fixture {
 }
 
 #[test]
+#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
 fn exit_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")
-        .args(["--user", "--map-auto", "--map-root-user"])
+        .args(["--mount"])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -134,6 +135,10 @@ fn namespace_fixture() {
         .arg("--socket")
         .arg(&fixture.socket)
         .args([
+            "--target",
+            "host",
+            "--security-profile",
+            "host-baseline-cap",
             "--target-uid",
             "33",
             "--target-gid",
@@ -394,6 +399,8 @@ fn launch_approver_with(
         .arg(&fixture.signers)
         .arg("--identity")
         .arg(identity)
+        .arg("--epoch-file")
+        .arg(fixture.state.join("host-epoch.json"))
         .stdin(Stdio::from(slave))
         .stdout(Stdio::null())
         .stderr(File::create(error).unwrap());
@@ -489,7 +496,7 @@ fn signed_response(
             "-Y",
             "sign",
             "-n",
-            "sigrun.warrant.v2",
+            "sigrun.warrant.v3",
             "-O",
             "hashalg=sha512",
             "-f",

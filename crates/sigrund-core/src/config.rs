@@ -20,6 +20,11 @@ const MAX_COLLECTOR_TIMEOUT_MS: u32 = 3_000;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
+    pub version: String,
+    pub host_profiles: Vec<crate::host::Constraints>,
+    pub host_rules: Vec<crate::host::ScopedRule>,
+    #[serde(default)]
+    pub host_limits: crate::host_budget::Limits,
     #[serde(default)]
     pub digest_direct: DigestDirectConfig,
     /// Derived from daemon-side startup inspection, never accepted from TOML.
@@ -224,6 +229,17 @@ impl MvpProfile {
         requester_uid: u32,
     ) -> Result<()> {
         self.validate_hello(hello)?;
+        if hello.mode == "thin_csr"
+            && hello
+                .original_intent
+                .as_ref()
+                .is_some_and(|i| matches!(i.account, crate::host::Account::Name { .. }))
+        {
+            // Named thin intent has no resolved UID yet. Preparation resolves
+            // trusted account data once and applies the same-UID restriction
+            // before source acquisition; its internal placeholder is not an ID.
+            return Ok(());
+        }
         let target = if let Some(context) = &hello.requested_execution_context {
             context.target_uid
         } else {
@@ -369,6 +385,7 @@ pub struct SignerPolicyFile {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignerConfig {
+    pub host_rules: Vec<crate::host::ScopedRule>,
     pub signer_id: String,
     #[serde(rename = "type")]
     pub signature_type: String,
@@ -421,6 +438,25 @@ impl SignerPolicyFile {
         }
         let mut signer_ids = BTreeSet::new();
         for signer in &self.signers {
+            use crate::host::Record;
+            if signer.host_rules.is_empty() || signer.host_rules.len() > 64 {
+                return Err(CoreError::Config(
+                    "signer requires scoped host rules".into(),
+                ));
+            }
+            for rule in &signer.host_rules {
+                rule.validate()?;
+                if !daemon
+                    .host_profiles
+                    .iter()
+                    .any(|p| p.sha256().is_ok_and(|hash| hash == rule.profile_sha256))
+                {
+                    return Err(CoreError::Config(
+                        "signer references unavailable profile".into(),
+                    ));
+                }
+            }
+
             if daemon.mvp.is_some()
                 && !matches!(
                     signer.signature_type.as_str(),
@@ -589,6 +625,46 @@ impl DaemonConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        use crate::host::Record;
+        if self.version != "3.0"
+            || self.host_profiles.is_empty()
+            || self.host_profiles.len() > 16
+            || self.host_rules.is_empty()
+            || self.host_rules.len() > 64
+        {
+            return Err(CoreError::Config(
+                "v3 requires explicit host profiles and scoped rules".into(),
+            ));
+        }
+        self.host_limits.validate()?;
+        let mut profiles = BTreeSet::new();
+        for profile in &self.host_profiles {
+            profile.validate()?;
+            if !profiles.insert(&profile.profile_id)
+                || !self
+                    .executable_trust_models
+                    .contains(&profile.executable_model)
+                || profile.memory_max != self.job_memory_max_bytes
+                || profile.memory_swap_max != self.job_memory_swap_max_bytes
+                || u64::from(profile.pids_max) != self.job_pids_max
+            {
+                return Err(CoreError::Config(
+                    "host profile differs from enforced job configuration".into(),
+                ));
+            }
+        }
+        for rule in &self.host_rules {
+            rule.validate()?;
+            if !self
+                .host_profiles
+                .iter()
+                .any(|p| p.sha256().is_ok_and(|hash| hash == rule.profile_sha256))
+            {
+                return Err(CoreError::Config(
+                    "host rule references unavailable immutable profile".into(),
+                ));
+            }
+        }
         if self.executable_trust_models.is_empty()
             || self
                 .executable_trust_models
@@ -930,6 +1006,25 @@ mod tests {
 
     fn valid() -> DaemonConfig {
         DaemonConfig {
+            version: "3.0".into(),
+            host_limits: Default::default(),
+            host_profiles: vec![{
+                use crate::host::Record;
+                crate::host::Constraints::parse(include_bytes!(
+                    "../tests/fixtures/v3-host/constraints.json"
+                ))
+                .unwrap()
+            }],
+            host_rules: vec![crate::host::ScopedRule {
+                requester_uids: vec![1001],
+                target_scope: "host".into(),
+                target_uids: vec![0, 33],
+                target_gids: vec![0, 33],
+                supplementary_gids: vec![33, 104],
+                profile_sha256: "6135f3b7915f316b816bc26eed46aaa0d2028966850bc769cb69ab169981ffb5"
+                    .into(),
+                cross_owner: true,
+            }],
             digest_direct: DigestDirectConfig::default(),
             admin_trusted_composefs_mounts: vec![],
             executable_trust_models: crate::executable::default_models(),

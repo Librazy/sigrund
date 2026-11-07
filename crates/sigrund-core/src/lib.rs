@@ -8,6 +8,8 @@ pub mod config;
 pub mod crypto;
 pub mod executable;
 pub mod framing;
+pub mod host;
+pub mod host_budget;
 pub mod json;
 pub mod lifecycle;
 pub mod paths;
@@ -15,6 +17,7 @@ pub mod protocol;
 pub mod snapshot;
 mod sqlite_pinned;
 pub mod state;
+pub mod v3;
 pub mod warrant;
 
 use thiserror::Error;

@@ -35,7 +35,7 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
     .unwrap();
     assert_eq!(approver.socket.to_str(), Some("/tmp/approve.sock"));
     assert_eq!(approver.tty.to_str(), Some("/dev/pts/1"));
-    let client = ClientArgs::parse(&args(&[
+    let client = ClientArgs::parse(&client_args(&[
         "--socket",
         "/tmp/client.sock",
         "--",
@@ -50,11 +50,15 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
         ClientArgs::Run {
             socket: "/tmp/client.sock".into(),
             command: args(&["/usr/bin/printf", "--socket", "two words", ""]),
-            options: Box::new(RequestOptions::default())
+            options: Box::new(RequestOptions {
+                target: Some("host".into()),
+                security_profile: Some("host-baseline".into()),
+                ..RequestOptions::default()
+            })
         }
     );
     assert!(matches!(
-        ClientArgs::parse(&args(&["--", "/usr/bin/id"])).unwrap(),
+        ClientArgs::parse(&client_args(&["--", "/usr/bin/id"])).unwrap(),
         ClientArgs::Run { .. }
     ));
     assert_eq!(
@@ -104,13 +108,13 @@ fn invalid_or_ambiguous_cli_forms_are_rejected() {
         &["--encode-signal", "9"],
     ] {
         assert!(
-            ClientArgs::parse(&args(arguments)).is_err(),
+            ClientArgs::parse(&client_args(arguments)).is_err(),
             "{arguments:?}"
         );
     }
     for signal in [1, 2, 10, 12, 15] {
         assert_eq!(
-            ClientArgs::parse(&args(&["--encode-signal", &signal.to_string()])).unwrap(),
+            ClientArgs::parse(&client_args(&["--encode-signal", &signal.to_string()])).unwrap(),
             ClientArgs::EncodeSignal(signal)
         );
     }
@@ -138,7 +142,20 @@ fn shipped_binaries_expose_help_and_reject_invalid_or_unavailable_invocations() 
     }
     assert_eq!(
         Command::new(env!("CARGO_BIN_EXE_sigrun"))
-            .args(["--socket", "/tmp/cli-test.sock", "--", "/usr/bin/id"])
+            .args([
+                "--target",
+                "host",
+                "--security-profile",
+                "host-baseline",
+                "--target-uid",
+                "0",
+                "--target-gid",
+                "0",
+                "--socket",
+                "/tmp/cli-test.sock",
+                "--",
+                "/usr/bin/id"
+            ])
             .output()
             .unwrap()
             .status
@@ -264,3 +281,29 @@ mod request;
 
 #[path = "cli/warrant.rs"]
 mod warrant;
+
+fn client_args(values: &[&str]) -> Vec<String> {
+    let mut result = Vec::new();
+    let end = values
+        .iter()
+        .position(|v| *v == "--")
+        .unwrap_or(values.len());
+    let flags = &values[..end];
+    if !flags.contains(&"--warrant")
+        && !flags.contains(&"--encode-signal")
+        && !flags.contains(&"--validate-hello")
+    {
+        for (flag, value) in [
+            ("--target", "host"),
+            ("--security-profile", "host-baseline"),
+            ("--target-uid", "0"),
+            ("--target-gid", "0"),
+        ] {
+            if !flags.contains(&flag) {
+                result.extend([flag.to_owned(), value.to_owned()]);
+            }
+        }
+    }
+    result.extend(args(values));
+    result
+}

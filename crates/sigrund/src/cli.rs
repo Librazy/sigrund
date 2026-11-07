@@ -11,8 +11,8 @@ use std::{
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
 pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nExecution startup requires a dedicated delegated cgroup service.\n       --authorization-only provides the non-executing authorization diagnostic profile.";
-pub const CLIENT_HELP: &str = "Usage: sigrun [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --full-only --export-csr PATH\n         --socket PATH --target-uid UID --target-gid GID --supplementary-gid GID\n         --capability CAP --cwd PATH --env NAME=VALUE --umask OCTAL\n         --stdin null|sha256 --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: target 0:0, cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nCommands execute in the daemon execution domain. APPROVED confirms durable authorization; separate readiness reports unknown or exec_event_observed, followed by an execution result.";
-pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty and /etc/sigrund/signers.toml.\nOnly UID 0 with a controlling TTY may approve and sign.";
+pub const CLIENT_HELP: &str = "Usage: sigrun --target host --security-profile ID (--account NAME | --target-uid UID --target-gid GID) [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --binding-bundle PATH --full-only --export-csr PATH\n         --socket PATH --supplementary-gid GID --capability CAP\n         --cwd PATH --env NAME=VALUE --umask OCTAL --stdin null|sha256\n         --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nAPPROVED confirms durable authorization; separate readiness reports unknown or exec_event_observed, followed by an execution result.";
+pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] [--epoch-file PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty, /etc/sigrund/signers.toml and /var/lib/sigrund/host-epoch.json.\nOnly UID 0 with a controlling TTY may approve and sign. Private evidence must match the live daemon epoch and exact CSR.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonMode {
@@ -142,6 +142,10 @@ impl ClientArgs {
                 .next()
                 .ok_or_else(|| invalid("missing option value"))?;
             match flag.as_str() {
+                "--target" if value == "host" => options.target = Some(value.clone()),
+                "--security-profile" => options.security_profile = Some(value.clone()),
+                "--account" => options.account = Some(value.clone()),
+                "--binding-bundle" => options.binding_bundle = Some(absolute_path(value)?),
                 "--socket" => socket = absolute_path(value)?,
                 "--warrant" => options.warrant = Some(absolute_path(value)?),
                 "--export-csr" => {
@@ -218,6 +222,29 @@ impl ClientArgs {
         if command.is_empty() {
             return Err(invalid("missing -- and absolute command"));
         }
+        if options.target.as_deref() != Some("host") || options.security_profile.is_none() {
+            return Err(invalid("--target host and --security-profile are required"));
+        }
+        if options.account.is_some() {
+            if !options.supplementary_gids.is_empty()
+                || seen.iter().any(|f| {
+                    matches!(
+                        f.as_str(),
+                        "--target-uid" | "--target-gid" | "--supplementary-gid"
+                    )
+                })
+            {
+                return Err(invalid(
+                    "named and numeric account options are mutually exclusive",
+                ));
+            }
+        } else if !seen.iter().any(|f| f.as_str() == "--target-uid")
+            || !seen.iter().any(|f| f.as_str() == "--target-gid")
+        {
+            return Err(invalid(
+                "select --account or both --target-uid and --target-gid",
+            ));
+        }
         absolute_path(&command[0])?;
         options.capabilities.sort();
         if options.capabilities.windows(2).any(|p| p[0] == p[1]) {
@@ -240,6 +267,10 @@ impl ClientArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestOptions {
+    pub target: Option<String>,
+    pub security_profile: Option<String>,
+    pub account: Option<String>,
+    pub binding_bundle: Option<PathBuf>,
     pub warrant: Option<PathBuf>,
     pub full_only: bool,
     pub export_csr: Option<PathBuf>,
@@ -258,6 +289,10 @@ pub struct RequestOptions {
 impl Default for RequestOptions {
     fn default() -> Self {
         Self {
+            target: None,
+            security_profile: None,
+            account: None,
+            binding_bundle: None,
             warrant: None,
             full_only: false,
             export_csr: None,
@@ -291,7 +326,8 @@ impl RequestOptions {
             .unwrap_or(current)
             .to_str()
             .ok_or_else(|| invalid("cwd is not UTF-8"))?;
-        let hello = ClientHello {
+        let mut hello = ClientHello {
+            original_intent: None,
             csr_payload: None,
             caller_env: BTreeMap::new(),
             mode: "thin_csr".into(),
@@ -322,6 +358,31 @@ impl RequestOptions {
                 ttl_secs: self.ttl_secs,
             }),
         };
+        let requested = hello.requested_execution_context.as_ref().unwrap();
+        hello.original_intent = Some(sigrund_core::v3::Intent {
+            target: sigrund_core::host::Selector::Host {},
+            account: match &self.account {
+                Some(name) => sigrund_core::host::Account::Name { name: name.clone() },
+                None => sigrund_core::host::Account::Numeric {
+                    uid: self.target_uid,
+                    gid: self.target_gid,
+                    supplementary_gids: self.supplementary_gids.clone(),
+                },
+            },
+            security_profile: self
+                .security_profile
+                .clone()
+                .ok_or_else(|| invalid("explicit security profile required"))?,
+            command: hello.requested_command.clone().unwrap(),
+            execution_context: sigrund_core::v3::IntentContext {
+                capabilities: requested.capabilities.clone(),
+                env_exact: requested.env_exact.clone(),
+                caller_env_allowlist: requested.caller_env_allowlist.clone(),
+                umask: requested.umask,
+            },
+            policy: hello.requested_policy.clone().unwrap(),
+            caller_env: hello.caller_env.clone(),
+        });
         hello.validate_request()?;
         Ok(hello)
     }
@@ -344,6 +405,7 @@ pub struct ApprovalArgs {
     pub socket: PathBuf,
     pub tty: PathBuf,
     pub signers: PathBuf,
+    pub epoch_file: PathBuf,
     pub identity: Option<PathBuf>,
 }
 
@@ -353,6 +415,7 @@ impl ApprovalArgs {
             socket: APPROVAL_SOCKET.into(),
             tty: "/dev/tty".into(),
             signers: "/etc/sigrund/signers.toml".into(),
+            epoch_file: crate::host_registry::DEFAULT_EPOCH_FILE.into(),
             identity: None,
         };
         let mut seen = BTreeSet::new();
@@ -365,6 +428,7 @@ impl ApprovalArgs {
                 "--socket" => result.socket = path_value(&mut args)?,
                 "--tty" => result.tty = path_value(&mut args)?,
                 "--signers" => result.signers = path_value(&mut args)?,
+                "--epoch-file" => result.epoch_file = path_value(&mut args)?,
                 "--identity" => result.identity = Some(path_value(&mut args)?),
                 _ => return Err(invalid("unknown approval option")),
             }

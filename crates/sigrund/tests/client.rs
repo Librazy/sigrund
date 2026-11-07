@@ -97,7 +97,7 @@ impl Fixture {
                 });
                 socket.set_nonblocking(false).unwrap();
                 send(&mut socket, FrameType::ServerContext, &serde_json::to_vec(&serde_json::json!({
-                    "version":"2.0", "host_id":format!("sigrun-host:sha256:{}", "0".repeat(64)), "policy_generation":1,
+                    "version":"3.0", "host_id":format!("sigrun-host:sha256:{}", "0".repeat(64)), "policy_generation":1,
                     "executable_trust_models":models,
                     "limits":{"max_executable_bytes":67108864,"max_direct_digest_bytes":268435456,"direct_digest_timeout_ms":5000,
                         "max_stdin_bytes":16777216,"max_ttl_secs":3600,"max_onetime_window_secs":3600,"authorization_timeout_ms":120000},
@@ -111,9 +111,35 @@ impl Fixture {
             path,
         }
     }
+    fn binding(&self, model: &str) -> std::path::PathBuf {
+        use sigrund_core::host::Record;
+        let mut bundle = sigrund_core::host::BindingBundle::parse(include_bytes!(
+            "../../sigrund-core/tests/fixtures/v3-host/bundle.json"
+        ))
+        .unwrap();
+        bundle.host_id = format!("sigrun-host:sha256:{}", "0".repeat(64));
+        bundle.constraints.executable_model =
+            serde_json::from_value(serde_json::json!(model)).unwrap();
+        bundle.constraints.verify_exec_stop = model != "digest_memfd";
+        bundle.profile_sha256 = bundle.constraints.sha256().unwrap();
+        let path = self._dir.path().join("trusted-host-binding.json");
+        fs::write(&path, bundle.canonical().unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        path
+    }
     fn command(&self) -> Command {
         let mut command = Command::new(self._dir.path().join("sigrun"));
         command
+            .args([
+                "--target",
+                "host",
+                "--security-profile",
+                "host-baseline",
+                "--target-uid",
+                "0",
+                "--target-gid",
+                "0",
+            ])
             .arg("--socket")
             .arg(&self.path)
             .stdin(Stdio::null())
@@ -324,16 +350,18 @@ fn client_namespace_fixture() {
     verify_signals_and_blocked_sink(false);
     verify_signals_and_blocked_sink(true);
     verify_terminal();
-    verify_ctime_online_and_offline_selection();
+    verify_cross_domain_binding_preserves_thin_and_refuses_local_export();
 }
 
-fn verify_ctime_online_and_offline_selection() {
+fn verify_cross_domain_binding_preserves_thin_and_refuses_local_export() {
     for offline in [false, true] {
         let fixture = Fixture::with_models(&["ctime", "digest_direct", "digest_memfd"], true);
         let program = fixture._dir.path().join("program");
         fs::copy("/bin/true", &program).unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let binding = fixture.binding(if offline { "digest_direct" } else { "ctime" });
         let mut command = fixture.command();
+        command.arg("--binding-bundle").arg(binding);
         if offline {
             let export = fixture._dir.path().join("export");
             fs::create_dir(&export).unwrap();
@@ -346,17 +374,14 @@ fn verify_ctime_online_and_offline_selection() {
                 .arg(&program)
                 .output()
                 .unwrap();
+            assert!(!output.status.success());
             assert!(
-                output.status.success(),
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("local host preparation domain differs"),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let value: serde_json::Value =
-                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-            assert_eq!(
-                value["command"]["executable_trust"]["model"],
-                "digest_direct"
-            );
+            assert!(!path.exists());
             assert!(fixture.listener.set_nonblocking(true).is_ok());
             assert_eq!(
                 fixture.listener.accept().unwrap_err().kind(),
@@ -368,10 +393,21 @@ fn verify_ctime_online_and_offline_selection() {
             socket.set_nonblocking(true).unwrap();
             let frame = hello(&socket);
             let hello: ClientHello = serde_json::from_slice(&frame.payload).unwrap();
-            assert_eq!(hello.mode, "full_csr");
-            let value: serde_json::Value =
-                serde_json::from_str(hello.csr_payload.as_ref().unwrap()).unwrap();
-            assert_eq!(value["command"]["executable_trust"]["model"], "ctime");
+            assert_eq!(hello.mode, "thin_csr");
+            assert!(hello.csr_payload.is_none());
+            assert_eq!(
+                hello
+                    .original_intent
+                    .as_ref()
+                    .unwrap()
+                    .command
+                    .executable_path,
+                program.to_str().unwrap()
+            );
+            assert_eq!(
+                hello.original_intent.as_ref().unwrap().security_profile,
+                "host-baseline"
+            );
             decide(&mut socket, "REJECTED");
             assert_eq!(child.wait().unwrap().code(), Some(255));
         }
@@ -382,6 +418,8 @@ fn verify_ctime_online_and_offline_selection() {
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
     let output = fixture
         .command()
+        .arg("--binding-bundle")
+        .arg(fixture.binding("ctime"))
         .arg("--export-csr")
         .arg(fixture._dir.path().join("must-not-exist"))
         .arg("--")
@@ -390,7 +428,7 @@ fn verify_ctime_online_and_offline_selection() {
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no enabled executable model applies"),
+        String::from_utf8_lossy(&output.stderr).contains("local host preparation domain differs"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -563,8 +601,16 @@ fn verify_slow_and_broken_output() {
             }
         });
         if broken {
+            let mut reports = std::io::BufReader::new(&mut report);
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reports, &mut line).unwrap();
+            assert!(line.contains("APPROVED"));
             drop(sink);
-            assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+            match socket.read(&mut [0]) {
+                Ok(0) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => (),
+                result => panic!("broken local sink did not disconnect: {result:?}"),
+            }
             wait(|| child.try_wait().unwrap().is_some());
             assert_eq!(child.wait().unwrap().code(), Some(254));
         } else {

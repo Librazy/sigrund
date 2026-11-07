@@ -26,7 +26,7 @@ fn executable_models_are_ordered_nonempty_and_captured() {
     cfg.validate().unwrap();
     let store = sigrund_core::config::PolicyStore::new(cfg.clone());
     let captured = store.capture();
-    cfg.executable_trust_models = vec![TrustModel::FsVerity];
+    cfg.executable_trust_models = vec![TrustModel::FsVerity, TrustModel::DigestMemfd];
     store.reload(cfg.clone()).unwrap();
     assert_eq!(
         captured.executable_trust_models,
@@ -34,7 +34,7 @@ fn executable_models_are_ordered_nonempty_and_captured() {
     );
     assert_eq!(
         store.capture().executable_trust_models,
-        vec![TrustModel::FsVerity]
+        vec![TrustModel::FsVerity, TrustModel::DigestMemfd]
     );
     cfg.executable_trust_models.clear();
     assert!(cfg.validate().is_err());
@@ -98,7 +98,7 @@ fn profile_restrictions_apply_to_signed_and_unsigned_requests() {
     let profile = MvpProfile::default();
     let signed_hello = |warrant| -> ClientHello {
         parse_strict(&serde_json::to_vec(&json!({
-            "version":"2.0", "mode": "signed", "tty_mode": "stdio", "caller_env": {}, "dsse_envelope": signed(warrant)
+            "version":"3.0", "mode": "signed", "tty_mode": "stdio", "caller_env": {}, "dsse_envelope": signed(warrant)
         })).unwrap()).unwrap()
     };
     for mode in ["null", "sha256"] {
@@ -228,4 +228,26 @@ fn direct_digest_limits_are_independent_bounded_and_captured() {
         cfg.direct_digest_timeout_ms = timeout;
         assert!(cfg.validate().is_err());
     }
+}
+
+#[test]
+fn unresolved_named_thin_account_is_not_the_internal_numeric_placeholder() {
+    let profile = MvpProfile::default();
+    let mut named = unsigned();
+    named.original_intent.as_mut().unwrap().account = sigrund_core::host::Account::Name {
+        name: "target".into(),
+    };
+    named
+        .requested_execution_context
+        .as_mut()
+        .unwrap()
+        .target_uid = 0;
+    profile.validate_for_peer(&named, 0).unwrap();
+    let mut numeric = unsigned();
+    numeric
+        .requested_execution_context
+        .as_mut()
+        .unwrap()
+        .target_uid = 0;
+    assert!(profile.validate_for_peer(&numeric, 0).is_err());
 }

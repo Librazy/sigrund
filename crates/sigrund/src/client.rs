@@ -412,6 +412,7 @@ fn signed_hello(bytes: &[u8]) -> io::Result<ClientHello> {
     let envelope: DsseEnvelope = parse_strict(bytes).map_err(|e| invalid(e.to_string()))?;
     let warrant = envelope.warrant().map_err(|e| invalid(e.to_string()))?;
     let hello = ClientHello {
+        original_intent: None,
         csr_payload: None,
         caller_env: warrant.warrant().caller_env.clone(),
         mode: "signed".into(),
@@ -440,7 +441,7 @@ fn public_context(
     let deadline = Instant::now() + transport::FRAME_TIMEOUT;
     let mut writer = FrameWriter::control(
         FrameType::ClientContextQuery,
-        br#"{"version":"2.0"}"#,
+        br#"{"version":"3.0"}"#,
         Instant::now(),
     )?;
     while !writer.write(socket.as_raw_fd(), Instant::now())? {
@@ -477,7 +478,7 @@ fn public_context(
             Some(deadline),
         )?;
     };
-    if result.version != "2.0"
+    if result.version != "3.0"
         || result.policy_generation == 0
         || result.executable_trust_models.is_empty()
         || result.executable_trust_models.len() > 4
@@ -512,26 +513,52 @@ fn full_csr(
     public: &sigrund_core::protocol::PublicContext,
     stdin_sha256: Option<String>,
     purpose: crate::executable::EvidencePurpose,
+    binding_path: Option<&Path>,
 ) -> io::Result<Csr> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use sigrund_core::host::Record;
+    let path =
+        binding_path.ok_or_else(|| transport::invalid("trusted host binding bundle required"))?;
+    let mut bytes = Vec::new();
+    File::open(path)?.take(65_537).read_to_end(&mut bytes)?;
+    let bundle = sigrund_core::host::BindingBundle::parse(&bytes).map_err(io::Error::other)?;
+    let original = hello
+        .original_intent
+        .as_ref()
+        .ok_or_else(|| transport::invalid("missing original intent"))?;
+    if bundle.host_id != public.host_id
+        || bundle.constraints.profile_id != original.security_profile
+        || bundle.constraints.capabilities != original.execution_context.capabilities
+    {
+        return Err(transport::invalid(
+            "host bundle authority or profile differs",
+        ));
+    }
+    let (root, relative) = crate::host_target::preparation_root(
+        &bundle,
+        Path::new(&original.command.executable_path),
+    )?;
+    let mut hello = hello.clone();
+    let (uid, gid, groups) = crate::accounts::resolve(&original.account)?;
+    hello.requested_execution_context = Some(original.execution_context.resolve(uid, gid, groups));
+    let mut public = public.clone();
+    if !public
+        .executable_trust_models
+        .contains(&bundle.constraints.executable_model)
+    {
+        return Err(transport::invalid("bound executable model unavailable"));
+    }
+    public.features.admin_trusted_composefs_mounts = bundle.admin_trusted_composefs_mounts.clone();
+    public.executable_trust_models = vec![bundle.constraints.executable_model];
     let intent = hello
         .intent()
         .map_err(|e| transport::invalid(e.to_string()))?;
-    let slash = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open("/")?;
-    let source: File = crate::linux::openat2_file(
-        slash.as_raw_fd(),
-        Path::new(intent.command.executable_path.trim_start_matches('/')),
-    )?
-    .into();
+    let source: File = crate::linux::openat2_file(root.as_raw_fd(), &relative)?.into();
     let deadline =
         Instant::now() + Duration::from_millis(public.limits.direct_digest_timeout_ms.into());
     let (trust, profile) = crate::executable::client_evidence(
         &source,
         &intent.execution_context,
-        public,
+        &public,
         purpose,
         || {
             if Instant::now() >= deadline {
@@ -546,8 +573,9 @@ fn full_csr(
         .map_err(io::Error::other)?
         .as_secs();
     Csr::from_unsigned(
-        hello,
+        &hello,
         sigrund_core::warrant::CsrIdentity {
+            binding: Some(bundle),
             grant_id: sigrund_core::crypto::new_uuidv7().to_string(),
             host_id: public.host_id.clone(),
             requester_uid: unsafe { libc::getuid() },
@@ -660,6 +688,11 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
     } else {
         None
     };
+    if public.is_none() && options.full_only {
+        return Err(transport::invalid(
+            "public context required for full preparation",
+        ));
+    }
     let mut thin_fallback = false;
     if let Some(public) = &public {
         let purpose = if options.export_csr.is_some() {
@@ -672,6 +705,7 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
             public,
             spool.as_ref().map(|s| s.1.sha256.clone()),
             purpose,
+            options.binding_bundle.as_deref(),
         ) {
             Ok(csr) => {
                 if let Some(export) = &options.export_csr {
@@ -935,6 +969,8 @@ mod signed_input_tests {
         let options = RequestOptions {
             stdin_policy: if hashed_stdin { "sha256" } else { "null" }.into(),
             cwd: Some("/signed-directory".into()),
+            target: Some("host".into()),
+            security_profile: Some("host-baseline".into()),
             ..RequestOptions::default()
         };
         let hello = options
@@ -946,6 +982,13 @@ mod signed_input_tests {
         let csr = Csr::from_unsigned(
             &hello,
             CsrIdentity {
+                binding: Some({
+                    use sigrund_core::host::Record;
+                    sigrund_core::host::BindingBundle::parse(include_bytes!(
+                        "../../sigrund-core/tests/fixtures/v3-host/bundle.json"
+                    ))
+                    .unwrap()
+                }),
                 grant_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into(),
                 host_id: format!("sigrun-host:sha256:{}", "1".repeat(64)),
                 requester_uid: 1001,
@@ -1001,8 +1044,8 @@ mod signed_input_tests {
     fn signed_input_accepts_v2_envelopes_above_the_legacy_wire_limit() {
         let original = envelope(false);
         let mut warrant = original.warrant().unwrap().warrant().clone();
-        warrant.command.argv.extend(vec!["a".repeat(4000); 13]);
-        warrant.intent_sha256 = warrant.intent().unwrap().sha256().unwrap();
+        warrant.command.argv.extend(vec!["a".repeat(4000); 6]);
+        crate::synchronize_test_intent(&mut warrant);
         let envelope = DsseEnvelope::from_warrant(
             &CanonicalWarrant::new(warrant).unwrap(),
             (0..4)
@@ -1038,7 +1081,7 @@ mod signed_input_tests {
                     .push("USER".into()),
                 _ => unreachable!(),
             }
-            warrant.intent_sha256 = warrant.intent().unwrap().sha256().unwrap();
+            crate::synchronize_test_intent(&mut warrant);
             let envelope = DsseEnvelope::from_warrant(
                 &CanonicalWarrant::new(warrant).unwrap(),
                 original.signatures.clone(),
@@ -1057,7 +1100,7 @@ mod signed_input_tests {
         assert!(signed_hello(&serde_json::to_vec(&wrong).unwrap()).is_err());
         assert_eq!(
             WARRANT_PAYLOAD_TYPE,
-            "application/vnd.sigrun.warrant.v2+json"
+            "application/vnd.sigrun.warrant.v3+json"
         );
     }
 }

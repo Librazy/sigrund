@@ -68,7 +68,7 @@ def connect_envelope(fixture, envelope):
     stream = socket.socket(socket.AF_UNIX)
     stream.settimeout(6)
     stream.connect(str(fixture.client))
-    hello = frame(1, {'version': '2.0', 'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
+    hello = frame(1, {'version': '3.0', 'mode': 'signed', 'tty_mode': 'stdio', 'caller_env': {}, 'dsse_envelope': envelope})
     with open('/dev/null', 'r+b') as null:
         stream.sendmsg([hello[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                     array.array('i', [null.fileno(), null.fileno()]))])
@@ -229,15 +229,20 @@ def root_tty_workflow(parent, binaries, evidence):
         with open(directory / 'approver.stderr', 'wb') as errors:
             approver = subprocess.Popen([str(binaries / 'sigrund-approve'), '--socket', str(fixture.approval),
                                          '--tty', '/dev/tty', '--signers', str(fixture.base / 'signers'),
-                                         '--identity', str(fixture.key)], stdin=slave, stdout=slave,
+                                         '--identity', str(fixture.key), '--epoch-file', str(fixture.state / 'host-epoch.json')], stdin=slave, stdout=slave,
                                         stderr=errors, preexec_fn=controlling_tty)
         wait_for(lambda: any('SOCKET_ADMITTED' in line and '"broker":true' in line
                             for line in fixture.diagnostics.read_text().splitlines()), 'root approver attachment')
-        for approve in (False, True):
-            status_path = directory / ('approved.status.jsonl' if approve else 'refused.status.jsonl')
+        for full, approve in ((False, False), (False, True), (True, False), (True, True)):
+            label = ('full-' if full else 'thin-') + ('approved' if approve else 'refused')
+            status_path = directory / (label + '.status.jsonl')
+            commits_before = sum(r.get('event_type') == 'AUTH_COMMIT' for r in fixture.records())
             with open(status_path, 'w+b') as status:
                 command = [str(fixture.client_binary), '--socket', str(fixture.client),
-                           '--cwd', '/', '--status-fd', str(status.fileno()), '--', str(fixture.commands / 'id'), '-u']
+                           '--target', 'host', '--security-profile', fixture.profile_id('digest_memfd'),
+                           '--target-uid', '0', '--target-gid', '0', '--cwd', '/', '--status-fd', str(status.fileno())]
+                if full: command += ['--binding-bundle', str(fixture.export_binding())]
+                command += ['--', str(fixture.commands / 'id'), '-u']
                 client = subprocess.Popen(command, preexec_fn=unprivileged, pass_fds=(status.fileno(),),
                                           cwd='/', stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 prompt = b''
@@ -248,8 +253,8 @@ def root_tty_workflow(parent, binaries, evidence):
                     if select.select([master], [], [], 0)[0]:
                         prompt += os.read(master, 4096)
                     assert len(prompt) <= 1048576
-                (directory / ('approved.prompt.txt' if approve else 'refused.prompt.txt')).write_bytes(prompt)
-                for field in (b'requester_uid', b'target_uid', b'argv', b'executable_trust', b'host_id', b'grant_id'):
+                (directory / (label + '.prompt.txt')).write_bytes(prompt)
+                for field in (b'requester_uid', b'target_uid', b'argv', b'executable_trust', b'host_id', b'grant_id', b'daemon_epoch', b'instance_id', b'uid_map', b'gid_map', b'securebits', b'no_new_privs', b'profile_sha256'):
                     assert field in prompt, (field, prompt)
                 assert b'65534' in prompt and b'id' in prompt
                 os.write(master, b'yes\n' if approve else b'no\n')
@@ -257,7 +262,7 @@ def root_tty_workflow(parent, binaries, evidence):
                 status.seek(0)
                 events = [json.loads(line) for line in status]
             if approve:
-                assert client.returncode == 0 and stdout == b'0\n' and stderr == CLIENT_PROGRESS, (client.returncode, stdout, stderr, events)
+                assert client.returncode == 0 and stdout == b'0\n' and stderr.endswith(CLIENT_PROGRESS), (client.returncode, stdout, stderr, events)
                 assert [e.get('status') for e in events] == ['APPROVED', None, 'EXITED'], events
                 assert exit_fields(events[-1]) == {'exit_code': 0, 'signal': None}
                 records = records_for(fixture, events[0])
@@ -265,8 +270,8 @@ def root_tty_workflow(parent, binaries, evidence):
                 assert records[0]['requester_uid'] == 65534 and records[0]['target_uid'] == 0
             else:
                 assert client.returncode == 255 and not stdout, (client.returncode, stdout, stderr, events)
-                assert len(events) == 1 and events[0]['status'] == 'REJECTED', events
-                assert not any(r.get('event_type') == 'AUTH_COMMIT' for r in fixture.records())
+                assert len(events) == 1 and events[0]['status'] == ('REJECTED' if full else 'TIMEOUT'), events
+                assert sum(r.get('event_type') == 'AUTH_COMMIT' for r in fixture.records()) == commits_before
             wait_for(fixture.empty, 'root-TTY workflow cleanup')
         fixture.stop()
         evidence.passed('root-tty-workflow', requester_uid=65534, approver_uid=0, target_uid=0,
@@ -355,6 +360,8 @@ def observed_execution(parent, binaries, evidence, strace):
         policy = fixture.base / 'signers'
         policy.write_text(policy.read_text().replace('allowed_supplementary_gids = [33, 104]',
                                                      'allowed_supplementary_gids = [0, 33, 104]'))
+        for path in (fixture.base / 'signers', fixture.base / 'config'):
+            path.write_text(path.read_text().replace('supplementary_gids = [33, 104]', 'supplementary_gids = [0, 33, 104]'))
         probe = fixture.commands / 'probe'
         subprocess.run(['cc', '-std=gnu11', '-O2', '-Wall', '-Werror', '-o', str(probe),
                         str(REPO / 'crates/sigrund/tests/fixtures/execution/setup.c')], check=True)

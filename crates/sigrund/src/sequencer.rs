@@ -11,7 +11,7 @@ use crate::{
 use sigrund_core::{
     crypto::sha256_hex,
     lifecycle::{Lifecycle, Phase},
-    state::{AuthorizationRequest, AuthorizationResult, GrantMode},
+    state::AuthorizationResult,
 };
 use std::{
     io,
@@ -391,30 +391,19 @@ fn authorize(
         });
     }
     let w = verified.warrant.warrant();
+    use sigrund_core::host::Record;
+    let binding_digest = w
+        .execution_binding()
+        .map_err(|e| e.to_string())?
+        .sha256()
+        .map_err(|e| e.to_string())?;
     let candidates: Vec<_> = verified.signer_ids.iter().map(String::as_str).collect();
     let (result, signer_id) = resources
         .store
-        .authorize_candidates_guarded(
-            AuthorizationRequest {
-                exec_id: &task.exec_id,
-                request_origin: &w.request_origin,
-                intent_sha256: &w.intent_sha256,
-                approval_exec_id: w.approval_exec_id.as_deref(),
-                grant_id: &w.grant_id,
-                payload: verified.warrant.as_bytes(),
-                signer_id: candidates[0],
-                requester_uid: request.requester_uid,
-                mode: match w.policy.mode.as_str() {
-                    "one_time" => GrantMode::OneTime,
-                    "time_range" => GrantMode::TimeRange,
-                    "permanent" => GrantMode::Permanent,
-                    _ => return Err("unsupported grant mode".into()),
-                },
-                not_before: w.policy.not_before,
-                not_after: w.policy.not_after,
-                now: 0,
-            },
-            &candidates[1..],
+        .authorize_warrant_candidates_guarded(
+            &task.exec_id,
+            &verified.warrant,
+            &candidates,
             realtime,
             || {
                 let (permit, reply) = sync_channel(1);
@@ -437,9 +426,10 @@ fn authorize(
             },
         )
         .map_err(|e| format!("authorization database failed; reconciliation required: {e}"))?;
-    let signer_id = signer_id.map(str::to_owned);
     let limit = request.policy.audit_record_max_bytes as usize;
     let fields = serde_json::json!({"exec_id":task.exec_id,"request_origin":w.request_origin,"intent_sha256":w.intent_sha256,"approval_exec_id":w.approval_exec_id, "grant_id":w.grant_id,
+        "execution_binding_sha256": binding_digest,
+        "target_binding":w.target_binding,"security_constraints":w.security_constraints,
         "payload_sha256":sha256_hex(verified.warrant.as_bytes()), "signer_id":signer_id,
         "policy_mode":w.policy.mode,"not_before":w.policy.not_before,"not_after":w.policy.not_after,
         "requester_uid":w.requester_uid,"requester_gid":w.requester_gid,

@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RATCHET_DOMAIN: &[u8] = b"sigrun-ratchet-v2";
+pub const RATCHET_DOMAIN: &[u8] = b"sigrun-ratchet-v3";
 const MAX_RECORD_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -92,9 +92,9 @@ impl AuditLog {
             return Err(CoreError::Database("oversized ratchet state".into()));
         }
         let state: RatchetState = crate::protocol::parse_strict(&bytes)?;
-        if state.schema_version != 2 {
+        if state.schema_version != 3 {
             return Err(CoreError::Database(
-                "ratchet requires schema version 2".into(),
+                "ratchet requires schema version 3".into(),
             ));
         }
         log.seek(SeekFrom::Start(0))
@@ -192,9 +192,9 @@ impl AuditLog {
             .map_err(|e| CoreError::Database(format!("read audit state: {e}")))?;
         let state: RatchetState = serde_json::from_slice(&state_bytes)
             .map_err(|e| CoreError::Database(format!("parse audit state: {e}")))?;
-        if state.schema_version != 2 {
+        if state.schema_version != 3 {
             return Err(CoreError::Database(
-                "ratchet requires schema version 2".into(),
+                "ratchet requires schema version 3".into(),
             ));
         }
         let key = decode_hex_32(&state.key_hex)?;
@@ -289,7 +289,7 @@ impl AuditLog {
                 "invalid event type or reserved audit field".into(),
             ));
         }
-        body.insert("schema_version".into(), 2.into());
+        body.insert("schema_version".into(), 3.into());
         body.insert("event_type".into(), event_type.into());
         body.insert("host_id".into(), self.host_id.clone().into());
         body.insert("seq".into(), self.state.seq.into());
@@ -336,7 +336,7 @@ impl AuditLog {
         let seq = self.state.seq;
         let next_key = next_ratchet_key(&self.key);
         let next_state = RatchetState {
-            schema_version: 2,
+            schema_version: 3,
             key_hex: encode_hex(&next_key),
             initial_key_hex: self.state.initial_key_hex.clone(),
             last_record_sha256: record_hash(record),
@@ -634,10 +634,10 @@ fn record_metadata(record: &[u8]) -> Result<(u64, String)> {
     if value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
-        != Some(2)
+        != Some(3)
     {
         return Err(CoreError::Database(
-            "audit record requires schema version 2".into(),
+            "audit record requires schema version 3".into(),
         ));
     }
     if serde_json::to_vec(&value)
@@ -710,7 +710,7 @@ mod tests {
             let log = dir.path().join("audit.jsonl");
             let state = dir.path().join("audit_ratchet.state");
             let genesis_body = serde_json::to_vec(&serde_json::json!({
-                "schema_version":2,"event_type": "AUDIT_INIT", "host_id": "host", "seq": 0,
+                "schema_version":3,"event_type": "AUDIT_INIT", "host_id": "host", "seq": 0,
                 "prev_record_sha256": "0".repeat(64),
             }))
             .unwrap();
@@ -724,7 +724,7 @@ mod tests {
             let genesis = serde_json::to_vec(&genesis_map).unwrap();
             std::fs::write(&log, append_line_bytes(&genesis).unwrap()).unwrap();
             let initial = RatchetState {
-                schema_version: 2,
+                schema_version: 3,
                 key_hex: encode_hex(&next_ratchet_key(&key)),
                 initial_key_hex: Some(encode_hex(&key)),
                 last_record_sha256: record_hash(&genesis),
@@ -742,7 +742,7 @@ mod tests {
 
         fn record(&self) -> Vec<u8> {
             let body = serde_json::to_vec(&serde_json::json!({
-                "schema_version":2,"event_type": "TEST", "host_id": "host", "seq": 1,
+                "schema_version":3,"event_type": "TEST", "host_id": "host", "seq": 1,
                 "prev_record_sha256": record_hash(&self.genesis),
             }))
             .unwrap();
@@ -900,7 +900,7 @@ mod tests {
         writer.append_raw(&record).unwrap();
         drop(writer);
         let corrupt_genesis = serde_json::to_vec(&serde_json::json!({
-            "schema_version":2,"event_type": "AUDIT_INIT", "host_id": "host", "seq": 0,
+            "schema_version":3,"event_type": "AUDIT_INIT", "host_id": "host", "seq": 0,
             "prev_record_sha256": "0".repeat(64), "extra": "tampered",
         }))
         .unwrap();
@@ -989,7 +989,7 @@ mod tests {
         let mut log = OpenOptions::new().append(true).open(&fixture.log).unwrap();
         for seq in 1..=512 {
             let mut record = serde_json::json!({
-                "schema_version":2,"event_type": "TEST", "host_id": "host", "seq": seq,
+                "schema_version":3,"event_type": "TEST", "host_id": "host", "seq": seq,
                 "prev_record_sha256": state.last_record_sha256, "data": "x".repeat(4096),
             });
             record["entry_hmac"] = entry_hmac(&key, &serde_json::to_vec(&record).unwrap()).into();

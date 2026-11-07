@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Native v2 confidentiality, requester access and provenance acceptance gates."""
+"""Native v3 confidentiality, requester access and provenance acceptance gates."""
 import argparse
 import array
 import base64
@@ -51,18 +51,20 @@ def payload(f, executable=None):
 
 
 def hello(w, mode='thin_csr'):
-    common = {'version':'2.0', 'mode':mode, 'tty_mode':'stdio', 'caller_env':{}}
+    common = {'version':'3.0', 'mode':mode, 'tty_mode':'stdio', 'caller_env':{}}
     if mode == 'full_csr':
         return {**common, 'csr_payload':canonical(w).decode()}
-    intent = {'command':{k:v for k,v in w['command'].items() if k not in ('executable_trust','stdin_sha256')},
-              'execution_context':{k:v for k,v in w['execution_context'].items() if k != 'post_exec_capabilities'},
-              'policy':{'mode':w['policy']['mode'],'ttl_secs':w['policy']['not_after']-w['policy']['not_before']}, 'caller_env':{}}
+    intent = copy.deepcopy(w['intent'])
+    intent['command'] = {k:v for k,v in w['command'].items() if k not in ('executable_trust','stdin_sha256')}
+    intent['execution_context'] = {k:v for k,v in w['execution_context'].items() if k not in ('post_exec_capabilities','target_uid','target_gid','supplementary_gids')}
+    intent['account'] = {'kind':'numeric','uid':w['execution_context']['target_uid'],'gid':w['execution_context']['target_gid'], 'supplementary_gids':w['execution_context']['supplementary_gids']}
+    intent['policy'] = {'mode':w['policy']['mode'],'ttl_secs':w['policy']['not_after']-w['policy']['not_before']}
     return {**common,'intent':intent}
 
 
 def submit(peer, body):
     read, write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
-    regular = os.memfd_create('v2-output-observation', os.MFD_CLOEXEC)
+    regular = os.memfd_create('v3-output-observation', os.MFD_CLOEXEC)
     peer.sendmsg([frame(1,body)],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[write,regular]))])
     os.close(write)
     return read, regular
@@ -181,9 +183,11 @@ def gate(parent, binaries):
         # privileged expansion request, even when a mandator is connected.
         approver = broker(f)
         before = f.diagnostics.read_text().count('"event":"SOCKET_ADMITTED"')
-        export_dir = f.base / 'v2-exports'; export_dir.mkdir(); os.chown(export_dir,65534,65534)
+        export_dir = f.base / 'v3-exports'; export_dir.mkdir(); os.chown(export_dir,65534,65534)
+        binding = f.export_binding()
+        selection = ['--target','host','--security-profile',f.profile_id('digest_memfd'),'--binding-bundle',str(binding)]
         for option in (['--full-only'], ['--export-csr',str(export_dir/'missing.csr')]):
-            result = subprocess.run([str(f.client_binary),'--socket',str(f.client),*option,
+            result = subprocess.run([str(f.client_binary),'--socket',str(f.client),*selection,'--target-uid','33','--target-gid','33',*option,
                                      '--',str(f.commands/'missing')],preexec_fn=SHARED['unprivileged'],
                                     input=b'',capture_output=True,timeout=6)
             assert result.returncode == 64 and not result.stdout, result
@@ -196,7 +200,7 @@ def gate(parent, binaries):
         approver = broker(f)
         with open(f.base/'fallback.status','w+b') as status:
             started = time.monotonic()
-            client = subprocess.Popen([str(f.client_binary),'--socket',str(f.client),'--cwd','/',
+            client = subprocess.Popen([str(f.client_binary),'--socket',str(f.client),*selection,'--cwd','/',
                                        '--target-uid','33','--target-gid','33','--status-fd',str(status.fileno()),
                                        '--stdin','sha256',
                                        '--',str(program)],preexec_fn=SHARED['unprivileged'],
@@ -246,11 +250,11 @@ def gate(parent, binaries):
         assert len(commits)==1 and commits[0]['approval_exec_id']==request['exec_id']
         peer = requester_socket(f)
         started = time.monotonic()
-        endpoints = submit(peer,{'version':'2.0','mode':'signed','tty_mode':'stdio','caller_env':{},'dsse_envelope':envelope})
+        endpoints = submit(peer,{'version':'3.0','mode':'signed','tty_mode':'stdio','caller_env':{},'dsse_envelope':envelope})
         timeout(peer,endpoints,started)
         assert len([r for r in f.records() if r.get('event_type')=='AUTH_COMMIT'])==1
         f.stop()
-        print(json.dumps({'gate':'v2-native-access-and-confidentiality','result':'passed','silent_cases':len(cases),'full_rejection':True,'supplementary_groups':True,'thin_execution':True,'thin_redemption_denied':True}),flush=True)
+        print(json.dumps({'gate':'v3-native-access-and-confidentiality','result':'passed','silent_cases':len(cases),'full_rejection':True,'supplementary_groups':True,'thin_execution':True,'thin_redemption_denied':True}),flush=True)
     finally:
         if sys.exc_info()[0] is not None:
             print(f.diagnostics.read_text(), file=sys.stderr)

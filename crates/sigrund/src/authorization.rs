@@ -5,6 +5,7 @@ use crate::{
     workers::ValidatedRequest,
 };
 use sha2::{Digest, Sha256};
+use sigrund_core::host::Record;
 use sigrund_core::{paths::select_root, warrant::CanonicalWarrant};
 use std::{
     ffi::CString,
@@ -71,6 +72,14 @@ pub(crate) fn verify(
     }
     let w = warrant.warrant();
     w.validate().map_err(|_| policy())?;
+    let bundle = request.host_bundle.as_ref().ok_or_else(policy)?;
+    w.verify_bundle(bundle).map_err(|_| policy())?;
+    request
+        .host_lease
+        .as_ref()
+        .ok_or_else(policy)?
+        .verify(bundle)
+        .map_err(|_| policy())?;
     if w.intent().map_err(|_| policy())? != request.hello.intent().map_err(|_| policy())? {
         return Err(policy());
     }

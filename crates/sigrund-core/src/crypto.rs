@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{CoreError, Result};
 
-pub const WARRANT_PAYLOAD_TYPE: &str = "application/vnd.sigrun.warrant.v2+json";
+pub const WARRANT_PAYLOAD_TYPE: &str = "application/vnd.sigrun.warrant.v3+json";
 
 pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload_type.len() + payload.len() + 32);
@@ -94,6 +94,34 @@ pub fn verify_ssh_signature(
     require_user_presence: bool,
     require_user_verification: bool,
 ) -> Result<()> {
+    if payload_type != WARRANT_PAYLOAD_TYPE {
+        return Err(CoreError::Value(
+            "unsupported warrant signing domain".into(),
+        ));
+    }
+    verify_ssh_signature_in_namespace(
+        signature_type,
+        public_key_text,
+        signature_b64,
+        payload_type,
+        payload,
+        require_user_presence,
+        require_user_verification,
+        "sigrun.warrant.v3",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_ssh_signature_in_namespace(
+    signature_type: &str,
+    public_key_text: &str,
+    signature_b64: &str,
+    payload_type: &str,
+    payload: &[u8],
+    require_user_presence: bool,
+    require_user_verification: bool,
+    namespace: &str,
+) -> Result<()> {
     let public_key = PublicKey::from_openssh(public_key_text)
         .map_err(|e| CoreError::Value(format!("invalid SSH public key: {e}")))?;
     let expected_algorithm = match signature_type {
@@ -138,7 +166,7 @@ pub fn verify_ssh_signature(
         }
     }
     public_key
-        .verify("sigrun.warrant.v2", &pae(payload_type, payload), &signature)
+        .verify(namespace, &pae(payload_type, payload), &signature)
         .map_err(|e| CoreError::Value(format!("SSHSIG verification failed: {e}")))
 }
 
@@ -152,7 +180,7 @@ mod tests {
     };
 
     const TEST_PAYLOAD: &[u8] = b"warrant payload";
-    const TEST_NAMESPACE: &str = "sigrun.warrant.v2";
+    const TEST_NAMESPACE: &str = "sigrun.warrant.v3";
 
     /// Build signatures with an independent Ed25519 implementation, including
     /// the authenticator's signed application, flags, and counter for SK keys.
@@ -279,7 +307,7 @@ mod tests {
     fn pae_matches_spec_vector_prefix() {
         let payload = br#"{"grant_id":"0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f","version":"1.0"}"#;
         let encoded = pae(WARRANT_PAYLOAD_TYPE, payload);
-        assert!(encoded.starts_with(b"DSSEv1 38 application/vnd.sigrun.warrant.v2+json "));
+        assert!(encoded.starts_with(b"DSSEv1 38 application/vnd.sigrun.warrant.v3+json "));
         assert_eq!(encoded.len(), 119);
     }
 
