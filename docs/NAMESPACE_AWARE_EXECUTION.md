@@ -224,15 +224,66 @@ features above remain explicitly unqualified; Phase 0 prototypes do not close
 their gates.
 
 
+### Phase 1.5 — Operator workflow for an existing rootless container
+
+**Status:** Planned for a separate implementation PR. Phase 1 supplies the v3
+host workflow. The [Phase 0 record](NAMESPACE_PHASE0.md#g-05-bounded-records-and-administration)
+supplies the registration grammar and evidence contracts.
+
+**User story:** A host operator wants a one-time command to run as a service
+account inside an already-running rootless container B. The operator must be
+able to establish which environment will receive the command and withdraw that
+authority while a request is pending.
+
+1. **Make B available.** Write and exercise an operator recipe on a real
+   rootless deployment. Identify who may start the dedicated single-threaded
+   anchor inside B, how root authenticates and captures it using G-01, which
+   socket and ptrace permissions are required, and who owns cleanup. Use the
+   G-05 registration ID/revision, declared host owner UID and profile digest.
+   Record prerequisites and observed failures, including denied attachment.
+2. **Explain the target at review time.** Produce a private sample review from
+   the captured records. Distinguish the operator's label and declared owner
+   from the observed epoch, instance, root, namespaces and mappings. An operator
+   should be able to explain what the label refers to and which facts justify
+   that claim. Exercise the existing host workflow alongside it: follow a thin
+   request's public TIMEOUT to the private diagnosis by execution ID, and show
+   the immediate REJECTED outcome for explicit refusal of a validated full CSR.
+3. **Exercise replacement and revocation.** Pause a fixture review, replace B
+   under the same name, and record two outcomes. If the anchor dies, its instance
+   becomes invalid. If the old anchor survives, its binding still identifies the
+   old process environment. Revoke the old revision, register the replacement
+   with a fresh instance, and verify that the pending review cannot authorize
+   the replacement. Record what the administrator must do when no manager
+   lifecycle signal is available.
+4. **Simplify the host code before adding selectors.** Give each public v3 wire
+   document one authoritative serialized type and validator shared by client
+   and daemon. Keep private preparation inputs such as ComposeFS enrollment in
+   the trusted binding. Exercise the real parse/serialize paths against existing
+   canonical vectors, unknown-key rejection and target-independent context tests.
+
+**Exit gate:** Deliver the reproducible recipe, private review example and a
+reusable fixture with an account present only in B, distinct executable bytes
+at the same absolute path on host and in B, and a distinguishable destination
+cwd. Record acquisition, revision replacement, revocation and actual cleanup
+on the stated topology. Run Phase 1 host regressions after the wire-type
+consolidation. This milestone exercises registration and review semantics in
+the fixture. Production registry integration and destination preparation belong
+to Phase 2, workload spawn to Phase 3. Record any unsupported anchor topology
+and keep its dependent route gated.
+
 ### Phase 2 — Pinned targets and destination preparation
 
-**Dependencies:** Phase 1; G-01 acquisition and G-05 management contracts.
+**Dependencies:** Phase 1.5's demonstrated anchor workflow, G-01 acquisition and G-05 management contracts.
 **Subsystems:** target registry, workers/helpers, account/path/evidence preparation,
 source access, authorization and cancellation.
 
 **Deliverables:**
 
-- Add administrator-registered and validated daemon-PID-scope process targets.
+- Integrate registered B first. Reuse the Phase 1.5 fixture through the production
+  registry and preparation workers. At the pending-review boundary, revoke or
+  replace the registration and verify that authorization fails for the old
+  revision. Check the destination-only account, executable bytes and cwd.
+- Extend the same ownership path to validated daemon-PID-scope process targets.
   Retain pidfd/proc/namespace/root resources, mappings and lifecycle state; scope
   instances to the daemon epoch and invalidate rather than re-resolve.
 - Revalidate before review/final authorization and retain the same owner for later
@@ -265,7 +316,12 @@ checkpoints and runtime lifecycle.
   capabilities, securebits and NNP; verify the actual final context.
 - Enforce host-controlled job placement/limits, launcher/final-child ownership,
   cancellation, anchor-death teardown, deadlines and descendant cleanup.
-- Exercise all four routes using supported rootful/rootless targets and
+- Run the Phase 2 host → B request end to end first. Observe the actual child's
+  account, executable output and cwd, then cancel a job and verify descendant
+  cleanup. Repeat the pending-review replacement case and check for zero spawn.
+- Next exercise A → host with both public endpoints exposed. Add A → self with
+  the connector handshake and inherited/passed-socket cases, then A → B with
+  independent source and destination lifetimes. Cover supported rootful/rootless targets and
   same-owner/cross-owner policy. Enable self only when its acquisition and
   transport semantics are integrated and verified.
 
@@ -282,6 +338,10 @@ approval, daemon packaging and privileged acceptance.
 
 **Deliverables:**
 
+- Qualify one explicit host → B deployment first using the same fixture,
+  operator recipe and actual child observations. Publish the supported topology,
+  evidence model and enforcement prerequisites for each additional route.
+  Keep G-04's strict concurrent-policy-replacement case open until verified.
 - Implement supported composable SELinux/AppArmor transitions and actual-state
   verification, policy-change handling and declared seccomp restrictions.
   Include memfd checkpoints wherever the approved profile requires them.
@@ -308,6 +368,9 @@ acceptance/release reporting.
 
 **Deliverables:**
 
+- Replay the Phase 1.5 same-name replacement with the old anchor still alive.
+  For a manager-backed target, demonstrate which authenticated manager event or
+  generation check invalidates the old binding and how resolver loss is handled.
 - Add optional manager resolvers scoped by endpoint, owner/tenant and manager
   namespace. Validate their resources through the existing acquisition path;
   names and user-owned metadata confer no independent authority.
@@ -329,13 +392,13 @@ verification ownership, preserving the original proposal's acceptance coverage.
 
 | Requirement | Contract location in main spec | Phases | Required evidence |
 | --- | --- | --- | --- |
-| NS-01 — Routes/deployment | §1.5 | 0, 3–5 | Four routes; rootful/rootless; correct destination account; both client endpoints |
+| NS-01 — Routes/deployment | §1.5 | 0, 1.5, 3–5 | Existing rootless B operator recipe; four routes; rootful/rootless; correct destination account; both client endpoints |
 | NS-02 — Source attribution | §1.5 | 0, 2–3 | Shared/unshared namespaces, inherited/passed sockets, connector exit, exec/credential races |
 | NS-03 — Selector/identity separation | §1.5 | 0–2 | Names/PIDs/inodes/cgroups/images cannot independently authorize or identify a generation |
-| NS-04 — Instance lifetime | §1.5, §4.2 | 0, 2–3 | PID reuse, context/change-and-restore races, anchor death, restart/replacement and daemon restart |
+| NS-04 — Instance lifetime | §1.5, §4.2 | 0, 1.5, 2–3 | Same-name replacement with a surviving anchor; PID reuse, context/change-and-restore races, anchor death, restart/replacement and daemon restart |
 | NS-05 — Mapped authority/injection | §1.1, §4.2 | 0, 2–4 | Nested/unmapped credentials, groups/setgroups, rootless UID 0, injection authority and mapping composition |
 | NS-06 — Scoped/cross-owner policy | §1.5–1.6, §4.1–4.2 | 0–3 | Requester/signer ceilings, cross-owner approval, equal integers in different domains |
-| NS-07 — Destination/access | §2.2.1 | 2, 4 | Different bytes/cwd at same paths, account changes, mutable roots, bounded lookup and requester-access denial |
+| NS-07 — Destination/access | §2.2.1 | 1.5 (fixture), 2, 4 | Different bytes/cwd at same paths, account changes, mutable roots, bounded lookup and requester-access denial |
 | NS-08 — Evidence/provenance | §2.2.1–2.2.2 | 2, 4 | ComposeFS/PrivateMounts, default/full-only/export/thin, unsigned negotiation and signed substitution rejection |
 | NS-09 — Placement | §5.4 | 0, 3–4 | Userns/delegation, cgroup view versus membership, limits, escape boundary and manager teardown |
 | NS-10 — Executor | §5.4 | 0, 3–4 | Root/cwd, namespace ordering, PID/time children, idmapped mounts, final context and syscall-only setup |
@@ -357,8 +420,8 @@ ordinary delegated-platform tests supplement rather than replace real-host gates
 The former proposal is incorporated as follows: goals/deployment and identity
 move to §1.5; destination preparation to §2.2; signed semantics to §3.2 and §4;
 execution/lifecycle to §5.4; confinement to §5.5; acceptance to §8. The native
-backend rationale remains here. CLI examples are deliberately omitted until
-G-05 fixes the grammar; friendly manager names require Phase 5 integration.
+backend rationale remains here. The Phase 0 record distinguishes the draft registration grammar from the
+installed host CLI; friendly manager names require Phase 5 integration.
 
 Keep these independent features deferred unless explicitly selected for a
 separate milestone: PTY, hook runtime, remote collector/ACK runtime, reload,
@@ -372,5 +435,5 @@ application versus Linux ABI versions, JSON/TOML/SQL examples where concrete,
 PAE lengths/hex and intent hashes. Review wire, approval, policy, consumption,
 audit and collector bindings together. All draft schemas need independent
 fixtures before their runtime release. README and implementation notes must
-continue to describe actual v2 behavior; changing this roadmap does not close a
+describe the shipped v3 host behavior; changing this roadmap does not close a
 runtime gate or enable any CLI option.
