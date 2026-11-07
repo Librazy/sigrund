@@ -97,6 +97,19 @@ pub(crate) struct Pending {
     null_stdin: Option<OwnedFd>,
 }
 
+fn verify_full_account(csr: &Csr) -> io::Result<()> {
+    let w = csr.warrant();
+    let (uid, gid, groups) = crate::accounts::resolve(&w.intent.account)?;
+    let c = &w.execution_context;
+    if (uid, gid, &groups) != (c.target_uid, c.target_gid, &c.supplementary_gids) {
+        return Err(fail(
+            "POLICY_VIOLATION",
+            "resolved account differs from full CSR",
+        ));
+    }
+    Ok(())
+}
+
 fn capture_target(request: &mut ValidatedRequest, context: &Context) -> io::Result<()> {
     if request.host_lease.is_none() {
         request.host_lease = Some(
@@ -126,6 +139,18 @@ fn capture_target(request: &mut ValidatedRequest, context: &Context) -> io::Resu
             let (uid, gid, groups) = crate::accounts::resolve(&original.account)?;
             request.hello.requested_execution_context =
                 Some(original.execution_context.resolve(uid, gid, groups));
+        }
+        if request.hello.mode == "full_csr" {
+            let csr = Csr::parse(
+                request
+                    .hello
+                    .csr_payload
+                    .as_ref()
+                    .expect("validated full CSR")
+                    .as_bytes(),
+            )
+            .map_err(io::Error::other)?;
+            verify_full_account(&csr)?;
         }
         let original = if let Some(intent) = &request.hello.original_intent {
             intent.clone()
@@ -1348,5 +1373,30 @@ mod tests {
             drop(request);
             assert_eq!(fixture.budget.usage(1001), (0, 0));
         }
+    }
+}
+
+#[cfg(test)]
+mod full_account_tests {
+    use super::*;
+    #[test]
+    fn full_named_account_must_match_host_credentials() {
+        let mut w = Csr::parse(include_bytes!(
+            "../../sigrund-core/tests/fixtures/v3-host/warrant.json"
+        ))
+        .unwrap()
+        .warrant()
+        .clone();
+        w.intent.account = sigrund_core::host::Account::Name {
+            name: "root".into(),
+        };
+        use sigrund_core::host::Record;
+        w.intent_sha256 = w.intent.sha256().unwrap();
+        assert!(verify_full_account(&Csr::new(w.clone()).unwrap()).is_err());
+        let (uid, gid, groups) = crate::accounts::resolve(&w.intent.account).unwrap();
+        w.execution_context.target_uid = uid;
+        w.execution_context.target_gid = gid;
+        w.execution_context.supplementary_gids = groups;
+        verify_full_account(&Csr::new(w).unwrap()).unwrap();
     }
 }
