@@ -1096,7 +1096,6 @@ impl ForegroundDaemon {
                 authorization_timeout_ms: self.config.authorization_timeout_ms,
             },
             features: ContextFeatures {
-                admin_trusted_composefs_mounts: self.config.admin_trusted_composefs_mounts.clone(),
                 direct_exec_checkpoint: crate::execution::trace_available(),
                 host_file_capabilities: crate::execution::trace_available(),
                 tty_modes: vec!["stdio".into()],

@@ -333,7 +333,12 @@ pub(crate) fn request_provenance(request: &crate::workers::ValidatedRequest) -> 
         "full_csr" | "signed" => Some("client_full"),
         _ => None,
     };
-    let intent = request.hello.intent().ok().and_then(|i| i.sha256().ok());
+    use sigrund_core::host::Record;
+    let intent = request
+        .hello
+        .original_intent()
+        .ok()
+        .and_then(|i| i.sha256().ok());
     serde_json::json!({"request_origin":origin,"intent_sha256":intent,
         "approval_exec_id":if origin==Some("daemon_expanded_thin") {Some(request.exec_id.as_str())} else {None}})
 }

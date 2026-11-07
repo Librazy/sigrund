@@ -109,10 +109,10 @@ impl ProtocolSchema for GrantPolicy {}
 impl Warrant {
     /// Resolved internal view. The complete original selection remains signed
     /// in `intent`, including a named account before numeric resolution.
-    pub fn intent(&self) -> Result<crate::protocol::Intent> {
+    pub fn intent(&self) -> Result<crate::protocol::ResolvedIntent> {
         use crate::host::Record;
         self.intent.validate()?;
-        Ok(crate::protocol::Intent {
+        Ok(crate::protocol::ResolvedIntent {
             command: self.intent.command.clone(),
             execution_context: self.execution_context.requested(),
             policy: self.intent.policy.clone(),

@@ -478,34 +478,7 @@ fn public_context(
             Some(deadline),
         )?;
     };
-    if result.version != "3.0"
-        || result.policy_generation == 0
-        || result.executable_trust_models.is_empty()
-        || result.executable_trust_models.len() > 4
-        || result.features.admin_trusted_composefs_mounts.len() > 1
-        || result.features.admin_trusted_composefs_mounts.contains(&0)
-        || result
-            .executable_trust_models
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != result.executable_trust_models.len()
-        || !result
-            .host_id
-            .strip_prefix("sigrun-host:sha256:")
-            .is_some_and(|v| {
-                v.len() == 64
-                    && v.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-        || result.limits.max_executable_bytes > 67_108_864
-        || result.limits.max_direct_digest_bytes > 1_073_741_824
-        || result.limits.max_stdin_bytes > 16_777_216
-        || !(1..=30_000).contains(&result.limits.direct_digest_timeout_ms)
-        || !(1_000..=300_000).contains(&result.limits.authorization_timeout_ms)
-    {
-        return Err(transport::invalid("invalid public preparation context"));
-    }
+    sigrund_core::host::Record::validate(&result).map_err(io::Error::other)?;
     Ok(result)
 }
 fn full_csr(
@@ -547,7 +520,6 @@ fn full_csr(
     {
         return Err(transport::invalid("bound executable model unavailable"));
     }
-    public.features.admin_trusted_composefs_mounts = bundle.admin_trusted_composefs_mounts.clone();
     public.executable_trust_models = vec![bundle.constraints.executable_model];
     let intent = hello
         .intent()
@@ -559,6 +531,7 @@ fn full_csr(
         &source,
         &intent.execution_context,
         &public,
+        &bundle.admin_trusted_composefs_mounts,
         purpose,
         || {
             if Instant::now() >= deadline {

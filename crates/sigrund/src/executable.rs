@@ -444,6 +444,7 @@ pub(crate) fn client_evidence(
     source: &File,
     context: &RequestedExecutionContext,
     public: &sigrund_core::protocol::PublicContext,
+    admin_trusted_composefs_mounts: &[u64],
     purpose: EvidencePurpose,
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<(ExecutableTrust, CapabilitySets)> {
@@ -476,7 +477,7 @@ pub(crate) fn client_evidence(
             &selection,
             public.limits.max_executable_bytes,
             public.limits.max_direct_digest_bytes,
-            &public.features.admin_trusted_composefs_mounts,
+            admin_trusted_composefs_mounts,
         )?
         else {
             continue;
