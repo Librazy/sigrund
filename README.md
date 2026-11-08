@@ -9,7 +9,10 @@ executes the command, and returns its output and exit status to the requester.
 
 The local **v3 host** profile supports private thin intent and client-generated
 full CSRs, bound to a live daemon epoch, exact numeric credentials and an
-immutable security profile. Container execution remains disabled. See the
+immutable security profile. Phase 2 adds registered process environments and
+private destination preparation/review. Approved namespace previews receive the
+scheduled TIMEOUT without consumption or execution. See the
+[Phase 2 operator and qualification guide](docs/NAMESPACE_PHASE2.md), the
 [Phase 1 implementation and qualification record](docs/NAMESPACE_PHASE1.md),
 [implementation notes](IMPLEMENTATION_NOTES.md) and
 [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>).
@@ -23,7 +26,7 @@ there is no automatic migration or deletion.
 
 ## How the current implementation works
 
-1. `sigrun` requires `--target host`, an explicit account or numeric credentials,
+1. Host execution requires `--target host`, an explicit account or numeric credentials,
    and `--security-profile ID`. With an administrator-distributed live binding
    bundle it queries target-independent context and prepares a full CSR using
    its own file access. Otherwise it submits the unchanged thin intent.
@@ -141,10 +144,12 @@ and policy before using them outside the disposable lab.
 
 ## Current scope
 
-The runtime implements the host portion of v3. The
-[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) records the completed Phase 1
-host qualification and tracks later namespace work. `self`, process and registered targets
-are rejected. The [fresh provisioning and binding export procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export)
+The runtime executes host jobs and supports private thin review for
+`registered:ID` and `process:DAEMON_PID` targets through the same retained
+registration. Root uses `sigrundctl target register` and `target revoke`;
+namespace workloads remain disabled and `self` is rejected. The
+[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) tracks execution and confinement
+work. The [fresh provisioning and binding export procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export)
 explains the cutover, private bundle distribution and offline signing.
 
 The local execution profile supports SSH Ed25519 signatures, one-time grants,

@@ -1,0 +1,598 @@
+{
+  "schema": "sigrund.phase2-review-validation.v1",
+  "date": "2026-11-08",
+  "result": "passed",
+  "review_findings": {
+    "verified_valid": 13,
+    "addressed": 13
+  },
+  "source_sha256": "3307b800f578b1ad562e128dba650581f32397126726cda5f6e25548972429e8",
+  "source_algorithm": "scripts/check.py path/NUL/content/NUL over Cargo inputs, crates, scripts, config and packaging",
+  "binaries_sha256": {
+    "sigrund": "14983d9b1a1b81a8ff66e2d749d19d071db676744d9fb65e36f0b535d2e7eafe",
+    "sigrun": "2030bfee843163a1abb7194c4a195e872a858560dc30de4d8fd4a396ad77e36d",
+    "sigrundctl": "e343c322d90ea733d48c8fa2af53c7e3d7d5eff7b5cde612efb360c7f67c876c",
+    "sigrund-approve": "239f4dfa6cff7ea98fef238bf90c88bedeae3d1a53779430e7c66b87d75f001d",
+    "sigrund-collector": "9126a40ff73753e5071302fe9ab0fbbd03273d66a63f52aad1936086a481649e"
+  },
+  "privileged_test_sha256": {
+    "library": "24fa5dac15664812a8e2043c7f4d9892491a4c7cee544c2a0f81721225651983",
+    "daemon": "8e4fd294ccbf8c6cf281a03a5022905016bd3077a8e4e5e00f64b2906f5b1651"
+  },
+  "platform": {
+    "os": "Fedora 44 Cloud x86_64",
+    "kernel": "6.19.10-300.fc44.x86_64",
+    "selinux": "Enforcing",
+    "cgroup": "v2 delegated memory/pids",
+    "user_namespace": "one initialized child of initial user namespace; all selected non-user namespaces owned by it",
+    "mapping": "destination 0 -> host 1000; destination 1..65535 -> host 524288..589822, for UID and GID",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)"
+  },
+  "ordinary": {
+    "command": [
+      "python3",
+      "scripts/check.py",
+      "--artifacts",
+      "/var/tmp/sigrund-phase2-review-complete-checks"
+    ],
+    "checks": [
+      {
+        "name": "build",
+        "command": [
+          "cargo",
+          "build",
+          "--workspace",
+          "--locked"
+        ],
+        "exit": 0,
+        "log": "build.log"
+      },
+      {
+        "name": "tests",
+        "command": [
+          "cargo",
+          "test",
+          "--workspace",
+          "--locked",
+          "--",
+          "--test-threads=1"
+        ],
+        "exit": 0,
+        "log": "tests.log"
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--locked",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 0,
+        "log": "clippy.log"
+      },
+      {
+        "name": "format",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "exit": 0,
+        "log": "format.log"
+      },
+      {
+        "name": "diff",
+        "command": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "exit": 0,
+        "log": "diff.log"
+      },
+      {
+        "name": "python",
+        "command": [
+          "/usr/bin/python3",
+          "-c",
+          "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').glob('*.py')]"
+        ],
+        "exit": 0,
+        "log": "python.log"
+      },
+      {
+        "name": "harness-tests",
+        "command": [
+          "/usr/bin/python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-v"
+        ],
+        "exit": 0,
+        "log": "harness-tests.log"
+      },
+      {
+        "name": "host-vectors",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/verify-host-vectors.py"
+        ],
+        "exit": 0,
+        "log": "host-vectors.log"
+      },
+      {
+        "name": "namespace-vectors",
+        "command": [
+          "/usr/bin/python3",
+          "scripts/namespace-phase0/verify-vectors.py"
+        ],
+        "exit": 0,
+        "log": "namespace-vectors.log"
+      },
+      {
+        "name": "privileged-build",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "sigrund",
+          "--lib",
+          "--test",
+          "daemon",
+          "--locked",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "exit": 0,
+        "log": "privileged-build.log"
+      },
+      {
+        "name": "platform-build",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "sigrund",
+          "--test",
+          "cgroup",
+          "--locked",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "exit": 0,
+        "log": "platform-build.log"
+      }
+    ],
+    "rust_passes": 195,
+    "python_harness_passes": 32
+  },
+  "namespace": {
+    "command": [
+      "python3",
+      "scripts/verify-namespace-phase2.py",
+      "--binaries",
+      "/home/lab/sigrund-phase2-review/bin",
+      "--artifacts",
+      "/var/lib/sigrund-phase2-review-complete",
+      "--owner",
+      "lab"
+    ],
+    "result": "passed",
+    "gates": [
+      {
+        "name": "production-register-live-rootless-B",
+        "result": "passed"
+      },
+      {
+        "name": "per-UID-rendezvous-limit-preserves-other-owner-registration",
+        "result": "passed"
+      },
+      {
+        "name": "destination-only-account-bytes-cwd-and-private-approval",
+        "result": "passed"
+      },
+      {
+        "name": "finite-stdin-is-bound-and-drained-before-private-target-lookup",
+        "result": "passed"
+      },
+      {
+        "name": "numeric-and-daemon-process-selectors-use-retained-owner",
+        "result": "passed"
+      },
+      {
+        "name": "private-target-account-profile-denial-and-refusal-have-scheduled-timeout",
+        "result": "passed"
+      },
+      {
+        "name": "partial-disconnected-and-late-approval-never-grant",
+        "result": "passed"
+      },
+      {
+        "name": "malformed-helper-IPC-closes-rights-and-preserves-healthy-retry",
+        "result": "passed"
+      },
+      {
+        "name": "executable-root-objects-are-fixed-for-the-target-generation",
+        "result": "passed"
+      },
+      {
+        "name": "same-owner-and-equal-local-UID-policy-use-composed-host-identities",
+        "result": "passed"
+      },
+      {
+        "name": "real-client-and-root-TTY-display-signature-private-gate",
+        "result": "passed"
+      },
+      {
+        "name": "account-edits-do-not-redirect-approved-numeric-credentials",
+        "result": "passed"
+      },
+      {
+        "name": "pending-review-replacement-retains-old-owner-and-rejects-old-revision",
+        "result": "passed"
+      },
+      {
+        "name": "revocation-invalidates-pending-approval",
+        "result": "passed"
+      },
+      {
+        "name": "anchor-death-invalidates-pending-approval",
+        "result": "passed"
+      },
+      {
+        "name": "destination-direct-digest-preserves-profile-and-uses-mapped-credentials",
+        "result": "passed"
+      },
+      {
+        "name": "host-execution-and-reaping-work-with-live-container-registration",
+        "result": "passed"
+      },
+      {
+        "name": "blocked-final-destination-stat-does-not-stall-host-authorization",
+        "result": "passed"
+      },
+      {
+        "name": "blocked-pending-anchor-close-keeps-management-responsive",
+        "result": "passed"
+      },
+      {
+        "name": "blocked-actual-close-retains-helper-quota-until-release",
+        "result": "passed"
+      },
+      {
+        "name": "shutdown-reaps-retained-anchor-and-closes-management-listeners",
+        "result": "passed"
+      },
+      {
+        "name": "restart-discards-registrations-and-rejects-full-and-signed-namespace-input",
+        "result": "passed"
+      },
+      {
+        "name": "delayed-handshake-succeeds-and-spoofed-seccomp-anchor-is-rejected",
+        "result": "passed"
+      },
+      {
+        "name": "production-acquisition-rejects-mixed-ownership-and-missing-roots",
+        "result": "passed"
+      },
+      {
+        "name": "production-acquisition-without-ptrace-capability-fails-closed",
+        "result": "passed"
+      }
+    ],
+    "namespace_consumptions": 0,
+    "control_host_consumptions": 2,
+    "namespace_workload_spawned": false,
+    "supervisor_stopped_empty_verified": true
+  },
+  "host_acceptance": {
+    "command": [
+      "python3",
+      "scripts/verify-acceptance.py",
+      "--binaries",
+      "/home/lab/sigrund-phase2-review/bin",
+      "--checks",
+      "/home/lab/sigrund-phase2-review/checks.json",
+      "--artifacts",
+      "/var/lib/sigrund-phase2-host-complete",
+      "--requester",
+      "lab"
+    ],
+    "result": "passed",
+    "gates": [
+      {
+        "gate": "privileged-rust",
+        "result": "passed"
+      },
+      {
+        "gate": "platform",
+        "result": "passed"
+      },
+      {
+        "gate": "runtime",
+        "result": "passed"
+      },
+      {
+        "gate": "v3",
+        "result": "passed"
+      },
+      {
+        "gate": "trust",
+        "result": "passed"
+      },
+      {
+        "gate": "failures",
+        "result": "passed"
+      },
+      {
+        "gate": "execution-binding-digest-equality",
+        "result": "passed"
+      },
+      {
+        "gate": "offline-workflow",
+        "result": "passed"
+      },
+      {
+        "gate": "independent-v3-audit-ratchet",
+        "result": "passed"
+      },
+      {
+        "gate": "binding-and-concurrent-replay",
+        "result": "passed"
+      },
+      {
+        "gate": "live-host-binding-substitutions",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-targets",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-reviews",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-target_fds",
+        "result": "passed"
+      },
+      {
+        "gate": "host-owned-helpers",
+        "result": "passed"
+      },
+      {
+        "gate": "public-context-capacity-independent",
+        "result": "passed"
+      },
+      {
+        "gate": "thin-input-before-private-account-lookup",
+        "result": "passed"
+      },
+      {
+        "gate": "host-account-profile-after-preparation",
+        "result": "passed"
+      },
+      {
+        "gate": "output-and-enforced-limits",
+        "result": "passed"
+      },
+      {
+        "gate": "failed-job-limit",
+        "result": "passed"
+      },
+      {
+        "gate": "synchronized-partial-tail-recovery",
+        "result": "passed"
+      },
+      {
+        "gate": "coherent-rollback-local-audit-limit",
+        "result": "passed"
+      },
+      {
+        "gate": "operator-workflow",
+        "result": "passed"
+      }
+    ],
+    "privileged_rust": [
+      {
+        "gate": "authorization::exit_gate",
+        "result": "passed"
+      },
+      {
+        "gate": "approver::exit_gate",
+        "result": "passed"
+      },
+      {
+        "gate": "daemon_gate_in_user_namespace",
+        "result": "passed"
+      },
+      {
+        "gate": "startup::stale_audit_temporary_gate",
+        "result": "passed"
+      },
+      {
+        "gate": "startup::v3_provisioning_set_gate",
+        "result": "passed"
+      },
+      {
+        "gate": "storage::exit_gate",
+        "result": "passed"
+      },
+      {
+        "gate": "v3::confidentiality_gate",
+        "result": "passed"
+      },
+      {
+        "gate": "preparation::tests::final_authorization_rechecks_retained_policy_and_identity",
+        "result": "passed"
+      },
+      {
+        "gate": "host_registry::tests::epoch_registry_requires_live_owner_and_exact_private_review",
+        "result": "passed"
+      }
+    ],
+    "trust": [
+      {
+        "gate": "digest-direct",
+        "result": "passed"
+      },
+      {
+        "gate": "file-capabilities",
+        "result": "passed"
+      },
+      {
+        "gate": "ctime",
+        "result": "passed"
+      },
+      {
+        "gate": "mutation",
+        "result": "passed"
+      },
+      {
+        "gate": "noexec",
+        "result": "passed"
+      },
+      {
+        "gate": "tracer-death",
+        "result": "passed"
+      },
+      {
+        "gate": "fs-verity",
+        "result": "passed"
+      }
+    ],
+    "execution": [
+      {
+        "gate": "startup-swap-unavailable",
+        "result": "passed"
+      },
+      {
+        "gate": "startup-clone-fail",
+        "result": "passed"
+      },
+      {
+        "gate": "startup-mount-unavailable",
+        "result": "passed"
+      },
+      {
+        "gate": "step-1",
+        "result": "passed"
+      },
+      {
+        "gate": "step-2",
+        "result": "passed"
+      },
+      {
+        "gate": "step-3",
+        "result": "passed"
+      },
+      {
+        "gate": "step-4",
+        "result": "passed"
+      },
+      {
+        "gate": "step-5",
+        "result": "passed"
+      },
+      {
+        "gate": "step-6",
+        "result": "passed"
+      },
+      {
+        "gate": "step-7",
+        "result": "passed"
+      },
+      {
+        "gate": "step-8",
+        "result": "passed"
+      },
+      {
+        "gate": "step-9",
+        "result": "passed"
+      },
+      {
+        "gate": "step-10",
+        "result": "passed"
+      },
+      {
+        "gate": "step-11",
+        "result": "passed"
+      },
+      {
+        "gate": "fd-exhaust",
+        "result": "passed"
+      },
+      {
+        "gate": "clone-fail",
+        "result": "passed"
+      },
+      {
+        "gate": "kill-before-ready",
+        "result": "passed"
+      },
+      {
+        "gate": "partial-ready",
+        "result": "passed"
+      },
+      {
+        "gate": "excess-ready",
+        "result": "passed"
+      },
+      {
+        "gate": "stop-before-ready",
+        "result": "passed"
+      },
+      {
+        "gate": "stop-after-ready",
+        "result": "passed"
+      },
+      {
+        "gate": "kernel-exec-error",
+        "result": "passed"
+      },
+      {
+        "gate": "post-token-pre-exec-death",
+        "result": "passed"
+      },
+      {
+        "gate": "root-tty-workflow",
+        "result": "passed"
+      },
+      {
+        "gate": "control-and-exit-races",
+        "result": "passed"
+      },
+      {
+        "gate": "post-exec-observations",
+        "result": "passed"
+      }
+    ],
+    "supervisor_cgroup_removed": true
+  },
+  "additional_checks": {
+    "production_proc_predicates_with_filtered_spoofed_name": "passed as unprivileged lab user",
+    "syscall_traced_device_rejection": "passed; device source opened only with O_PATH",
+    "syscall_traced_regular_file_control": "passed; readable open uses retained procfd"
+  },
+  "cleanup": {
+    "guest_name": "sigrund-phase2-review",
+    "vmid": 9033,
+    "guest_destroyed": true,
+    "anchors_helpers_reaped": true,
+    "management_listeners_removed": true
+  },
+  "private_artifacts": "/var/tmp/sigrund-phase2-review-evidence",
+  "scope": "Private namespace preparation/review only; no namespace execution or confinement qualification",
+  "supersedes_source_snapshot": "0f10bfd7684250608e7aab86ab978c22d4567aae99d1a379b1c9da2fd0bc0e91"
+}

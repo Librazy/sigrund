@@ -1,12 +1,14 @@
 # Namespace-aware execution: phased v3 roadmap
 
-Updated 2026-11-07. This is the delivery roadmap for the
+Updated 2026-11-08. This is the delivery roadmap for the
 [draft normative v3 security specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>).
 The specification owns the contract; this document owns implementation order,
 feasibility decisions, acceptance evidence and deferred scope. NS-01–NS-16 refer
 to its stable namespace requirements; G-01–G-05 refer to its release-blocking
 design gates. Supported host CLI options are documented in the
-[Phase 1 record](NAMESPACE_PHASE1.md); later-phase selectors remain planned.
+[Phase 1 record](NAMESPACE_PHASE1.md). Registered/process private review is
+documented in the [Phase 2 guide](NAMESPACE_PHASE2.md); namespace execution and
+self acquisition remain later milestones.
 
 ## Current state and intended outcome
 
@@ -19,6 +21,12 @@ and credentials; they are not general namespace/LSM verifiers. See
 [implementation notes](../IMPLEMENTATION_NOTES.md#deferred-namespace-aware-executable-evidence)
 for the ComposeFS limitation and current coverage. Namespace-root fixtures do
 not establish container-routing support.
+
+Phase 2 adds production root-controlled registration of a constrained dedicated
+anchor, cached destination roots and bounded account/path preparation. Explicit
+registered/process thin requests reach verified private root-TTY review and final
+signature checks, then stop before consumption, public APPROVED and workload
+spawn. All public namespace outcomes retain the admission-based TIMEOUT.
 
 The v3 outcome is one host authority executing in explicitly selected local
 existing environments:
@@ -290,6 +298,17 @@ open for their declared combinations.
 
 ### Phase 2 — Pinned targets and destination preparation
 
+**Status:** Complete for the qualified private-review boundary (2026-11-08).
+Production registration, destination preparation, root-TTY review and final
+signature checks pass 21 namespace gates, all 11 ordinary checks and the full
+23-gate host acceptance suite. The disposable guest was removed after preserving
+evidence and verifying cleanup. See the [operator guide](NAMESPACE_PHASE2.md)
+and [sanitized qualification record](evidence/namespace-phase2-20261108.json).
+Namespace workload execution remains disabled.
+The [review follow-up](NAMESPACE_PHASE2_REVIEW.md) supersedes the initial source
+snapshot: all 13 review findings are addressed, with 25 production namespace
+gates and the complete host acceptance suite passing on the corrected build.
+
 **Dependencies:** Phase 1.5's demonstrated anchor workflow, G-01 acquisition and G-05 management contracts.
 **Subsystems:** target registry, workers/helpers, account/path/evidence preparation,
 source access, authorization and cancellation.
@@ -318,6 +337,44 @@ cannot disclose target existence/accounts; account/mapping edits do not redirect
 approval; identical paths with different bytes/cwd use the intended destination.
 Target/helper leases remain charged through real cleanup. No container workload
 execution is advertised yet.
+
+The production process-context digest uses versioned
+`sigrund.process-context.v1`: the frozen acquisition record plus the cached
+executable-root identity map. This pins roots for the entire generation and
+preserves the historical Phase 0 bytes. The independent execution-binding digest
+still covers exactly canonical `{target_binding, security_constraints}`.
+Registration uses the live host daemon epoch; restart requires fresh capture.
+Namespace profiles are prospective review obligations in this phase. Workload
+confinement has no execution claim until the Phase 3/4 gates pass.
+
+#### Phase 2 acceptance applicability
+
+The [Phase 2 guide](NAMESPACE_PHASE2.md) records commands, topology and evidence.
+This table adds namespace preparation/review dispositions to the host V-01–V-20
+record above. A private approval never closes a namespace workload gate.
+
+| Gate | Phase 2 disposition |
+| --- | --- |
+| V-01 | Strict namespace record/context/review schemas and frozen vectors pass; existing v3 provisioning/version rejection remains a host regression gate. No new durable namespace schema is introduced. |
+| V-02 | Public context remains target-independent. Management/anchor records travel on separate bounded endpoints; profile and target absence receive no public evidence. |
+| V-03 | Real registered and daemon-PID process thin selection, named/numeric accounts and finite input pass. Namespace full-only/export/bundle options fail locally. |
+| V-04 | Different bytes/cwd at the same path use the retained destination. Cached root pathname replacement cannot redirect preparation. Namespace full-access proof and cloned mount domains remain Phase 4. |
+| V-05 | Raw unknown target/account/profile, refusal, absent/partial/disconnected/late approval and malformed helper IPC preserve scheduled TIMEOUT and zero workload output. Finite stdin is drained before private lookup. |
+| V-06 | Exact CSR/context/constraint/selector checks pass. Replacement changes revision, instance and profile; pending old review fails. Account edits preserve signed credentials; restart discards registrations and rejects stale full/signed input without fallback. |
+| V-07 | Real destination digest-memfd and digest-direct evidence passes; direct access checks use composed host credentials. Namespace ctime/fs-verity, ComposeFS and workload checkpoints remain later qualifications. |
+| V-08 | Numeric and named destination IDs/groups are signed and mapped independently; equal local integers and equal mapped host UIDs are distinguished. Actual namespace child credentials/capabilities remain Phase 3. |
+| V-09 | The final signature/policy/evidence predicate is exercised before a hard private no-consumption gate. Late replies cannot grant. Namespace durable commit is deliberately unavailable. |
+| V-10 | No namespace APPROVED or spawn exists, including after a valid signature, partial reply or disconnect. Host delivery-before-spawn and later-failure consumption remain regression gates. |
+| V-11 | Independent frozen JCS/digest and existing production signing vectors pass; real root TTY uses the normal SSH signature path. Namespace offline export/redemption is closed. Physical FIDO remains unqualified. |
+| V-12 | Production management and helper framing is bounded. A corrupted real FD transfer closes received rights and permits a healthy retry. Existing raw transport/blocked-I/O host checks remain required. |
+| V-13 | Ordinary tests cover global/per-UID target/review limits and retired registrations. Privileged blocked actual root close retains helper quota, rejects excess acquisition, and allows reacquisition only after disposal. One-review broker limit remains. |
+| V-14 | Revocation, replacement and anchor death cancel pending approval while the old owner remains retained. Process selectors cannot reacquire arbitrary PIDs. Namespace grants cannot be consumed or replayed. |
+| V-15 | Private audit separates authenticated source, approved mapped destination and null observed execution; its binding digest matches independent CSR hashing. Namespace DB/collector consumption is absent. Host three-way digest equality remains the collector milestone. |
+| V-16 | The shipped root TTY verifies root epoch records and displays complete escaped acquisition, registration, mappings, credentials, provenance, pinned roots and prospective constraints before signing. Mismatch tests prevent rendering. Hooks remain deferred. |
+| V-17 | Actual requester CLI receives TIMEOUT, no stdout and no early output EOF. Namespace stdio relay/PTY execution is deferred; host stdio/cancellation checks remain required. |
+| V-18 | Fresh-exec production capture/preparation passes on the stated rootless topology; mixed ownership, missing roots and denied ptrace fail closed. Namespace entry, placement and final-child faults remain Phase 3. |
+| V-19 | Namespace registrations are ephemeral and never reconstructed from durable IDs. Host audit/recovery and consumption regressions remain required; external rollback protection is still deferred. |
+| V-20 | Production shutdown reaps a live capture/anchor and removes management/anchor listeners; restart creates a fresh epoch. Whole-service cleanup is independently verified. Namespace workload teardown remains Phase 3. |
 
 ### Phase 3 — Native execution and supervision
 
