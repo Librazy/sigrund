@@ -21,7 +21,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "--help") {
         println!(
-            "Usage: sigrundctl init-host --state-dir PATH --log-path PATH\n       sigrundctl target export-binding host --security-profile ID [--epoch-file PATH] --output PATH\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
+            "Usage: sigrundctl init-host --state-dir PATH --log-path PATH\n       sigrundctl target register ID --pid DAEMON_PID --owner-uid HOST_UID --security-profile ID [--socket PATH]\n       sigrundctl target revoke ID [--socket PATH]\n       sigrundctl target export-binding host --security-profile ID [--epoch-file PATH] --output PATH\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
         );
         return ExitCode::SUCCESS;
     }
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
         };
     }
     if args.get(1).is_some_and(|arg| arg == "target") {
-        return match export_binding(&args[1..]) {
+        return match target_command(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("sigrundctl: {error}");
@@ -68,6 +68,55 @@ fn main() -> ExitCode {
     }
     eprintln!("sigrundctl: provisioning commands are not enabled in this build");
     ExitCode::from(78)
+}
+
+fn target_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use sigrund::target_management::{Request, execute, management_path};
+    if args.get(1).is_some_and(|value| value == "export-binding") {
+        return export_binding(args);
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("target management requires effective UID 0".into());
+    }
+    let operation = args.get(1).ok_or("missing target operation")?;
+    let id = args.get(2).ok_or("missing target registration ID")?.clone();
+    sigrund_core::namespace::identifier(&id)?;
+    let mut options = BTreeMap::new();
+    for pair in args[3..].chunks(2) {
+        if pair.len() != 2
+            || pair[1].is_empty()
+            || !["--pid", "--owner-uid", "--security-profile", "--socket"]
+                .contains(&pair[0].as_str())
+            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return Err("invalid or duplicate target management option".into());
+        }
+    }
+    let socket = Path::new(options.remove("--socket").unwrap_or("/run/sigrund.sock"));
+    sigrund::linux::validate_absolute_path(socket)?;
+    let request = match operation.as_str() {
+        "register" => {
+            if options.len() != 3 {
+                return Err("register requires --pid, --owner-uid and --security-profile".into());
+            }
+            Request::Register {
+                id,
+                daemon_pid: options.get("--pid").ok_or("--pid required")?.parse()?,
+                owner_uid: options
+                    .get("--owner-uid")
+                    .ok_or("--owner-uid required")?
+                    .parse()?,
+                security_profile: options
+                    .get("--security-profile")
+                    .ok_or("--security-profile required")?
+                    .to_string(),
+            }
+        }
+        "revoke" if options.is_empty() => Request::Revoke { id },
+        _ => return Err("invalid target management operation".into()),
+    };
+    execute(&management_path(socket), &request)?;
+    Ok(())
 }
 
 fn export_binding(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

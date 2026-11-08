@@ -34,7 +34,7 @@ pub fn resolve(account: &Account) -> io::Result<(u32, u32, Vec<u32>)> {
     let groups = account_file(Path::new("/etc/group"))?;
     parse(name, &passwd, &groups)
 }
-fn parse(name: &str, passwd: &str, groups: &str) -> io::Result<(u32, u32, Vec<u32>)> {
+pub(crate) fn parse(name: &str, passwd: &str, groups: &str) -> io::Result<(u32, u32, Vec<u32>)> {
     let mut selected = None;
     for line in passwd.lines() {
         if line.len() > 4096 {

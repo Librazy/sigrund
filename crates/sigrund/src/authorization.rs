@@ -52,6 +52,15 @@ pub(crate) fn verify(
     request
         .check()
         .map_err(|_| Denial::new("REQUEST_TIMEOUT", "authorization cancelled"))?;
+    if let Some(process) = &request.process {
+        if !process.final_verified {
+            return Err(policy());
+        }
+        return Err(Denial::new(
+            "PHASE2_EXECUTION_DISABLED",
+            "private process approval verified; execution is disabled",
+        ));
+    }
     request
         .policy
         .mvp
@@ -251,7 +260,7 @@ pub(crate) fn verify(
     })
 }
 
-fn verify_snapshot(
+pub(crate) fn verify_snapshot(
     snapshot: &SealedSnapshot,
     expected: &str,
     maximum: u64,

@@ -244,6 +244,10 @@ impl HostTarget {
     }
     /// Only the retained instance can mint a binding. Neither a pathname nor a
     /// previously signed instance ID can recreate this owner.
+    pub fn epoch(&self) -> &str {
+        &self.acquisition.daemon_epoch
+    }
+
     pub fn bundle(&self, host_id: String, constraints: Constraints) -> io::Result<BindingBundle> {
         self.revalidate()?;
         let bundle = BindingBundle {

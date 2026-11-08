@@ -52,6 +52,7 @@ pub(crate) struct ValidatedRequest {
     pub cancelled: Arc<AtomicBool>,
     pub host_profile: Option<sigrund_core::host::Constraints>,
     pub host_bundle: Option<sigrund_core::host::BindingBundle>,
+    pub process: Option<crate::process_request::ProcessState>,
     pub host_lease: Option<crate::host_target::HostLease>,
 }
 pub(crate) struct MeasuredSnapshots {
@@ -64,6 +65,11 @@ impl ValidatedRequest {
             check(&self.cancelled, self.deadline)?;
         } else if self.cancelled.load(Ordering::Acquire) {
             return Err(io::ErrorKind::Interrupted.into());
+        }
+        if let Some(process) = &self.process {
+            process.lease.check_lifecycle().map_err(|error| {
+                crate::preparation::fail("TARGET_INVALIDATED", error.to_string())
+            })?;
         }
         if let Some(snapshots) = &self.snapshots {
             snapshots.executable.check_ctime_guard()?;
@@ -319,6 +325,7 @@ fn read_request(
         host_profile: None,
         host_bundle: None,
         host_lease: None,
+        process: None,
         deferred_cleanup: vec![],
         failure,
         exec_id: String::new(),

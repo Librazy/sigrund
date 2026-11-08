@@ -22,6 +22,8 @@ struct Epoch {
     version: String,
     bundles: Vec<BindingBundle>,
     review: Option<ReviewEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_review: Option<sigrund_core::namespace::ProcessReview>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +48,15 @@ fn validate(epoch: &Epoch) -> io::Result<()> {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return Err(invalid("invalid review digest"));
+        }
+    }
+    if let Some(review) = &epoch.process_review {
+        use sigrund_core::namespace::Contract;
+        review.validate().map_err(invalid)?;
+        if epoch.review.is_some()
+            || review.acquisition.daemon_epoch != epoch.bundles[0].acquisition.daemon_epoch
+        {
+            return Err(invalid("mixed process review epoch"));
         }
     }
     for (i, bundle) in epoch.bundles.iter().enumerate() {
@@ -85,6 +96,7 @@ impl EpochOwner {
             version: "3.0".into(),
             bundles,
             review: None,
+            process_review: None,
         };
         validate(&epoch)?;
         let bytes = json::canonical_bytes(&epoch).map_err(invalid)?;
@@ -125,11 +137,40 @@ impl EpochOwner {
         {
             return Err(invalid("ComposeFS review requires direct digest"));
         }
+        epoch.process_review = None;
         epoch.review = Some(ReviewEvidence {
             exec_id: exec_id.into(),
             csr_sha256: sha256_hex(csr.as_bytes()),
             admin_trusted_composefs,
         });
+        validate(epoch)?;
+        let bytes = json::canonical_bytes(epoch).map_err(invalid)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid("epoch record exceeds bound"));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&bytes)?;
+        file.set_len(bytes.len() as u64)?;
+        file.sync_all()
+    }
+    pub fn publish_process_review(
+        &self,
+        review: &sigrund_core::namespace::ProcessReview,
+        csr: &Csr,
+    ) -> io::Result<()> {
+        review.verify_csr(csr).map_err(invalid)?;
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| invalid("epoch owner poisoned"))?;
+        let (file, epoch) = &mut *data;
+        if csr.warrant().host_id != epoch.bundles[0].host_id
+            || review.acquisition.daemon_epoch != epoch.bundles[0].acquisition.daemon_epoch
+        {
+            return Err(invalid("process review authority differs from live epoch"));
+        }
+        epoch.review = None;
+        epoch.process_review = Some(review.clone());
         validate(epoch)?;
         let bytes = json::canonical_bytes(epoch).map_err(invalid)?;
         if bytes.len() as u64 > MAX_BYTES {
@@ -183,6 +224,25 @@ pub fn live_review(path: &Path, exec_id: &str, csr: &Csr) -> io::Result<(Binding
         return Err(invalid("invalid review storage basis"));
     }
     Ok((bundle, review.admin_trusted_composefs))
+}
+
+pub fn live_process_review(
+    path: &Path,
+    exec_id: &str,
+    csr: &Csr,
+) -> io::Result<sigrund_core::namespace::ProcessReview> {
+    let epoch = live_epoch(path)?;
+    if csr.warrant().host_id != epoch.bundles[0].host_id {
+        return Err(invalid("process review authority differs"));
+    }
+    let review = epoch
+        .process_review
+        .ok_or_else(|| invalid("missing process review"))?;
+    if review.exec_id != exec_id {
+        return Err(invalid("process review execution ID differs"));
+    }
+    review.verify_csr(csr).map_err(invalid)?;
+    Ok(review)
 }
 
 fn require_live(file: &File) -> io::Result<()> {

@@ -355,12 +355,30 @@ fn authorize(
         Ok(verified) => verified,
         Err(denial) => {
             publish_denial(completed, wake, task.token, &denial)?;
+            let mut fields = serde_json::json!({"exec_id":task.exec_id,
+                "requester_uid":request.requester_uid, "status":denial.status});
+            if let Some(process) = &request.process {
+                let review = process
+                    .review
+                    .as_ref()
+                    .ok_or("missing process review at authorization")?;
+                use sigrund_core::host::Record;
+                let binding = review.binding().map_err(|error| error.to_string())?;
+                fields["source_authenticated"] = serde_json::json!({
+                    "uid":request.requester_uid, "gid":request.requester_gid,
+                    "supplementary_gids":request.requester_groups});
+                fields["approved_target"] = serde_json::json!({
+                    "binding":binding.target_binding,
+                    "security_constraints":binding.security_constraints,
+                    "execution_binding_sha256":binding.sha256().map_err(|error| error.to_string())?,
+                    "numeric_credentials":process.evidence.credentials});
+                fields["execution_observed"] = serde_json::Value::Null;
+            }
             append_event(
                 resources,
                 &request.policy,
                 "AUTH_REJECTED",
-                serde_json::json!({"exec_id":task.exec_id,
-                "requester_uid":request.requester_uid, "status":denial.status}),
+                fields,
                 request.policy.audit_record_max_bytes as usize,
             )
             .map_err(|e| e.to_string())?;

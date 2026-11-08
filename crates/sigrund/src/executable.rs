@@ -32,6 +32,7 @@ pub struct Executable {
     direct_digest_limit: u64,
     admin_trusted_composefs_mount: Option<u64>,
     ctime_guard: Option<CtimeGuard>,
+    allow_file_capabilities: bool,
 }
 impl From<SealedSnapshot> for Executable {
     fn from(sealed: SealedSnapshot) -> Self {
@@ -47,6 +48,7 @@ impl From<SealedSnapshot> for Executable {
             direct_digest_limit: 0,
             admin_trusted_composefs_mount: None,
             ctime_guard: None,
+            allow_file_capabilities: false,
         }
     }
 }
@@ -135,7 +137,7 @@ impl Executable {
             source,
             &metadata,
             &context.requested(),
-            context.post_exec_capabilities.is_some(),
+            self.allow_file_capabilities && context.post_exec_capabilities.is_some(),
         )?;
         if observed_profile.as_ref() != Some(&context.expected_capabilities()) {
             return Err(invalid("direct executable is no longer eligible"));
@@ -372,6 +374,7 @@ pub fn prepare(
                 direct_digest_limit: config.max_direct_digest_bytes,
                 admin_trusted_composefs_mount,
                 ctime_guard,
+                allow_file_capabilities: selection.allow_file_capabilities,
             };
             let mut context: ExecutionContext = selection.context.clone().into();
             context.post_exec_capabilities = executable.post_exec_capabilities.clone();

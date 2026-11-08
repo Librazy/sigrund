@@ -55,7 +55,7 @@ const CONTEXT_LISTENER: u64 = 8;
 const CONTEXT_COMPLETE: u64 = 9;
 const FIRST_CONNECTION: u64 = 10;
 
-struct BoundSocket {
+pub(crate) struct BoundSocket {
     fd: Option<OwnedFd>,
     disposal: Option<Permit>,
     parent: File,
@@ -65,7 +65,11 @@ struct BoundSocket {
 }
 
 impl BoundSocket {
-    fn bind(path: &Path, mode: u32) -> io::Result<Self> {
+    pub(crate) fn protect_close(&mut self, permit: crate::socket_disposal::Permit) {
+        self.disposal = Some(permit);
+    }
+
+    pub(crate) fn bind(path: &Path, mode: u32) -> io::Result<Self> {
         validate_absolute_path(path)?;
         if path.as_os_str().as_bytes().len() >= 108 {
             return Err(invalid("Unix socket path is too long"));
@@ -145,14 +149,14 @@ impl BoundSocket {
         Ok(bound)
     }
 
-    fn listen(&self) -> io::Result<()> {
+    pub(crate) fn listen(&self) -> io::Result<()> {
         if unsafe { libc::listen(self.fd(), 64) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
-    fn fd(&self) -> RawFd {
+    pub(crate) fn fd(&self) -> RawFd {
         self.fd.as_ref().expect("live listener").as_raw_fd()
     }
 
@@ -897,6 +901,8 @@ pub struct ForegroundDaemon {
     _resources: StartupResources,
     host_target: Arc<crate::host_target::HostTarget>,
     _epoch_owner: Arc<crate::host_registry::EpochOwner>,
+    _target_registry: Option<Arc<crate::target_registry::TargetRegistry>>,
+    management: Option<crate::target_management::Management>,
     config: Arc<DaemonConfig>,
     _signers: SignerPolicyFile,
     signals: SignalSource,
@@ -1038,6 +1044,30 @@ impl ForegroundDaemon {
             .collect::<io::Result<Vec<_>>>()?;
         let epoch_owner =
             crate::host_registry::EpochOwner::publish(&resources.state_directory, bundles)?;
+        let target_registry = if config.namespace_profiles.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                crate::target_registry::TargetRegistry::new_with_roots(
+                    host_target.epoch().into(),
+                    target_budget.clone(),
+                    config.csr_allowed_executable_dirs.clone(),
+                )?,
+            ))
+        };
+        let management = if config.namespace_profiles.is_empty() {
+            None
+        } else {
+            Some(crate::target_management::Management::bind(
+                socket,
+                target_registry
+                    .as_ref()
+                    .expect("namespace profiles require registry")
+                    .clone(),
+                config.namespace_profiles.clone(),
+                target_budget.clone(),
+            )?)
+        };
         let context_path = crate::client::context_path(socket);
         if context_path == approval_socket {
             return Err(invalid("context and approval sockets must differ"));
@@ -1060,6 +1090,8 @@ impl ForegroundDaemon {
             _resources: resources,
             host_target,
             _epoch_owner: epoch_owner,
+            _target_registry: target_registry,
+            management,
             config: Arc::new(config),
             _signers: signers,
             signals,
@@ -1070,6 +1102,7 @@ impl ForegroundDaemon {
     pub fn run(mut self) -> io::Result<()> {
         let context = Arc::new(Context {
             epoch: Some(self._epoch_owner.clone()),
+            targets: self._target_registry.clone(),
             host_target: Some(self.host_target.clone()),
             roots: self
                 .host_target
@@ -1107,6 +1140,11 @@ impl ForegroundDaemon {
         let budget = SnapshotBudget::default();
         let signals = self.signals;
         crate::startup::CgroupLayout::register_subreaper()?;
+        let management = self
+            .management
+            .take()
+            .map(|server| server.start())
+            .transpose()?;
         // Threads inherit the blocked signal mask, leaving shutdown handling
         // on signalfd even when a metadata syscall cannot be interrupted.
         let mut workers = IoWorkers::new(&self.config)?;
@@ -1773,6 +1811,9 @@ impl ForegroundDaemon {
                 }
             }
             if stopping.is_some() {
+                if let Some(server) = &management {
+                    server.stop();
+                }
                 if !stop_notified {
                     service.stopping();
                     stop_notified = true;
@@ -1881,7 +1922,8 @@ impl ForegroundDaemon {
                 service.tick();
             }
             if let Some(start) = stopping {
-                if execution.is_idle()
+                if management.as_ref().is_none_or(|server| server.is_idle())
+                    && execution.is_idle()
                     && context_workers.is_idle()
                     && workers.is_idle()
                     && admission.is_idle()
@@ -1995,6 +2037,7 @@ mod approval_tests {
         let context = Arc::new(Context {
             epoch: None,
             host_target: None,
+            targets: None,
             roots: vec![],
             host_id: csr.warrant().host_id.clone(),
             signers: SignerPolicyFile::from_toml(include_bytes!(

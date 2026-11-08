@@ -661,13 +661,24 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
     } else {
         None
     };
+    let cross_domain = !matches!(
+        hello.original_intent().map_err(io::Error::other)?.target,
+        sigrund_core::host::Selector::Host {}
+    );
+    if cross_domain
+        && (options.full_only || options.export_csr.is_some() || options.binding_bundle.is_some())
+    {
+        return Err(transport::invalid(
+            "cross-domain full preparation is unavailable",
+        ));
+    }
     if public.is_none() && options.full_only {
         return Err(transport::invalid(
             "public context required for full preparation",
         ));
     }
     let mut thin_fallback = false;
-    if let Some(public) = &public {
+    if let Some(public) = public.as_ref().filter(|_| !cross_domain) {
         let purpose = if options.export_csr.is_some() {
             crate::executable::EvidencePurpose::OfflineExport
         } else {
