@@ -91,6 +91,18 @@ pub enum Selector {
     },
 }
 impl Selector {
+    pub fn validate_selection(&self) -> Result<()> {
+        match self {
+            Self::Host {} => Ok(()),
+            Self::Registered { id } => identifier(id),
+            Self::Process { pid, pid_scope }
+                if *pid > 0 && *pid <= i32::MAX as u32 && pid_scope == "daemon" =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid("unsupported target selector")),
+        }
+    }
     pub fn validate_host(&self) -> Result<()> {
         if !matches!(self, Self::Host {}) {
             return Err(invalid("only host targets are supported"));
@@ -278,7 +290,7 @@ pub struct TargetBinding {
 }
 impl Record for TargetBinding {
     fn validate(&self) -> Result<()> {
-        if self.kind != "host" {
+        if !["host", "process_environment"].contains(&self.kind.as_str()) {
             return Err(invalid("unsupported target binding"));
         }
         validate_uuidv7(&self.daemon_epoch)?;
@@ -326,6 +338,7 @@ pub struct BindingBundle {
 impl Record for BindingBundle {
     fn validate(&self) -> Result<()> {
         if self.schema != "sigrund.host-binding-bundle.v1"
+            || self.target_binding.kind != "host"
             || self.admin_trusted_composefs_mounts.len() > 1
             || self.admin_trusted_composefs_mounts.contains(&0)
         {

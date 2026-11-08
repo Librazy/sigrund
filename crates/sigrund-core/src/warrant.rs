@@ -197,6 +197,25 @@ impl Csr {
         snapshots: SnapshotDigests,
         max_ttl_secs: u64,
     ) -> Result<Self> {
+        let binding = identity
+            .binding
+            .as_ref()
+            .ok_or_else(|| invalid("live v3 host binding required"))?
+            .binding()?;
+        Self::from_unsigned_binding(hello, identity, snapshots, max_ttl_secs, binding)
+    }
+
+    /// Shared construction for retained host and process-environment owners.
+    /// The caller supplies the exact execution binding after private acquisition.
+    pub fn from_unsigned_binding(
+        hello: &ClientHello,
+        identity: CsrIdentity,
+        snapshots: SnapshotDigests,
+        max_ttl_secs: u64,
+        binding: crate::host::ExecutionBinding,
+    ) -> Result<Self> {
+        use crate::host::Record;
+        binding.validate()?;
         hello.validate_request()?;
         if hello.mode != "thin_csr" {
             return Err(invalid("CSR requires unsigned request"));
@@ -224,11 +243,7 @@ impl Csr {
             )
         };
         let version = "3.0";
-        let bundle = identity
-            .binding
-            .ok_or_else(|| invalid("live v3 host binding required"))?;
-        use crate::host::Record;
-        bundle.validate()?;
+
         let mut execution_context: ExecutionContext = hello
             .requested_execution_context
             .clone()
@@ -251,8 +266,8 @@ impl Csr {
         }
         Self::new(Warrant {
             intent: original.clone(),
-            target_binding: bundle.target_binding.clone(),
-            security_constraints: bundle.binding()?.security_constraints,
+            target_binding: binding.target_binding,
+            security_constraints: binding.security_constraints,
             request_origin: "client_full".into(),
             intent_sha256: original.sha256()?,
             approval_exec_id: None,

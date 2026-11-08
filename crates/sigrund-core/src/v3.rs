@@ -1,4 +1,4 @@
-//! Strict v3 host-only wire and signed-byte contracts. Runtime support must be
+//! Strict v3 wire and signed-byte contracts. Runtime support must be
 //! gated separately: parsing a valid document grants no execution authority.
 use crate::{
     CoreError, Result,
@@ -51,7 +51,7 @@ pub struct Intent {
 }
 impl Record for Intent {
     fn validate(&self) -> Result<()> {
-        self.target.validate_host()?;
+        self.target.validate_selection()?;
         self.account.validate()?;
         host::identifier(&self.security_profile)?;
         let (uid, gid, groups) = match &self.account {
@@ -100,6 +100,13 @@ impl Record for Warrant {
         self.intent.validate()?;
         self.target_binding.validate()?;
         self.security_constraints.validate()?;
+        let expected_kind = match self.intent.target {
+            host::Selector::Host {} => "host",
+            _ => "process_environment",
+        };
+        if self.target_binding.kind != expected_kind {
+            return Err(invalid("selector and target binding domains differ"));
+        }
         if self.version != "3.0"
             || self.intent_sha256 != self.intent.sha256()?
             || self.security_constraints.profile_id != self.intent.security_profile

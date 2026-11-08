@@ -165,6 +165,22 @@ impl Budget {
             inherited: false,
         })
     }
+    /// Charge descriptors owned only by a separate helper process. These
+    /// resources are never inherited by a subsequent fork of the daemon.
+    pub fn reserve_child_resources(&self, uid: u32, charge: Charge) -> Option<Reservation> {
+        if uid == u32::MAX || charge == Charge::default() {
+            return None;
+        }
+        let mut used = self.used.lock().expect("host budget poisoned");
+        used.reserve(self.limits, uid, charge)?;
+        Some(Reservation {
+            budget: self.clone(),
+            uid,
+            charge,
+            inherited: true,
+        })
+    }
+
     /// Transfer the inherited-copy reservation to a child owner. Callers keep
     /// it through actual close/reap, including an unpublished clone result.
     /// Only the fork/clone operation runs under the accounting lock. An unwind
@@ -242,6 +258,18 @@ impl Budget {
         )
     }
 }
+impl Reservation {
+    pub fn budget_reserve(&self, charge: Charge) -> Option<Reservation> {
+        self.budget.reserve(self.uid, charge)
+    }
+    pub fn with_retained_fd_copies<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Option<(T, Reservation)> {
+        self.budget.with_retained_fd_copies(self.uid, operation)
+    }
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut used = self.budget.used.lock().expect("host budget poisoned");
@@ -255,6 +283,54 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn helper_only_fds_are_charged_without_being_inherited_by_the_daemon() {
+        let budget = Budget::new(Default::default()).unwrap();
+        let remote = budget
+            .reserve_child_resources(
+                7,
+                Charge {
+                    target_fds: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let parent = budget
+            .reserve(
+                0,
+                Charge {
+                    target_fds: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(budget.with_transient_fd_copies(7, || true), Some(true));
+        assert!(
+            budget
+                .reserve(
+                    7,
+                    Charge {
+                        target_fds: 9,
+                        ..Default::default()
+                    }
+                )
+                .is_none()
+        );
+        drop(remote);
+        assert!(
+            budget
+                .reserve(
+                    7,
+                    Charge {
+                        target_fds: 128,
+                        ..Default::default()
+                    }
+                )
+                .is_some()
+        );
+        drop(parent);
+    }
+
     #[test]
     fn exhaustion_is_atomic_and_charges_survive_owner_transfer() {
         let budget = Budget::new(Limits::default()).unwrap();
