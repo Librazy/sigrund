@@ -420,6 +420,25 @@ impl From<JobCgroupError> for io::Error {
     }
 }
 impl JobCgroup {
+    pub(crate) fn contains_pid(&self, pid: i32) -> io::Result<bool> {
+        use std::io::Read;
+        let mut bytes = String::new();
+        File::from(crate::linux::openat2_file(
+            self.fd(),
+            std::path::Path::new("cgroup.procs"),
+        )?)
+        .take(65537)
+        .read_to_string(&mut bytes)?;
+        if bytes.len() > 65536 {
+            return Err(invalid("oversized job membership"));
+        }
+        let pids = bytes
+            .lines()
+            .map(str::parse::<i32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid("invalid job membership"))?;
+        Ok(pids.contains(&pid))
+    }
     pub fn fd(&self) -> i32 {
         self.directory
             .as_ref()

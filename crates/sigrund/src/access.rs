@@ -42,7 +42,7 @@ fn pause(fd: i32, events: i16) -> io::Result<()> {
     }
     Ok(())
 }
-fn domain() -> io::Result<()> {
+pub(crate) fn domain() -> io::Result<()> {
     // A credential change must never enable same-UID tracing before the final
     // PR_SET_DUMPABLE(0). Both SUID_DUMP_DISABLE (0) and SUID_DUMP_ROOT (2)
     // reject unprivileged ptrace access; SUID_DUMP_USER (1) is unsafe.

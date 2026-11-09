@@ -18,7 +18,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{ChildStdin, ChildStdout, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -26,22 +26,51 @@ fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
 
+fn verify_namespace(
+    file: &File,
+    name: &str,
+    expected: &sigrund_core::namespace::NamespaceIdentity,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let kind = match name {
+        "cgroup" => libc::CLONE_NEWCGROUP,
+        "ipc" => libc::CLONE_NEWIPC,
+        "mnt" => libc::CLONE_NEWNS,
+        "net" => libc::CLONE_NEWNET,
+        "pid" => libc::CLONE_NEWPID,
+        "time" => 0x80,
+        "user" => libc::CLONE_NEWUSER,
+        "uts" => libc::CLONE_NEWUTS,
+        _ => return Err(invalid("unknown namespace type")),
+    };
+    let stat = file.metadata()?;
+    if stat.dev().to_string() != expected.device
+        || stat.ino().to_string() != expected.inode
+        || unsafe { libc::ioctl(file.as_raw_fd(), 0xb703) } != kind
+    {
+        return Err(invalid("captured namespace identity or type differs"));
+    }
+    Ok(())
+}
+
 unsafe extern "C" {
     fn sigrund_capture_begin(socket: i32, pid: i32, uid: u32) -> *mut libc::c_void;
     fn sigrund_capture_print(target: *mut libc::c_void);
     fn sigrund_capture_check(target: *mut libc::c_void);
     fn sigrund_capture_root(target: *mut libc::c_void) -> i32;
+    fn sigrund_capture_namespace(target: *mut libc::c_void, index: u32) -> i32;
     fn sigrund_capture_dispose(target: *mut libc::c_void);
 }
 
 struct Worker {
     failed: bool,
-    helper_pidfd: OwnedFd,
+    helper_pidfd: Arc<OwnedFd>,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     control: UnixStream,
-    pidfd: OwnedFd,
+    pidfd: Arc<OwnedFd>,
     _child_fds: Reservation,
+    _target_fds: Option<Reservation>,
 }
 impl Worker {
     fn line(&mut self, check: impl Fn() -> io::Result<()>) -> io::Result<Vec<u8>> {
@@ -151,26 +180,46 @@ impl Drop for Worker {
     }
 }
 
+pub(crate) struct CaptureIdentity<'a> {
+    pub pid: u32,
+    pub uid: u32,
+    pub registration: Option<&'a Registration>,
+}
+
 pub struct TargetCapture {
     worker: Mutex<Worker>,
+    // Shared ownership adds no descriptors; lifecycle checks never need the
+    // capture IPC lock, even while a destination filesystem exchange stalls.
+    helper_pidfd: Arc<OwnedFd>,
+    pidfd: Arc<OwnedFd>,
     root: File,
+    namespaces: Vec<File>,
     acquisition: Acquisition,
     roots: Vec<PathBuf>,
     executable_roots: BTreeMap<String, FsIdentity>,
     _parent_fds: Reservation,
+    _namespace_resources: Option<Reservation>,
 }
 impl TargetCapture {
     /// The caller holds a pre-acquisition registry reservation and must retain it
     /// until this result, or every failed capture resource, has been disposed.
     pub(crate) fn acquire(
         peer: impl AsRawFd,
-        registration: &Registration,
+        identity: CaptureIdentity<'_>,
         epoch: &str,
         budget: &Budget,
         roots: &[PathBuf],
         check: impl Fn() -> io::Result<()>,
     ) -> io::Result<Self> {
-        registration.validate().map_err(io::Error::other)?;
+        if let Some(registration) = identity.registration {
+            registration.validate().map_err(io::Error::other)?;
+            if registration.daemon_pid != identity.pid || registration.owner_uid != identity.uid {
+                return Err(invalid("capture identity differs from registration"));
+            }
+        }
+        if identity.pid == 0 || identity.pid > i32::MAX as u32 || identity.uid == u32::MAX {
+            return Err(invalid("invalid capture identity"));
+        }
         sigrund_core::crypto::validate_uuidv7(epoch).map_err(io::Error::other)?;
         check()?;
         if roots.is_empty() || roots.len() > 64 {
@@ -178,33 +227,81 @@ impl TargetCapture {
         }
         // Includes the parent's peer pidfd, pipe/socket ends, high-numbered
         // duplicates, received root and the worker's transient observation FDs.
+        let parent_fds = budget
+            .reserve(
+                identity.uid,
+                Charge {
+                    target_fds: 6,
+                    ..Default::default()
+                },
+            )
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "capture parent capacity exhausted",
+                )
+            })?;
+        // Declare this owner before Worker so failed transfers close/reap the
+        // worker and its queued SCM_RIGHTS before refunding their reservation.
+        let mut namespace_resources = Some(
+            budget
+                .reserve_child_resources(
+                    identity.uid,
+                    Charge {
+                        target_fds: 8,
+                        ..Default::default()
+                    },
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "capture queued namespaces capacity exhausted",
+                    )
+                })?,
+        );
         let temporary = budget
             .reserve(
-                registration.owner_uid,
+                identity.uid,
                 Charge {
-                    target_fds: 14,
+                    // Six spawn pipe ends, including the exec-error pipe.
+                    target_fds: 6,
                     ..Default::default()
                 },
             )
-            .ok_or(io::ErrorKind::WouldBlock)?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "capture temporary capacity exhausted",
+                )
+            })?;
         let child_fds = budget
             .reserve_child_resources(
-                registration.owner_uid,
+                identity.uid,
                 Charge {
                     target_fds: 4,
                     ..Default::default()
                 },
             )
-            .ok_or(io::ErrorKind::WouldBlock)?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "capture child IPC capacity exhausted",
+                )
+            })?;
         let transient_child = budget
             .reserve_child_resources(
-                registration.owner_uid,
+                identity.uid,
                 Charge {
                     target_fds: 4,
                     ..Default::default()
                 },
             )
-            .ok_or(io::ErrorKind::WouldBlock)?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "capture transient child capacity exhausted",
+                )
+            })?;
         let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
         let mut size = size_of::<libc::ucred>() as libc::socklen_t;
         if unsafe {
@@ -220,8 +317,8 @@ impl TargetCapture {
             return Err(io::Error::last_os_error());
         }
         if size as usize != size_of::<libc::ucred>()
-            || credentials.pid != registration.daemon_pid as i32
-            || credentials.uid != registration.owner_uid
+            || credentials.pid != identity.pid as i32
+            || credentials.uid != identity.uid
         {
             return Err(invalid("registration differs from authenticated connector"));
         }
@@ -242,7 +339,7 @@ impl TargetCapture {
         if pidfd < 0 || length as usize != size_of::<i32>() {
             return Err(invalid("missing original connector pidfd"));
         }
-        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        let pidfd = Arc::new(unsafe { OwnedFd::from_raw_fd(pidfd) });
         let (parent, child) = UnixStream::pair()?;
         parent.set_nonblocking(true)?;
         let duplicate = |fd| -> io::Result<OwnedFd> {
@@ -265,8 +362,8 @@ impl TargetCapture {
             .env_clear()
             .env("SIGRUND_DAEMON_EPOCH", epoch)
             .env("SIGRUND_TARGET_INSTANCE", &instance)
-            .env("SIGRUND_TARGET_PID", registration.daemon_pid.to_string())
-            .env("SIGRUND_TARGET_UID", registration.owner_uid.to_string())
+            .env("SIGRUND_TARGET_PID", identity.pid.to_string())
+            .env("SIGRUND_TARGET_UID", identity.uid.to_string())
             .env("SIGRUND_TARGET_ROOTS", serde_json::to_string(roots)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -297,8 +394,16 @@ impl TargetCapture {
         // has then closed every inherited parent target descriptor. The passed
         // IPC/peer and stdio descriptors have their separate child charge.
         let mut child_process = budget
-            .with_transient_fd_copies(registration.owner_uid, || command.spawn())
-            .ok_or(io::ErrorKind::WouldBlock)??;
+            .with_transient_fd_copies(identity.uid, || command.spawn())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "capture fork FD capacity exhausted: {:?}",
+                        budget.usage(identity.uid)
+                    ),
+                )
+            })??;
         drop(peer_copy);
         drop(control_copy);
         drop(child);
@@ -311,7 +416,7 @@ impl TargetCapture {
             let _ = child_process.wait();
             return Err(error);
         }
-        let helper_pidfd = unsafe { OwnedFd::from_raw_fd(helper_fd) };
+        let helper_pidfd = Arc::new(unsafe { OwnedFd::from_raw_fd(helper_fd) });
         drop(reaper);
         let input = child_process.stdin.take().expect("capture stdin");
         let output = child_process.stdout.take().expect("capture stdout");
@@ -323,7 +428,28 @@ impl TargetCapture {
             control: parent,
             pidfd,
             _child_fds: child_fds,
+            _target_fds: None,
         };
+        // Command::spawn completed its exec handshake, and all parent spawn
+        // duplicates closed above. Only now admit the helper's target pins.
+        drop(temporary);
+        worker._target_fds = Some(
+            budget
+                .reserve_child_resources(
+                    identity.uid,
+                    Charge {
+                        target_fds: 20 + roots.len() as u32,
+                        ..Default::default()
+                    },
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "capture target capacity exhausted",
+                    )
+                })?,
+        );
+        worker.input.write_all(b"B")?;
         if unsafe {
             libc::fcntl(
                 worker.output.get_ref().as_raw_fd(),
@@ -336,13 +462,16 @@ impl TargetCapture {
         }
         let mut acquisition =
             Acquisition::parse(&worker.line(&check)?).map_err(io::Error::other)?;
-        if acquisition.pid != registration.daemon_pid
-            || acquisition.anchor.host_uid != registration.owner_uid
+        if acquisition.pid != identity.pid
+            || acquisition.anchor.host_uid != identity.uid
             || acquisition.daemon_epoch != epoch
             || acquisition.instance_id != instance
         {
             return Err(invalid("capture reply differs from selected anchor"));
         }
+        // Before any SCM_RIGHTS receive, transfer the pre-reserved namespace
+        // references to parent ownership. The helper fork has already execed.
+        namespace_resources = namespace_resources.take().map(Reservation::into_parent);
         let mut reader = ControlReader::new(true);
         let (root, executable_roots) = loop {
             check()?;
@@ -377,11 +506,40 @@ impl TargetCapture {
         {
             return Err(invalid("captured root identity differs"));
         }
-        acquisition.lifecycle.registration_id = Some(registration.id.clone());
-        acquisition.lifecycle.registration_revision = Some(registration.revision.clone());
+        let mut namespaces = Vec::new();
+        for name in ["cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"] {
+            let mut reader = ControlReader::new(true);
+            loop {
+                check()?;
+                if let Some(mut frame) = reader.read(worker.control.as_raw_fd(), Instant::now())? {
+                    if frame.payload != name.as_bytes() || frame.rights.len() != 1 {
+                        return Err(invalid("invalid captured namespace transfer"));
+                    }
+                    let namespace = File::from(frame.rights.remove(0));
+                    verify_namespace(&namespace, name, &acquisition.namespaces[name])?;
+                    namespaces.push(namespace);
+                    break;
+                }
+                let mut descriptor = libc::pollfd {
+                    fd: worker.control.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    libc::poll(&mut descriptor, 1, 10);
+                }
+            }
+        }
+        acquisition.lifecycle.registration_id = identity
+            .registration
+            .map(|registration| registration.id.clone());
+        acquisition.lifecycle.registration_revision = identity
+            .registration
+            .map(|registration| registration.revision.clone());
         acquisition.validate().map_err(io::Error::other)?;
         ProcessContext {
             schema: "sigrund.process-context.v1".into(),
+            authenticated_source: None,
             acquisition: acquisition.clone(),
             executable_roots: executable_roots.clone(),
         }
@@ -395,23 +553,17 @@ impl TargetCapture {
         drop(peer);
         drop(transient_child);
 
-        let parent_fds = budget
-            .reserve(
-                registration.owner_uid,
-                Charge {
-                    target_fds: 6,
-                    ..Default::default()
-                },
-            )
-            .ok_or(io::ErrorKind::WouldBlock)?;
-        drop(temporary);
         let result = Self {
+            helper_pidfd: worker.helper_pidfd.clone(),
+            pidfd: worker.pidfd.clone(),
             worker: Mutex::new(worker),
             root,
+            namespaces,
             acquisition,
             roots: roots.to_vec(),
             executable_roots,
             _parent_fds: parent_fds,
+            _namespace_resources: namespace_resources,
         };
         result.revalidate()?;
         Ok(result)
@@ -421,6 +573,9 @@ impl TargetCapture {
     }
 }
 impl CapturedAnchor for TargetCapture {
+    fn namespace_files(&self) -> &[File] {
+        &self.namespaces
+    }
     fn executable_roots(&self) -> BTreeMap<String, FsIdentity> {
         self.executable_roots.clone()
     }
@@ -467,6 +622,9 @@ impl CapturedAnchor for TargetCapture {
     }
 
     fn alive(&self) -> bool {
+        if !pidfds_live(&self.pidfd, &self.helper_pidfd) {
+            return false;
+        }
         let worker = match self.worker.try_lock() {
             Ok(worker) => worker,
             Err(std::sync::TryLockError::WouldBlock) => return true,
@@ -475,19 +633,7 @@ impl CapturedAnchor for TargetCapture {
         if worker.failed {
             return false;
         }
-        let mut descriptors = [
-            libc::pollfd {
-                fd: worker.pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: worker.helper_pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 0) == 0 }
+        true
     }
 
     fn root(&self) -> &File {
@@ -497,6 +643,9 @@ impl CapturedAnchor for TargetCapture {
         &self.acquisition
     }
     fn revalidate(&self) -> io::Result<()> {
+        if !pidfds_live(&self.pidfd, &self.helper_pidfd) {
+            return Err(invalid("capture process exited"));
+        }
         let mut worker = self
             .worker
             .lock()
@@ -514,12 +663,28 @@ impl CapturedAnchor for TargetCapture {
                 Ok(())
             }
         })?;
-        if line != b"{\"live\":true}\n" {
+        if line != b"{\"live\":true}\n" || !pidfds_live(&self.pidfd, &self.helper_pidfd) {
             return Err(invalid("anchor no longer live"));
         }
         worker.failed = false;
         Ok(())
     }
+}
+
+fn pidfds_live(anchor: &OwnedFd, helper: &OwnedFd) -> bool {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: anchor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: helper.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 0) == 0 }
 }
 
 /// Internal entry before configuration, secrets or listeners.
@@ -546,6 +711,11 @@ pub fn helper_main() -> io::Result<()> {
         serde_json::from_str(&std::env::var("SIGRUND_TARGET_ROOTS").map_err(io::Error::other)?)?;
     if roots.is_empty() || roots.len() > 64 {
         return Err(invalid("invalid target executable roots"));
+    }
+    let mut begin = [0];
+    io::stdin().read_exact(&mut begin)?;
+    if begin != *b"B" {
+        return Err(invalid("invalid target acquisition grant"));
     }
     let target = unsafe { sigrund_capture_begin(3, pid, uid) };
     unsafe {
@@ -592,6 +762,36 @@ pub fn helper_main() -> io::Result<()> {
         };
         unsafe {
             libc::poll(&mut descriptor, 1, 10);
+        }
+    }
+    for (index, name) in ["cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"]
+        .iter()
+        .enumerate()
+    {
+        let fd = unsafe {
+            libc::fcntl(
+                sigrund_capture_namespace(target, index as u32),
+                libc::F_DUPFD_CLOEXEC,
+                10,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut writer = FrameWriter::private_rights(
+            name.as_bytes(),
+            vec![unsafe { OwnedFd::from_raw_fd(fd) }],
+            Instant::now(),
+        )?;
+        while !writer.write(socket.as_raw_fd(), Instant::now())? {
+            let mut descriptor = libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut descriptor, 1, 10);
+            }
         }
     }
     io::stdout().write_all(b"{\"ready\":true}\n")?;
@@ -643,27 +843,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interrupted_root_exchange_permanently_retires_stream() {
+    fn namespace_handoff_rejects_other_namespace_types_and_inodes() {
+        use std::os::unix::fs::MetadataExt;
+        let file = File::open("/proc/self/ns/mnt").unwrap();
+        let stat = file.metadata().unwrap();
+        let mut expected = sigrund_core::namespace::NamespaceIdentity {
+            device: stat.dev().to_string(),
+            inode: stat.ino().to_string(),
+            owner_userns_device: "0".into(),
+            owner_userns_inode: "0".into(),
+        };
+        verify_namespace(&file, "mnt", &expected).unwrap();
+        assert!(verify_namespace(&file, "user", &expected).is_err());
+        expected.inode = "0".into();
+        assert!(verify_namespace(&file, "mnt", &expected).is_err());
+        let ordinary = File::open("/dev/null").unwrap();
+        let stat = ordinary.metadata().unwrap();
+        expected.device = stat.dev().to_string();
+        expected.inode = stat.ino().to_string();
+        assert!(verify_namespace(&ordinary, "mnt", &expected).is_err());
+    }
+
+    fn capture_fixture() -> (TargetCapture, std::process::Child, std::process::Child) {
         let budget = Budget::new(Default::default()).unwrap();
         let mut helper = Command::new("/bin/cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut anchor = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let anchor = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pidfd = |pid: u32| {
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
             assert!(fd >= 0);
             unsafe { OwnedFd::from_raw_fd(fd) }
         };
+        let helper_pidfd = Arc::new(pidfd(helper.id()));
+        let anchor_pidfd = Arc::new(pidfd(anchor.id()));
         let capture = TargetCapture {
+            helper_pidfd: helper_pidfd.clone(),
+            pidfd: anchor_pidfd.clone(),
             worker: Mutex::new(Worker {
                 failed: false,
-                helper_pidfd: pidfd(helper.id()),
-                pidfd: pidfd(anchor.id()),
+                helper_pidfd,
+                pidfd: anchor_pidfd,
                 input: helper.stdin.take().unwrap(),
                 output: BufReader::new(helper.stdout.take().unwrap()),
                 control: UnixStream::pair().unwrap().0,
+                _target_fds: None,
                 _child_fds: budget
                     .reserve(
                         1000,
@@ -675,6 +901,8 @@ mod tests {
                     .unwrap(),
             }),
             root: File::open("/").unwrap(),
+            namespaces: Vec::new(),
+            _namespace_resources: None,
             acquisition: Acquisition::parse(include_bytes!(
                 "../../sigrund-phase0/tests/fixtures/acquisition.json"
             ))
@@ -691,6 +919,46 @@ mod tests {
                 )
                 .unwrap(),
         };
+        (capture, helper, anchor)
+    }
+
+    #[test]
+    fn anchor_and_helper_death_remain_visible_during_a_blocked_directory_exchange() {
+        for kill_anchor in [true, false] {
+            let (capture, mut helper, mut anchor) = capture_fixture();
+            let capture = Arc::new(capture);
+            let (entered, arrived) = std::sync::mpsc::sync_channel(1);
+            let (release, wait) = std::sync::mpsc::sync_channel(1);
+            let request = capture.clone();
+            let exchange = std::thread::spawn(move || {
+                request.directory(Path::new("/usr/bin"), &|| {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Err(io::ErrorKind::Interrupted.into())
+                })
+            });
+            arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(capture.worker.try_lock().is_err());
+            assert!(capture.alive());
+            let victim = if kill_anchor {
+                &mut anchor
+            } else {
+                &mut helper
+            };
+            victim.kill().unwrap();
+            victim.wait().unwrap();
+            assert!(!capture.alive(), "IPC contention cannot hide process exit");
+            release.send(()).unwrap();
+            assert!(exchange.join().unwrap().is_err());
+            drop(capture);
+            let _ = helper.wait();
+            let _ = anchor.wait();
+        }
+    }
+
+    #[test]
+    fn interrupted_root_exchange_permanently_retires_stream() {
+        let (capture, mut helper, mut anchor) = capture_fixture();
         assert!(
             capture
                 .directory(Path::new("/usr/bin"), &|| Err(
@@ -726,12 +994,13 @@ mod tests {
             .unwrap();
         let mut anchor = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let worker = Worker {
+            _target_fds: None,
             failed: false,
-            helper_pidfd: pidfd(helper.id()),
+            helper_pidfd: Arc::new(pidfd(helper.id())),
             input: helper.stdin.take().unwrap(),
             output: BufReader::new(helper.stdout.take().unwrap()),
             control: UnixStream::pair().unwrap().0,
-            pidfd: pidfd(anchor.id()),
+            pidfd: Arc::new(pidfd(anchor.id())),
             _child_fds: budget
                 .reserve(
                     1000,

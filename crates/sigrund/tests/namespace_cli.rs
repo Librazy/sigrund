@@ -19,6 +19,7 @@ fn args(target: &str, extra: &[&str]) -> Vec<String> {
 #[test]
 fn namespace_selection_preserves_explicit_intent_and_process_pid_scope() {
     for (target, expected) in [
+        ("self", Selector::Self_ {}),
         (
             "registered:container-b",
             Selector::Registered {
@@ -61,7 +62,7 @@ fn unsupported_cross_domain_models_and_selectors_fail_locally() {
         assert!(ClientArgs::parse(&args("registered:container-b", &extra)).is_err());
     }
     for target in [
-        "self",
+        "self:1234",
         "process:0",
         "process:2147483648",
         "registered:",

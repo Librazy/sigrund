@@ -34,13 +34,18 @@ pub trait CapturedAnchor: Send + Sync {
         Err(invalid("pinned executable roots unavailable"))
     }
 
+    fn namespace_files(&self) -> &[std::fs::File] {
+        &[]
+    }
     fn revalidate(&self) -> io::Result<()>;
 }
 
 struct Instance {
     // Close/reap the capture before refunding the resource reservation.
     anchor: Box<dyn CapturedAnchor>,
-    registration: Registration,
+    registration: Option<Registration>,
+    authenticated_source: Option<sigrund_core::namespace::ConnectorObservation>,
+    owner_uid: u32,
     constraints: Constraints,
     revoked: AtomicBool,
     _resources: Reservation,
@@ -48,6 +53,9 @@ struct Instance {
     cleanup_lifetime: Arc<()>,
 }
 impl Instance {
+    fn registration(&self) -> &Registration {
+        self.registration.as_ref().expect("registered owner")
+    }
     fn check(&self) -> io::Result<()> {
         if self.revoked.load(Ordering::Acquire) {
             return Err(invalid("target registration revoked"));
@@ -70,9 +78,9 @@ impl Retired {
     fn new(owner: &Arc<Instance>) -> Self {
         Self {
             owner: Arc::downgrade(&owner.cleanup_lifetime),
-            revision: owner.registration.revision.clone(),
+            revision: owner.registration().revision.clone(),
             instance_id: owner.anchor.acquisition().instance_id.clone(),
-            daemon_pid: owner.registration.daemon_pid,
+            daemon_pid: owner.registration().daemon_pid,
         }
     }
 }
@@ -91,6 +99,7 @@ pub struct TargetRegistry {
     epoch: String,
     budget: Budget,
     roots: Vec<std::path::PathBuf>,
+    self_capture: Mutex<Option<crate::target_management::SelfCapture>>,
     entries: Mutex<Entries>,
 }
 
@@ -122,7 +131,24 @@ pub struct TargetLease {
     // Drop the instance and its actual resources before releasing the lease.
     _reservation: Reservation,
 }
+pub(crate) struct TargetWatch(std::sync::Weak<Instance>);
+impl TargetWatch {
+    // Called while the committed request lease still owns this instance.
+    pub fn valid(&self) -> bool {
+        self.0.upgrade().is_some_and(|instance| {
+            !instance.revoked.load(Ordering::Acquire) && instance.anchor.alive()
+        })
+    }
+}
 impl TargetLease {
+    pub(crate) fn watch(&self) -> TargetWatch {
+        TargetWatch(Arc::downgrade(&self.instance))
+    }
+    pub(crate) fn reserve_child_resources(&self, charge: Charge) -> io::Result<Reservation> {
+        self._reservation
+            .budget_reserve_child(charge)
+            .ok_or(io::ErrorKind::WouldBlock.into())
+    }
     pub fn executable_roots(&self) -> BTreeMap<String, sigrund_core::namespace::FsIdentity> {
         self.instance.anchor.executable_roots()
     }
@@ -145,6 +171,15 @@ impl TargetLease {
         Ok(())
     }
 
+    pub(crate) fn namespace_files(&self) -> io::Result<&[std::fs::File]> {
+        self.check_lifecycle()?;
+        let files = self.instance.anchor.namespace_files();
+        if files.len() != 8 {
+            return Err(invalid("incomplete namespace handoff"));
+        }
+        Ok(files)
+    }
+
     pub fn root(&self) -> &std::fs::File {
         self.instance.anchor.root()
     }
@@ -156,14 +191,39 @@ impl TargetLease {
     pub fn with_fd_copies<T>(&self, operation: impl FnOnce() -> T) -> io::Result<(T, Reservation)> {
         self._reservation
             .with_retained_fd_copies(operation)
-            .ok_or(io::ErrorKind::WouldBlock.into())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "launcher inherited descriptor capacity exhausted: {:?}",
+                        self._reservation.usage()
+                    ),
+                )
+            })
     }
 
     pub fn revalidate(&self) -> io::Result<()> {
         self.instance.check()
     }
     pub fn registration(&self) -> &Registration {
-        &self.instance.registration
+        self.instance.registration()
+    }
+    pub(crate) fn authenticated_source(
+        &self,
+    ) -> Option<&sigrund_core::namespace::ConnectorObservation> {
+        self.instance.authenticated_source.as_ref()
+    }
+    pub(crate) fn registration_record(&self) -> Option<&Registration> {
+        self.instance.registration.as_ref()
+    }
+    pub(crate) fn owner_uid(&self) -> u32 {
+        self.instance.owner_uid
+    }
+    pub(crate) fn scope(&self) -> String {
+        self.registration_record().map_or_else(
+            || "self".into(),
+            |registration| format!("registered:{}", registration.id),
+        )
     }
     pub fn acquisition(&self) -> &Acquisition {
         self.instance.anchor.acquisition()
@@ -177,7 +237,9 @@ impl TargetLease {
         let a = self.acquisition();
         if a.daemon_epoch != epoch
             || a.instance_id != instance
-            || self.registration().revision != revision
+            || self
+                .registration_record()
+                .is_none_or(|registration| registration.revision != revision)
         {
             return Err(invalid("stale target binding"));
         }
@@ -205,6 +267,7 @@ impl TargetRegistry {
             epoch,
             budget,
             roots: Vec::new(),
+            self_capture: Mutex::new(None),
             entries: Mutex::new(Entries {
                 by_id: BTreeMap::new(),
                 retired: Vec::new(),
@@ -246,7 +309,7 @@ impl TargetRegistry {
             || entries
                 .by_id
                 .values()
-                .any(|owner| owner.registration.daemon_pid == pid)
+                .any(|owner| owner.registration().daemon_pid == pid)
             || entries
                 .retired
                 .iter()
@@ -263,6 +326,29 @@ impl TargetRegistry {
         })
     }
 
+    pub(crate) fn reserve_source_reference(&self, uid: u32) -> io::Result<Reservation> {
+        self.budget
+            .reserve(
+                uid,
+                Charge {
+                    target_fds: 1,
+                    ..Default::default()
+                },
+            )
+            .ok_or(io::ErrorKind::WouldBlock.into())
+    }
+    pub(crate) fn reserve_self_lease(&self, uid: u32) -> io::Result<Reservation> {
+        self.budget
+            .reserve(
+                uid,
+                Charge {
+                    targets: 1,
+                    reviews: 1,
+                    ..Default::default()
+                },
+            )
+            .ok_or(io::ErrorKind::WouldBlock.into())
+    }
     pub fn reserve_registration(
         self: &Arc<Self>,
         owner: u32,
@@ -332,7 +418,7 @@ impl TargetRegistry {
                 let mut matches = entries
                     .by_id
                     .values()
-                    .filter(|entry| entry.registration.daemon_pid == *pid);
+                    .filter(|entry| entry.registration().daemon_pid == *pid);
                 let first = matches.next().cloned();
                 if matches.next().is_some() {
                     return Err(invalid("ambiguous retained process selector"));
@@ -399,7 +485,7 @@ impl TargetRegistry {
             instance.revoked.store(true, Ordering::Release);
             let removed = {
                 let mut entries = self.entries.lock().expect("registry poisoned");
-                let id = &instance.registration.id;
+                let id = &instance.registration().id;
                 if entries
                     .by_id
                     .get(id)
@@ -433,6 +519,37 @@ impl TargetRegistry {
         }
     }
 
+    pub(crate) fn set_self_capture(&self, service: Option<crate::target_management::SelfCapture>) {
+        *self.self_capture.lock().expect("self capture service") = service;
+    }
+    pub(crate) fn capture_self(
+        self: &Arc<Self>,
+        source: crate::socket_disposal::Socket,
+        constraints: Constraints,
+        deadline: std::time::Instant,
+        cancelled: Arc<AtomicBool>,
+        check: impl Fn() -> io::Result<()>,
+    ) -> io::Result<TargetLease> {
+        loop {
+            check()?;
+            let service = self
+                .self_capture
+                .lock()
+                .map_err(|_| invalid("self capture service poisoned"))?
+                .clone();
+            if let Some(service) = service {
+                return service.capture(
+                    self.clone(),
+                    source,
+                    constraints,
+                    deadline,
+                    cancelled,
+                    check,
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     pub fn epoch(&self) -> &str {
         &self.epoch
     }
@@ -442,7 +559,7 @@ impl RegistrationSlot {
     /// Capture the authenticated dedicated anchor before publishing its name.
     /// All failure paths dispose it before releasing this slot's reservation.
     pub fn capture_and_publish(
-        self,
+        mut self,
         id: String,
         pid: u32,
         constraints: Constraints,
@@ -460,9 +577,21 @@ impl RegistrationSlot {
         registration.validate().map_err(io::Error::other)?;
         let registry = self.registry.clone();
         let _capture = registry.reserve_capture(pid)?;
+        // No target descriptors exist yet. The fresh helper reserves these
+        // after exec has closed inherited copies, before its acquisition gate.
+        drop(
+            self.resources
+                .as_mut()
+                .expect("capture resources")
+                .take_target_fds(),
+        );
         let anchor = crate::target_capture::TargetCapture::acquire(
             peer,
-            &registration,
+            crate::target_capture::CaptureIdentity {
+                pid,
+                uid: self.owner,
+                registration: Some(&registration),
+            },
             &self.registry.epoch,
             &self.registry.budget,
             &self.registry.roots,
@@ -470,6 +599,55 @@ impl RegistrationSlot {
         )?;
         check()?;
         self.publish(registration, constraints, Box::new(anchor))
+    }
+
+    pub(crate) fn capture_self(
+        mut self,
+        source: sigrund_core::namespace::ConnectorObservation,
+        constraints: Constraints,
+        peer: crate::socket_disposal::Socket,
+        lease: Reservation,
+        check: impl Fn() -> io::Result<()>,
+    ) -> io::Result<TargetLease> {
+        constraints.validate().map_err(io::Error::other)?;
+        let pid = source.pid;
+        let registry = self.registry.clone();
+        let _capture = registry.reserve_capture(pid)?;
+        drop(
+            self.resources
+                .as_mut()
+                .expect("self capture resources")
+                .take_target_fds(),
+        );
+        let anchor = crate::target_capture::TargetCapture::acquire(
+            peer,
+            crate::target_capture::CaptureIdentity {
+                pid,
+                uid: self.owner,
+                registration: None,
+            },
+            &registry.epoch,
+            &registry.budget,
+            &registry.roots,
+            &check,
+        )?;
+        check()?;
+        source
+            .verify_capture(anchor.acquisition())
+            .map_err(io::Error::other)?;
+        Ok(TargetLease {
+            instance: Arc::new(Instance {
+                anchor: Box::new(anchor),
+                registration: None,
+                authenticated_source: Some(source),
+                owner_uid: self.owner,
+                constraints,
+                revoked: AtomicBool::new(false),
+                _resources: self.resources.take().expect("self capture resources"),
+                cleanup_lifetime: Arc::new(()),
+            }),
+            _reservation: lease,
+        })
     }
 
     /// Publish only coherent live resources. A replacement atomically revokes
@@ -507,7 +685,7 @@ impl RegistrationSlot {
             .lock()
             .map_err(|_| invalid("registry poisoned"))?;
         if entries.by_id.values().any(|entry| {
-            entry.registration.revision == registration.revision
+            entry.registration().revision == registration.revision
                 || entry.anchor.acquisition().instance_id == acquisition.instance_id
         }) || entries.retired.iter().any(|entry| {
             entry.revision == registration.revision || entry.instance_id == acquisition.instance_id
@@ -517,7 +695,9 @@ impl RegistrationSlot {
         let id = registration.id.clone();
         let instance = Arc::new(Instance {
             anchor,
-            registration,
+            owner_uid: registration.owner_uid,
+            registration: Some(registration),
+            authenticated_source: None,
             constraints,
             revoked: AtomicBool::new(false),
             _resources: self.resources.take().expect("registration resource owner"),

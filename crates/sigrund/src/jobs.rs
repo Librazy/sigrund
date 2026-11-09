@@ -1,6 +1,6 @@
 //! Bounded off-loop cgroup and clone operations. All completions return owners.
 use crate::{
-    execution::{ChildProcess, PreparedChild},
+    execution::{ChildProcess, NamespaceLauncher, NamespaceTarget, PreparedChild, Spawned},
     sequencer::CommittedJob,
     startup::{CgroupLayout, JobCgroup},
 };
@@ -18,6 +18,10 @@ pub(crate) struct PreparedJob {
     pub job: CommittedJob,
     pub cgroup: Option<JobCgroup>,
     pub(crate) inherited_target_fds: Option<sigrund_core::host_budget::Reservation>,
+    pub(crate) namespace_resources: Option<(
+        sigrund_core::host_budget::Reservation,
+        sigrund_core::host_budget::Reservation,
+    )>,
 }
 pub(crate) enum Task {
     Prepare(CommittedJob),
@@ -30,6 +34,10 @@ pub(crate) enum SpawnOutcome {
         owner: Box<PreparedJob>,
         failure: Option<String>,
     },
+    Launched {
+        owner: Box<PreparedJob>,
+        launcher: NamespaceLauncher,
+    },
     Spawned {
         owner: Box<PreparedJob>,
         child: io::Result<ChildProcess>,
@@ -37,7 +45,7 @@ pub(crate) enum SpawnOutcome {
     Cleaned(Box<CommittedJob>),
     ExecVerified {
         owner: Box<PreparedJob>,
-        result: io::Result<()>,
+        result: io::Result<serde_json::Value>,
     },
     Signal {
         token: u64,
@@ -113,38 +121,53 @@ impl JobSupervisor {
                             match task {
                                 Task::VerifyExec(owner, pid, deadline) => {
                                     let request = owner.job.lease.request();
+                                    let check = || {
+                                        request.check()?;
+                                        if owner
+                                            .job
+                                            .lifecycle
+                                            .cancelled
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                        {
+                                            return Err(io::ErrorKind::Interrupted.into());
+                                        }
+                                        if std::time::Instant::now() >= deadline {
+                                            return Err(io::ErrorKind::TimedOut.into());
+                                        }
+                                        Ok(())
+                                    };
                                     let result = eligible(&owner.job).and_then(|()| {
+                                        let mut credentials = owner
+                                            .job
+                                            .authorized
+                                            .warrant
+                                            .warrant()
+                                            .execution_context
+                                            .clone();
+                                        if let Some(process) = &request.process {
+                                            credentials.target_uid =
+                                                process.evidence.credentials.host_uid;
+                                            credentials.target_gid =
+                                                process.evidence.credentials.host_gid;
+                                            credentials.supplementary_gids =
+                                                process.evidence.credentials.host_groups.clone();
+                                        }
                                         request
                                             .snapshots
                                             .as_ref()
                                             .expect("executable owner")
                                             .executable
-                                            .verify_exec_checked(
+                                            .verify_exec_checked(pid, &credentials, check)?;
+                                        if request.process.is_some() {
+                                            crate::process_request::verify_execution(
+                                                request,
                                                 pid,
-                                                &owner
-                                                    .job
-                                                    .authorized
-                                                    .warrant
-                                                    .warrant()
-                                                    .execution_context,
-                                                || {
-                                                    request.check()?;
-                                                    if owner
-                                                        .job
-                                                        .lifecycle
-                                                        .cancelled
-                                                        .load(std::sync::atomic::Ordering::Acquire)
-                                                    {
-                                                        return Err(
-                                                            io::ErrorKind::Interrupted.into()
-                                                        );
-                                                    }
-                                                    if std::time::Instant::now() >= deadline {
-                                                        return Err(io::ErrorKind::TimedOut.into());
-                                                    }
-                                                    Ok(())
-                                                },
+                                                owner.cgroup.as_ref().expect("job placement"),
+                                                check,
                                             )
+                                        } else {
+                                            Ok(serde_json::Value::Null)
+                                        }
                                     });
                                     notifier.send(SpawnOutcome::ExecVerified {
                                         owner: Box::new(owner),
@@ -159,16 +182,28 @@ impl JobSupervisor {
                                             job,
                                             cgroup,
                                             inherited_target_fds: None,
+                                            namespace_resources: None,
                                         }),
                                         failure,
                                     });
                                 }
                                 Task::Spawn(mut owner) => {
                                     let child = spawn(&mut owner);
-                                    notifier.send(SpawnOutcome::Spawned {
-                                        owner: Box::new(owner),
-                                        child,
-                                    });
+                                    match child {
+                                        Ok(Spawned::Launcher(launcher)) => {
+                                            notifier.send(SpawnOutcome::Launched {
+                                                owner: Box::new(owner),
+                                                launcher,
+                                            })
+                                        }
+                                        other => notifier.send(SpawnOutcome::Spawned {
+                                            owner: Box::new(owner),
+                                            child: other.map(|child| match child {
+                                                Spawned::Child(child) => child,
+                                                Spawned::Launcher(_) => unreachable!(),
+                                            }),
+                                        }),
+                                    }
                                 }
                                 Task::Cleanup(mut owner) => {
                                     if let Some(cgroup) = owner.cgroup.take()
@@ -242,6 +277,18 @@ fn wake_coordinator(fd: RawFd) {
 pub(crate) fn eligible(job: &CommittedJob) -> io::Result<()> {
     eligible_for_release(job)?;
     let request = job.lease.request();
+    if let Some(process) = &request.process {
+        if !process
+            .verified
+            .as_ref()
+            .is_some_and(|proof| proof.matches(request))
+        {
+            return Err(io::Error::other(
+                "namespace execution plan differs from authorization",
+            ));
+        }
+        return process.lease.revalidate();
+    }
     let bundle = request
         .host_bundle
         .as_ref()
@@ -277,8 +324,23 @@ pub(crate) fn eligible_for_release(job: &CommittedJob) -> io::Result<()> {
     }
     Ok(())
 }
-fn spawn(owner: &mut PreparedJob) -> io::Result<ChildProcess> {
+fn spawn(owner: &mut PreparedJob) -> io::Result<Spawned> {
     let request = owner.job.lease.request();
+    if let Some(process) = &request.process {
+        let parent = process
+            .lease
+            .reserve_resources(sigrund_core::host_budget::Charge {
+                target_fds: 8,
+                ..Default::default()
+            })?;
+        let child = process
+            .lease
+            .reserve_child_resources(sigrund_core::host_budget::Charge {
+                target_fds: 18,
+                ..Default::default()
+            })?;
+        owner.namespace_resources = Some((parent, child));
+    }
     let mut command = PreparedChild::new(
         owner.job.authorized.warrant.warrant(),
         owner.job.authorized.envp.clone(),
@@ -297,39 +359,61 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<ChildProcess> {
                 .as_ref()
                 .and_then(|p| p.null_stdin.as_ref().map(AsRawFd::as_raw_fd))
         })
-        .or_else(|| request.rights.first().map(AsRawFd::as_raw_fd))
         .ok_or_else(|| io::Error::other("missing stdin"))?;
     let n = request.rights.len();
     if n < 2 {
         return Err(io::Error::other("missing output rights"));
     }
     eligible(&owner.job)?;
-    let (child, copies) = request
-        .host_lease
-        .as_ref()
-        .expect("validated target owner")
-        .with_retained_fd_copies(|| {
-            if owner
-                .job
-                .lifecycle
-                .cancelled
-                .load(std::sync::atomic::Ordering::Acquire)
-                || !crate::sequencer::connection_live(owner.job.control)
-            {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            request.check()?;
-            command.spawn_checkpoint(
-                owner.cgroup.as_ref().expect("prepared cgroup").fd(),
-                [
-                    input,
-                    request.rights[n - 2].as_raw_fd(),
-                    request.rights[n - 1].as_raw_fd(),
-                    snapshot.executable.as_fd().as_raw_fd(),
-                ],
-                snapshot.executable.needs_checkpoint(),
-            )
-        })?;
+    let operation = || {
+        if owner
+            .job
+            .lifecycle
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !crate::sequencer::connection_live(owner.job.control)
+        {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        request.check()?;
+        let fds = [
+            input,
+            request.rights[n - 2].as_raw_fd(),
+            request.rights[n - 1].as_raw_fd(),
+            snapshot.executable.as_fd().as_raw_fd(),
+        ];
+        if let Some(process) = &request.process {
+            command
+                .spawn_namespace(
+                    owner.cgroup.as_ref().expect("prepared cgroup").fd(),
+                    fds,
+                    NamespaceTarget {
+                        namespaces: process.lease.namespace_files()?,
+                        root: process.lease.root().as_raw_fd(),
+                        cwd: process.cwd.as_raw_fd(),
+                    },
+                )
+                .map(Spawned::Launcher)
+        } else {
+            command
+                .spawn_checkpoint(
+                    owner.cgroup.as_ref().expect("prepared cgroup").fd(),
+                    fds,
+                    snapshot.executable.needs_checkpoint(),
+                )
+                .map(Spawned::Child)
+        }
+    };
+    let (child, copies) = if let Some(process) = &request.process {
+        let (result, copies) = process.lease.with_fd_copies(operation)?;
+        (result?, copies)
+    } else {
+        request
+            .host_lease
+            .as_ref()
+            .expect("validated host owner")
+            .with_retained_fd_copies(operation)?
+    };
     owner.inherited_target_fds = Some(copies);
     Ok(child)
 }
@@ -352,12 +436,27 @@ pub(crate) fn prepare_job(
         return (None, "execution disabled".into());
     };
     let p = &job.lease.request().policy;
-    match layout.create_job(
-        &job.exec_id,
-        p.job_memory_max_bytes,
-        p.job_memory_swap_max_bytes,
-        p.job_pids_max,
-    ) {
+    let (memory, swap, pids) = if let Some(process) = &job.lease.request().process {
+        let profile = process.lease.constraints();
+        if profile.memory_max > p.job_memory_max_bytes
+            || profile.memory_swap_max > p.job_memory_swap_max_bytes
+            || u64::from(profile.pids_max) > p.job_pids_max
+        {
+            return (None, "namespace limits exceed daemon ceilings".into());
+        }
+        (
+            profile.memory_max,
+            profile.memory_swap_max,
+            u64::from(profile.pids_max),
+        )
+    } else {
+        (
+            p.job_memory_max_bytes,
+            p.job_memory_swap_max_bytes,
+            p.job_pids_max,
+        )
+    };
+    match layout.create_job(&job.exec_id, memory, swap, pids) {
         Ok(cgroup) => (Some(cgroup), String::new()),
         Err(error) => (
             error.owner,

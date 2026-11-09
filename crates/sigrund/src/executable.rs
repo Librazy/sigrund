@@ -194,13 +194,19 @@ impl Executable {
         context: &ExecutionContext,
         check: impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.verify_evidence(context, true, &check)?;
+        if let Some(sealed) = &self.sealed {
+            crate::authorization::verify_snapshot(
+                sealed,
+                &self.digest.sha256,
+                self.digest.bytes,
+                true,
+                &check,
+            )?;
+        } else {
+            self.verify_evidence(context, true, &check)?;
+        }
         let actual = std::fs::metadata(format!("/proc/{pid}/exe"))?;
-        let source = self
-            .source
-            .as_ref()
-            .expect("direct executable")
-            .metadata()?;
+        let source = File::from(self.as_fd().try_clone_to_owned()?).metadata()?;
         if (actual.dev(), actual.ino()) != (source.dev(), source.ino()) {
             return Err(invalid("exec loaded a different inode"));
         }

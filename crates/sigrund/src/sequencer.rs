@@ -366,7 +366,7 @@ fn authorize(
                 let binding = review.binding().map_err(|error| error.to_string())?;
                 fields["source_authenticated"] = serde_json::json!({
                     "uid":request.requester_uid, "gid":request.requester_gid,
-                    "supplementary_gids":request.requester_groups});
+                    "supplementary_gids":request.requester_groups,"connector_observations":process.lease.authenticated_source()});
                 fields["approved_target"] = serde_json::json!({
                     "binding":binding.target_binding,
                     "security_constraints":binding.security_constraints,
@@ -450,7 +450,7 @@ fn authorize(
         )
         .map_err(|e| format!("authorization database failed; reconciliation required: {e}"))?;
     let limit = request.policy.audit_record_max_bytes as usize;
-    let fields = serde_json::json!({"exec_id":task.exec_id,"request_origin":w.request_origin,"intent_sha256":w.intent_sha256,"approval_exec_id":w.approval_exec_id, "grant_id":w.grant_id,
+    let mut fields = serde_json::json!({"exec_id":task.exec_id,"request_origin":w.request_origin,"intent_sha256":w.intent_sha256,"approval_exec_id":w.approval_exec_id, "grant_id":w.grant_id,
         "execution_binding_sha256": binding_digest,
         "target_binding":w.target_binding,"security_constraints":w.security_constraints,
         "payload_sha256":sha256_hex(verified.warrant.as_bytes()), "signer_id":signer_id,
@@ -464,6 +464,11 @@ fn authorize(
         "post_exec_capabilities":w.execution_context.expected_capabilities(),
         "stdin_sha256":w.command.stdin_sha256,
         "tty_mode":w.command.tty_mode,"environment_entries":verified.envp.len()});
+    if let Some(process) = &request.process {
+        fields["source_authenticated"] = serde_json::json!({"uid":request.requester_uid,"gid":request.requester_gid,"supplementary_gids":request.requester_groups,"connector_observations":process.lease.authenticated_source()});
+        fields["approved_target"] = serde_json::json!({"binding":w.target_binding,"security_constraints":w.security_constraints,"numeric_credentials":process.evidence.credentials});
+        fields["execution_observed"] = serde_json::Value::Null;
+    }
     if result == AuthorizationResult::Allowed {
         if !task
             .lifecycle

@@ -103,4 +103,37 @@ fn unpublished_child_cannot_be_swept_and_known_primary_stays_serviceable() {
     assert!(reaper.reserve(4));
     assert!(reaper.complete(4, None).is_ok());
     assert!(reaper.poll().unwrap().is_empty());
+    assert!(reaper.reserve(5));
+    let (launcher, lfd, lgate) = child(0);
+    reaper.complete_launcher(5, launcher, lfd);
+    // Destination setup can remain blocked while an unrelated primary starts.
+    assert!(reaper.poll().unwrap().is_empty());
+    assert!(reaper.reserve(6));
+    let (primary, pfd, pgate) = child(31);
+    assert!(reaper.complete(6, Some((primary, pfd))).is_ok());
+    release(pgate);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let exits = reaper.poll().unwrap();
+        if let Some(exit) = exits.first() {
+            assert_eq!((exit.pid, exit.token, exit.status), (primary, Some(6), 31));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(reaper.take_launcher_exits().is_empty());
+    release(lgate);
+    loop {
+        assert!(reaper.poll().unwrap().is_empty());
+        let exits = reaper.take_launcher_exits();
+        if let Some(exit) = exits.first() {
+            assert_eq!((exit.pid, exit.token, exit.status), (launcher, Some(5), 0));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    reaper.poll().unwrap();
+    assert!(reaper.is_idle());
 }

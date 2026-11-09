@@ -11,7 +11,7 @@ use sigrund_core::{
     crypto::{new_uuidv7, sha256_hex},
     host::Selector,
     host_budget::Reservation,
-    namespace::ProcessReview,
+    namespace::{Contract, ProcessReview},
     warrant::{Csr, CsrIdentity, SnapshotDigests},
 };
 use std::{
@@ -21,14 +21,52 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Worker-produced verification of one exact signed warrant and retained owner.
+/// Private fields prevent admission or sequencer code from fabricating proof.
+pub(crate) struct VerifiedProcess {
+    pub(crate) authorized: crate::authorization::Authorized,
+    warrant_sha256: String,
+    instance_id: String,
+    registration_revision: Option<String>,
+    _launcher_resources: Option<Reservation>,
+}
+impl VerifiedProcess {
+    /// This check is deliberately free of destination filesystem I/O and helper
+    /// exchanges. The sequencer may only inspect the retained lifecycle state.
+    pub(crate) fn matches(&self, request: &ValidatedRequest) -> bool {
+        let Some(state) = &request.process else {
+            return false;
+        };
+        let Some(prepared) = &request.prepared else {
+            return false;
+        };
+        let Document::Signed { warrant, .. } = &prepared.document else {
+            return false;
+        };
+        let namespace_plan = state.lease.constraints().schema
+            != "sigrund.constraints.namespace-experimental.v1"
+            || state.lease.namespace_files().is_ok();
+        namespace_plan
+            && state.lease.check_lifecycle().is_ok()
+            && self.warrant_sha256 == sha256_hex(warrant.as_bytes())
+            && self.instance_id == state.lease.acquisition().instance_id
+            && self.registration_revision.as_deref()
+                == state
+                    .lease
+                    .registration_record()
+                    .map(|registration| registration.revision.as_str())
+    }
+}
+
 pub(crate) struct ProcessState {
-    pub final_verified: bool,
+    pub verified: Option<VerifiedProcess>,
     pub directory: File,
     pub cwd: File,
     pub evidence: Evidence,
     pub review: Option<ProcessReview>,
     pub lease: TargetLease,
     _resources: Reservation,
+    _null_resources: Option<Reservation>,
 }
 fn invalid(message: impl Into<String>) -> io::Error {
     preparation::fail("POLICY_VIOLATION", message)
@@ -44,9 +82,18 @@ pub(crate) fn prepare(
         return Err(invalid("cross-domain requests require thin intent"));
     }
     let original = request.hello.original_intent().map_err(io::Error::other)?;
+    if request.policy.namespace_profiles.iter().any(|profile| {
+        profile.profile_id == original.security_profile
+            && profile.schema == "sigrund.constraints.namespace-experimental.v1"
+    }) {
+        crate::access::domain()?;
+        if std::path::Path::new(&original.command.cwd).starts_with("/run") {
+            return Err(invalid("cwd would be covered by the private runtime mount"));
+        }
+    }
     if !matches!(
         original.target,
-        Selector::Registered { .. } | Selector::Process { .. }
+        Selector::Registered { .. } | Selector::Process { .. } | Selector::Self_ {}
     ) {
         return Err(invalid("unsupported process target selector"));
     }
@@ -54,14 +101,6 @@ pub(crate) fn prepare(
         .targets
         .as_ref()
         .ok_or_else(|| invalid("target registry unavailable"))?;
-    let lease = registry.lease(&original.target, request.requester_uid, true)?;
-    if original.security_profile != lease.constraints().profile_id
-        || original.execution_context.capabilities != lease.constraints().capabilities
-    {
-        return Err(invalid(
-            "requested profile differs from target registration",
-        ));
-    }
     let signer = context
         .signers
         .signers
@@ -74,6 +113,46 @@ pub(crate) fn prepare(
                 .is_some_and(|m| m.approval_signer_id == s.signer_id)
         })
         .ok_or_else(|| invalid("approval signer unavailable"))?;
+    let lease = if matches!(original.target, Selector::Self_ {}) {
+        let profile = request
+            .policy
+            .namespace_profiles
+            .iter()
+            .find(|profile| profile.profile_id == original.security_profile)
+            .ok_or_else(|| invalid("self profile unavailable"))?
+            .clone();
+        if profile.schema != "sigrund.constraints.namespace-experimental.v1" {
+            return Err(invalid("self requires the experimental namespace profile"));
+        }
+        check_scoped_policy(
+            request,
+            context,
+            signer,
+            &profile,
+            "self",
+            request.requester_uid,
+            None,
+        )?;
+        let source = request
+            .source
+            .as_ref()
+            .ok_or_else(|| invalid("missing authenticated source socket"))?
+            .clone();
+        registry.capture_self(
+            source,
+            profile,
+            request.deadline,
+            request.cancelled.clone(),
+            || request.check(),
+        )?
+    } else {
+        registry.lease(&original.target, request.requester_uid, true)?
+    };
+    if original.security_profile != lease.constraints().profile_id
+        || original.execution_context.capabilities != lease.constraints().capabilities
+    {
+        return Err(invalid("requested profile differs from target owner"));
+    }
     let numeric = if let sigrund_core::host::Account::Numeric {
         uid,
         gid,
@@ -112,14 +191,23 @@ pub(crate) fn prepare(
     .map_err(io::Error::other)?;
     let root_identity = FileIdentity::read(&result.directory)?;
     let source_identity = FileIdentity::read(&result.source)?;
+    let null_resources = if original.command.stdin_policy == "null" {
+        Some(lease.reserve_resources(sigrund_core::host_budget::Charge {
+            target_fds: 1,
+            ..Default::default()
+        })?)
+    } else {
+        None
+    };
     request.process = Some(ProcessState {
-        final_verified: false,
+        verified: None,
         directory: result.directory,
         cwd: result.cwd,
         evidence: result.evidence,
         review: None,
         lease,
         _resources: result.resources,
+        _null_resources: null_resources,
     });
     let model = request
         .process
@@ -160,7 +248,7 @@ pub(crate) fn prepare(
         root_path: selected.root,
         root_identity,
         source_identity,
-        null_stdin: None,
+        null_stdin: preparation::null_stdin(&original.command.stdin_policy)?,
     });
     if request
         .snapshots
@@ -198,24 +286,64 @@ fn scoped_policy(
     lease: &TargetLease,
     credentials: Option<&crate::destination::Credentials>,
 ) -> io::Result<()> {
+    check_scoped_policy(
+        request,
+        context,
+        signer,
+        lease.constraints(),
+        &lease.scope(),
+        lease.owner_uid(),
+        credentials,
+    )
+}
+fn check_scoped_policy(
+    request: &ValidatedRequest,
+    context: &Context,
+    signer: &SignerConfig,
+    constraints: &sigrund_core::namespace::Constraints,
+    scope: &str,
+    owner_uid: u32,
+    credentials: Option<&crate::destination::Credentials>,
+) -> io::Result<()> {
     let intent = request.hello.original_intent().map_err(io::Error::other)?;
-    let constraints = lease.constraints();
-    let registration = lease.registration();
-    let scope = format!("registered:{}", registration.id);
+    let profile_sha256 = constraints.sha256().map_err(io::Error::other)?;
+    let unsupported_numeric = matches!(&intent.account, sigrund_core::host::Account::Numeric { uid, supplementary_gids, .. } if *uid == 0 || !supplementary_gids.is_empty());
+    if constraints.schema == "sigrund.constraints.namespace-experimental.v1"
+        && (unsupported_numeric || credentials.is_some_and(|c| c.uid == 0 || !c.groups.is_empty()))
+    {
+        return Err(invalid(
+            "experimental execution requires non-root UID and empty groups",
+        ));
+    }
     let permits = |rule: &sigrund_core::namespace::ScopedRule| {
         rule.requester_uids.contains(&request.requester_uid)
             && rule.target_scope == scope
-            && rule.profile_sha256 == registration.profile_sha256
-            && (request.requester_uid == registration.owner_uid || rule.cross_owner)
+            && rule.profile_sha256 == profile_sha256
+            && (request.requester_uid == owner_uid || rule.cross_owner)
+            && (credentials.is_some()
+                || match &intent.account {
+                    sigrund_core::host::Account::Numeric {
+                        uid,
+                        gid,
+                        supplementary_gids,
+                    } => {
+                        rule.target_uids.contains(uid)
+                            && rule.target_gids.contains(gid)
+                            && supplementary_gids
+                                .iter()
+                                .all(|gid| rule.supplementary_gids.contains(gid))
+                    }
+                    _ => true,
+                })
             && credentials.is_none_or(|c| {
                 rule.permits(
                     request.requester_uid,
-                    &scope,
+                    scope,
                     c.uid,
                     c.gid,
                     &c.groups,
-                    &registration.profile_sha256,
-                    registration.owner_uid,
+                    &profile_sha256,
+                    owner_uid,
                 )
             })
     };
@@ -266,11 +394,17 @@ pub(crate) fn finish(
         .ok_or_else(|| invalid("missing process owner"))?;
     state.lease.revalidate()?;
     let mut review = ProcessReview {
-        schema: "sigrund.process-review.v1".into(),
+        schema: if state.lease.registration_record().is_some() {
+            "sigrund.process-review.v1"
+        } else {
+            "sigrund.self-review.v1"
+        }
+        .into(),
         exec_id: request.exec_id.clone(),
         csr_sha256: "00".repeat(32),
         acquisition: state.lease.acquisition().clone(),
-        registration: state.lease.registration().clone(),
+        authenticated_source: state.lease.authenticated_source().cloned(),
+        registration: state.lease.registration_record().cloned(),
         constraints: state.lease.constraints().clone(),
         executable_roots: state.lease.executable_roots(),
         prepared_cwd: state.evidence.cwd.clone(),
@@ -333,13 +467,39 @@ pub(crate) fn finish(
 
 /// A successful result proves final private authorization checks. The caller
 /// still must enforce Phase 2's stop before consumption or public approval.
-pub(crate) fn verify_final(request: &ValidatedRequest, context: &Context) -> io::Result<()> {
+pub(crate) fn verify_final(
+    request: &ValidatedRequest,
+    context: &Context,
+) -> io::Result<VerifiedProcess> {
     request.check()?;
     let state = request
         .process
         .as_ref()
         .ok_or_else(|| invalid("missing process owner"))?;
     state.lease.revalidate()?;
+    if state.lease.constraints().schema == "sigrund.constraints.namespace-experimental.v1" {
+        crate::access::domain()?;
+        use std::os::fd::AsRawFd;
+        let mut stat = unsafe { std::mem::zeroed::<libc::statx>() };
+        if unsafe {
+            libc::statx(
+                state.lease.root().as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_BASIC_STATS,
+                &mut stat,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let flag = libc::STATX_ATTR_MOUNT_ROOT as u64;
+        if stat.stx_attributes_mask & flag == 0 || stat.stx_attributes & flag == 0 {
+            return Err(invalid(
+                "experimental namespace execution requires a mount-point root",
+            ));
+        }
+    }
     let prepared = request
         .prepared
         .as_ref()
@@ -420,15 +580,20 @@ pub(crate) fn verify_final(request: &ValidatedRequest, context: &Context) -> io:
             .executable
             .verify_direct_checked(&kernel_context, || request.check())?;
     }
-    match (&snapshots.stdin, &w.command.stdin_sha256) {
-        (Some(input), Some(hash)) => crate::authorization::verify_snapshot(
+    match (
+        w.command.stdin_policy.as_str(),
+        &snapshots.stdin,
+        &w.command.stdin_sha256,
+        &prepared.null_stdin,
+    ) {
+        ("sha256", Some(input), Some(hash), None) => crate::authorization::verify_snapshot(
             input,
             hash,
             request.policy.max_stdin_bytes,
             false,
             || request.check(),
         )?,
-        (None, None) if w.command.stdin_policy == "null" => (),
+        ("null", None, None, Some(fd)) => preparation::verify_null_stdin(fd)?,
         _ => return Err(invalid("retained stdin differs")),
     }
     let now = SystemTime::now()
@@ -438,5 +603,214 @@ pub(crate) fn verify_final(request: &ValidatedRequest, context: &Context) -> io:
     if now < w.policy.not_before as u64 || w.policy.not_after.is_none_or(|end| now > end as u64) {
         return Err(invalid("process warrant expired"));
     }
-    state.lease.revalidate()
+    state.lease.revalidate()?;
+    request.check()?;
+    let mut environment = w.execution_context.env_exact.clone();
+    for (name, value) in &request.hello.caller_env {
+        if environment.insert(name.clone(), value.clone()).is_some() {
+            return Err(invalid("caller environment overlaps exact environment"));
+        }
+    }
+    let envp = environment
+        .iter()
+        .map(|(name, value)| {
+            std::ffi::CString::new(format!("{name}={value}")).map_err(io::Error::other)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let signer_ids =
+        signer_ids
+            .iter()
+            .filter(|id| {
+                context.signers.signers.iter().any(|signer| {
+                    signer.signer_id == **id && policy(request, context, signer).is_ok()
+                })
+            })
+            .cloned()
+            .collect();
+    let launcher_resources =
+        if state.lease.constraints().schema == "sigrund.constraints.namespace-experimental.v1" {
+            state.lease.namespace_files()?;
+            Some(
+                state
+                    .lease
+                    .reserve_resources(sigrund_core::host_budget::Charge {
+                        helpers: 1,
+                        ..Default::default()
+                    })?,
+            )
+        } else {
+            None
+        };
+    Ok(VerifiedProcess {
+        authorized: crate::authorization::Authorized {
+            warrant: warrant.clone(),
+            signer_ids,
+            envp,
+        },
+        warrant_sha256: sha256_hex(warrant.as_bytes()),
+        instance_id: state.lease.acquisition().instance_id.clone(),
+        registration_revision: state
+            .lease
+            .registration_record()
+            .map(|registration| registration.revision.clone()),
+        _launcher_resources: launcher_resources,
+    })
+}
+
+/// Runs on the bounded job worker while the actual final child is at exec stop.
+pub(crate) fn verify_execution(
+    request: &ValidatedRequest,
+    pid: i32,
+    cgroup: &crate::startup::JobCgroup,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<serde_json::Value> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::MetadataExt,
+    };
+    let state = request
+        .process
+        .as_ref()
+        .ok_or_else(|| invalid("missing namespace owner"))?;
+    state.lease.revalidate()?;
+    let acquisition = state.lease.acquisition();
+    let mut observed = std::collections::BTreeMap::new();
+    for name in ["cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"] {
+        check()?;
+        let file = File::open(format!("/proc/{pid}/ns/{name}"))?;
+        let metadata = file.metadata()?;
+        let expected = &acquisition.namespaces[name];
+        let equal = metadata.dev().to_string() == expected.device
+            && metadata.ino().to_string() == expected.inode;
+        if equal == matches!(name, "mnt" | "cgroup") {
+            return Err(invalid("final child namespace differs from approved plan"));
+        }
+        if matches!(name, "mnt" | "cgroup") {
+            let fd = unsafe { libc::ioctl(file.as_raw_fd(), 0xb701) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let owner = unsafe { File::from_raw_fd(fd) }.metadata()?;
+            let user = &acquisition.namespaces["user"];
+            if owner.dev().to_string() != user.device || owner.ino().to_string() != user.inode {
+                return Err(invalid("private namespace has the wrong owner"));
+            }
+        }
+        observed.insert(name, serde_json::json!({"device":metadata.dev().to_string(),"inode":metadata.ino().to_string()}));
+    }
+    let pin = |suffix: &str| -> io::Result<File> {
+        let path =
+            std::ffi::CString::new(format!("/proc/{pid}/{suffix}")).map_err(io::Error::other)?;
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    };
+    let root = destination_helper::identity(&pin("root")?)?;
+    let cwd = destination_helper::identity(&pin("cwd")?)?;
+    if root.device != acquisition.root.device
+        || root.inode != acquisition.root.inode
+        || root.mount_id == acquisition.root.mount_id
+        || cwd.device != state.evidence.cwd.device
+        || cwd.inode != state.evidence.cwd.inode
+        || cwd.mount_id == state.evidence.cwd.mount_id
+    {
+        return Err(invalid(
+            "final child root or cwd differs from private pinned tree",
+        ));
+    }
+    if !cgroup.contains_pid(pid)? {
+        return Err(invalid("final child escaped job placement"));
+    }
+    // Before loader instructions, every setup-only descriptor must have closed.
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let name = entry?.file_name();
+        if !matches!(name.to_str(), Some("0" | "1" | "2")) {
+            return Err(invalid("final child retained a setup descriptor"));
+        }
+    }
+    // Every exposed cgroup mount must be recursively private and restrictive.
+    use std::io::Read;
+    let mut mounts = String::new();
+    File::open(format!("/proc/{pid}/mountinfo"))?
+        .take(1_048_577)
+        .read_to_string(&mut mounts)?;
+    if mounts.len() > 1_048_576 {
+        return Err(invalid("oversized child mount table"));
+    }
+    let run = destination_helper::identity(&pin("root/run")?)?;
+    let mut private_run = false;
+    for line in mounts.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let separator = fields
+            .iter()
+            .position(|field| *field == "-")
+            .ok_or_else(|| invalid("invalid child mount table"))?;
+        if separator < 6 || fields.len() < separator + 4 {
+            return Err(invalid("invalid child mount fields"));
+        }
+        if fields[6..separator].iter().any(|tag| {
+            tag.starts_with("shared:")
+                || tag.starts_with("master:")
+                || tag.starts_with("propagate_from:")
+        }) {
+            return Err(invalid("child mount propagation is not private"));
+        }
+        // mountinfo also lists a covered host /run mount. Verify the mount
+        // actually visible through the stopped child's root, not that shadow.
+        if fields[0] == run.mount_id {
+            let flags: Vec<_> = fields[5].split(',').collect();
+            if fields[4] != "/run"
+                || fields[separator + 1] != "tmpfs"
+                || ["nosuid", "nodev", "noexec"]
+                    .iter()
+                    .any(|flag| !flags.contains(flag))
+            {
+                return Err(invalid("child private run mount differs from setup"));
+            }
+            private_run = true;
+        }
+        if matches!(fields[separator + 1], "cgroup" | "cgroup2") {
+            let flags: Vec<_> = fields[5].split(',').collect();
+            if ["ro", "nosuid", "nodev", "noexec"]
+                .iter()
+                .any(|flag| !flags.contains(flag))
+            {
+                return Err(invalid("child cgroup mount is insufficiently restricted"));
+            }
+        }
+    }
+    if !private_run {
+        return Err(invalid("child private run mount is missing"));
+    }
+    let mut status = String::new();
+    File::open(format!("/proc/{pid}/status"))?
+        .take(65537)
+        .read_to_string(&mut status)?;
+    if status.len() > 65536
+        || !status.lines().any(|line| {
+            line.strip_prefix("Seccomp:")
+                .is_some_and(|value| value.trim() == "0")
+        })
+    {
+        return Err(invalid(
+            "experimental child has an undeclared seccomp filter",
+        ));
+    }
+    let mut label = String::new();
+    let lsm = match File::open(format!("/proc/{pid}/attr/current"))
+        .and_then(|file| file.take(4097).read_to_string(&mut label))
+    {
+        Ok(_) if label.len() <= 4096 => {
+            serde_json::json!({"state":"observed", "context":label.trim_end_matches(['\0', '\n'])})
+        }
+        Ok(_) => return Err(invalid("oversized observed LSM context")),
+        Err(error) => serde_json::json!({"state":"unreadable", "errno":error.raw_os_error()}),
+    };
+    state.lease.revalidate()?;
+    check()?;
+    Ok(
+        serde_json::json!({"child_pid":pid,"namespaces":observed,"root":root,"cwd":cwd,"host_credentials":state.evidence.credentials,"job_placement_verified":true,"setup_descriptors_closed":true,"private_run_verified":true,"seccomp":0,"ambient_lsm":lsm}),
+    )
 }

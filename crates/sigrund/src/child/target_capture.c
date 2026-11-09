@@ -202,7 +202,10 @@ static void pin(struct target *target) {
     target->procfd = open_proc(target->pid, "", O_PATH | O_DIRECTORY); MUST(target->procfd >= 0);
     target->root = openat(target->procfd, "root", O_PATH | O_DIRECTORY | O_CLOEXEC);
     target->cwd = openat(target->procfd, "cwd", O_PATH | O_DIRECTORY | O_CLOEXEC);
-    MUST(target->root >= 0 && target->cwd >= 0 && same_fs(target->root, target->cwd));
+    /* CLONE_FS was detached at the captured syscall exit. Root and cwd are
+     * coherent retained observations and may name different directories. Job
+     * cwd is independently resolved beneath the pinned root during preparation. */
+    MUST(target->root >= 0 && target->cwd >= 0);
     for (size_t i = 0; i < COUNT(names); i++) {
         char name[64]; snprintf(name, sizeof(name), "ns/%s", names[i]);
         target->ns[i] = openat(target->procfd, name, O_RDONLY | O_CLOEXEC); MUST(target->ns[i] >= 0);
@@ -338,6 +341,11 @@ void sigrund_capture_print(void *pointer) {
 }
 void sigrund_capture_check(void *pointer) { revalidate(pointer); }
 int sigrund_capture_root(void *pointer) { return ((struct target *)pointer)->root; }
+int sigrund_capture_namespace(void *pointer, unsigned index) {
+    MUST(index < COUNT(names));
+    return ((struct target *)pointer)->ns[index];
+}
+
 void sigrund_capture_dispose(void *pointer) {
     struct target *target = pointer;
     if (live(target->pidfd)) {

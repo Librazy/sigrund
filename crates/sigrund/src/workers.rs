@@ -35,6 +35,7 @@ pub(crate) struct ValidatedRequest {
     // Shared control ownership retains its separate bounded disposal permit
     // through the actual final close, including unread queued SCM_RIGHTS.
     pub deferred_cleanup: Vec<Socket>,
+    pub source: Option<Socket>,
     pub failure: Option<io::Error>,
     pub exec_id: String,
     pub requester_gid: u32,
@@ -322,6 +323,14 @@ fn read_request(
             .err();
     }
     let mut request = ValidatedRequest {
+        source: if hello
+            .original_intent()
+            .is_ok_and(|intent| matches!(intent.target, sigrund_core::host::Selector::Self_ {}))
+        {
+            Some(socket.clone())
+        } else {
+            None
+        },
         host_profile: None,
         host_bundle: None,
         host_lease: None,

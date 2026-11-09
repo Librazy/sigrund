@@ -98,6 +98,35 @@ pub(crate) struct Pending {
     pub(crate) null_stdin: Option<OwnedFd>,
 }
 
+/// Pin the host null device before any destination transition. Output rights
+/// are never an alternative source of unsigned input.
+pub(crate) fn null_stdin(policy: &str) -> io::Result<Option<OwnedFd>> {
+    if policy == "sha256" {
+        return Ok(None);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/dev/null")?;
+    let fd = file.into();
+    verify_null_stdin(&fd)?;
+    Ok(Some(fd))
+}
+
+pub(crate) fn verify_null_stdin(fd: &OwnedFd) -> io::Result<()> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFCHR
+        || stat.st_rdev != libc::makedev(1, 3)
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE != libc::O_RDONLY
+    {
+        return Err(fail("INVALID_REQUEST", "invalid null device"));
+    }
+    Ok(())
+}
+
 fn verify_full_account(csr: &Csr) -> io::Result<()> {
     let w = csr.warrant();
     let (uid, gid, groups) = crate::accounts::resolve(&w.intent.account)?;
@@ -514,19 +543,7 @@ pub(crate) fn prepare(
     )
     .map_err(|e| snapshot_error(e, "EXECUTABLE_MUTATED_OR_TOO_LARGE"))?;
     request.snapshots = Some(MeasuredSnapshots { executable, stdin });
-    let null_stdin = if command.stdin_policy == "sha256" {
-        None
-    } else {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open("/dev/null")?;
-        let m = file.metadata()?;
-        if m.mode() & libc::S_IFMT != libc::S_IFCHR || m.rdev() != libc::makedev(1, 3) {
-            return Err(fail("INVALID_REQUEST", "invalid null device"));
-        }
-        Some(file.into())
-    };
+    let null_stdin = null_stdin(&command.stdin_policy)?;
     request.check()?;
     request.pending_preparation = Some(Pending {
         signed,
@@ -893,11 +910,13 @@ pub(crate) fn approve(
         warrant,
         signer_ids: vec![signer.signer_id.clone()],
     };
-    if request.process.is_some() {
-        crate::process_request::verify_final(request, context)?;
-    }
+    let verified = request
+        .process
+        .as_ref()
+        .map(|_| crate::process_request::verify_final(request, context))
+        .transpose()?;
     if let Some(process) = &mut request.process {
-        process.final_verified = true;
+        process.verified = verified;
     }
     Ok(())
 }
@@ -1086,6 +1105,7 @@ mod tests {
                 );
             }
             ValidatedRequest {
+                source: None,
                 host_profile: None,
                 host_bundle: None,
                 host_lease: None,

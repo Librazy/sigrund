@@ -221,14 +221,115 @@ pub(crate) fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
             return Err(io::Error::from_raw_os_error(error));
         }
     }
+    verify_daemon_peer(&fd)?;
+    Ok(fd)
+}
+fn verify_daemon_peer(fd: &OwnedFd) -> io::Result<()> {
     transport::disable_ancillary_credentials(fd.as_raw_fd())?;
-    if transport::peer_credentials(fd.as_raw_fd())?.uid != 0 {
+    if transport::daemon_peer_credentials(fd.as_raw_fd())?.uid != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "daemon peer is not UID 0",
         ));
     }
-    Ok(fd)
+    Ok(())
+}
+
+unsafe extern "C" {
+    fn sigrun_spawn_self_connector(
+        public: *const libc::sockaddr_un,
+        anchor: *const libc::sockaddr_un,
+        pidfd: *mut i32,
+        control: *mut i32,
+    ) -> i32;
+}
+struct SelfConnector {
+    pidfd: OwnedFd,
+}
+impl Drop for SelfConnector {
+    fn drop(&mut self) {
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                0,
+                0,
+            );
+            let mut status = zeroed::<libc::siginfo_t>();
+            // A capture tracer can still own the final wait. Never hold CLI
+            // completion behind privileged target disposal or a stopped tracer.
+            libc::waitid(
+                libc::P_PIDFD,
+                self.pidfd.as_raw_fd() as u32,
+                &mut status,
+                libc::WEXITED | libc::WNOHANG,
+            );
+        }
+    }
+}
+fn connect_self(path: &Path, signals: &Signals) -> io::Result<(OwnedFd, SelfConnector)> {
+    let address = |path: &Path| -> io::Result<libc::sockaddr_un> {
+        let bytes = path.as_os_str().as_bytes();
+        let mut address = unsafe { zeroed::<libc::sockaddr_un>() };
+        if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+            return Err(transport::invalid("invalid self connector endpoint"));
+        }
+        address.sun_family = libc::AF_UNIX as _;
+        for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as _;
+        }
+        Ok(address)
+    };
+    let public = address(path)?;
+    let anchor = address(&crate::target_management::anchor_path(path))?;
+    let mut pidfd = -1;
+    let mut channel = -1;
+    let pid = unsafe { sigrun_spawn_self_connector(&public, &anchor, &mut pidfd, &mut channel) };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    assert!(
+        pid > 0 && pidfd >= 0 && channel >= 0,
+        "self connector clone ABI"
+    );
+    let connector = SelfConnector {
+        pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
+    };
+    let channel = unsafe { OwnedFd::from_raw_fd(channel) };
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if signals.next()?.is_some() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let mut bytes = [0u8; 2];
+        if let Some(mut received) = transport::receive(channel.as_raw_fd(), &mut bytes, true)? {
+            if received.length != 1 || bytes[0] != b'S' || received.rights.len() != 1 {
+                return Err(transport::invalid(
+                    "self connector did not transfer its request socket",
+                ));
+            }
+            let socket = received.rights.remove(0);
+            verify_daemon_peer(&socket)?;
+            return Ok((socket, connector));
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: channel.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signals.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        poll(&mut fds, Some(deadline))?;
+    }
 }
 
 fn check_input_signals(signals: &Signals, caught: &std::cell::Cell<Option<u8>>) -> io::Result<()> {
@@ -715,7 +816,16 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
             Err(_) => thin_fallback = true,
         }
     }
-    let socket = connect(path, &signals)?;
+    let (socket, _self_connector) = if hello.mode == "thin_csr"
+        && matches!(
+            hello.original_intent().map_err(io::Error::other)?.target,
+            sigrund_core::host::Selector::Self_ {}
+        ) {
+        let (socket, connector) = connect_self(path, &signals)?;
+        (socket, Some(connector))
+    } else {
+        (connect(path, &signals)?, None)
+    };
     let wake_raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     if wake_raw < 0 {
         return Err(io::Error::last_os_error());

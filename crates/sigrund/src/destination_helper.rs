@@ -94,10 +94,21 @@ pub fn prepare(
     check()?;
     target.revalidate()?;
     let resources = target.reserve_resources(Charge {
-        target_fds: 6,
+        target_fds: 3,
         ..Default::default()
     })?;
-    let _helper = target.reserve_resources(Charge {
+    // Only directory/source/cwd survive this call. The socket pair, spawn
+    // duplicates and pidfd are closed before this transient charge is released.
+    let _transient = target.reserve_resources(Charge {
+        // Directory + socketpair + three remap copies + Command's three null
+        // stdio FDs and exec-error pipe: eleven at peak, three retained.
+        target_fds: 8,
+        ..Default::default()
+    })?;
+    // These descriptors exist only in the fresh-exec helper. Keep their
+    // charge until it is reaped, without counting them as descriptors another
+    // daemon fork would inherit.
+    let _helper = target.reserve_child_resources(Charge {
         helpers: 1,
         target_fds: 16,
         ..Default::default()
@@ -159,6 +170,12 @@ pub fn prepare(
     }
     let (spawned, _copies) = target.with_fd_copies(|| command.spawn())?;
     let mut helper = spawned?;
+    // Keep the short reaper guard while removing spawn-only parent FDs. The
+    // helper is already execed; only then acquire its independently owned pidfd.
+    drop(root);
+    drop(socket);
+    drop(directory_copy);
+    drop(child);
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, helper.id(), 0) } as i32;
     if raw < 0 {
         let error = io::Error::last_os_error();
@@ -168,10 +185,6 @@ pub fn prepare(
     }
     let helper_pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
     drop(reaper);
-    drop(root);
-    drop(socket);
-    drop(directory_copy);
-    drop(child);
     let result = (|| {
         let mut writer = FrameWriter::control(
             sigrund_core::framing::FrameType::ClientHello,

@@ -1,4 +1,10 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/child/client_anchor.c");
+    cc::Build::new()
+        .file("src/child/client_anchor.c")
+        .flag("-std=c11")
+        .warnings_into_errors(true)
+        .compile("sigrun_client_anchor");
     println!("cargo:rerun-if-changed=src/child/target_capture.c");
     cc::Build::new()
         .file("src/child/target_capture.c")

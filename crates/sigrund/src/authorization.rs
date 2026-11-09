@@ -38,6 +38,7 @@ fn policy() -> Denial {
 
 /// Includes immutable command bytes and the deterministic environment for the
 /// later child setup. Success is not a durable grant or readiness decision.
+#[derive(Clone)]
 pub(crate) struct Authorized {
     pub warrant: CanonicalWarrant,
     pub signer_ids: Vec<String>,
@@ -53,8 +54,23 @@ pub(crate) fn verify(
         .check()
         .map_err(|_| Denial::new("REQUEST_TIMEOUT", "authorization cancelled"))?;
     if let Some(process) = &request.process {
-        if !process.final_verified {
+        if !process
+            .verified
+            .as_ref()
+            .is_some_and(|proof| proof.matches(request))
+        {
             return Err(policy());
+        }
+        if process.lease.constraints().schema == "sigrund.constraints.namespace-experimental.v1" {
+            if gid != request.requester_gid {
+                return Err(policy());
+            }
+            return Ok(process
+                .verified
+                .as_ref()
+                .ok_or_else(policy)?
+                .authorized
+                .clone());
         }
         return Err(Denial::new(
             "PHASE2_EXECUTION_DISABLED",

@@ -10,12 +10,12 @@ use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
@@ -124,6 +124,173 @@ struct Pending {
     uid: u32,
     expires: Instant,
 }
+struct SourceReference {
+    descriptor: OwnedFd,
+    _resources: Reservation,
+}
+impl SourceReference {
+    fn live(&self) -> bool {
+        let mut poll = libc::pollfd {
+            fd: self.descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut poll, 1, 0) == 0 }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SelfCapture {
+    pending: Arc<Mutex<BTreeMap<u32, Pending>>>,
+    sender: std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
+    busy: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+struct AcquisitionPermit {
+    service: SelfCapture,
+    submitted: bool,
+}
+impl Drop for AcquisitionPermit {
+    fn drop(&mut self) {
+        if !self.submitted {
+            self.service.busy.store(false, Ordering::Release);
+        }
+    }
+}
+impl AcquisitionPermit {
+    fn submit(mut self, job: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+        self.service
+            .sender
+            .try_send(job)
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        self.submitted = true;
+        Ok(())
+    }
+}
+impl SelfCapture {
+    fn reserve(&self) -> io::Result<AcquisitionPermit> {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        Ok(AcquisitionPermit {
+            service: self.clone(),
+            submitted: false,
+        })
+    }
+    pub(crate) fn capture(
+        &self,
+        registry: Arc<TargetRegistry>,
+        source: crate::socket_disposal::Socket,
+        constraints: Constraints,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        check: impl Fn() -> io::Result<()>,
+    ) -> io::Result<crate::target_registry::TargetLease> {
+        check()?;
+        let original = credentials(&source)?;
+        let groups = crate::transport::peer_groups(source.as_raw_fd())?;
+        let observation = sigrund_core::namespace::ConnectorObservation {
+            pid: original.pid as u32,
+            uid: original.uid,
+            gid: original.gid,
+            supplementary_gids: groups,
+            security_label: crate::transport::peer_security_label(source.as_raw_fd())?,
+        };
+        let lease = registry.reserve_self_lease(original.uid).map_err(|error| {
+            io::Error::new(error.kind(), format!("self lease reservation: {error}"))
+        })?;
+        let slot = registry
+            .reserve_registration(original.uid, registry.capture_fd_count())
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("self capture reservation: {error}"))
+            })?;
+        let source_resources = registry.reserve_source_reference(original.uid)?;
+        let mut descriptor = -1i32;
+        let mut size = size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                source.as_raw_fd(),
+                libc::SOL_SOCKET,
+                77,
+                (&mut descriptor as *mut i32).cast(),
+                &mut size,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if descriptor < 0 {
+            return Err(invalid("original connector pidfd unavailable"));
+        }
+        let source_reference = SourceReference {
+            descriptor: unsafe { OwnedFd::from_raw_fd(descriptor) },
+            _resources: source_resources,
+        };
+        if size as usize != size_of::<i32>() {
+            return Err(invalid("invalid original connector pidfd length"));
+        }
+        let (permit, peer) = loop {
+            check()?;
+            if self.stop.load(Ordering::Acquire) || !source_reference.live() {
+                return Err(invalid("source connector exited"));
+            }
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| invalid("pending anchors poisoned"))?;
+            if pending
+                .get(&(original.pid as u32))
+                .is_some_and(|peer| peer.uid == original.uid && peer.expires > Instant::now())
+            {
+                let permit = self.reserve().map_err(|error| {
+                    io::Error::new(error.kind(), "self acquisition worker busy")
+                })?;
+                let peer = pending
+                    .remove(&(original.pid as u32))
+                    .expect("matched source anchor");
+                break (permit, peer);
+            }
+            drop(pending);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stop = self.stop.clone();
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        permit.submit(Box::new(move || {
+            let check = || {
+                if stop.load(Ordering::Acquire)
+                    || cancelled.load(Ordering::Acquire)
+                    || Instant::now() >= deadline
+                    || !source_reference.live()
+                {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                Ok(())
+            };
+            let captured = (|| {
+                check()?;
+                let owner =
+                    slot.capture_self(observation, constraints, peer.socket, lease, check)?;
+                check()?;
+                Ok(owner)
+            })();
+            let _ = reply.send(captured);
+            drop(source_reference);
+            drop(source);
+        }))?;
+        loop {
+            check()?;
+            match result.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    check()?;
+                    return result;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+                Err(_) => return Err(invalid("self acquisition worker stopped")),
+            }
+        }
+    }
+}
+
 pub struct Management {
     control: BoundSocket,
     anchors: BoundSocket,
@@ -221,7 +388,7 @@ impl Management {
         Ok(Some((unsafe { UnixStream::from_raw_fd(raw) }, reservation)))
     }
     fn run(self, stopping: &Arc<AtomicBool>) {
-        let mut pending = BTreeMap::<u32, Pending>::new();
+        let pending = Arc::new(Mutex::new(BTreeMap::<u32, Pending>::new()));
         let mut monitor_at = Instant::now();
         let (acquire_tx, acquire_rx) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(1);
         let acquiring = Arc::new(AtomicBool::new(false));
@@ -237,13 +404,20 @@ impl Management {
                 }
             })
             .unwrap_or_else(|_| std::process::abort());
+        let self_capture = SelfCapture {
+            pending: pending.clone(),
+            sender: acquire_tx.clone(),
+            busy: acquiring.clone(),
+            stop: stopping.clone(),
+        };
+        self.registry.set_self_capture(Some(self_capture.clone()));
         while !stopping.load(Ordering::Acquire) {
             self.disposal.drain();
             if Instant::now() >= monitor_at {
                 self.registry.monitor();
                 monitor_at = Instant::now() + Duration::from_millis(100);
             }
-            pending.retain(|_, peer| {
+            pending.lock().expect("pending anchors").retain(|_, peer| {
                 let mut fd = libc::pollfd {
                     fd: peer.socket.as_raw_fd(),
                     events: libc::POLLRDHUP,
@@ -255,7 +429,7 @@ impl Management {
                 peer.expires > Instant::now()
                     && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) == 0
             });
-            if pending.len() < 16
+            if pending.lock().expect("pending anchors").len() < 16
                 && let Some(permit) = self.disposal.reserve()
                 && let Ok(Some((socket, temporary))) = self.accept(&self.anchors)
             {
@@ -272,14 +446,25 @@ impl Management {
                     )
                 {
                     socket.set_resources(resources);
-                    if pending.values().filter(|p| p.uid == peer.uid).count() < 4 {
+                    if pending
+                        .lock()
+                        .expect("pending anchors")
+                        .values()
+                        .filter(|p| p.uid == peer.uid)
+                        .count()
+                        < 4
+                    {
                         // One authenticated connector per daemon PID. Do not
                         // overwrite a retained rendezvous with a second socket.
-                        pending.entry(peer.pid as u32).or_insert(Pending {
-                            socket,
-                            uid: peer.uid,
-                            expires: Instant::now() + Duration::from_secs(10),
-                        });
+                        pending
+                            .lock()
+                            .expect("pending anchors")
+                            .entry(peer.pid as u32)
+                            .or_insert(Pending {
+                                socket,
+                                uid: peer.uid,
+                                expires: Instant::now() + Duration::from_secs(10),
+                            });
                     }
                 }
             }
@@ -330,7 +515,10 @@ impl Management {
                                     )
                                     .ok_or(io::ErrorKind::WouldBlock)?;
                                 let mut reply = socket.try_clone()?;
+                                let permit = self_capture.reserve()?;
                                 let peer = pending
+                                    .lock()
+                                    .expect("pending anchors")
                                     .remove(&daemon_pid)
                                     .filter(|peer| {
                                         peer.uid == owner_uid && peer.expires > Instant::now()
@@ -339,9 +527,8 @@ impl Management {
                                         invalid("matching dedicated anchor has not connected")
                                     })?;
                                 let stop = stopping.clone();
-                                acquiring.store(true, Ordering::Release);
-                                if acquire_tx
-                                    .try_send(Box::new(move || {
+                                if permit
+                                    .submit(Box::new(move || {
                                         let result = slot.capture_and_publish(
                                             id,
                                             daemon_pid,
@@ -405,7 +592,9 @@ impl Management {
                 },
                 libc::pollfd {
                     fd: self.anchors.fd(),
-                    events: if pending.len() < 16 && self.disposal.available() {
+                    events: if pending.lock().expect("pending anchors").len() < 16
+                        && self.disposal.available()
+                    {
                         libc::POLLIN
                     } else {
                         0
@@ -417,7 +606,10 @@ impl Management {
                 libc::poll(descriptors.as_mut_ptr(), 2, 10);
             }
         }
+        self.registry.set_self_capture(None);
+        pending.lock().expect("pending anchors").clear();
         drop(pending);
+        drop(self_capture);
         while self.disposal.used() > 1 {
             std::thread::sleep(Duration::from_millis(10));
         }
