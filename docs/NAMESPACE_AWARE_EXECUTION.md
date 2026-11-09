@@ -1,14 +1,15 @@
 # Namespace-aware execution: phased v3 roadmap
 
-Updated 2026-11-08. This is the delivery roadmap for the
+Updated 2026-11-09. This is the delivery roadmap for the
 [draft normative v3 security specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>).
 The specification owns the contract; this document owns implementation order,
 feasibility decisions, acceptance evidence and deferred scope. NS-01–NS-16 refer
 to its stable namespace requirements; G-01–G-05 refer to its release-blocking
 design gates. Supported host CLI options are documented in the
 [Phase 1 record](NAMESPACE_PHASE1.md). Registered/process private review is
-documented in the [Phase 2 guide](NAMESPACE_PHASE2.md); namespace execution and
-self acquisition remain later milestones.
+documented in the [Phase 2 guide](NAMESPACE_PHASE2.md). Opt-in experimental
+namespace execution and self capture are documented in the
+[Phase 3 guide](NAMESPACE_PHASE3.md).
 
 ## Current state and intended outcome
 
@@ -26,7 +27,16 @@ Phase 2 adds production root-controlled registration of a constrained dedicated
 anchor, cached destination roots and bounded account/path preparation. Explicit
 registered/process thin requests reach verified private root-TTY review and final
 signature checks, then stop before consumption, public APPROVED and workload
-spawn. All public namespace outcomes retain the admission-based TIMEOUT.
+spawn. All public namespace outcomes under those profiles retain the
+admission-based TIMEOUT.
+
+Phase 3 adds a distinct experimental constraint contract. Registered/process and
+self thin requests under that profile can consume, receive APPROVED and run
+through a verified final-child exec stop. Four routes, initial/one-child-userns
+targets and namespace ownership/failure cases have integrated production-code
+qualification, with complete host regression passing. Historical Phase 0/2
+profiles retain their private no-execution boundary. This is experimental
+execution without a production LSM/seccomp confinement claim.
 
 The v3 outcome is one host authority executing in explicitly selected local
 existing environments:
@@ -378,6 +388,11 @@ record above. A private approval never closes a namespace workload gate.
 
 ### Phase 3 — Native execution and supervision
 
+**Status:** Complete for the declared experimental profile/topology. The 39-case
+namespace matrix, 25-case Phase 2 regression, eleven ordinary checks and complete
+23-gate host acceptance pass with matching source and binaries. See the
+[implementation and qualification guide](NAMESPACE_PHASE3.md).
+
 **Dependencies:** Phase 2 and validated G-02/G-03 plans; G-01 for self.
 **Subsystems:** launcher/executor, syscall-only child setup, cgroups, reaper,
 checkpoints and runtime lifecycle.
@@ -404,6 +419,50 @@ registration-race and cleanup scenarios pass for declared profiles. Any blocked
 route remains explicitly incomplete; passing explicit targets does not complete
 self. Work at this stage remains experimental until applicable Phase 4 gates pass.
 
+#### Phase 3 acceptance applicability
+
+The 39-case production runner qualifies the experimental profile on Fedora 44
+x86-64, enforcing ambient SELinux with an unconfined administrative service,
+cgroup v2 delegation, initial userns self targets and one-child-userns B targets.
+Its four actual CLI routes use different destination executable bytes. A source
+whose user namespace cannot authenticate host root remains unsupported by the
+CLI; nested/mixed namespace ownership and idmapped mounts remain unqualified.
+The Phase 3 guide describes these boundaries and exact reproduction commands.
+
+| Gate | Phase 3 experimental disposition |
+| --- | --- |
+| V-01 | Strict versioned experimental constraints/self-context/review contracts and unchanged historical vectors pass. The full host run requalifies v3 provisioning and startup rejection. |
+| V-02 | Context remains target-independent; self uses a separate bounded anchor rendezvous and private epoch evidence. |
+| V-03 | Real CLI host→B, A→host, A→self and A→B, process selection, named/numeric destination accounts and connector relay pass. |
+| V-04 | Actual different destination bytes, retained roots/cwd and mapped accounts pass. Namespace full-access proof remains Phase 4. |
+| V-05 | Experimental root/groups denial, partial/disconnected/late broker approval and target invalidation retain scheduled TIMEOUT with no workload output. |
+| V-06 | Source substitutions are rejected; account edits preserve approved numeric IDs; pending same-name replacement keeps the old anchor and prevents old consumption/spawn. |
+| V-07 | Digest-memfd execution is sealed and independently verified at exec stop. Other namespace executable models are not enabled by this profile. |
+| V-08 | Actual mapped nonroot UID/GID, empty groups/five capability sets, securebits 15, NNP, root/cwd and private namespaces are checked before target instructions. |
+| V-09 | Final worker proof binds the exact warrant and live lease. A gated late durable commit retains consumption without spawning after public TIMEOUT. |
+| V-10 | Partial APPROVED delivery, setns/root/private-mount/final-clone errors, short handoffs, setup deadline and final credential/NNP/exec failures produce zero workload output and retain consumption. |
+| V-11 | Existing independent signing/digest vectors pass; actual root-TTY SSH signing enables self execution. Namespace full/export/offline remains closed; physical FIDO remains unqualified. |
+| V-12 | Native launch handoff checks strict ordering, sizes, ancillary rights and kernel pidfd identity; malformed real transfers clean up without losing consumption. |
+| V-13 | Blocked namespace cleanup retains the sole per-UID helper through another request's TIMEOUT, permits another UID's host execution, then admits a healthy retry after actual cleanup. Capture reservations are staged before acquisition. |
+| V-14 | Revocation/disconnect and self connector death kill primary and session-detached descendants. Retained generations never follow a replacement. Namespace standalone signed redemption remains rejected. |
+| V-15 | Namespace consumption stores the same 32 raw digest bytes as private AUTH_COMMIT and collector target_auth; deliberate collector mismatch is rejected. Observed execution is separate from approved target/source facts. |
+| V-16 | The real root TTY verifies and displays authenticated connector evidence, live acquisition/mappings, resolved accounts, provenance and complete experimental constraints before signing. |
+| V-17 | Actual CLI/stdio relay, output in the selected destination and descendant cleanup pass. PTY remains deferred. |
+| V-18 | Native host-cgroup launcher, PID/time final child, subreaper adoption, exec checkpoint, private run/cgroup mounts, setup-FD closure and thirteen real setup/handoff fault cases pass. Fresh-exec memory isolation, dumpability admission, null-input binding and covered-cwd rejection also pass. |
+| V-19 | Namespace durable consumption and digest equality pass, with full host provisioning/audit recovery regression. External rollback protection remains deferred. |
+| V-20 | Namespace revocation, connector/peer death, blocked cleanup and whole-service supervisor cleanup pass. Phase 2 requalifies capture shutdown/restart; full host crash/shutdown and operator-service regression pass. |
+
+NS-01/02 are exercised by the four routes, original-connector socket passing and
+self connector death. NS-03/04/06 use retained generations, independent scoped
+rules and replacement/revocation checks. NS-05/07/08 are limited to the declared
+mapping topologies, thin destination preparation and sealed-byte profile.
+NS-09/10 verify actual placement/context and native fault cleanup. NS-12/14/15
+cover retained ownership, disclosure scheduling, exact approval and three-way
+digest equality. NS-16 has the matching complete regression record in the
+[sanitized evidence](evidence/namespace-phase3-fedora44-20261109.json), with private
+raw artifacts preserved and the disposable VM removed. NS-11 production confinement stays in Phase 4 and NS-13
+manager resolvers in Phase 5.
+
 ### Phase 4 — Confinement, full evidence and packaging
 
 **Dependencies:** Phase 3; G-04 and the applicable full-access G-05 contract.
@@ -428,6 +487,10 @@ approval, daemon packaging and privileged acceptance.
 - Supply daemon LSM packaging policy separately from target confinement policy.
   Document socket exposure, delegation, explicit fresh provisioning and profile
   limitations for administrators.
+- Qualify client-to-host authority for each additional source user-namespace
+  topology. Do not accept an overflow or mapped UID-zero peer as proof of host
+  root; keep unsupported source deployments closed until their trusted authority
+  mechanism and actual client workflow are verified.
 
 **Exit gate:** Each candidate production profile passes real enforcing-platform,
 full/thin/export/evidence, public/private-outcome, durable-consumption and lifecycle

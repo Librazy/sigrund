@@ -10,8 +10,11 @@ executes the command, and returns its output and exit status to the requester.
 The local **v3 host** profile supports private thin intent and client-generated
 full CSRs, bound to a live daemon epoch, exact numeric credentials and an
 immutable security profile. Phase 2 adds registered process environments and
-private destination preparation/review. Approved namespace previews receive the
+private destination preparation/review. Phase 3 adds opt-in experimental native
+execution for registered/process and authenticated self targets, with an actual
+final-child exec checkpoint. Historical namespace preview profiles retain their
 scheduled TIMEOUT without consumption or execution. See the
+[Phase 3 workflow and platform scope](docs/NAMESPACE_PHASE3.md),
 [Phase 2 operator and qualification guide](docs/NAMESPACE_PHASE2.md), the
 [Phase 1 implementation and qualification record](docs/NAMESPACE_PHASE1.md),
 [implementation notes](IMPLEMENTATION_NOTES.md) and
@@ -144,11 +147,12 @@ and policy before using them outside the disposable lab.
 
 ## Current scope
 
-The runtime executes host jobs and supports private thin review for
-`registered:ID` and `process:DAEMON_PID` targets through the same retained
-registration. Root uses `sigrundctl target register` and `target revoke`;
-namespace workloads remain disabled and `self` is rejected. The
-[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) tracks execution and confinement
+The runtime executes host jobs. The explicit `namespace-experimental-v1` profile
+enables thin requests for `registered:ID`, `process:DAEMON_PID` and `self`.
+Root registers/revokes dedicated anchors; self captures its authenticated
+connector through the `.anchor` endpoint. The qualified experimental topology
+and constraints are in the [Phase 3 guide](docs/NAMESPACE_PHASE3.md). The
+[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) tracks production confinement
 work. The [fresh provisioning and binding export procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export)
 explains the cutover, private bundle distribution and offline signing.
 
@@ -159,16 +163,17 @@ signature verification is implemented; physical FIDO interaction still needs
 hardware acceptance testing.
 
 PTY sessions, hook execution, remote collector/ACK integration, policy reload,
-reusable grants and cross-host/container routing remain outside this profile.
+reusable grants and remote-host routing remain outside this profile.
 Collector configuration is required even when remote audit is disabled. See
 [implementation notes](IMPLEMENTATION_NOTES.md#remaining-specification-scope)
 for the full remaining specification scope.
 
 Approving a privileged interpreter such as Bash, Python or Node grants its
 programmable authority under the selected credentials. Executable snapshots do
-not bind mutable script files, imports or libraries. Execution uses the daemon's
-configured domain; it does not follow requester namespaces or automatically
-cross container boundaries. Root inside a container alone does not supply the
+not bind mutable script files, imports or libraries. Host execution uses the
+daemon's configured domain; namespace execution requires explicit selection,
+a live captured owner and scoped approval. Experimental execution does not
+provide production LSM/seccomp confinement. Root inside a container alone does not supply the
 required delegation and kernel access. These boundaries are discussed in
 [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
 [namespace-aware execution roadmap](docs/NAMESPACE_AWARE_EXECUTION.md).

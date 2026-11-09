@@ -2,8 +2,11 @@
 
 The production local one-time SSH/stdio workflow now uses **v3 host bindings**.
 See the [Phase 1 record](docs/NAMESPACE_PHASE1.md) for exact scope, fresh
-provisioning, binding export and current qualification evidence. Container,
-process, registered and `self` targets remain unavailable. The
+provisioning, binding export and current qualification evidence. Phase 2 adds
+private registered/process review; Phase 3 adds opt-in experimental native
+registered/process/self execution with a verified final-child exec stop. The
+[Phase 3 guide](docs/NAMESPACE_PHASE3.md) states its supported topology and
+limitations. The
 [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
 and [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) retain later namespace and
 confinement requirements. The independent [Phase 0 experiments](docs/NAMESPACE_PHASE0.md)
@@ -103,13 +106,14 @@ operation.
 
 Interpreter approval grants programmable authority within the selected
 credentials. An executable digest does not bind mutable script files, libraries
-or imports. Jobs execute in the daemon's configured domain; requester namespaces
-are not followed automatically. Explicit registered/process targets now support
-private destination review only; namespace execution remains disabled.
+or imports. Host jobs execute in the daemon's configured domain. Namespace jobs
+require explicit registered/process/self selection, a live acquired owner and
+the experimental profile. Historical namespace profiles retain private review
+without execution. Production namespace confinement remains Phase 4.
 See [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
 [namespace-aware execution roadmap](docs/NAMESPACE_AWARE_EXECUTION.md).
 
-### Host binding and later namespace execution
+### Host and namespace bindings
 
 Full preparation/export requires an explicitly supplied administrator-distributed
 binding bundle. `.context` contains no target records. The immutable profile
@@ -125,9 +129,18 @@ root FDs; fresh-exec destination helpers resolve bounded account files and paths
 `namespace::ProcessContext` binds cached executable roots alongside the frozen
 acquisition record. Daemon and one signer independently apply registered scopes
 and composed credential policy. The root TTY verifies exact private evidence
-before prompting. Final namespace authorization stops before durable consumption,
-public APPROVED and spawn. See the [Phase 2 guide](docs/NAMESPACE_PHASE2.md).
-Namespace entry, child placement and actual confinement remain later-phase work.
+before prompting. Historical profiles stop before consumption, APPROVED and
+spawn. See the [Phase 2 guide](docs/NAMESPACE_PHASE2.md).
+
+Phase 3's separate experimental schema enables durable namespace authorization.
+Self adds the original public connector observations to its versioned context
+digest and uses a dedicated syscall-only client connector/relay. The same owner
+lease survives capture, approval, commit, complete delivery, native namespace
+entry, final-child pidfd handoff, exec-stop verification and cleanup. Private
+source/approved-target evidence remains separate from actual child observations.
+Target filesystem checks stay on bounded workers, with an exact-warrant proof
+handed to the durable sequencer. Production LSM/seccomp confinement and namespace
+full/export/offline workflows remain later gates.
 
 ## Code ownership and security boundaries
 
@@ -137,7 +150,7 @@ Namespace entry, child placement and actual confinement remain later-phase work.
 | `cli`, `client`, `approver`, `warrant_tools` | Options, requester output/status and signal handling, root-TTY signing, and byte-preserving offline packaging. |
 | `daemon`, `transport`, `admission`, `workers`, `socket_disposal` | Coordinator transitions, credential checks, bounded socket/worker ownership, deadlines, framing and off-loop disposal. |
 | `linux`, `memfd`, `snapshot`, `preparation`, `authorization` | Pinned executable-root resolution, sealed snapshots, digest/signature binding and final authorization predicates. |
-| `target_registry`, `target_capture`, `target_management`, `destination`, `destination_helper`, `process_request` | Epoch-local registered owners, root management, fresh-exec acquisition/preparation, mapped policy and private namespace review. |
+| `target_registry`, `target_capture`, `target_management`, `destination`, `destination_helper`, `process_request` | Epoch-local registered/self owners, root management, fresh-exec acquisition/preparation, mapped policy, private review and actual namespace-context verification. |
 | `sequencer`, `storage` | Serialized durable consumption/audit, retained denial-audit leases, poison handling and sticky storage-pressure admission gates. |
 | `startup`, `cgroup`, `jobs`, `execution`, `reaper`, `runtime`, `service` | Verified provisioning/startup, cgroup limits, syscall-only child transition, readiness, reaping, shutdown and service-manager supervision. |
 
@@ -544,8 +557,10 @@ Beyond the implemented workflow, independent deferred features include:
 
 Additional namespace/container execution domains have a v3 contract and
 [gated roadmap](docs/NAMESPACE_AWARE_EXECUTION.md). Phase 2 supplies constrained
-production acquisition and private destination review. Namespace entry,
-cgroup placement and enforceable confinement remain release-blocking design gates.
+production acquisition and private destination review. Phase 3 adds experimental
+native namespace entry, cgroup placement and final-child verification on its
+declared topology. Production confinement and broader deployment qualification
+remain release gates.
 No v2 compatibility layer or automatic state migration is planned; explicit fresh
 v3 provisioning must preserve existing state. Interpreter artifact binding remains
 separate deferred work.

@@ -1430,6 +1430,74 @@ approval. Reusable grants, when separately implemented, remain limited to the
 same live instance and epoch; they never follow a registration to its replacement.
 The sample context/profile digests are illustrative, not usable registrations.
 
+#### Phase 3 experimental namespace contract
+
+The opt-in `sigrund.constraints.namespace-experimental.v1` record is distinct
+from the frozen Phase 0 constraints. Its canonical record is
+[`experimental-constraints.json`](crates/sigrund-core/tests/fixtures/v3-namespace/experimental-constraints.json).
+It requires all eight declared namespace inputs, private mount/cgroup views,
+digest-memfd, a final-child exec stop, securebits 15, NNP, finite memory/pids
+limits and empty capability sets. Destination UID must be nonzero and requested
+supplementary groups empty. SELinux fields declare no requested transition
+(`context=""`, `enforcing=false`, `policy_change="unmanaged"`); AppArmor is
+unsupported and seccomp is explicitly none. Ambient kernel LSM policy still
+applies. This experimental profile does not qualify production confinement or
+relax any historical profile. Phase 4 owns those additional obligations.
+
+Registered/process bindings retain `sigrund.process-context.v1`: exactly the
+acquisition and pinned executable-root map. Self uses
+`sigrund.self-context.v1`, adding `authenticated_source` with the original
+public connector's positive host PID, UID, GID, sorted supplementary GIDs and
+required nullable `security_label`. These are the host daemon's kernel socket
+observations, distinct from live acquisition process attributes. Self acquisition
+must match that connector via its original peer pidfd and the dedicated `.anchor`
+rendezvous. The single thread is traced through successful `unshare(CLONE_FS |
+CLONE_FILES)` and held at syscall exit; namespace/root/mapping observations are
+then pinned. Connector death, exec, credential or namespace changes invalidate
+capture. Relaying an inherited/passed public stream never changes attribution.
+The CLI uses a dedicated syscall-only connector and keeps its pidfd through
+completion; the parent relays the stream. Exposing self requires the `.anchor`
+endpoint alongside the public socket and target-independent `.context` endpoint.
+
+Root-controlled review records are `sigrund.process-review.v1` for registrations
+and `sigrund.self-review.v1` for self. The `registration` key is mandatory;
+self requires null, an authenticated source, and null registration lifecycle
+fields. A registered review requires its exact registration/revision and no
+self source. Both must verify the exact CSR, resolved credentials, complete
+constraints, executable/cwd identities and context digest before rendering or
+signing. Namespace requests remain thin-only in this phase; full/signed namespace
+input is rejected without fallback.
+
+The actual execution lease survives authorization, complete APPROVED delivery,
+launcher/final-child handoff, exec-stop verification and cleanup. Destination
+I/O and capture exchanges stay off the durable sequencer. Capture helpers wait
+for an explicit acquisition grant after fresh exec, so inherited-descriptor
+copies close before target-pin reservations begin; each stage reserves before
+its own acquisition. No timeout or cancellation refunds live resources. Durable
+consumption survives all post-commit failures, including incomplete APPROVED
+delivery and a commit whose completion is observed after the request deadline.
+
+The namespace launcher MUST fresh-exec before entering destination authority,
+carrying only a bounded sealed per-job configuration and the explicit descriptor
+allowlist. It MUST NOT carry the live daemon's address space, environment, keys
+or unrelated requests into a target user namespace. The host coordinator attaches
+its EXITKILL tracer before granting namespace entry. Initial host mappings and
+`fs.suid_dumpable` 0 or 2 are required for credential transitions; value 1 is
+rejected before review and checked again before execution. Dumpability is
+disabled before namespace entry and after credential changes. Concurrent host
+security-policy replacement is not qualified by this experimental profile.
+
+Null stdin MUST use a verified retained host null-device descriptor; output
+rights are never an input fallback. Configured experimental limits MUST fit the
+daemon's job ceilings before admission. Requested cwd beneath the covered `/run`
+tree is rejected before approval, and the completed private tree MUST resolve
+the approved cwd to the same inode and mount as the actual inherited cwd before
+final-child creation. Anchor and helper death MUST remain observable without
+acquiring the capture IPC mutex. Transient spawn descriptors and inherited
+duplicates remain charged through actual close or reap. Self connection retries
+have an independent deadline, bounded backoff and parent-death protection;
+their capture handshake retains the constrained read-to-unshare sequence.
+
 
 ### 3.3 Strict JCS Round-Trip & String Sanitization Rules
 
