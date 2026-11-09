@@ -139,8 +139,11 @@ lease survives capture, approval, commit, complete delivery, native namespace
 entry, final-child pidfd handoff, exec-stop verification and cleanup. Private
 source/approved-target evidence remains separate from actual child observations.
 Target filesystem checks stay on bounded workers, with an exact-warrant proof
-handed to the durable sequencer. Production LSM/seccomp confinement and namespace
-full/export/offline workflows remain later gates.
+handed to the durable sequencer. The [Phase 4 release gate](docs/NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
+requires a production confinement profile and an installed anchor workflow for
+host → registered B. Namespace full/export/offline and additional requester
+topologies have separate gates. The [Phase 3 guide](docs/NAMESPACE_PHASE3.md#platform-scope-and-qualification)
+describes the current client peer-authentication limitation.
 
 ## Code ownership and security boundaries
 

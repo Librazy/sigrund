@@ -1,6 +1,6 @@
 # Namespace-aware execution: phased v3 roadmap
 
-Updated 2026-11-09. This is the delivery roadmap for the
+Updated 2026-11-10. This is the delivery roadmap for the
 [draft normative v3 security specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>).
 The specification owns the contract; this document owns implementation order,
 feasibility decisions, acceptance evidence and deferred scope. NS-01–NS-16 refer
@@ -19,7 +19,7 @@ It runs jobs in the daemon's configured domain, creates private namespaces for i
 and uses a requester-access helper limited to the daemon filesystem domain and
 initial userns mappings. Direct-execution checkpoints verify executable evidence
 and credentials; they are not general namespace/LSM verifiers. See
-[implementation notes](../IMPLEMENTATION_NOTES.md#deferred-namespace-aware-executable-evidence)
+[implementation notes](../IMPLEMENTATION_NOTES.md#executable-trust-selection)
 for the ComposeFS limitation and current coverage. Namespace-root fixtures do
 not establish container-routing support.
 
@@ -52,8 +52,10 @@ All routes need policy and signer approval, including cross-owner execution.
 Rootful container root, mapped rootless root and host root remain distinct.
 Mapping a source container account into a host account is a separate deferred
 selection mode. Remote hosts, proxy authentication, container creation and socket
-injection are out of scope. Operators expose both client endpoints; the approval
-socket and state remain host-controlled.
+injection are out of scope. Unsigned requesters need the execution socket and
+`.context`; a self requester also needs `.anchor`. For host → registered B,
+only B's dedicated anchor needs the rendezvous endpoint inside B. Management,
+approval and state stay on the host. See the [endpoint table](NAMESPACE_PHASE3.md#operator-workflow).
 
 V3 replaces v2 contracts without compatibility requirements. Wire formats,
 configuration, CLI, signing domains, storage and collector contracts can change
@@ -424,9 +426,10 @@ self. Work at this stage remains experimental until applicable Phase 4 gates pas
 The 39-case production runner qualifies the experimental profile on Fedora 44
 x86-64, enforcing ambient SELinux with an unconfined administrative service,
 cgroup v2 delegation, initial userns self targets and one-child-userns B targets.
-Its four actual CLI routes use different destination executable bytes. A source
-whose user namespace cannot authenticate host root remains unsupported by the
-CLI; nested/mixed namespace ownership and idmapped mounts remain unqualified.
+Its four actual CLI routes use different destination executable bytes. The A
+source uses the initial user namespace even when its root and other namespaces
+are private. Authenticating the daemon from a rootless source, nested/mixed
+namespace ownership and idmapped mounts remain unqualified.
 The Phase 3 guide describes these boundaries and exact reproduction commands.
 
 | Gate | Phase 3 experimental disposition |
@@ -463,39 +466,77 @@ digest equality. NS-16 has the matching complete regression record in the
 raw artifacts preserved and the disposable VM removed. NS-11 production confinement stays in Phase 4 and NS-13
 manager resolvers in Phase 5.
 
-### Phase 4 — Confinement, full evidence and packaging
+### Phase 4 — First production namespace profile
 
-**Dependencies:** Phase 3; G-04 and the applicable full-access G-05 contract.
-**Subsystems:** security profiles, exec verifier, source access, evidence negotiation,
-approval, daemon packaging and privileged acceptance.
+**Status: planned.** The first release candidate is one host requester running a
+thin, one-time SSH/stdio command as a named nonroot service account in an
+already-running, explicitly registered rootless B. Use the Phase 3 host → B
+topology as the starting point. Passing Phase 3 on that topology did not qualify
+production confinement or an installed operator workflow.
 
-**Deliverables:**
+**Carry forward two Phase 3 security checks:**
 
-- Qualify one explicit host → B deployment first using the same fixture,
-  operator recipe and actual child observations. Publish the supported topology,
-  evidence model and enforcement prerequisites for each additional route.
-  Keep G-04's strict concurrent-policy-replacement case open until verified.
-- Implement supported composable SELinux/AppArmor transitions and actual-state
-  verification, policy-change handling and declared seccomp restrictions.
-  Include memfd checkpoints wherever the approved profile requires them.
-- Validate profiles on genuinely enforcing systems. Disabled, unreadable,
-  unconfined and permissive/complain states cannot satisfy required enforcement;
-  never remove NNP/tracing or switch signed executable models to pass a test.
-- Add supported destination full-CSR/export access and binding paths. Reconcile
-  unsigned evidence eligibility across cloned ComposeFS/PrivateMounts while
-  preserving provenance, exact intent and signed-mismatch rejection.
-- Supply daemon LSM packaging policy separately from target confinement policy.
-  Document socket exposure, delegation, explicit fresh provisioning and profile
-  limitations for administrators.
-- Qualify client-to-host authority for each additional source user-namespace
-  topology. Do not accept an overflow or mapped UID-zero peer as proof of host
-  root; keep unsupported source deployments closed until their trusted authority
-  mechanism and actual client workflow are verified.
+- **Client authentication (NS-01).** The current client can send intent and
+  finite stdin to a substitute socket whose unprivileged host owner appears
+  as UID 0 to a rootless requester. Reject an unprovable peer before sending
+  a query, request or rights. Test counterfeit context and execution listeners
+  independently, and retain a genuine host-peer positive control. This is a
+  client disclosure, not evidence of host authorization bypass. Supporting a
+  rootless requester is a separate gate from running *into* rootless B.
+- **Requester injection (NS-05).** Exercise a requester with a different mapped
+  UID from the workload but ownership of, or tracing authority over, B's user
+  namespace. Attempt attachment after exec-stop release; include a control that
+  demonstrates the attempted trace can succeed without the claimed guard. This
+  is an open evidence gap. If injection succeeds, or prevention cannot be
+  established, reject that combination before authorization in the current
+  experimental profile. Qualify only combinations that exclude this authority.
 
-**Exit gate:** Each candidate production profile passes real enforcing-platform,
-full/thin/export/evidence, public/private-outcome, durable-consumption and lifecycle
-cases. Any unsupported full-access or confinement combination remains rejected
-and listed. No claim of arbitrary requester confinement or manager-exec equivalence.
+**First production gate (NS-16).** Deliver and qualify all of the following on
+one named deployment, from installed packages:
+
+1. **Bring B online.** Document the exact OS, kernel, namespace ownership and
+   mappings, delegation, socket exposure and LSM prerequisites. Provision fresh
+   v3 state, configure independent daemon and signer rules, and start the
+   service. Use a supported tool or reproducible installation recipe to start
+   the dedicated disposable anchor in the running B. Register it from the host.
+   The operator must be able to do this without running the test harness.
+2. **Enforce one immutable profile (G-04).** Specify the executable model,
+   effective LSM requirements, explicit seccomp policy and policy-change
+   guarantee. Package daemon policy separately from workload policy. Verify
+   actual confinement at exec stop on an enforcing system, then exercise a
+   workload operation denied by that policy. Reject disabled, unreadable, permissive,
+   complain, unconfined or mismatched states when enforcement is required.
+   Preserve NNP, tracing and the signed executable model. When adding this
+   transition, give the Rust and C launcher one authoritative descriptor and
+   event layout and test malformed handoffs and cleanup. A sealed image does
+   not bind libraries or scripts subsequently loaded from B.
+3. **Run and withdraw the command.** Follow the operator guide: approve the
+   destination-only account, credentials, executable and cwd; distinguish
+   APPROVED from readiness; check actual child identity, output and exit status.
+   Correlate a public TIMEOUT with its private diagnosis by execution ID. Revoke
+   during review (no consumption or spawn) and during execution (whole-job
+   teardown). Restart the daemon, verify the old binding is unusable, and
+   register a fresh anchor for a successful retry.
+4. **Publish release evidence.** Record package versions/digests, commands,
+   platform, observed enforcement, public/private outcomes, durable consumption
+   and actual descendant cleanup. Re-run host acceptance and applicable V/NS
+   cases against the candidate. Verify that namespace full-only/export fails
+   locally without submission or an exported CSR. Raw full/signed namespace
+   submissions that reach authorization must retain the scheduled TIMEOUT
+   without fallback, consumption or spawn. These negative results qualify the
+   exclusions; an untested applicable confinement or lifecycle guarantee blocks
+   release.
+
+**Later Phase 4 gates, independent of the thin-only release:**
+
+| Capability | Evidence required before enabling it |
+| --- | --- |
+| Namespace client-full, export and offline redemption (G-05) | Trusted epoch binding distribution, requester-limited destination access, cloned ComposeFS/PrivateMounts evidence where applicable, preserved provenance, signed mismatch and replay rejection. |
+| Additional sources and routes | Establish host authority in each source user namespace; test real and substitute endpoints, original-connector attribution and applicable self/anchor lifetimes. Never accept overflow or mapped UID zero alone as host-root proof. |
+| Other LSM stacks, executable models or policy-change guarantees (G-04) | Qualify each combination on its enforcing system with NNP and tracing intact. For a claim that no instruction runs under concurrently replaced policy, demonstrate serialization for the complete job lifetime; final token sampling is insufficient. Keep the strict combination blocked otherwise. |
+
+Manager-backed identity and teardown remain Phase 5. A manager-free profile
+identifies the registered process environment and carries no manager-exec claim.
 
 ### Phase 5 — Optional resolvers and release qualification
 
@@ -529,11 +570,11 @@ verification ownership, preserving the original proposal's acceptance coverage.
 
 | Requirement | Contract location in main spec | Phases | Required evidence |
 | --- | --- | --- | --- |
-| NS-01 — Routes/deployment | §1.5 | 0, 1.5, 3–5 | Existing rootless B operator recipe; four routes; rootful/rootless; correct destination account; both client endpoints |
+| NS-01 — Routes/deployment | §1.5 | 0, 1.5, 3–5 | Existing rootless B operator recipe; four routes; rootful/rootless; correct destination account; route-specific endpoints and authenticated daemon |
 | NS-02 — Source attribution | §1.5 | 0, 2–3 | Shared/unshared namespaces, inherited/passed sockets, connector exit, exec/credential races |
 | NS-03 — Selector/identity separation | §1.5 | 0–2 | Names/PIDs/inodes/cgroups/images cannot independently authorize or identify a generation |
 | NS-04 — Instance lifetime | §1.5, §4.2 | 0, 1.5, 2–3 | Same-name replacement with a surviving anchor; PID reuse, context/change-and-restore races, anchor death, restart/replacement and daemon restart |
-| NS-05 — Mapped authority/injection | §1.1, §4.2 | 0, 2–4 | Nested/unmapped credentials, groups/setgroups, rootless UID 0, injection authority and mapping composition |
+| NS-05 — Mapped authority/injection | §1.1, §4.2 | 0, 2–4 | Nested/unmapped credentials, groups/setgroups, rootless UID 0, post-release requester tracing authority and mapping composition |
 | NS-06 — Scoped/cross-owner policy | §1.5–1.6, §4.1–4.2 | 0–3 | Requester/signer ceilings, cross-owner approval, equal integers in different domains |
 | NS-07 — Destination/access | §2.2.1 | 1.5 (fixture), 2, 4 | Different bytes/cwd at same paths, account changes, mutable roots, bounded lookup and requester-access denial |
 | NS-08 — Evidence/provenance | §2.2.1–2.2.2 | 2, 4 | ComposeFS/PrivateMounts, default/full-only/export/thin, unsigned negotiation and signed substitution rejection |

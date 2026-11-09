@@ -152,8 +152,11 @@ enables thin requests for `registered:ID`, `process:DAEMON_PID` and `self`.
 Root registers/revokes dedicated anchors; self captures its authenticated
 connector through the `.anchor` endpoint. The qualified experimental topology
 and constraints are in the [Phase 3 guide](docs/NAMESPACE_PHASE3.md). The
-[phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) tracks production confinement
-work. The [fresh provisioning and binding export procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export)
+[Phase 4 roadmap](docs/NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
+targets one installed, thin-only host → registered rootless container workflow.
+A rootless *requester* is outside current qualification: a substitute server can
+appear as UID 0 in its user namespace. Run the client on the host for this route.
+The [fresh provisioning and binding export procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export)
 explains the cutover, private bundle distribution and offline signing.
 
 The local execution profile supports SSH Ed25519 signatures, one-time grants,

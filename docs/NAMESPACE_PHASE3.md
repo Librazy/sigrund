@@ -102,6 +102,16 @@ precedes the launcher. Revocation and disconnect tear down the whole job cgroup.
 
 ## Operator workflow
 
+The endpoints depend on the role. For the unsigned CLI workflows below, use
+these paths relative to the configured execution socket:
+
+| Participant | Required access |
+| --- | --- |
+| Host requester, or supported A requesting host or registered B | Execution socket and its `.context` companion |
+| A requesting self | Execution socket, `.context` and `.anchor` in A |
+| Dedicated anchor in registered B | `.anchor` in B; no execution or context socket is needed just to receive the job |
+| Host administrator and approver | Root-only `.management` for registration/revocation; separate private approval socket and epoch evidence for signing. Keep these on the host. |
+
 Start with fresh v3 provisioning and the qualified dedicated-anchor deployment
 in the [Phase 2 guide](NAMESPACE_PHASE2.md). Deliberately append
 [`namespace-experimental-profiles.toml.example`](../config/namespace-experimental-profiles.toml.example)
@@ -170,15 +180,22 @@ namespace owned by the selected user namespace. Rootless B maps service
 UID/GID 12001 to host 536288. The tested A source uses the initial user namespace
 and private namespaces/root. Cross-owner B and same-owner self rules are distinct.
 
-A client may authenticate a host daemon outside its PID namespace (kernel peer
-PID zero), while server admission still requires a positive original connector
-PID. The client continues requiring peer UID zero in its own user namespace.
-Consequently a source user namespace in which host root is unmapped cannot use
-the CLI; overflow UID is never accepted as root authentication. Such source
-topologies, nested/mixed ownership, idmapped mounts, other architectures and
-manager-specific deployments have no qualification claim here. Ambient LSM
-policy may also deny a declared operation. Phase 4 must resolve deployment
-authority and confinement for any broader support claim.
+The qualified A can see peer PID zero when the daemon is outside A's PID
+namespace; daemon admission still requires a visible original connector. Do
+not use this client from a rootless user namespace to submit secrets or grants:
+the current client checks peer UID zero **as seen by the caller**. A genuine
+host daemon can appear unmapped and be refused, while a substituted socket
+owned by mapped root can be accepted and receive request data and stdin.
+This concerns client disclosure; a substitute cannot approve a job at the real
+daemon. Host → registered B uses a host-side client.
+
+The [Phase 4 roadmap](NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
+tracks that client correction and the outstanding post-release injection test
+for a requester with authority in the target user namespace. Different mapped
+UIDs alone do not establish protection against tracing. Nested/mixed ownership,
+idmapped mounts, other runtime architectures and manager-specific deployments
+remain unqualified. The first production gate will exercise installation and
+operation of a dedicated anchor; the fixture recipe above is experimental.
 
 The whole workspace also passes an ARM64 compile check, including the connector's
 portable wait syscall. Namespace runtime qualification remains limited to the

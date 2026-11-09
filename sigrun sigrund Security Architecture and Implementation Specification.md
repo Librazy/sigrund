@@ -6,9 +6,10 @@ supervises execution in explicitly selected local environments. Full/thin
 provenance, confidential outcomes, executable evidence, durable authorization,
 hooks and audit replication remain part of this contract.
 
-The implemented local one-time SSH/stdio runtime is **v2**; see
-[implementation notes](IMPLEMENTATION_NOTES.md). This rewrite does not enable
-v3 or establish conformance. The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md)
+The implemented local one-time SSH/stdio runtime uses **v3**. The host profile
+and the narrower experimental namespace profile have separate qualification
+records (Section 8.3). A target requirement in this document is not a support
+claim. The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md)
 tracks requirements, feasibility gates and release evidence. Requirements marked
 NS-01–NS-16 are normative obligations; unresolved mechanisms in Section 8.4 are
 release blockers, not permission to weaken those obligations. Schema examples
@@ -409,12 +410,23 @@ policy, root-TTY approval, durable authorization and supervision:
 | 3 | Container A | Existing container B | In B |
 
 Execution is local; no remote-host or delegated proxy authentication is implied.
-Operators expose the client socket and its `.context` companion with their path
-relationship intact. No socket injection, container modification or container
-creation is performed. Approval sockets, state and management credentials stay
-host-controlled. DAC and SELinux/AppArmor must permit connection; reachability
+For unsigned requests, expose the execution socket and its `.context` companion
+to the requester with their path relationship intact. Self also requires the
+`.anchor` rendezvous there. For a registered target, expose the rendezvous to
+its dedicated anchor; receiving a workload does not require exposing the
+execution or context socket in the destination. No socket injection, container
+modification or container creation is performed. Approval sockets, state and
+management credentials stay host-controlled. DAC and SELinux/AppArmor must permit connection; reachability
 only permits submission. Mapping a source container account into a host account
 is a separate deferred selection mode.
+
+The client MUST establish the host daemon's authority independently on each
+connection used for context or submission, including signed submissions that
+skip context. It MUST do so before sending the query, intent, warrant, stdin or
+stdio rights. In a noninitial user namespace, a peer UID of zero may identify
+an unprivileged host user. Neither that observation alone nor an overflow UID
+authenticates the host daemon. If no trusted mechanism exists for the source
+topology, fail locally without sending; do not fall back to thin submission.
 
 **NS-02 — Authenticated source contract.** The baseline attributes requests to
 kernel-authenticated connection credentials (`SO_PEERCRED`, `SO_PEERGROUPS`) as
@@ -518,10 +530,9 @@ The [Phase 0 contract supplement](docs/NAMESPACE_PHASE0.md) fixes the initial
 constrained-anchor source-attribution mechanism, bounded private acquisition and
 constraint records, target-scoped policy/management grammar, binding distribution
 and quota defaults. Its experimental validators and fixtures are the concrete
-draft schema reference for the initial profile. These are not production v2
-interfaces. Unsupported combinations and the concurrent-SELinux-policy-replacement
-limitation remain blocked; later runtime gates must implement and validate the
-same contracts before issuing bindings or making support claims.
+schema reference for the prototype. See Section 3.2.1 for the distinct
+experimental execution contract. Prototype results alone cannot qualify a
+runtime profile; strict concurrent SELinux policy replacement remains blocked.
 
 ### 2.1 Binary Framing & Public Outcome Contract
 
@@ -622,8 +633,8 @@ client and daemon derive it from their configured execution socket path; startup
 checks the resulting Unix-socket path bound and trusted parent. Publish it only
 after the same startup/recovery gates as the execution listener. On this socket
 send exactly `{"version":"3.0"}` as `CLIENT_CONTEXT_QUERY`. The daemon accepts no path, intent or rights and performs
-no request-dependent filesystem inspection. Authenticate the daemon through its
-trusted socket location and root peer credentials. Context queries do not consume
+no request-dependent filesystem inspection. Use the trusted socket location
+and verify the peer on the context connection itself as required by Section 1.5. Context queries do not consume
 approval slots or execution-request rate counters. Limit them to 8 active global,
 2 per UID, and 64 global/8 per UID per existing admission window; these fixed
 ceilings share the total Unix-socket disposal budget. Assemble/send within five
@@ -692,10 +703,10 @@ V3 `sigrun --export-csr PATH -- ...` prepares and exports a full canonical CSR
 without execution submission (and implies full-only). It may query public context;
 it never requests privileged expansion. Offline `sigrundctl csr-pae --csr PATH`
 and `pack-warrant` consume those bytes, sign/package without rewriting fields,
-and refuse overwrites. Thin requests have no export/redemption path. These are
-v3 target semantics; runnable v2 commands remain documented in implementation
-notes. Full preparation/export requires an already trustworthy destination
-binding obtainable without privileged public target discovery (NS-07).
+and refuse overwrites. Thin requests have no export/redemption path. The
+[host workflow](docs/NAMESPACE_PHASE1.md) implements full/export; the experimental
+namespace profile accepts only thin requests. Full preparation/export requires
+an already trustworthy destination binding obtainable without privileged public target discovery (NS-07).
 
 ### 2.2.1 Preparation, Access Validation, and Exact Binding
 
@@ -2178,8 +2189,9 @@ signature cannot resume evaluation. Details remain in protected audit only.
 The `[mvp]` profile replaces hook dispatch with one authenticated root approver.
 It uses the same full/thin preparation, provenance, deadlines, durable gates and
 public outcomes. Signed client-full warrants bypass review, not authorization.
-This is the v3 target for local root-TTY approval. The existing implementation
-supports a v2 local profile; this document does not claim v3 availability.
+The v3 host profile implements local root-TTY approval. For experimental
+namespace targets only the active thin request can proceed after approval
+(Section 3.2.1).
 
 **Configuration:** Exact fields are `tty_mode = "stdio"`, `hooks_enabled = false`,
 `pty_enabled = false`, `max_active_approval_requests = 1`, and a nonempty
@@ -2492,17 +2504,29 @@ state diagrams must have independently checkable fixtures before runtime release
 
 ### 8.3 Implementation Status and Release Gate (NS-16)
 
-The current implementation is the **v2 local one-time SSH/stdio profile**, as
-recorded in [implementation notes](IMPLEMENTATION_NOTES.md). No v3 runtime or
-namespace support is established by this specification update. Preserve that
-status until integrated evidence demonstrates each claimed capability.
+The [host qualification](docs/NAMESPACE_PHASE1.md) covers the v3 one-time
+SSH/stdio workflow. [Phase 3](docs/NAMESPACE_PHASE3.md) covers experimental
+namespace execution on its declared topology. Its four CLI routes used an A
+source in the initial user namespace and do not qualify a rootless requester,
+production workload confinement or arbitrary manager deployments.
 
-The [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) defines six dependency-ordered
-phases, requirement traceability and their acceptance gates. All applicable
-V-01–V-20 cases above remain required under v3; add the namespace matrix below.
-Phases 2–3 can yield experimental execution, not production support. No profile
-ships before its applicable confinement, packaging and lifecycle gates pass.
-Manager resolvers are optional and cannot delay a validated manager-free profile.
+The [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
+defines the first candidate production profile: a host requester, one registered
+rootless B, and thin one-time approval. Release requires installed-package
+evidence for all applicable V-01–V-20 and NS cases below, including actual
+confinement, private/public outcomes, durable authorization, revocation and
+cleanup. NS-05 requires an adversarial post-release attach test with different
+mapped UIDs and requester user-namespace authority, or verified pre-authorization
+rejection of that combination. Document the deployment's policy-change guarantee
+under Section 5.5; a final observation cannot serialize policy replacement.
+
+A thin-only production profile MUST reject namespace full and standalone signed
+input without fallback, consumption or spawn. Full-only/export MUST NOT invoke
+privileged preparation. Verify these exclusions against the CLI and raw protocol;
+positive namespace full/export, additional source routes, LSM stacks, executable
+models and optional manager resolvers require their own qualification before
+being advertised. The comprehensive matrix below remains the target across
+profiles; these exclusions do not waive any requirement for an enabled path.
 
 Keep PTY, hooks, collector/remote ACK, reload, reusable grants, scripts and extra
 signing adapters independently deferred until their integrated cases pass. They
@@ -2513,7 +2537,7 @@ a subset must name its supported profile and exclusions explicitly.
 
 | Requirement | Integrated acceptance scenario and required result |
 | --- | --- |
-| NS-01 | All four routes, rootful/rootless, same-owner/cross-owner; destination account and explicit policy/approval are correct; both client endpoints function |
+| NS-01 | All four routes, rootful/rootless, same-owner/cross-owner; destination account and explicit policy/approval are correct; route-specific endpoints function and the client authenticates the host daemon |
 | NS-02 | Shared/unshared namespaces, inherited/passed sockets, connector exit, exec/credential/context races; adhere to declared attribution or reject |
 | NS-03–NS-04 | PID reuse, anchor death, change-and-restore races, restart/replacement, daemon restart while reviewing; stale binding rejects without retargeting |
 | NS-05–NS-06 | Nested/unmapped IDs, setgroups restrictions, cross-owner requests, equal numeric IDs in different namespaces and different IDs mapping to one kernel UID; no authority confusion or injection bypass |
