@@ -664,6 +664,17 @@ impl DaemonConfig {
         }
         self.host_limits.validate()?;
         validate_namespace_policy(&self.namespace_profiles, &self.namespace_rules)?;
+        for profile in &self.namespace_profiles {
+            if profile.schema == "sigrund.constraints.namespace-experimental.v1"
+                && (profile.memory_max > self.job_memory_max_bytes
+                    || profile.memory_swap_max > self.job_memory_swap_max_bytes
+                    || u64::from(profile.pids_max) > self.job_pids_max)
+            {
+                return Err(CoreError::Config(
+                    "namespace profile limits exceed daemon job ceilings".into(),
+                ));
+            }
+        }
 
         let mut profiles = BTreeSet::new();
         for profile in &self.host_profiles {
@@ -1047,9 +1058,11 @@ fn validate_namespace_policy(
     }
     for rule in rules {
         rule.validate()?;
-        if !rule.target_scope.starts_with("registered:") || !hashes.contains(&rule.profile_sha256) {
+        if (!rule.target_scope.starts_with("registered:") && rule.target_scope != "self")
+            || !hashes.contains(&rule.profile_sha256)
+        {
             return Err(CoreError::Config(
-                "namespace rule requires a registered scope and configured profile".into(),
+                "namespace rule requires a supported scope and configured profile".into(),
             ));
         }
     }
@@ -1059,6 +1072,36 @@ fn validate_namespace_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experimental_namespace_limits_must_fit_daemon_before_admission() {
+        use crate::namespace::Contract;
+        let mut config = valid();
+        let profile = crate::namespace::Constraints::parse(include_bytes!(
+            "../tests/fixtures/v3-namespace/experimental-constraints.json"
+        ))
+        .unwrap();
+        config.namespace_profiles = vec![profile];
+        config.validate().unwrap();
+        for field in ["memory", "swap", "pids"] {
+            let mut changed = config.clone();
+            let profile = &mut changed.namespace_profiles[0];
+            match field {
+                "memory" => profile.memory_max = changed.job_memory_max_bytes + 1,
+                "swap" => profile.memory_swap_max = changed.job_memory_swap_max_bytes + 1,
+                "pids" => changed.job_pids_max = u64::from(profile.pids_max) - 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                changed
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("namespace profile limits"),
+                "{field}"
+            );
+        }
+    }
 
     #[test]
     fn namespace_policy_requires_exact_configured_profile_and_registered_scope() {

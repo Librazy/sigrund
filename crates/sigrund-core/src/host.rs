@@ -93,7 +93,7 @@ pub enum Selector {
 impl Selector {
     pub fn validate_selection(&self) -> Result<()> {
         match self {
-            Self::Host {} => Ok(()),
+            Self::Host {} | Self::Self_ {} => Ok(()),
             Self::Registered { id } => identifier(id),
             Self::Process { pid, pid_scope }
                 if *pid > 0 && *pid <= i32::MAX as u32 && pid_scope == "daemon" =>

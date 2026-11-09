@@ -149,6 +149,15 @@ impl Budget {
             used: Arc::new(Mutex::new(Used::default())),
         })
     }
+    /// Private diagnostic snapshot; this is never a public authorization result.
+    pub fn usage(&self, uid: u32) -> (Charge, Charge, u32) {
+        let used = self.used.lock().expect("host budget poisoned");
+        (
+            used.global,
+            used.per_uid.get(&uid).copied().unwrap_or_default(),
+            used.parent_target_fds,
+        )
+    }
     /// Reserve before acquiring resources, including transient FD duplicates.
     /// Failure leaves all counters unchanged and adds no UID table entry.
     pub fn reserve(&self, uid: u32, charge: Charge) -> Option<Reservation> {
@@ -259,6 +268,42 @@ impl Budget {
     }
 }
 impl Reservation {
+    /// Separate a reservation for not-yet-acquired descriptors from other
+    /// resources. Splitting preserves every charge until either owner drops.
+    pub fn take_target_fds(&mut self) -> Option<Self> {
+        if self.charge.target_fds == 0 {
+            return None;
+        }
+        let target_fds = std::mem::take(&mut self.charge.target_fds);
+        Some(Self {
+            budget: self.budget.clone(),
+            uid: self.uid,
+            charge: Charge {
+                target_fds,
+                ..Default::default()
+            },
+            inherited: self.inherited,
+        })
+    }
+    pub fn usage(&self) -> (Charge, Charge, u32) {
+        self.budget.usage(self.uid)
+    }
+    /// Transfer already charged IPC descriptor ownership into the coordinator.
+    /// Queued/helper descriptors do not inflate the coordinator's fork table.
+    pub fn into_parent(mut self) -> Self {
+        if self.inherited {
+            let mut used = self.budget.used.lock().expect("host budget poisoned");
+            used.parent_target_fds = used
+                .parent_target_fds
+                .checked_add(self.charge.target_fds)
+                .expect("parent FD accounting overflow");
+            self.inherited = false;
+        }
+        self
+    }
+    pub fn budget_reserve_child(&self, charge: Charge) -> Option<Reservation> {
+        self.budget.reserve_child_resources(self.uid, charge)
+    }
     pub fn budget_reserve(&self, charge: Charge) -> Option<Reservation> {
         self.budget.reserve(self.uid, charge)
     }
@@ -272,6 +317,9 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if self.charge == Charge::default() {
+            return;
+        }
         let mut used = self.budget.used.lock().expect("host budget poisoned");
         used.release(self.uid, self.charge);
         if !self.inherited {
@@ -283,6 +331,53 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn splitting_unacquired_fds_keeps_helpers_charged_and_all_drop_orders_safe() {
+        for helpers in [0, 1] {
+            let budget = Budget::new(Default::default()).unwrap();
+            let mut reservation = budget
+                .reserve_child_resources(
+                    7,
+                    Charge {
+                        target_fds: 128,
+                        helpers,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let fds = reservation.take_target_fds().unwrap();
+            assert_eq!(budget.usage(7).1.target_fds, 128);
+            drop(fds);
+            assert_eq!(budget.usage(7).1.target_fds, 0);
+            assert_eq!(budget.usage(7).1.helpers, helpers);
+            drop(reservation);
+            assert_eq!(budget.usage(7).0, Charge::default());
+        }
+    }
+    #[test]
+    fn transferring_queued_fds_preserves_charges_and_changes_only_fork_accounting() {
+        let budget = Budget::new(Default::default()).unwrap();
+        let queued = budget
+            .reserve_child_resources(
+                7,
+                Charge {
+                    target_fds: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(budget.used.lock().unwrap().parent_target_fds, 0);
+        let before = budget.used.lock().unwrap().global;
+        let parent = queued.into_parent();
+        assert_eq!(budget.used.lock().unwrap().parent_target_fds, 8);
+        assert_eq!(budget.used.lock().unwrap().global, before);
+        let (_, copies) = parent.with_retained_fd_copies(|| ()).unwrap();
+        assert_eq!(budget.used.lock().unwrap().global.target_fds, 16);
+        drop(copies);
+        drop(parent);
+        assert_eq!(budget.used.lock().unwrap().parent_target_fds, 0);
+        assert_eq!(budget.used.lock().unwrap().global.target_fds, 0);
+    }
     #[test]
     fn helper_only_fds_are_charged_without_being_inherited_by_the_daemon() {
         let budget = Budget::new(Default::default()).unwrap();

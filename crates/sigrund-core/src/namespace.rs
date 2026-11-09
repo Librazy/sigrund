@@ -333,7 +333,10 @@ pub enum Seccomp {
 }
 impl Contract for Constraints {
     fn validate(&self) -> Result<()> {
-        if self.schema != "sigrund.constraints.phase0.v1" {
+        if !matches!(
+            self.schema.as_str(),
+            "sigrund.constraints.phase0.v1" | "sigrund.constraints.namespace-experimental.v1"
+        ) {
             return Err(invalid("wrong constraint schema"));
         }
         identifier(&self.profile_id)?;
@@ -357,8 +360,6 @@ impl Contract for Constraints {
                 .iter()
                 .any(|c| c != "CAP_NET_BIND_SERVICE")
             || self.capabilities.len() > 1
-            || !self.selinux.enforcing
-            || self.selinux.policy_change != "reject"
             || self.apparmor != "unsupported"
             || !matches!(
                 self.executable_model,
@@ -368,9 +369,25 @@ impl Contract for Constraints {
         {
             return Err(invalid("unsupported phase0 constraint combination"));
         }
-        text(&self.selinux.context, 4096)?;
-        if self.selinux.context.splitn(4, ':').count() != 4 {
-            return Err(invalid("complete SELinux context required"));
+        if self.schema == "sigrund.constraints.namespace-experimental.v1" {
+            if self.profile_id != "namespace-experimental-v1"
+                || !self.capabilities.is_empty()
+                || self.executable_model != crate::executable::TrustModel::DigestMemfd
+                || self.selinux.enforcing
+                || !self.selinux.context.is_empty()
+                || self.selinux.policy_change != "unmanaged"
+                || !matches!(self.seccomp, Seccomp::None {})
+            {
+                return Err(invalid("unsupported experimental constraint combination"));
+            }
+        } else {
+            text(&self.selinux.context, 4096)?;
+            if !self.selinux.enforcing
+                || self.selinux.policy_change != "reject"
+                || self.selinux.context.splitn(4, ':').count() != 4
+            {
+                return Err(invalid("complete enforcing SELinux context required"));
+            }
         }
         if let Seccomp::DenySyscalls {
             audit_arch,
@@ -535,11 +552,15 @@ pub struct ProcessContext {
     pub schema: String,
     pub acquisition: Acquisition,
     pub executable_roots: BTreeMap<String, FsIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_source: Option<ConnectorObservation>,
 }
 impl Contract for ProcessContext {
     fn validate(&self) -> Result<()> {
-        if self.schema != "sigrund.process-context.v1"
-            || self.executable_roots.is_empty()
+        if !matches!(
+            self.schema.as_str(),
+            "sigrund.process-context.v1" | "sigrund.self-context.v1"
+        ) || self.executable_roots.is_empty()
             || self.executable_roots.len() > 64
         {
             return Err(invalid(
@@ -547,6 +568,15 @@ impl Contract for ProcessContext {
             ));
         }
         self.acquisition.validate()?;
+        match (&self.authenticated_source, self.schema.as_str()) {
+            (None, "sigrund.process-context.v1") => (),
+            (Some(source), "sigrund.self-context.v1")
+                if self.acquisition.lifecycle.registration_id.is_none() =>
+            {
+                source.verify_capture(&self.acquisition)?
+            }
+            _ => return Err(invalid("context schema differs from source attribution")),
+        }
         for (path, identity) in &self.executable_roots {
             if !path.starts_with('/')
                 || path == "/"
@@ -563,6 +593,34 @@ impl Contract for ProcessContext {
     }
 }
 
+/// Kernel credentials from the public request connection and its SO_PEERSEC
+/// observation at capture. Live process attributes remain in Acquisition::anchor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorObservation {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_gids: Vec<u32>,
+    #[serde(deserialize_with = "required_option")]
+    pub security_label: Option<String>,
+}
+impl ConnectorObservation {
+    pub fn verify_capture(&self, acquisition: &Acquisition) -> Result<()> {
+        if self.pid != acquisition.pid
+            || self.uid != acquisition.anchor.host_uid
+            || self.gid != acquisition.anchor.host_gid
+            || self.supplementary_gids != acquisition.anchor.host_groups
+        {
+            return Err(invalid("capture differs from public connector credentials"));
+        }
+        if let Some(label) = &self.security_label {
+            text(label, 4096)?;
+        }
+        Ok(())
+    }
+}
+
 /// Root-controlled review evidence for a single prepared process request.
 /// Its references are checked against the exact canonical CSR before rendering.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -572,32 +630,56 @@ pub struct ProcessReview {
     pub exec_id: String,
     pub csr_sha256: String,
     pub acquisition: Acquisition,
-    pub registration: Registration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_source: Option<ConnectorObservation>,
+    #[serde(deserialize_with = "required_option")]
+    pub registration: Option<Registration>,
     pub constraints: Constraints,
     pub executable_roots: BTreeMap<String, FsIdentity>,
     pub prepared_cwd: FsIdentity,
     pub prepared_executable: FsIdentity,
 }
+fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
+}
 impl Contract for ProcessReview {
     fn validate(&self) -> Result<()> {
-        if self.schema != "sigrund.process-review.v1" {
+        if !matches!(
+            self.schema.as_str(),
+            "sigrund.process-review.v1" | "sigrund.self-review.v1"
+        ) {
             return Err(invalid("unsupported process review schema"));
         }
         uuid7(&self.exec_id)?;
         hex(&self.csr_sha256)?;
         self.context().validate()?;
-        self.registration.validate()?;
         self.constraints.validate()?;
         self.prepared_cwd.validate()?;
         self.prepared_executable.validate()?;
-        if self.registration.profile_sha256 != self.constraints.sha256()?
-            || self.registration.daemon_pid != self.acquisition.pid
-            || self.acquisition.lifecycle.registration_id.as_deref() != Some(&self.registration.id)
-            || self.acquisition.lifecycle.registration_revision.as_deref()
-                != Some(&self.registration.revision)
-            || !matches!(self.acquisition.capture, Capture::TracedPrivateFsV1)
-        {
-            return Err(invalid("process review records differ"));
+        if !matches!(self.acquisition.capture, Capture::TracedPrivateFsV1) {
+            return Err(invalid("process review requires a captured connector"));
+        }
+        match (&self.registration, self.schema.as_str()) {
+            (Some(registration), "sigrund.process-review.v1") => {
+                registration.validate()?;
+                if registration.profile_sha256 != self.constraints.sha256()?
+                    || registration.daemon_pid != self.acquisition.pid
+                    || self.acquisition.lifecycle.registration_id.as_deref()
+                        != Some(&registration.id)
+                    || self.acquisition.lifecycle.registration_revision.as_deref()
+                        != Some(&registration.revision)
+                {
+                    return Err(invalid("process review records differ"));
+                }
+            }
+            (None, "sigrund.self-review.v1")
+                if self.acquisition.lifecycle.registration_id.is_none()
+                    && self.acquisition.lifecycle.registration_revision.is_none()
+                    && self.constraints.schema
+                        == "sigrund.constraints.namespace-experimental.v1" => {}
+            _ => return Err(invalid("review schema and registration dependency differ")),
         }
         Ok(())
     }
@@ -605,8 +687,14 @@ impl Contract for ProcessReview {
 impl ProcessReview {
     pub fn context(&self) -> ProcessContext {
         ProcessContext {
-            schema: "sigrund.process-context.v1".into(),
+            schema: if self.schema == "sigrund.self-review.v1" {
+                "sigrund.self-context.v1"
+            } else {
+                "sigrund.process-context.v1"
+            }
+            .into(),
             acquisition: self.acquisition.clone(),
+            authenticated_source: self.authenticated_source.clone(),
             executable_roots: self.executable_roots.clone(),
         }
     }
@@ -618,7 +706,10 @@ impl ProcessReview {
                 kind: "process_environment".into(),
                 daemon_epoch: self.acquisition.daemon_epoch.clone(),
                 instance_id: self.acquisition.instance_id.clone(),
-                description: format!("Registered process environment {}", self.registration.id),
+                description: self.registration.as_ref().map_or_else(
+                    || "Authenticated connector process environment".into(),
+                    |registration| format!("Registered process environment {}", registration.id),
+                ),
                 context_sha256: self.context().sha256()?,
             },
             security_constraints: crate::host::SecurityConstraints {
@@ -636,13 +727,27 @@ impl ProcessReview {
             w.execution_context.target_gid,
             w.execution_context.supplementary_gids.clone(),
         )?;
-        let target_matches = match &w.intent.target {
-            crate::host::Selector::Registered { id } => id == &self.registration.id,
-            crate::host::Selector::Process { pid, pid_scope } => {
-                *pid == self.registration.daemon_pid && pid_scope == "daemon"
+        let target_matches = match (&w.intent.target, &self.registration) {
+            (crate::host::Selector::Registered { id }, Some(registration)) => {
+                id == &registration.id
+            }
+            (crate::host::Selector::Process { pid, pid_scope }, Some(registration)) => {
+                *pid == registration.daemon_pid && pid_scope == "daemon"
+            }
+            (crate::host::Selector::Self_ {}, None) => {
+                w.requester_uid == self.acquisition.anchor.host_uid
+                    && w.requester_gid == self.acquisition.anchor.host_gid
             }
             _ => false,
         };
+        if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1"
+            && (w.execution_context.target_uid == 0
+                || !w.execution_context.supplementary_gids.is_empty())
+        {
+            return Err(invalid(
+                "experimental execution requires non-root UID and empty groups",
+            ));
+        }
         if !target_matches
             || self.csr_sha256 != crate::crypto::sha256_hex(csr.as_bytes())
             || w.request_origin != "daemon_expanded_thin"
@@ -671,6 +776,7 @@ impl ProcessReview {
             "authority": w.host_id,
             "target_binding": w.target_binding,
             "declared_registration": self.registration,
+            "authenticated_source": self.authenticated_source,
             "verified_acquisition": self.acquisition,
             "pinned_executable_roots": self.executable_roots,
             "requested_account": w.intent.account,
@@ -690,7 +796,14 @@ impl ProcessReview {
             "prepared_cwd": self.prepared_cwd,
             "prepared_executable": self.prepared_executable,
             "security_constraints": self.constraints,
-            "execution_availability": "Phase 2 private review; execution is disabled",
+            "execution_availability": if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
+                "Experimental execution; final-child checkpoint required"
+            } else { "Phase 2 private review; execution is disabled" },
+            "workload_lsm_transition": if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
+                "none requested; ambient LSM policy still applies"
+            } else {
+                "required by security_constraints"
+            },
         }))
         .map_err(|error| invalid(&error.to_string()))
     }

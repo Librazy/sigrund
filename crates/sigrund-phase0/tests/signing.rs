@@ -1,4 +1,4 @@
-//! Independent OpenSSH fixture; it is not a warrant usable by the v2 runtime.
+//! Independent frozen OpenSSH fixture predating production v3 self capture.
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use sigrund_core::crypto::{pae, verify_ssh_signature};
@@ -43,7 +43,27 @@ fn v3_openssh_fixture_binds_intent_target_and_profile_and_rejects_v2() {
         )
         .is_ok()
     );
-    assert!(sigrund_core::warrant::CanonicalWarrant::parse(payload).is_err());
+    let parsed = sigrund_core::warrant::CanonicalWarrant::parse(payload).unwrap();
+    // Production now recognizes self intent. The historical acquisition-only
+    // binding still cannot substitute for the live process-context domain,
+    // which additionally binds the pinned executable-root identity map.
+    use sigrund_core::namespace::Contract as ProductionContract;
+    let acquisition =
+        sigrund_core::namespace::Acquisition::parse(include_bytes!("fixtures/acquisition.json"))
+            .unwrap();
+    let production = sigrund_core::namespace::ProcessContext {
+        schema: "sigrund.process-context.v1".into(),
+        authenticated_source: None,
+        executable_roots: std::collections::BTreeMap::from([(
+            "/usr/bin".into(),
+            acquisition.root.clone(),
+        )]),
+        acquisition,
+    };
+    assert_ne!(
+        parsed.warrant().target_binding.context_sha256,
+        production.sha256().unwrap()
+    );
 
     let warrant: serde_json::Value = serde_json::from_slice(payload).unwrap();
     let binding = serde_json::json!({"target_binding": warrant["target_binding"], "security_constraints": warrant["security_constraints"]});

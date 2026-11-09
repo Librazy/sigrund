@@ -1,0 +1,39 @@
+# Opt-in Phase 3 experimental execution. Append deliberately to a v3 daemon
+# configuration; this does not provide the Phase 4 LSM/seccomp confinement.
+# Read docs/NAMESPACE_PHASE3.md before granting either scope.
+
+[[namespace_profiles]]
+apparmor = "unsupported"
+capabilities = []
+executable_model = "digest_memfd"
+join_namespaces = ["cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"]
+memory_max = 268435456
+memory_swap_max = 0
+no_new_privs = true
+pids_max = 32
+private_cgroup = true
+private_mount = true
+profile_id = "namespace-experimental-v1"
+schema = "sigrund.constraints.namespace-experimental.v1"
+seccomp = {kind = "none"}
+securebits = 15
+selinux = {context = "", enforcing = false, policy_change = "unmanaged"}
+verify_exec_stop = true
+
+[[namespace_rules]]
+requester_uids = [1001]
+target_scope = "registered:container-b"
+target_uids = [12001]
+target_gids = [12001]
+supplementary_gids = []
+profile_sha256 = "866b2ad85e718cb1ba73527b5c088d229006ef6a24071f4e573b76ff52b1ea56"
+cross_owner = true
+
+[[namespace_rules]]
+requester_uids = [1001]
+target_scope = "self"
+target_uids = [12001]
+target_gids = [12001]
+supplementary_gids = []
+profile_sha256 = "866b2ad85e718cb1ba73527b5c088d229006ef6a24071f4e573b76ff52b1ea56"
+cross_owner = false
