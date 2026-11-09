@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
+#include <linux/sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -15,19 +16,46 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static long (*real_call)(long,...);
 static char mode[64],arm[4096];
 static int entered,release_fd,active;
+static int partial_decision_fd = -1;
+static char preload_env[8192],mode_env[128],arm_env[8192];
+static char *launcher_env[] = {preload_env, mode_env, arm_env, "SIGRUND_EXEC_LAUNCHER=1", NULL};
 __attribute__((constructor)) static void initialize(void) {
     real_call=dlsym(RTLD_NEXT,"syscall");
     const char *p=getenv("SIGRUND_EXEC_MODE"),*a=getenv("SIGRUND_EXEC_ARM");
     if(p)snprintf(mode,sizeof(mode),"%s",p);
     if(a)snprintf(arm,sizeof(arm),"%s",a);
+    p=getenv("LD_PRELOAD");
+    if(p)snprintf(preload_env,sizeof(preload_env),"LD_PRELOAD=%s",p);
+    snprintf(mode_env,sizeof(mode_env),"SIGRUND_EXEC_MODE=%s",mode);
+    snprintf(arm_env,sizeof(arm_env),"SIGRUND_EXEC_ARM=%s",arm);
+    if(getenv("SIGRUND_EXEC_LAUNCHER"))active=1;
     p=getenv("SIGRUND_EXEC_ENTERED");entered=p?atoi(p):-1;
     p=getenv("SIGRUND_EXEC_RELEASE");release_fd=p?atoi(p):-1;
+    if(active&&!strcmp(mode,"namespace-bootstrap-memory")) {
+        char path[8192],pid[32];
+        snprintf(path,sizeof(path),"%s.entered",arm);
+        int fd=real_call(SYS_openat,AT_FDCWD,path,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+        int length=snprintf(pid,sizeof(pid),"%ld",real_call(SYS_getpid));
+        if(fd<0||real_call(SYS_write,fd,pid,length)!=length)real_call(SYS_exit_group,99);
+        real_call(SYS_close,fd);
+        snprintf(path,sizeof(path),"%s.release",arm);
+        struct timespec pause={.tv_nsec=1000000};
+        unsigned retry;
+        for(retry=0;retry<1500;++retry) {
+            fd=real_call(SYS_openat,AT_FDCWD,path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW,0);
+            if(fd>=0){real_call(SYS_close,fd);break;}
+            real_call(SYS_nanosleep,&pause,NULL);
+        }
+        if(retry==1500)real_call(SYS_exit_group,99);
+    }
 }
 static int take_arm(void) {return arm[0]&&real_call(SYS_unlinkat,AT_FDCWD,arm,0)==0;}
 static int parent_gate_mode(void) {
@@ -54,16 +82,44 @@ long ptrace(enum __ptrace_request request, ...) {
 long syscall(long number,...) {
     va_list ap;va_start(ap,number);
     long args[6];for(unsigned i=0;i<6;++i)args[i]=va_arg(ap,long);va_end(ap);
+    /* Reinject ONLY this root-owned test interposer across the new bootstrap
+     * exec. Production supplies an empty environment and no fault controls. */
+    if(number==SYS_execve&&!strcmp((const char *)args[0],"/proc/self/exe"))
+        return real_call(number,args[0],args[1],launcher_env,args[3],args[4],args[5]);
     if(number==SYS_clone3) {
         if(!strcmp(mode,"clone-fail")&&take_arm()){errno=ENOSYS;return -1;}
+        if(active&&!strcmp(mode,"namespace-final-clone")&&
+           !(((struct clone_args *)args[0])->flags&CLONE_INTO_CGROUP)){errno=EIO;return -1;}
         long result=real_call(number,args[0],args[1],args[2],args[3],args[4],args[5]);
         int saved=errno;
         if(result>0&&!strcmp(mode,"clone-after")&&take_arm())gate(result);
         if(result>0&&parent_gate_mode())active=1;
-        if(result==0&&strcmp(mode,"clone-after")&&strcmp(mode,"exec-detach")&&!parent_gate_mode())active=take_arm();
+        if(result==0&&strcmp(mode,"clone-after")&&strcmp(mode,"exec-detach")&&!parent_gate_mode())active=active||take_arm();
         errno=saved;return result;
     }
     if(active) {
+        if(number==SYS_fchdir&&args[0]==25&&!strcmp(mode,"namespace-covered-cwd"))
+            return real_call(SYS_chdir,"/run");
+        if((number==SYS_setns&&!strcmp(mode,"namespace-setns")) ||
+           (number==SYS_chroot&&!strcmp(mode,"namespace-root")) ||
+           (number==SYS_unshare&&(args[0]&CLONE_NEWNS)&&!strcmp(mode,"namespace-private")) ||
+           (number==SYS_mount&&!strcmp((const char *)args[1],"/run")&&!strcmp(mode,"namespace-run"))) {
+            errno=EIO;return -1;
+        }
+        if(number==SYS_sendmsg) {
+            const struct msghdr *message=(void *)args[1];
+            if(message->msg_iovlen==1&&message->msg_iov[0].iov_len==8) {
+                const uint32_t *words=message->msg_iov[0].iov_base;
+                if(words[0]==1&&!strcmp(mode,"namespace-ready-deadline"))
+                    real_call(SYS_kill,real_call(SYS_getpid),SIGSTOP);
+                if((words[0]==1&&!strcmp(mode,"namespace-short-ready")) ||
+                   (words[0]==2&&!strcmp(mode,"namespace-short-handoff"))) {
+                    struct iovec iov={.iov_base=message->msg_iov[0].iov_base,.iov_len=7};
+                    struct msghdr shortened=*message;shortened.msg_iov=&iov;
+                    return real_call(SYS_sendmsg,args[0],&shortened,args[2]);
+                }
+            }
+        }
         if(number==SYS_write&&(args[2]==2||args[2]==8)) {
             char name[64],path[4096];
             snprintf(name,sizeof(name),"/proc/self/fd/%d",(int)args[0]);
@@ -139,4 +195,16 @@ ssize_t write(int fd,const void *data,size_t len) {
             }}
     }
     return real_call(SYS_write,fd,data,len);
+}
+ssize_t send(int fd,const void *data,size_t len,int flags) {
+    if(!strcmp(mode,"namespace-partial-approved")) {
+        if(fd==partial_decision_fd){errno=EAGAIN;return -1;}
+        if(len>5&&((const unsigned char *)data)[0]==2&&memmem(data,len,"APPROVED",8)&&take_arm()) {
+            partial_decision_fd=fd;
+            uint64_t message[2]={(uint64_t)real_call(SYS_gettid),0};
+            real_call(SYS_write,entered,message,sizeof(message));
+            return real_call(SYS_sendto,fd,data,1,flags,NULL,0);
+        }
+    }
+    return real_call(SYS_sendto,fd,data,len,flags,NULL,0);
 }

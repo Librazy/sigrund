@@ -765,6 +765,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
         run([sys.executable, lab, 'start', '--directory', base], capture_output=True)
         run([sys.executable, lab, 'status', '--directory', base], capture_output=True)
         master, slave = pty.openpty()
+        SHARED['enable_confirmation_packets'](master)
         masters.extend([master, slave])
         def operator_tty():
             os.setsid()
@@ -807,13 +808,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
                 if stdin_bytes is not None:
                     child.stdin.write(stdin_bytes)
                 child.stdin.close()
-                prompt = b''
-                deadline = time.monotonic() + 8
-                while b'Approve and sign? [y/yes/n/no] ' not in prompt:
-                    assert time.monotonic() < deadline and child.poll() is None, prompt
-                    if select.select([master], [], [], 0.1)[0]:
-                        prompt += os.read(master, 8192)
-                    assert len(prompt) < 1048576
+                prompt = SHARED['read_confirmation_prompt'](master)
                 assert str(account.pw_uid).encode() in prompt
                 if stdin_bytes is not None:
                     assert hashlib.sha256(stdin_bytes).hexdigest().encode() in prompt
@@ -890,7 +885,8 @@ def prerequisites(binaries, platform_binary):
     problems = []
     if os.geteuid() != 0:
         problems.append('run this entry point as root in the disposable VM')
-    for command in ('systemd-run', 'systemctl', 'cc', 'ssh-keygen', 'strace'):
+    for command in ('systemd-run', 'systemctl', 'cc', 'ssh-keygen', 'strace',
+                    'setfacl', 'setcap', 'fsverity', 'mkfs.ext4', 'mount', 'umount', 'unshare'):
         import shutil
         if shutil.which(command) is None:
             problems.append('missing command: ' + command)

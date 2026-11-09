@@ -229,6 +229,7 @@ def management(args, f, operation, container=None, profile=None, *, succeeds=Tru
 
 def tty_review(args, f, profile, artifacts):
     master, slave = pty.openpty()
+    API['SHARED']['enable_confirmation_packets'](master)
     operator = client = None
     rendered = bytearray()
     def controlling_tty():
@@ -249,20 +250,12 @@ def tty_review(args, f, profile, artifacts):
             '--cwd', '/srv/service', '--ttl-secs', '120', '--', str(f.commands / 'tool')],
             preexec_fn=API['SHARED']['unprivileged'], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        deadline = time.monotonic() + 2
-        while b'Approve and sign?' not in rendered:
-            if operator.poll() is not None:
-                raise AssertionError(operator.stderr.read().decode())
-            assert time.monotonic() < deadline, rendered.decode(errors='replace')
-            if select.select([master], [], [], 0.02)[0]:
-                rendered.extend(os.read(master, 65536))
+        rendered.extend(API['SHARED']['read_confirmation_prompt'](master, timeout=2))
         review = json.loads((f.state / 'host-epoch.json').read_bytes())['process_review']
         for fragment in (b'Phase 2 private review', b'phase2_service', b'12001',
                          b'verified_acquisition', b'mapped_host_credentials', b'security_constraints',
                          b'daemon_expanded_thin', b'container-b'):
             assert fragment in rendered, fragment
-        # Confirmation must be sent after the approver's pre-prompt input flush.
-        time.sleep(0.03)
         os.write(master, b'yes\n')
         stdout, stderr = client.communicate(timeout=6)
         assert client.returncode == 255 and not stdout, (client.returncode, stdout, stderr)
