@@ -38,6 +38,14 @@ qualification, with complete host regression passing. Historical Phase 0/2
 profiles retain their private no-execution boundary. This is experimental
 execution without a production LSM/seccomp confinement claim.
 
+Phase 4 qualifies the explicit `namespace-selinux-v1` thin one-time SSH/stdio
+profile on Fedora 44 x86-64 across all four routes, including real rootless sources.
+Its [record](NAMESPACE_PHASE4.md) separates the installed qualification snapshot
+from subsequent producer-guard and older-kernel authentication fixes. Phase 5
+first consolidates final-candidate release evidence for this manager-free scope;
+optional manager integration follows as a separate milestone. Neither milestone
+automatically enables the independent later Phase 4 gates.
+
 The v3 outcome is one host authority executing in explicitly selected local
 existing environments:
 
@@ -553,24 +561,52 @@ identifies the registered process environment and carries no manager-exec claim.
 **Subsystems:** manager adapters, lifecycle evidence, deployment documentation and
 acceptance/release reporting.
 
-**Deliverables:**
+**Status: planned.** The next milestone is final-candidate release qualification.
+The [Phase 5 delivery plan](NAMESPACE_PHASE5.md) defines evidence, adapter design
+decisions and acceptance cases. Existing Phase 4 results remain valid within
+their recorded scope; they do not constitute completed Phase 5 qualification.
 
-- Replay the Phase 1.5 same-name replacement with the old anchor still alive.
-  For a manager-backed target, demonstrate which authenticated manager event or
-  generation check invalidates the old binding and how resolver loss is handled.
-- Add optional manager resolvers scoped by endpoint, owner/tenant and manager
-  namespace. Validate their resources through the existing acquisition path;
-  names and user-owned metadata confer no independent authority.
-- Bind required lifecycle/configuration evidence and handle stop/delete,
-  replacement, name reuse and resolver loss without redirecting a job.
-- Complete the platform/profile matrix and publish reproducible evidence for all
-  advertised routes. Mark unsupported cases, experimental features and optional
-  adapters explicitly. A validated manager-free release does not wait for adapters.
+#### Phase 5A — Manager-free release qualification
 
-**Exit gate:** Manager integration passes scoped-name, dishonest/stale metadata,
-replacement and teardown cases without changing host authorization ownership.
-Every shipped profile passes all applicable V/NS requirements; no helper-only
-fixture substitutes for end-to-end evidence.
+- Freeze the candidate commit, build inputs, package/binary/policy hashes and
+  advertised platform/profile/route matrix. Keep historical evidence immutable
+  and identify which results cover the candidate, including the review fixes.
+- Run ordinary release checks, complete host acceptance and the installed
+  namespace matrix on matching candidate artifacts. Include host-only producer
+  separation, older-kernel client/approver compatibility, source attribution,
+  confinement, lifecycle, consumption/audit binding and exclusion regressions.
+- Publish a reproducible, sanitized evidence bundle and reconcile the README,
+  implementation notes, operator recipe and specification status. Record all
+  applicable V/NS dispositions, failures and unsupported combinations explicitly.
+
+**Exit gate:** Every advertised combination passes its applicable integrated
+cases against the identified candidate. Fedora 44 x86-64 production namespace
+evidence, Ubuntu 24.04 kernel 6.8 host compatibility and ARM64 cross-build results
+remain distinct claims. No helper-only fixture substitutes for installed
+end-to-end evidence. This manager-free release does not wait for adapters and
+claims a retained process environment, not a manager execution generation.
+
+#### Phase 5B — Optional manager integration
+
+- Select one manager and deployment scope before implementation; no adapter is
+  selected or enabled by this roadmap. Define authenticated endpoint/owner/tenant
+  and manager-namespace scope, generation evidence, required configuration and
+  lifecycle dependencies, resource bounds and loss/restart behavior.
+- Version the bounded selector/acquisition schemas and independent binding
+  fixtures before exposure. Validate resolver results through the existing
+  acquisition, private review and host authorization path. Names and user-owned
+  metadata confer no independent authority; manager exec APIs are not a shortcut.
+- Replay Phase 1.5 same-name replacement with the old anchor still alive. Prove
+  which authenticated generation check or event invalidates the binding. Cover
+  stop/delete, name reuse, stale/dishonest metadata, event gaps and resolver loss
+  during review and execution, without reacquiring or redirecting an approved job.
+
+**Exit gate:** The selected adapter passes scoped-name, generation, configuration,
+loss/restart and whole-job teardown cases on its installed deployment while
+preserving host policy, confidentiality and durable consumption. Publish its
+matrix/evidence separately; adapters without passing evidence remain disabled.
+Exact manager-exec equivalence requires its own demonstrated configuration and
+lifecycle contract and is never inferred from namespace membership.
 
 ## Requirement and acceptance traceability
 
@@ -591,10 +627,10 @@ verification ownership, preserving the original proposal's acceptance coverage.
 | NS-10 — Executor | §5.4 | 0, 3–4 | Root/cwd, namespace ordering, PID/time children, idmapped mounts, final context and syscall-only setup |
 | NS-11 — Confinement | §5.5 | 0, 4 | Enforcing SELinux/AppArmor, full ranges/stacks, policy reload/reuse, seccomp and NNP/ptrace/direct/memfd |
 | NS-12 — Ownership/privacy | §5.4 | 1–5 | Cancellation/disconnect, target/helper/tracer death, exhaustion, blocked cleanup, TIMEOUT timing and irreversible consumption |
-| NS-13 — Resolvers | §1.5 | 5 | Scoped identity, metadata trust, loss/restart, no direct-runtime bypass of manager assumptions |
+| NS-13 — Resolvers | §1.5 | 5B (optional) | Scoped identity, authenticated generation/configuration evidence, same-name replacement with a surviving anchor, loss/restart/event gaps and teardown; no direct-runtime bypass of manager assumptions |
 | NS-14 — Approval binding | §3.2–3.2.1, §6.3 | 0–4 | Independent schema/crypto fixtures, identity/profile substitution, complete approval display |
 | NS-15 — Audit/versioning | §7 | 1–5 | Private source/approved/observed distinction, execution digest equality, fresh state and collector binding |
-| NS-16 — Release evidence | §8.3–8.4 | All | Reproducible integrated matrix; truthful current/target/deferred status |
+| NS-16 — Release evidence | §8.3–8.4 | All; final candidate in 5A, adapters in 5B | Matching candidate/package/policy artifacts and reproducible integrated matrix; truthful current/target/deferred status |
 
 Record exact kernel/architecture, namespace/mapping topology, cgroup delegation,
 LSM enforcement/policy versions and executable model with privileged results.

@@ -6,9 +6,9 @@ supervises execution in explicitly selected local environments. Full/thin
 provenance, confidential outcomes, executable evidence, durable authorization,
 hooks and audit replication remain part of this contract.
 
-The implemented local one-time SSH/stdio runtime uses **v3**. The host profile
-and the narrower experimental namespace profile have separate qualification
-records (Section 8.3). A target requirement in this document is not a support
+The implemented local one-time SSH/stdio runtime uses **v3**. The host,
+experimental namespace and qualified production namespace profiles have separate
+qualification records (Section 8.3). A target requirement is not a support
 claim. The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md)
 tracks requirements, feasibility gates and release evidence. Requirements marked
 NS-01–NS-16 are normative obligations; unresolved mechanisms in Section 8.4 are
@@ -497,6 +497,24 @@ authorize host privilege. Bind required resolver evidence and define loss/restar
 behavior. Native runtime IDs may outlive execution generations. Exact manager
 exec semantics require separately validated configuration integration; neither
 OCI state nor direct runc/crun invocation supplies that equivalence automatically.
+
+For a manager-backed binding, retain authenticated execution-generation evidence
+in addition to the acquired process resources. A same-name replacement MUST
+invalidate the old binding even if its original anchor remains alive. Required
+configuration changes, stop/delete, generation uncertainty and loss of required
+resolver evidence MUST invalidate pending authorization and cancel active jobs
+under NS-12. Define event-gap and manager/resolver restart behavior; reconnecting
+MUST NOT silently rebind or revive a stale grant. Recovery requires fresh
+acquisition and approval. Observation and cancellation bounds are part of the
+declared integration contract, not a claim of atomic manager-event delivery.
+
+Manager selectors and required acquisition evidence need bounded, versioned
+schemas and independent binding fixtures before exposure. Their scope and
+generation/configuration meaning MUST be available in private approval and audit
+without introducing a public target-existence oracle. A manager-free release
+requires none of this optional manager identity, but MUST describe its target as
+a retained process environment and make no manager-generation or manager-exec
+claim.
 
 ### 1.6 Target and Security Policy Configuration
 
@@ -2541,6 +2559,24 @@ models and optional manager resolvers require their own qualification before
 being advertised. The comprehensive matrix below remains the target across
 profiles; these exclusions do not waive any requirement for an enabled path.
 
+Final-candidate release qualification and optional manager integration are
+separate milestones in the [Phase 5 plan](docs/NAMESPACE_PHASE5.md). A manager-free
+release MAY ship before any adapter is enabled. It MUST identify the exact
+candidate revision, package/binary/policy artifacts and advertised combinations,
+and supply matching integrated evidence for every applicable V/NS requirement.
+Preserve historical results as historical snapshots; review-fix regressions and
+partial reruns MUST NOT be presented as a complete final-candidate acceptance run.
+Record the relationship between source, tested and installed artifacts, including
+any packaging transformations or documentation-only revision differences.
+
+The Phase 4 follow-up establishes host authentication compatibility on Ubuntu
+24.04 kernel 6.8; it does not qualify production namespace execution there.
+ARM64 cross-build evidence is not runtime qualification. Additional deployment
+claims require their own applicable cases. Optional manager adapters MUST pass
+NS-13 scope, generation, dishonest/stale metadata, replacement, required-evidence
+loss/restart and teardown cases on the actual installed integration before being
+advertised. No adapter is selected or enabled by this specification update.
+
 Keep PTY, hooks, collector/remote ACK, reload, reusable grants, scripts and extra
 signing adapters independently deferred until their integrated cases pass. They
 remain target requirements, not mandatory scope for the namespace implementation
@@ -2559,9 +2595,9 @@ a subset must name its supported profile and exclusions explicitly.
 | NS-09–NS-10 | Userns entry, PID/time child creation, root/mount isolation, idmapped mounts, cgroup placement and delegation; actual final context and descendant supervision match profile |
 | NS-11 | Real SELinux/AppArmor enforcement including stacks/ranges, disabled/permissive/complain/unreadable states, policy reload/reuse, seccomp, NNP/ptrace/direct/memfd; require declared actual constraints before release |
 | NS-12 | Disconnect/cancel, target deletion, resolver/helper/tracer death, exhausted quotas and blocked cleanup; bounded ownership, correct disclosure timing and consumption |
-| NS-13 | Scoped manager names/owners/endpoints, stale or dishonest metadata and lifecycle loss; validate resources under unchanged host authorization |
+| NS-13 | Scoped manager names/owners/endpoints/namespaces, stale or dishonest metadata, same-name replacement with the old anchor alive, required configuration changes and resolver loss/restart/event gaps; invalidate stale generations, supervise teardown and retain unchanged host authorization |
 | NS-14–NS-15 | Independent schema/JCS/PAE/signature vectors, altered bindings/intent/profile, approval rendering, fresh-state rejection and audit/collector equality; no downgrade, hidden field or incompatible-state adoption |
-| NS-16 | Reproducible integrated results for each advertised platform/profile; no helper-only or namespace-root fixture substituted for a release gate |
+| NS-16 | Candidate revision and matching package/binary/policy evidence for each advertised platform/profile/route; explicit exclusions and historical-result boundaries; no helper-only or namespace-root fixture substituted for a release gate |
 
 ### 8.4 Release-Blocking Design Gates
 

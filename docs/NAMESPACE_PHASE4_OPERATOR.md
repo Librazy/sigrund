@@ -7,6 +7,12 @@ export, offline redemption, process-PID targets and other LSM stacks are exclude
 The example workload is static; sealing its ELF does not bind other libraries or
 scripts a different workload might subsequently load from its destination.
 
+This remains the operator recipe for the manager-free deployment. The
+[Phase 5 release plan](https://github.com/Librazy/sigrund/blob/main/docs/NAMESPACE_PHASE5.md#phase-5a-identify-and-qualify-the-release-candidate)
+uses it to qualify matching final-candidate packages and preserve reproducible
+evidence. Phase 5 adds no manager-name selector or broader supported topology to
+these commands.
+
 All unconfined host accounts are trusted administrators. Untrusted requester and
 destination-owner accounts have locked passwords, nologin shells and no sudo or
 alternate execution path. Start their code through the provided systemd recipe,

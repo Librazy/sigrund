@@ -106,10 +106,14 @@ operation.
 
 Interpreter approval grants programmable authority within the selected
 credentials. An executable digest does not bind mutable script files, libraries
-or imports. Host jobs execute in the daemon's configured domain. Namespace jobs
-require explicit registered/process/self selection, a live acquired owner and
-the experimental profile. Historical namespace profiles retain private review
-without execution. Production namespace confinement remains Phase 4.
+or imports. Host jobs use the daemon's configured execution environment; under
+the packaged SELinux producer domain they transition to `sigrund_host_workload_t`,
+including when no namespace profiles are configured. Namespace jobs require
+explicit selection, a live acquired owner and an enabled profile. The experimental
+profile supports registered/process/self targets within its declared limits;
+the qualified production profile supports registered/self targets on the
+[Phase 4 deployment](docs/NAMESPACE_PHASE4.md). Historical namespace profiles
+retain private review without execution.
 See [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
 [namespace-aware execution roadmap](docs/NAMESPACE_AWARE_EXECUTION.md).
 
@@ -139,11 +143,13 @@ lease survives capture, approval, commit, complete delivery, native namespace
 entry, final-child pidfd handoff, exec-stop verification and cleanup. Private
 source/approved-target evidence remains separate from actual child observations.
 Target filesystem checks stay on bounded workers, with an exact-warrant proof
-handed to the durable sequencer. The [Phase 4 release gate](docs/NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
-requires a production confinement profile and an installed anchor workflow for
-host → registered B. Namespace full/export/offline and additional requester
-topologies have separate gates. The [Phase 3 guide](docs/NAMESPACE_PHASE3.md#platform-scope-and-qualification)
-describes the current client peer-authentication limitation.
+handed to the durable sequencer. The [Phase 4 record](docs/NAMESPACE_PHASE4.md)
+qualifies an installed enforcing SELinux profile on Fedora 44 x86-64 for host →
+registered rootless B and real rootless A → B, A → host and A → self. It documents
+the exact requester-domain prerequisites and older-kernel host authentication
+compatibility. Namespace full/export/offline and additional requester topologies
+have separate gates. The [Phase 5 plan](docs/NAMESPACE_PHASE5.md) first consolidates
+final-candidate release evidence; optional manager resolvers remain deferred.
 
 ## Code ownership and security boundaries
 
@@ -562,8 +568,11 @@ Additional namespace/container execution domains have a v3 contract and
 [gated roadmap](docs/NAMESPACE_AWARE_EXECUTION.md). Phase 2 supplies constrained
 production acquisition and private destination review. Phase 3 adds experimental
 native namespace entry, cgroup placement and final-child verification on its
-declared topology. Production confinement and broader deployment qualification
-remain release gates.
+declared topology. Phase 4 qualifies production confinement for its named Fedora
+deployment. Phase 5A plans final-candidate manager-free release qualification;
+Phase 5B separately plans one optional manager integration. No manager adapter
+is currently enabled, and broader deployment/execution-mode claims retain their
+independent qualification gates.
 No v2 compatibility layer or automatic state migration is planned; explicit fresh
 v3 provisioning must preserve existing state. Interpreter artifact binding remains
 separate deferred work.

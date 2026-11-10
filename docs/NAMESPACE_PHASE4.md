@@ -174,6 +174,12 @@ not qualify the production namespace profile on Ubuntu or another LSM stack.
 
 ## Independent later gates
 
+The [Phase 5 plan](NAMESPACE_PHASE5.md) next consolidates complete release
+qualification against an identified final candidate, including the follow-up
+fixes above. It preserves this historical snapshot and adds a new evidence
+record. Optional manager integration is a separate milestone and does not block
+the manager-free release.
+
 Namespace client-full/export/offline redemption, process-PID production targets,
 other LSM stacks/ranges, other executable models and additional topologies need
 their own integrated qualification. The x86-64 production contract is not an
