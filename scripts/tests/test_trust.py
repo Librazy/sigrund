@@ -2,9 +2,11 @@
 import os
 from pathlib import Path
 import runpy
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 from types import SimpleNamespace
 import unittest
@@ -15,6 +17,53 @@ TRUST = runpy.run_path(str(REPO / 'scripts/verify-trust.py'))
 
 
 class TrustFixtureTests(unittest.TestCase):
+    def test_approval_retries_pre_request_eof_during_broker_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SimpleNamespace(approval=Path(directory) / 'approval.sock',
+                                      diagnostics=Path(directory) / 'diagnostics')
+            fixture.diagnostics.write_text('')
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(fixture.approval)); listener.listen(2); listener.settimeout(2)
+                errors = []
+                def serve():
+                    try:
+                        first, _ = listener.accept(); first.close()
+                        with listener.accept()[0] as admitted:
+                            admitted.settimeout(2)
+                            fixture.diagnostics.write_text('{"broker":true}\n')
+                            self.assertEqual(admitted.recv(1), b'', 'readiness must send no bytes')
+                    except BaseException as error:
+                        errors.append(error)
+                server = threading.Thread(target=serve); server.start()
+                try:
+                    connection = TRUST['connect_approval'](fixture, timeout=1)
+                    connection.close()
+                finally:
+                    server.join(3)
+                self.assertFalse(server.is_alive())
+                self.assertEqual(errors, [])
+
+    def test_approval_admission_timeout_closes_its_unadmitted_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SimpleNamespace(approval=Path(directory) / 'approval.sock',
+                                      diagnostics=Path(directory) / 'diagnostics')
+            fixture.diagnostics.write_text('')
+            closed = threading.Event()
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(fixture.approval)); listener.listen(1); listener.settimeout(2)
+                def serve():
+                    with listener.accept()[0] as connection:
+                        connection.settimeout(2)
+                        if connection.recv(1) == b'': closed.set()
+                server = threading.Thread(target=serve); server.start()
+                try:
+                    with self.assertRaisesRegex(AssertionError, 'broker registered'):
+                        TRUST['connect_approval'](fixture, timeout=0.05)
+                finally:
+                    server.join(3)
+                self.assertFalse(server.is_alive())
+                self.assertTrue(closed.is_set())
+
     def test_lease_cleanup_waits_for_delayed_owner_disposal(self):
         with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:
             path = Path(directory) / 'executable'
