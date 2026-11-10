@@ -157,9 +157,11 @@ Run these sequentially; they share a registration, approver and fixed resource
 ceilings. The resolver runner creates a root-only forwarding fault injector,
 then exercises native registration and actual approval/execution through it.
 The scope runner creates a second real rootful engine with separate storage
-and a socket-activated API, including a different Libpod namespace. Its service
+and a socket-activated API. Its service
 uses the ordinary container runtime domain and labels the alternate store
-`container_var_lib_t` before startup.
+`container_var_lib_t` before startup. Podman 5.8.1 rejects nondefault Libpod
+namespaces as unimplemented; the runner records that native exclusion and
+verifies explicit rejection of nondefault namespaces and nonroot API owners.
 The ownership runner tests client disconnect and retained helper quotas without
 replacing a still-valid registration. Each runner records private reviews and
 public outcomes in its new root-only artifact directory. The scope runner's

@@ -9,6 +9,8 @@ The first adapter uses a host-root-controlled local Podman Unix API service,
 with host UID/GID 0 and the default Libpod manager namespace. Endpoint, owner
 and manager namespace form the explicit resolver scope. Remote/TCP endpoints,
 rootless services and other manager namespaces require separate qualification.
+Podman 5.8.1 itself reports nondefault Libpod namespaces as unimplemented;
+the adapter rejects those selectors explicitly.
 The daemon authenticates the kernel socket peer and root-controlled endpoint
 path; container-owned labels and names confer no host authority.
 

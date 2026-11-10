@@ -42,7 +42,9 @@ def main():
         service_file.write_text('[Unit]\nRequires=' + SOCKET + '\nAfter=' + SOCKET + '\n[Service]\nType=exec\nExecStart=' + selected + '\nKillMode=control-group\n')
         harness.run('systemctl', 'daemon-reload')
     def ctl(*parts):
-        return subprocess.run([*prefix, *parts], check=True, timeout=15, capture_output=True)
+        reply = subprocess.run([*prefix, *parts], timeout=15, capture_output=True)
+        assert reply.returncode == 0, reply.stderr.decode()
+        return reply
     def create(namespace=''):
         options = ['--namespace', namespace] if namespace else []
         return ctl(*options, 'run', '--detach', '--name', harness.NAME, '--rootfs', '--read-only',
@@ -94,9 +96,22 @@ def main():
         subprocess.run(['sigrundctl', 'target', 'revoke', 'container-b', '--socket', api.SOCKET], capture_output=True, timeout=10)
         subprocess.run(['systemctl', 'stop', harness.UNIT], capture_output=True, timeout=10)
         harness.run('systemctl', 'stop', SERVICE)
-        create('tenant-b')
-        service('tenant-b')
-        reject_endpoint('actual-manager-namespace-mismatch-rejected')
+        # Podman 5.8.1 exposes --namespace but Libpod rejects it as unimplemented.
+        # Record the native exclusion, then exercise our own scope rejection.
+        unsupported = subprocess.run([*prefix, '--namespace', 'tenant-b', 'ps'], capture_output=True, timeout=15)
+        assert unsupported.returncode != 0 and b'namespaces are not supported' in unsupported.stderr, unsupported.stderr
+        result['cases'].append({'name': 'native-libpod-namespace-unavailable', 'passed': True,
+                                'disposition': 'unsupported', 'reply': unsupported.stderr.decode()})
+        binding = json.loads(subprocess.check_output(['python3', str(HERE / 'register-podman.py'), '--launch-only'], timeout=15))
+        for owner, namespace, label in (('0', 'tenant-b', 'nondefault-manager-namespace-rejected'),
+                                         ('1200', 'default', 'nonroot-manager-owner-rejected')):
+            reply = subprocess.run(['sigrundctl', 'target', 'register-podman', 'container-b',
+                '--pid', str(binding['anchor_pid']), '--owner-uid', '0',
+                '--security-profile', 'namespace-selinux-v1', '--socket', api.SOCKET,
+                '--podman-endpoint', str(endpoint), '--podman-owner-uid', owner,
+                '--podman-namespace', namespace, '--podman-container', harness.NAME], capture_output=True, timeout=12)
+            assert reply.returncode != 0 and b'unsupported Podman selector scope' in reply.stderr, reply.stderr
+            result['cases'].append({'name': label, 'passed': True, 'reply': reply.stderr.decode()})
         result['passed'] = True
     finally:
         subprocess.run(['sigrundctl', 'target', 'revoke', 'container-b', '--socket', api.SOCKET], capture_output=True, timeout=10)
