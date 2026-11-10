@@ -2577,8 +2577,13 @@ NS-13 scope, generation, dishonest/stale metadata, replacement, required-evidenc
 loss/restart and teardown cases on the actual installed integration before being
 advertised. The selected [Phase 5B Podman contract](docs/NAMESPACE_PHASE5B.md)
 restricts the first adapter to a local root-owned API, the default Libpod
-namespace, systemd cgroup v2 and a private PID-1 init. Its installed qualification
-is separate from the manager-free candidate and remains in progress.
+namespace, systemd cgroup v2 and a private PID-1 init. Its
+[installed qualification](docs/NAMESPACE_PHASE5B.md#installed-candidate-qualification)
+passes on the named enforcing Fedora deployment, separately from the manager-free
+candidate. Host and real rootless A sources to Podman B, scoped engine identity,
+required-evidence loss, teardown, ownership/quotas and matching regressions pass.
+Other managers, versions, scopes and topologies retain independent gates. Native
+entry supplies no manager exec-policy equivalence.
 
 The [Phase 5A qualification](docs/NAMESPACE_PHASE5A.md) closes the manager-free
 candidate gate for `77ed109` on the named Fedora deployment, with fresh installed

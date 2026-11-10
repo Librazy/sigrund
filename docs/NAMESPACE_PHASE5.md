@@ -1,13 +1,13 @@
 # Namespace-aware execution Phase 5 delivery plan
 
-Status: Phase 5A qualified, Phase 5B implementation and qualification in progress,
-2026-11-10. This document refines the
+Status: Phase 5A and the selected Phase 5B Podman deployment qualified,
+2026-11-11. This document refines the
 [roadmap](NAMESPACE_AWARE_EXECUTION.md#phase-5--optional-resolvers-and-release-qualification)
 and describes separate runtime qualification gates. The
 [specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>)
 owns NS-13 resolver semantics and NS-16 release obligations. Phase 5A closes the
 manager-free release evidence; Phase 5B is an optional, separately qualified
-manager adapter. Phase 5A may ship while Phase 5B remains deferred.
+manager adapter. The milestones keep separate evidence and release scope.
 
 The [Phase 5A completion record](NAMESPACE_PHASE5A.md) and
 [candidate evidence](evidence/namespace-phase5a-20261110.json) qualify candidate
@@ -59,8 +59,9 @@ their guides:
    ancestry case and confined rootless compatibility controls on Fedora.
 5. Reconcile all V-01–V-20 and NS-01–NS-16 dispositions for each advertised
    combination. A failed applicable case blocks that combination; an exclusion
-   needs an explicit boundary and, where reachable, a rejection test. NS-13 is
-   deferred because no manager adapter is enabled, not recorded as a test pass.
+   needs an explicit boundary and, where reachable, a rejection test. A
+   manager-free run supplies no NS-13 adapter pass; its separate evidence must
+   qualify the exact manager deployment.
 
 The new evidence bundle must associate each case with its command, environment,
 candidate artifacts, expected/observed result and raw-log location. Include
@@ -87,8 +88,8 @@ and [operator recipe](NAMESPACE_PHASE5B_OPERATOR.md) define a local root-owned
 Podman 5.8.1 service in the default Libpod namespace, systemd cgroup v2 and a
 single private PID namespace on enforcing Fedora 44 x86-64. Rootless APIs,
 other manager namespaces and Docker/containerd remain outside this gate.
-Installed acceptance must pass before the selected combination is qualified.
-The contract records:
+The [completion record and evidence](NAMESPACE_PHASE5B.md#installed-candidate-qualification)
+close this combination's installed acceptance gate. The contract records:
 
 - The authenticated manager endpoint, owner/tenant and manager namespace, who
   controls their metadata, and the host administrator's independent policy.
@@ -131,7 +132,11 @@ alone establishes no manager-exec equivalence.
 
 **Phase 5B completion:** publish a separate adapter matrix, operator recipe and
 reproducible evidence with all applicable V/NS dispositions. Unsupported managers
-and combinations remain disabled; Phase 5A's manager-free claim stays distinct.
+and combinations remain unqualified; Phase 5A's manager-free claim stays distinct.
+The selected Podman record passes 78 installed manager cases, the native
+dependency gate, matching manager-free/host regressions and 67 canonical binding
+checks. Nonroot owners/nondefault namespaces reject explicitly; Podman 5.8.1's
+native namespace exclusion is recorded. Historical Phase 4/5A evidence is unchanged.
 
 ## Independent gates remain closed
 

@@ -561,13 +561,22 @@ identifies the registered process environment and carries no manager-exec claim.
 **Subsystems:** manager adapters, lifecycle evidence, deployment documentation and
 acceptance/release reporting.
 
-**Status: Phase 5A qualified; Phase 5B implementation and qualification in progress.** The
+**Status: Phase 5A and the selected Phase 5B Podman deployment are qualified.** The
 [Phase 5A completion record](NAMESPACE_PHASE5A.md) and
 [candidate evidence](evidence/namespace-phase5a-20261110.json) cover clean candidate
 `77ed109`, fresh installed RPM qualification and matching complete host acceptance.
 The [Phase 5 delivery plan](NAMESPACE_PHASE5.md) defines reproduction obligations,
 adapter design decisions and acceptance cases. Historical Phase 4 evidence remains
 a separate snapshot. Publishing or merging the release is a separate action.
+
+The [Phase 5B record](NAMESPACE_PHASE5B.md) and
+[adapter evidence](evidence/namespace-phase5b-20261111.json) qualify Podman 5.8.1
+on the named Fedora deployment for host and real rootless A sources to a rootful
+Podman B. Runtime `164db5f` and verification snapshot `6b5fe87` have identical
+runtime artifacts; the latter fixes only host trust-harness broker handoff.
+Equal-name engine scope, generation/configuration loss, pending/running teardown,
+ownership/quotas and matching host/manager-free regressions pass. Other manager
+versions/deployments remain unqualified, with no manager exec-policy equivalence.
 
 #### Phase 5A — Manager-free release qualification
 

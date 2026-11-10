@@ -151,8 +151,9 @@ compatibility. Namespace full/export/offline and additional requester topologies
 have separate gates. The [Phase 5A record](docs/NAMESPACE_PHASE5A.md) consolidates
 matching final-candidate manager-free release evidence. The optional
 [Podman adapter](docs/NAMESPACE_PHASE5B.md) adds scoped manager evidence and a
-retained lifecycle dependency around ordinary acquisition; installed qualification
-is in progress.
+retained lifecycle dependency around ordinary acquisition. Its separate installed
+qualification covers Podman 5.8.1, a local root-owned default-namespace API and
+the named enforcing Fedora deployment. Namespace entry makes no manager exec-policy claim.
 
 ## Code ownership and security boundaries
 
@@ -573,8 +574,8 @@ production acquisition and private destination review. Phase 3 adds experimental
 native namespace entry, cgroup placement and final-child verification on its
 declared topology. Phase 4 qualifies production confinement for its named Fedora
 deployment. Phase 5A completes final-candidate manager-free release qualification;
-Phase 5B implements the selected local rootful Podman adapter with a separate
-installed qualification gate. It retains native execution under the displayed
+Phase 5B qualifies the selected local rootful Podman adapter on its separately
+recorded installed deployment. It retains native execution under the displayed
 constraints and claims no Podman exec-policy equivalence. Broader deployment
 and execution-mode claims retain their independent qualification gates.
 No v2 compatibility layer or automatic state migration is planned; explicit fresh

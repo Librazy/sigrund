@@ -1,6 +1,7 @@
 # Installed Podman adapter operator recipe
 
-Qualification is in progress. Use a disposable Fedora 44 x86-64 host with
+The Phase 5B record (`docs/NAMESPACE_PHASE5B.md` in the source repository)
+qualifies this deployment. Use a disposable Fedora 44 x86-64 host with
 Podman 5.8.1, enforcing SELinux, cgroup v2 and systemd delegation. This recipe
 uses the default rootful Libpod namespace and a read-only root-owned rootfs;
 the container init is PID 1 in a private PID namespace. Only trusted host
@@ -92,6 +93,11 @@ sigrundctl target register-podman container-b --pid DAEMON_ANCHOR_PID \
   --socket /run/sigrund/client.sock --podman-endpoint /run/podman/podman.sock \
   --podman-owner-uid 0 --podman-namespace default --podman-container sigrund-phase5b-b
 ```
+
+The default per-UID helper ceiling is two; this managed capture uses both slots
+for owner UID 0, permitting one concurrent managed registration in this recipe.
+If registration reports resource exhaustion after revocation, wait for actual
+job/helper disposal and start a fresh anchor before retrying.
 
 The daemon's existing management socket authenticates the administrator. The
 requester continues using `registered:container-b`. In a separate root TTY,

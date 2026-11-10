@@ -1,6 +1,9 @@
 # Namespace-aware execution Phase 5B: Podman adapter
 
-Status: implementation in progress. Podman is the selected first manager.
+Status: qualified for the declared Podman deployment, 2026-11-11. Runtime
+candidate `164db5f` and verification snapshot `6b5fe87` have identical runtime,
+privileged-test, namespace-helper, policy and packaging inputs. The latter fixes
+only approval-broker handoff in the host trust harness and adds its regressions.
 Phase 5A's manager-free qualification remains a separate candidate record.
 
 ## Integration contract
@@ -91,11 +94,80 @@ Load the separate `sigrund_podman` SELinux module explicitly for this integratio
 It permits only the producer to connect to the local manager API; it grants no
 requester/workload API access. Manager-free provisioning does not load it.
 
-## Qualification still required
+## Installed candidate qualification
 
-The [Phase 5B acceptance matrix](NAMESPACE_PHASE5.md#phase-5b-select-and-qualify-one-optional-adapter)
-remains open until installed Podman and candidate daemon runs demonstrate every
-applicable case, including real replacement and whole-job teardown. Unit/API
-fixtures alone do not enable this adapter for production. Publish exact versions,
-platform/profile, commands, artifacts, V/NS dispositions and an operator recipe
-when those gates pass.
+The [sanitized evidence](evidence/namespace-phase5b-20261111.json) closes the
+[Phase 5B acceptance matrix](NAMESPACE_PHASE5.md#phase-5b-select-and-qualify-one-optional-adapter)
+for Fedora 44 x86-64, kernel `6.19.10-300.fc44.x86_64`, enforcing SELinux,
+Podman 5.8.1 and the explicit [operator deployment](NAMESPACE_PHASE5B_OPERATOR.md).
+The destination uses the initial user namespace, a private PID namespace,
+systemd cgroup v2 and a read-only administrator-owned rootfs with a trusted init.
+Host and real rootless A sources execute as destination UID/GID 12001 with empty
+groups, NNP, the exact seccomp program and the displayed workload context.
+
+RPMs `0.1.0-0.20261111.phase5b3.git164db5f.fc44` contain the frozen runtime.
+All five installed binaries match the checked, RPM-transformed binaries;
+`rpm -V sigrun sigrund` passes. Both checked snapshots pass all eleven ordinary
+checks. The verification snapshot changes only `scripts/verify-trust.py` and
+its Python tests; the evidence records the exact delta and unchanged binary
+hashes. Installed namespace acceptance uses the frozen packaged helpers.
+
+| Installed gate | Result |
+| --- | --- |
+| Real routes and lifecycle | 26 cases pass: host/A → Podman B, replacement, stop/delete, configuration, pause and API loss during review/running execution, stale rejection and fresh recovery |
+| Resolver evidence | 37 cases pass: mismatched PID/ID/name/namespace, dishonest owner labels, malformed/missing/duplicate records, event loss, stalls and version changes |
+| Ownership and quotas | Nine cases pass: cancellation, retained-registration survival, repeated quota rejection and release after actual disposal |
+| Scope | Six cases pass: equal names in two real engines, wrong-anchor rejection, correct alternate-endpoint execution, native namespace exclusion and explicit namespace/owner selector rejection |
+| Native dependency | Generation loss with a live old init, no revival, fresh acquisition, cancellation/cleanup accounting and endpoint-directory replacement pass |
+| Binding equality | 67 managed, manager-free and host-only executions pass canonical consumption/audit/collector equality and altered-binding rejection |
+
+Fourteen running lifecycle/fault/cancellation cases independently observe at
+least two supervised descendants each and verify their exit and job removal.
+The largest measured teardown is 2.68 seconds, below the six-second gate.
+Pending-review cases attempt the old approval and retain scheduled TIMEOUT with
+zero consumption and no readiness/spawn. Restoring state never revives their
+registrations. These measurements describe this deployment's detection and
+termination behavior; they do not serialize manager operations with execution.
+
+The live source sample authenticates the original connector and observes UID
+mapping `0 → 1200` and `1..65535 → 589824..655358`; B has the initial identity
+map. The matching manager-free regression passes all 33 cases and all four routes,
+two source-attribution cases, two confined rootless compatibility controls and
+four host-only producer cases. Complete host acceptance passes 23 gates,
+including eleven privileged Rust gates, seven trust cases and 26 execution cases.
+
+The initial host acceptance attempt timed out waiting for broker admission.
+Inspection identified an unsynchronized trust-harness broker handoff. The bounded
+pre-request EOF retry and deterministic real-socket tests fix the harness; the
+complete suite passes with unchanged runtime artifacts. An initial
+Ubuntu TTY test returned TIMEOUT instead of its expected dry-run result; the same
+candidate passed the separate isolated client/approver rerun. Both attempts are
+retained. Ubuntu 6.8 results concern host authentication only. ARM64 is cross-build
+evidence only. Neither qualifies production namespace execution on that platform.
+
+The evidence records all 36 V/NS dispositions, exact commands, helper sources,
+package/policy/binary hashes, actual mappings, raw-log locations/hashes and final
+restoration. Historical Phase 4/5A evidence remains unchanged. Final inspection
+finds no jobs or disposable services/containers, unmounted fixture binds, restored
+configuration, enforcing relevant domains and clean RPM verification. Prior
+provisioning sets remain in separate private backups.
+
+## Operating limits
+
+The default per-UID helper ceiling is two. A managed capture consumes both slots
+for its owner, permitting one concurrent root-owned managed registration in this
+recipe. Quotas remain charged until the actual monitor/descriptors/helper are
+disposed; a revoke acknowledgment alone does not establish available capacity.
+
+Rootless APIs/nonroot owners and nondefault manager namespaces reject explicitly.
+Other Podman versions, remote APIs, other managers, LSMs, executable models and
+namespace topologies require their own qualification. Untrusted rootful
+container-root sources and unrestricted administrative Podman exec are outside
+this deployment. Native entry supplies no manager exec-policy equivalence.
+Namespace full/export/offline, process-PID production targets, PTY, hooks, remote
+ACK, reload, reusable grants, scripts and physical FIDO retain independent gates.
+
+The final qualification commit updates documentation/evidence relative to the
+verified harness snapshot. It does not change runtime artifacts or imply another
+runtime run. Packaged operator text belongs to the frozen revision; the final
+source guide updates qualification status and operating limits.
