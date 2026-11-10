@@ -20,6 +20,9 @@ fn invalid(message: &str) -> io::Error {
 /// Implementations own a capture helper and all retained descriptors. Disposal
 /// must close/reap before returning, including on cancellation.
 pub trait CapturedAnchor: Send + Sync {
+    fn manager_evidence(&self) -> Option<&sigrund_core::manager::PodmanEvidence> {
+        None
+    }
     fn acquisition(&self) -> &Acquisition;
     fn root(&self) -> &std::fs::File;
     fn alive(&self) -> bool;
@@ -150,6 +153,9 @@ impl TargetWatch {
     }
 }
 impl TargetLease {
+    pub(crate) fn manager_evidence(&self) -> Option<&sigrund_core::manager::PodmanEvidence> {
+        self.instance.anchor.manager_evidence()
+    }
     pub(crate) fn watch(&self) -> TargetWatch {
         TargetWatch(Arc::downgrade(&self.instance))
     }
@@ -574,14 +580,30 @@ impl RegistrationSlot {
     /// Capture the authenticated dedicated anchor before publishing its name.
     /// All failure paths dispose it before releasing this slot's reservation.
     pub fn capture_and_publish(
-        mut self,
+        self,
         id: String,
         pid: u32,
         constraints: Constraints,
         peer: impl std::os::fd::AsRawFd,
         check: impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        self.capture_and_publish_managed(id, pid, constraints, peer, None, check)
+    }
+    pub(crate) fn capture_and_publish_managed(
+        mut self,
+        id: String,
+        pid: u32,
+        constraints: Constraints,
+        peer: impl std::os::fd::AsRawFd,
+        manager: Option<sigrund_core::manager::PodmanSelector>,
+        check: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
         let _policy_guard = crate::lsm::for_profile(&constraints)?;
+        let manager = manager
+            .map(|selector| {
+                crate::podman::Guard::acquire(selector, self.owner, &self.registry.budget, &check)
+            })
+            .transpose()?;
         let registration = Registration {
             schema: "sigrund.registration.phase0.v1".into(),
             id,
@@ -614,7 +636,16 @@ impl RegistrationSlot {
             &check,
         )?;
         check()?;
-        self.publish(registration, constraints, Box::new(anchor))
+        let anchor: Box<dyn CapturedAnchor> = if let Some(guard) = manager {
+            guard.verify_anchor(&anchor)?;
+            Box::new(crate::podman::ManagedAnchor {
+                anchor: Box::new(anchor),
+                guard,
+            })
+        } else {
+            Box::new(anchor)
+        };
+        self.publish(registration, constraints, anchor)
     }
 
     pub(crate) fn capture_self(

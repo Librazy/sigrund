@@ -592,12 +592,14 @@ pub struct ProcessContext {
     pub executable_roots: BTreeMap<String, FsIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticated_source: Option<ConnectorObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<crate::manager::PodmanEvidence>,
 }
 impl Contract for ProcessContext {
     fn validate(&self) -> Result<()> {
         if !matches!(
             self.schema.as_str(),
-            "sigrund.process-context.v1" | "sigrund.self-context.v1"
+            "sigrund.process-context.v1" | "sigrund.self-context.v1" | "sigrund.podman-context.v1"
         ) || self.executable_roots.is_empty()
             || self.executable_roots.len() > 64
         {
@@ -606,8 +608,17 @@ impl Contract for ProcessContext {
             ));
         }
         self.acquisition.validate()?;
+        match (&self.manager, self.schema.as_str()) {
+            (Some(evidence), "sigrund.podman-context.v1")
+                if self.acquisition.lifecycle.registration_id.is_some() =>
+            {
+                evidence.validate()?
+            }
+            (None, "sigrund.process-context.v1" | "sigrund.self-context.v1") => (),
+            _ => return Err(invalid("manager evidence and context schema differ")),
+        }
         match (&self.authenticated_source, self.schema.as_str()) {
-            (None, "sigrund.process-context.v1") => (),
+            (None, "sigrund.process-context.v1" | "sigrund.podman-context.v1") => (),
             (Some(source), "sigrund.self-context.v1")
                 if self.acquisition.lifecycle.registration_id.is_none() =>
             {
@@ -670,6 +681,8 @@ pub struct ProcessReview {
     pub acquisition: Acquisition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticated_source: Option<ConnectorObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<crate::manager::PodmanEvidence>,
     #[serde(deserialize_with = "required_option")]
     pub registration: Option<Registration>,
     pub constraints: Constraints,
@@ -686,7 +699,7 @@ impl Contract for ProcessReview {
     fn validate(&self) -> Result<()> {
         if !matches!(
             self.schema.as_str(),
-            "sigrund.process-review.v1" | "sigrund.self-review.v1"
+            "sigrund.process-review.v1" | "sigrund.self-review.v1" | "sigrund.podman-review.v1"
         ) {
             return Err(invalid("unsupported process review schema"));
         }
@@ -700,7 +713,7 @@ impl Contract for ProcessReview {
             return Err(invalid("process review requires a captured connector"));
         }
         match (&self.registration, self.schema.as_str()) {
-            (Some(registration), "sigrund.process-review.v1") => {
+            (Some(registration), "sigrund.process-review.v1" | "sigrund.podman-review.v1") => {
                 registration.validate()?;
                 if registration.profile_sha256 != self.constraints.sha256()?
                     || registration.daemon_pid != self.acquisition.pid
@@ -724,7 +737,9 @@ impl Contract for ProcessReview {
 impl ProcessReview {
     pub fn context(&self) -> ProcessContext {
         ProcessContext {
-            schema: if self.schema == "sigrund.self-review.v1" {
+            schema: if self.schema == "sigrund.podman-review.v1" {
+                "sigrund.podman-context.v1"
+            } else if self.schema == "sigrund.self-review.v1" {
                 "sigrund.self-context.v1"
             } else {
                 "sigrund.process-context.v1"
@@ -732,6 +747,7 @@ impl ProcessReview {
             .into(),
             acquisition: self.acquisition.clone(),
             authenticated_source: self.authenticated_source.clone(),
+            manager: self.manager.clone(),
             executable_roots: self.executable_roots.clone(),
         }
     }
@@ -809,7 +825,7 @@ impl ProcessReview {
             w.execution_context.target_gid,
             w.execution_context.supplementary_gids.clone(),
         )?;
-        serde_json::to_string_pretty(&serde_json::json!({
+        let mut evidence = serde_json::json!({
             "authority": w.host_id,
             "target_binding": w.target_binding,
             "declared_registration": self.registration,
@@ -843,7 +859,15 @@ impl ProcessReview {
             } else {
                 "required by security_constraints"
             },
-        }))
-        .map_err(|error| invalid(&error.to_string()))
+        });
+        if let Some(manager) = &self.manager {
+            evidence["manager"] = serde_json::json!({
+                "evidence": manager,
+                "generation_contract": "Rootful Podman; systemd cgroup membership and private PID-1 init required; configuration must remain unchanged",
+                "loss_contract": "Invalidate pending approval and terminate supervised jobs; recovery requires fresh acquisition and approval",
+                "execution_contract": "Native retained-resource execution under the displayed security constraints; no Podman exec-policy equivalence",
+            });
+        }
+        serde_json::to_string_pretty(&evidence).map_err(|error| invalid(&error.to_string()))
     }
 }

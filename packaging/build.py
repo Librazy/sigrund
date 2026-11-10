@@ -38,12 +38,16 @@ def stage(root, package, kind):
         (root / 'etc/sigrund').mkdir(parents=True, mode=0o755)
         install(REPO / 'packaging/sigrund.service', root / 'usr/lib/systemd/system/sigrund.service')
         install(REPO / 'docs/NAMESPACE_PHASE4_OPERATOR.md', docs / 'NAMESPACE_PHASE4_OPERATOR.md')
+        install(REPO / 'docs/NAMESPACE_PHASE5B_OPERATOR.md', docs / 'NAMESPACE_PHASE5B_OPERATOR.md')
         for source in sorted((REPO / 'packaging/selinux').iterdir()):
             if source.suffix in ('.te', '.fc', '.md') or source.name == 'Makefile':
                 install(source, docs / 'selinux' / source.name)
         for source in sorted((REPO / 'scripts/namespace-phase4').iterdir()):
             if source.suffix in ('.py', '.c'):
                 install(source, docs / 'namespace-phase4' / source.name)
+        for source in sorted((REPO / 'scripts/namespace-phase5').iterdir()):
+            if source.suffix in ('.py', '.c'):
+                install(source, docs / 'namespace-phase5' / source.name)
         install(REPO / 'crates/sigrund/src/child/launcher_abi.h', docs / 'namespace-phase4/launcher_abi.h')
         for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example'):
             install(REPO / 'config' / name, docs / 'examples' / name)

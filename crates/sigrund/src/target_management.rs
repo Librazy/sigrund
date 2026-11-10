@@ -35,6 +35,13 @@ pub fn anchor_path(socket: &Path) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    RegisterPodmanV1 {
+        id: String,
+        daemon_pid: u32,
+        owner_uid: u32,
+        security_profile: String,
+        selector: sigrund_core::manager::PodmanSelector,
+    },
     Register {
         id: String,
         daemon_pid: u32,
@@ -482,7 +489,32 @@ impl Management {
                     let result = (|| {
                         let bytes = line(&mut socket, check)?;
                         let request = parse_request(&bytes)?;
+                        let (request, manager) = match request {
+                            Request::RegisterPodmanV1 {
+                                id,
+                                daemon_pid,
+                                owner_uid,
+                                security_profile,
+                                selector,
+                            } => {
+                                use sigrund_core::namespace::Contract;
+                                selector.validate().map_err(invalid)?;
+                                (
+                                    Request::Register {
+                                        id,
+                                        daemon_pid,
+                                        owner_uid,
+                                        security_profile,
+                                    },
+                                    Some(selector),
+                                )
+                            }
+                            other => (other, None),
+                        };
                         match request {
+                            Request::RegisterPodmanV1 { .. } => {
+                                unreachable!("normalized Podman request")
+                            }
                             Request::Revoke { id } => self.registry.revoke(&id).map(|_| false),
                             Request::Register {
                                 id,
@@ -530,11 +562,12 @@ impl Management {
                                 let stop = stopping.clone();
                                 if permit
                                     .submit(Box::new(move || {
-                                        let result = slot.capture_and_publish(
+                                        let result = slot.capture_and_publish_managed(
                                             id,
                                             daemon_pid,
                                             profile,
                                             peer.socket,
+                                            manager,
                                             || {
                                                 if stop.load(Ordering::Acquire)
                                                     || Instant::now() >= deadline

@@ -46,3 +46,16 @@ Restart the daemon and register a fresh anchor after any policy change.
 The installed operator guide is `../NAMESPACE_PHASE4_OPERATOR.md`. Qualification
 status and platform limits are recorded in `docs/NAMESPACE_PHASE4.md` in the
 source repository; installing these sources does not itself qualify a deployment.
+
+## Optional Podman resolver policy
+
+The default build installs no manager API permission. For the separately
+qualified local rootful Podman deployment, build `make podman`, load
+`sigrund_podman.pp`, and run `restorecon -RF /run/podman` after starting the
+standard root-owned socket. The optional file-context rule labels that directory
+and socket `container_var_run_t`; the module permits only the producer to connect
+to the container runtime or systemd-activated listener. Requester and workload
+domains receive no manager API access. Follow
+[the Podman operator recipe](../NAMESPACE_PHASE5B_OPERATOR.md) for scope,
+administrator trust, lifecycle and confinement prerequisites. When reading this
+file in the source tree, use [the source recipe](../../docs/NAMESPACE_PHASE5B_OPERATOR.md).

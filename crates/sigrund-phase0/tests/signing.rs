@@ -52,6 +52,7 @@ fn v3_openssh_fixture_binds_intent_target_and_profile_and_rejects_v2() {
         sigrund_core::namespace::Acquisition::parse(include_bytes!("fixtures/acquisition.json"))
             .unwrap();
     let production = sigrund_core::namespace::ProcessContext {
+        manager: None,
         schema: "sigrund.process-context.v1".into(),
         authenticated_source: None,
         executable_roots: std::collections::BTreeMap::from([(

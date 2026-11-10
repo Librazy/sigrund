@@ -1,0 +1,15 @@
+policy_module(sigrund_podman, 1.0.0)
+
+# Optional host-admin resolver access. Load only for the qualified local Podman
+# integration; requester and workload domains receive no manager API access.
+gen_require(`
+    type sigrund_daemon_t;
+    type container_runtime_t;
+    type container_var_run_t;
+    type init_t;
+')
+allow sigrund_daemon_t container_var_run_t:dir { search getattr };
+allow sigrund_daemon_t container_var_run_t:sock_file { write getattr };
+allow sigrund_daemon_t container_runtime_t:unix_stream_socket { connectto read write getattr getopt setopt shutdown };
+# The standard rootful socket is created by systemd socket activation.
+allow sigrund_daemon_t init_t:unix_stream_socket { connectto read write getattr getopt setopt shutdown };

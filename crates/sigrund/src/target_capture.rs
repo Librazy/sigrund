@@ -539,6 +539,7 @@ impl TargetCapture {
         acquisition.validate().map_err(io::Error::other)?;
         ProcessContext {
             schema: "sigrund.process-context.v1".into(),
+            manager: None,
             authenticated_source: None,
             acquisition: acquisition.clone(),
             executable_roots: executable_roots.clone(),

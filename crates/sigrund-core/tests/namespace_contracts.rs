@@ -57,6 +57,7 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
         profile_sha256: constraints.sha256().unwrap(),
     };
     let mut review = ProcessReview {
+        manager: None,
         schema: "sigrund.process-review.v1".into(),
         exec_id: "0192d8f4-0000-7000-8000-000000000004".into(),
         csr_sha256: "00".repeat(32),
@@ -96,6 +97,36 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
     let display = review.render(&csr).unwrap();
     assert!(display.contains("verified_acquisition"));
     assert!(display.contains("Phase 2 private review"));
+    {
+        let mut managed = review.clone();
+        managed.schema = "sigrund.podman-review.v1".into();
+        managed.manager = Some(
+            sigrund_core::manager::PodmanEvidence::parse(include_bytes!(
+                "fixtures/manager/podman-evidence.json"
+            ))
+            .unwrap(),
+        );
+        let binding = managed.binding().unwrap();
+        let mut payload = w.clone();
+        payload.target_binding = binding.target_binding;
+        payload.security_constraints = binding.security_constraints;
+        let managed_csr = Csr::new(payload).unwrap();
+        managed.csr_sha256 = sha256_hex(managed_csr.as_bytes());
+        let display: serde_json::Value =
+            serde_json::from_str(&managed.render(&managed_csr).unwrap()).unwrap();
+        assert_eq!(
+            display["manager"]["evidence"],
+            serde_json::to_value(managed.manager.as_ref().unwrap()).unwrap()
+        );
+        assert!(
+            display["manager"]["loss_contract"]
+                .as_str()
+                .unwrap()
+                .contains("fresh acquisition")
+        );
+        managed.manager.as_mut().unwrap().container_id = "ff".repeat(32);
+        assert!(managed.render(&managed_csr).is_err());
+    }
     {
         let mut own = review.clone();
         own.schema = "sigrund.self-review.v1".into();

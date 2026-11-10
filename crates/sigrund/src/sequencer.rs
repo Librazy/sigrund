@@ -372,6 +372,10 @@ fn authorize(
                     "security_constraints":binding.security_constraints,
                     "execution_binding_sha256":binding.sha256().map_err(|error| error.to_string())?,
                     "numeric_credentials":process.evidence.credentials});
+                if let Some(manager) = process.lease.manager_evidence() {
+                    fields["approved_target"]["manager"] =
+                        serde_json::to_value(manager).map_err(|error| error.to_string())?;
+                }
                 fields["execution_observed"] = serde_json::Value::Null;
             }
             append_event(
@@ -467,6 +471,10 @@ fn authorize(
     if let Some(process) = &request.process {
         fields["source_authenticated"] = serde_json::json!({"uid":request.requester_uid,"gid":request.requester_gid,"supplementary_gids":request.requester_groups,"connector_observations":process.lease.authenticated_source()});
         fields["approved_target"] = serde_json::json!({"binding":w.target_binding,"security_constraints":w.security_constraints,"numeric_credentials":process.evidence.credentials});
+        if let Some(manager) = process.lease.manager_evidence() {
+            fields["approved_target"]["manager"] =
+                serde_json::to_value(manager).map_err(|error| error.to_string())?;
+        }
         fields["execution_observed"] = serde_json::Value::Null;
     }
     if result == AuthorizationResult::Allowed {

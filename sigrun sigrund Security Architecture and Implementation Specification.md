@@ -2575,14 +2575,18 @@ ARM64 cross-build evidence is not runtime qualification. Additional deployment
 claims require their own applicable cases. Optional manager adapters MUST pass
 NS-13 scope, generation, dishonest/stale metadata, replacement, required-evidence
 loss/restart and teardown cases on the actual installed integration before being
-advertised. No adapter is selected or enabled by this specification update.
+advertised. The selected [Phase 5B Podman contract](docs/NAMESPACE_PHASE5B.md)
+restricts the first adapter to a local root-owned API, the default Libpod
+namespace, systemd cgroup v2 and a private PID-1 init. Its installed qualification
+is separate from the manager-free candidate and remains in progress.
 
 The [Phase 5A qualification](docs/NAMESPACE_PHASE5A.md) closes the manager-free
 candidate gate for `77ed109` on the named Fedora deployment, with fresh installed
 packages, all four routes and complete matching host acceptance. Its evidence
 also records the separate Ubuntu host compatibility and ARM64 build-only results.
 The completion documentation does not change runtime artifacts or expand the
-profile's exclusions. Optional manager integration remains deferred.
+profile's exclusions. Its historical manager-free evidence does not qualify the
+new optional Podman integration.
 
 Keep PTY, hooks, collector/remote ACK, reload, reusable grants, scripts and extra
 signing adapters independently deferred until their integrated cases pass. They

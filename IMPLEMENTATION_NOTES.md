@@ -149,7 +149,10 @@ registered rootless B and real rootless A → B, A → host and A → self. It d
 the exact requester-domain prerequisites and older-kernel host authentication
 compatibility. Namespace full/export/offline and additional requester topologies
 have separate gates. The [Phase 5A record](docs/NAMESPACE_PHASE5A.md) consolidates
-matching final-candidate release evidence; optional manager resolvers remain deferred.
+matching final-candidate manager-free release evidence. The optional
+[Podman adapter](docs/NAMESPACE_PHASE5B.md) adds scoped manager evidence and a
+retained lifecycle dependency around ordinary acquisition; installed qualification
+is in progress.
 
 ## Code ownership and security boundaries
 
@@ -570,9 +573,10 @@ production acquisition and private destination review. Phase 3 adds experimental
 native namespace entry, cgroup placement and final-child verification on its
 declared topology. Phase 4 qualifies production confinement for its named Fedora
 deployment. Phase 5A completes final-candidate manager-free release qualification;
-Phase 5B separately plans one optional manager integration. No manager adapter
-is currently enabled, and broader deployment/execution-mode claims retain their
-independent qualification gates.
+Phase 5B implements the selected local rootful Podman adapter with a separate
+installed qualification gate. It retains native execution under the displayed
+constraints and claims no Podman exec-policy equivalence. Broader deployment
+and execution-mode claims retain their independent qualification gates.
 No v2 compatibility layer or automatic state migration is planned; explicit fresh
 v3 provisioning must preserve existing state. Interpreter artifact binding remains
 separate deferred work.

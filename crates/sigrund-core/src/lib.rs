@@ -12,6 +12,7 @@ pub mod host;
 pub mod host_budget;
 pub mod json;
 pub mod lifecycle;
+pub mod manager;
 pub mod paths;
 pub mod protocol;
 pub mod snapshot;

@@ -433,7 +433,9 @@ pub(crate) fn finish(
             .map_err(|error| invalid(format!("sealed executable SELinux label: {error}")))?;
     }
     let mut review = ProcessReview {
-        schema: if state.lease.registration_record().is_some() {
+        schema: if state.lease.manager_evidence().is_some() {
+            "sigrund.podman-review.v1"
+        } else if state.lease.registration_record().is_some() {
             "sigrund.process-review.v1"
         } else {
             "sigrund.self-review.v1"
@@ -443,6 +445,7 @@ pub(crate) fn finish(
         csr_sha256: "00".repeat(32),
         acquisition: state.lease.acquisition().clone(),
         authenticated_source: state.lease.authenticated_source().cloned(),
+        manager: state.lease.manager_evidence().cloned(),
         registration: state.lease.registration_record().cloned(),
         constraints: state.lease.constraints().clone(),
         executable_roots: state.lease.executable_roots(),

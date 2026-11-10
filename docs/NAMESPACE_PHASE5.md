@@ -1,8 +1,9 @@
 # Namespace-aware execution Phase 5 delivery plan
 
-Status: Phase 5A qualified, Phase 5B deferred, 2026-11-10. This document refines the
+Status: Phase 5A qualified, Phase 5B implementation and qualification in progress,
+2026-11-10. This document refines the
 [roadmap](NAMESPACE_AWARE_EXECUTION.md#phase-5--optional-resolvers-and-release-qualification)
-and implements no new runtime capability. The
+and describes separate runtime qualification gates. The
 [specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>)
 owns NS-13 resolver semantics and NS-16 release obligations. Phase 5A closes the
 manager-free release evidence; Phase 5B is an optional, separately qualified
@@ -81,9 +82,13 @@ features. Publishing or merging the release remains a separate action.
 
 ## Phase 5B: select and qualify one optional adapter
 
-Choose the first manager and supported version/deployment only when this
-milestone is selected. Docker, Podman and containerd are possible integrations,
-not current support claims. Before coding, document:
+Podman is selected as the first adapter. The [integration contract](NAMESPACE_PHASE5B.md)
+and [operator recipe](NAMESPACE_PHASE5B_OPERATOR.md) define a local root-owned
+Podman 5.8.1 service in the default Libpod namespace, systemd cgroup v2 and a
+single private PID namespace on enforcing Fedora 44 x86-64. Rootless APIs,
+other manager namespaces and Docker/containerd remain outside this gate.
+Installed acceptance must pass before the selected combination is qualified.
+The contract records:
 
 - The authenticated manager endpoint, owner/tenant and manager namespace, who
   controls their metadata, and the host administrator's independent policy.

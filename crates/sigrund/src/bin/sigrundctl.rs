@@ -21,7 +21,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "--help") {
         println!(
-            "Usage: sigrundctl init-host --state-dir PATH --log-path PATH\n       sigrundctl target register ID --pid DAEMON_PID --owner-uid HOST_UID --security-profile ID [--socket PATH]\n       sigrundctl target revoke ID [--socket PATH]\n       sigrundctl target export-binding host --security-profile ID [--epoch-file PATH] --output PATH\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
+            "Usage: sigrundctl init-host --state-dir PATH --log-path PATH\n       sigrundctl target register ID --pid DAEMON_PID --owner-uid HOST_UID --security-profile ID [--socket PATH]\n       sigrundctl target register-podman ID --pid DAEMON_PID --owner-uid HOST_UID --security-profile ID --podman-endpoint PATH --podman-owner-uid 0 --podman-namespace default --podman-container NAME [--socket PATH]\n       sigrundctl target revoke ID [--socket PATH]\n       sigrundctl target export-binding host --security-profile ID [--epoch-file PATH] --output PATH\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
         );
         return ExitCode::SUCCESS;
     }
@@ -85,8 +85,17 @@ fn target_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     for pair in args[3..].chunks(2) {
         if pair.len() != 2
             || pair[1].is_empty()
-            || !["--pid", "--owner-uid", "--security-profile", "--socket"]
-                .contains(&pair[0].as_str())
+            || ![
+                "--pid",
+                "--owner-uid",
+                "--security-profile",
+                "--socket",
+                "--podman-endpoint",
+                "--podman-owner-uid",
+                "--podman-namespace",
+                "--podman-container",
+            ]
+            .contains(&pair[0].as_str())
             || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
         {
             return Err("invalid or duplicate target management option".into());
@@ -95,21 +104,56 @@ fn target_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let socket = Path::new(options.remove("--socket").unwrap_or("/run/sigrund.sock"));
     sigrund::linux::validate_absolute_path(socket)?;
     let request = match operation.as_str() {
-        "register" => {
-            if options.len() != 3 {
+        "register" | "register-podman" => {
+            let managed = operation == "register-podman";
+            if options.len() != if managed { 7 } else { 3 } {
                 return Err("register requires --pid, --owner-uid and --security-profile".into());
             }
-            Request::Register {
-                id,
-                daemon_pid: options.get("--pid").ok_or("--pid required")?.parse()?,
-                owner_uid: options
-                    .get("--owner-uid")
-                    .ok_or("--owner-uid required")?
-                    .parse()?,
-                security_profile: options
-                    .get("--security-profile")
-                    .ok_or("--security-profile required")?
-                    .to_string(),
+            let daemon_pid = options.get("--pid").ok_or("--pid required")?.parse()?;
+            let owner_uid = options
+                .get("--owner-uid")
+                .ok_or("--owner-uid required")?
+                .parse()?;
+            let security_profile = options
+                .get("--security-profile")
+                .ok_or("--security-profile required")?
+                .to_string();
+            if managed {
+                use sigrund_core::namespace::Contract;
+                let selector = sigrund_core::manager::PodmanSelector {
+                    schema: "sigrund.podman-selector.v1".into(),
+                    endpoint: options
+                        .get("--podman-endpoint")
+                        .ok_or("--podman-endpoint required")?
+                        .to_string(),
+                    owner_uid: options
+                        .get("--podman-owner-uid")
+                        .ok_or("--podman-owner-uid required")?
+                        .parse()?,
+                    manager_namespace: options
+                        .get("--podman-namespace")
+                        .ok_or("--podman-namespace required")?
+                        .to_string(),
+                    container_name: options
+                        .get("--podman-container")
+                        .ok_or("--podman-container required")?
+                        .to_string(),
+                };
+                selector.validate()?;
+                Request::RegisterPodmanV1 {
+                    id,
+                    daemon_pid,
+                    owner_uid,
+                    security_profile,
+                    selector,
+                }
+            } else {
+                Request::Register {
+                    id,
+                    daemon_pid,
+                    owner_uid,
+                    security_profile,
+                }
             }
         }
         "revoke" if options.is_empty() => Request::Revoke { id },

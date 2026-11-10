@@ -561,7 +561,7 @@ identifies the registered process environment and carries no manager-exec claim.
 **Subsystems:** manager adapters, lifecycle evidence, deployment documentation and
 acceptance/release reporting.
 
-**Status: Phase 5A qualified; Phase 5B deferred.** The
+**Status: Phase 5A qualified; Phase 5B implementation and qualification in progress.** The
 [Phase 5A completion record](NAMESPACE_PHASE5A.md) and
 [candidate evidence](evidence/namespace-phase5a-20261110.json) cover clean candidate
 `77ed109`, fresh installed RPM qualification and matching complete host acceptance.
@@ -591,10 +591,12 @@ claims a retained process environment, not a manager execution generation.
 
 #### Phase 5B — Optional manager integration
 
-- Select one manager and deployment scope before implementation; no adapter is
-  selected or enabled by this roadmap. Define authenticated endpoint/owner/tenant
-  and manager-namespace scope, generation evidence, required configuration and
-  lifecycle dependencies, resource bounds and loss/restart behavior.
+- The selected [Podman integration](NAMESPACE_PHASE5B.md) uses a local root-owned
+  API, the default Libpod namespace, systemd cgroup v2 and a private PID-1 init.
+  Its [operator recipe](NAMESPACE_PHASE5B_OPERATOR.md) defines trusted administrator
+  access and the enforcing deployment. Other adapters/scopes remain unqualified.
+  Endpoint/owner/namespace, generation/configuration evidence, observation bounds
+  and permanent invalidation are explicit parts of the binding.
 - Version the bounded selector/acquisition schemas and independent binding
   fixtures before exposure. Validate resolver results through the existing
   acquisition, private review and host authorization path. Names and user-owned
