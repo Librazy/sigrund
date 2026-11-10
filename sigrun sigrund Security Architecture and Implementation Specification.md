@@ -2577,6 +2577,13 @@ NS-13 scope, generation, dishonest/stale metadata, replacement, required-evidenc
 loss/restart and teardown cases on the actual installed integration before being
 advertised. No adapter is selected or enabled by this specification update.
 
+The [Phase 5A qualification](docs/NAMESPACE_PHASE5A.md) closes the manager-free
+candidate gate for `77ed109` on the named Fedora deployment, with fresh installed
+packages, all four routes and complete matching host acceptance. Its evidence
+also records the separate Ubuntu host compatibility and ARM64 build-only results.
+The completion documentation does not change runtime artifacts or expand the
+profile's exclusions. Optional manager integration remains deferred.
+
 Keep PTY, hooks, collector/remote ACK, reload, reusable grants, scripts and extra
 signing adapters independently deferred until their integrated cases pass. They
 remain target requirements, not mandatory scope for the namespace implementation

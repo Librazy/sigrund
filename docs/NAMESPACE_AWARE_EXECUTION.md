@@ -42,7 +42,7 @@ Phase 4 qualifies the explicit `namespace-selinux-v1` thin one-time SSH/stdio
 profile on Fedora 44 x86-64 across all four routes, including real rootless sources.
 Its [record](NAMESPACE_PHASE4.md) separates the installed qualification snapshot
 from subsequent producer-guard and older-kernel authentication fixes. Phase 5
-first consolidates final-candidate release evidence for this manager-free scope;
+consolidates final-candidate release evidence for this manager-free scope;
 optional manager integration follows as a separate milestone. Neither milestone
 automatically enables the independent later Phase 4 gates.
 
@@ -561,10 +561,13 @@ identifies the registered process environment and carries no manager-exec claim.
 **Subsystems:** manager adapters, lifecycle evidence, deployment documentation and
 acceptance/release reporting.
 
-**Status: planned.** The next milestone is final-candidate release qualification.
-The [Phase 5 delivery plan](NAMESPACE_PHASE5.md) defines evidence, adapter design
-decisions and acceptance cases. Existing Phase 4 results remain valid within
-their recorded scope; they do not constitute completed Phase 5 qualification.
+**Status: Phase 5A qualified; Phase 5B deferred.** The
+[Phase 5A completion record](NAMESPACE_PHASE5A.md) and
+[candidate evidence](evidence/namespace-phase5a-20261110.json) cover clean candidate
+`77ed109`, fresh installed RPM qualification and matching complete host acceptance.
+The [Phase 5 delivery plan](NAMESPACE_PHASE5.md) defines reproduction obligations,
+adapter design decisions and acceptance cases. Historical Phase 4 evidence remains
+a separate snapshot. Publishing or merging the release is a separate action.
 
 #### Phase 5A — Manager-free release qualification
 

@@ -16,7 +16,8 @@ final-child exec checkpoint. Historical namespace preview profiles retain their
 scheduled TIMEOUT without consumption or execution. Phase 4 adds an explicitly
 selected, enforcing SELinux namespace profile for thin one-time approval on the
 [qualified Fedora deployment](docs/NAMESPACE_PHASE4.md). See the
-[Phase 5 release and optional-adapter plan](docs/NAMESPACE_PHASE5.md),
+[Phase 5A candidate qualification](docs/NAMESPACE_PHASE5A.md), the
+[optional-adapter plan](docs/NAMESPACE_PHASE5.md),
 [Phase 3 workflow and platform scope](docs/NAMESPACE_PHASE3.md),
 [Phase 2 operator and qualification guide](docs/NAMESPACE_PHASE2.md), the
 [Phase 1 implementation and qualification record](docs/NAMESPACE_PHASE1.md),

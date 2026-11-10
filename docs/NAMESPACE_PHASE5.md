@@ -1,12 +1,17 @@
 # Namespace-aware execution Phase 5 delivery plan
 
-Status: planned, 2026-11-10. This document refines the
+Status: Phase 5A qualified, Phase 5B deferred, 2026-11-10. This document refines the
 [roadmap](NAMESPACE_AWARE_EXECUTION.md#phase-5--optional-resolvers-and-release-qualification)
 and implements no new runtime capability. The
 [specification](<../sigrun sigrund Security Architecture and Implementation Specification.md>)
 owns NS-13 resolver semantics and NS-16 release obligations. Phase 5A closes the
 manager-free release evidence; Phase 5B is an optional, separately qualified
 manager adapter. Phase 5A may ship while Phase 5B remains deferred.
+
+The [Phase 5A completion record](NAMESPACE_PHASE5A.md) and
+[candidate evidence](evidence/namespace-phase5a-20261110.json) qualify candidate
+`77ed109` for the declared manager-free release scope. The requirements below
+remain the reproduction and requalification checklist for future candidates.
 
 ## Phase 5A: identify and qualify the release candidate
 
@@ -15,7 +20,7 @@ and a separate review follow-up. Those results are inputs to final qualification
 not a single complete acceptance run against the final candidate. Preserve the
 historical evidence JSON and publish a new candidate record.
 
-The initial candidate matrix is deliberately limited:
+The candidate matrix is deliberately limited:
 
 | Combination | Existing evidence | Phase 5A obligation |
 | --- | --- | --- |

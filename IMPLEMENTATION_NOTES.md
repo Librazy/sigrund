@@ -148,8 +148,8 @@ qualifies an installed enforcing SELinux profile on Fedora 44 x86-64 for host �
 registered rootless B and real rootless A → B, A → host and A → self. It documents
 the exact requester-domain prerequisites and older-kernel host authentication
 compatibility. Namespace full/export/offline and additional requester topologies
-have separate gates. The [Phase 5 plan](docs/NAMESPACE_PHASE5.md) first consolidates
-final-candidate release evidence; optional manager resolvers remain deferred.
+have separate gates. The [Phase 5A record](docs/NAMESPACE_PHASE5A.md) consolidates
+matching final-candidate release evidence; optional manager resolvers remain deferred.
 
 ## Code ownership and security boundaries
 
@@ -569,7 +569,7 @@ Additional namespace/container execution domains have a v3 contract and
 production acquisition and private destination review. Phase 3 adds experimental
 native namespace entry, cgroup placement and final-child verification on its
 declared topology. Phase 4 qualifies production confinement for its named Fedora
-deployment. Phase 5A plans final-candidate manager-free release qualification;
+deployment. Phase 5A completes final-candidate manager-free release qualification;
 Phase 5B separately plans one optional manager integration. No manager adapter
 is currently enabled, and broader deployment/execution-mode claims retain their
 independent qualification gates.
