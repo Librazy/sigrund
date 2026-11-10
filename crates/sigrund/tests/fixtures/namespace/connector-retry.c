@@ -1,4 +1,5 @@
 /* Exercise production connection waits without requiring namespace privilege. */
+#include "../../../src/child/peer_auth.c"
 #include "../../../src/child/client_anchor.c"
 #include <stdio.h>
 #include <string.h>

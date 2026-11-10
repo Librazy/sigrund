@@ -17,6 +17,7 @@ use sigrund_core::{
 use std::{
     fs::File,
     io,
+    os::fd::AsRawFd,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,9 +44,8 @@ impl VerifiedProcess {
         let Document::Signed { warrant, .. } = &prepared.document else {
             return false;
         };
-        let namespace_plan = state.lease.constraints().schema
-            != "sigrund.constraints.namespace-experimental.v1"
-            || state.lease.namespace_files().is_ok();
+        let namespace_plan =
+            !state.lease.constraints().executes() || state.lease.namespace_files().is_ok();
         namespace_plan
             && state.lease.check_lifecycle().is_ok()
             && self.warrant_sha256 == sha256_hex(warrant.as_bytes())
@@ -82,11 +82,24 @@ pub(crate) fn prepare(
         return Err(invalid("cross-domain requests require thin intent"));
     }
     let original = request.hello.original_intent().map_err(io::Error::other)?;
-    if request.policy.namespace_profiles.iter().any(|profile| {
-        profile.profile_id == original.security_profile
-            && profile.schema == "sigrund.constraints.namespace-experimental.v1"
-    }) {
-        crate::access::domain()?;
+    if matches!(original.target, Selector::Process { .. })
+        && request.policy.namespace_profiles.iter().any(|profile| {
+            profile.profile_id == original.security_profile && profile.is_production()
+        })
+    {
+        return Err(invalid(
+            "production namespace execution requires a registered or authenticated self target",
+        ));
+    }
+
+    if request
+        .policy
+        .namespace_profiles
+        .iter()
+        .any(|profile| profile.profile_id == original.security_profile && profile.executes())
+    {
+        crate::access::domain()
+            .map_err(|error| invalid(format!("namespace access domain: {error}")))?;
         if std::path::Path::new(&original.command.cwd).starts_with("/run") {
             return Err(invalid("cwd would be covered by the private runtime mount"));
         }
@@ -121,8 +134,8 @@ pub(crate) fn prepare(
             .find(|profile| profile.profile_id == original.security_profile)
             .ok_or_else(|| invalid("self profile unavailable"))?
             .clone();
-        if profile.schema != "sigrund.constraints.namespace-experimental.v1" {
-            return Err(invalid("self requires the experimental namespace profile"));
+        if !profile.executes() {
+            return Err(invalid("self requires an executable namespace profile"));
         }
         check_scoped_policy(
             request,
@@ -138,6 +151,7 @@ pub(crate) fn prepare(
             .as_ref()
             .ok_or_else(|| invalid("missing authenticated source socket"))?
             .clone();
+        let _policy_guard = crate::lsm::for_profile(&profile)?;
         registry.capture_self(
             source,
             profile,
@@ -152,6 +166,20 @@ pub(crate) fn prepare(
         || original.execution_context.capabilities != lease.constraints().capabilities
     {
         return Err(invalid("requested profile differs from target owner"));
+    }
+    // Different mapped workload UIDs do not exclude namespace-owner ptrace
+    // authority. Until a workload LSM guard is qualified, reject that authority
+    // before any destination account/path operation or private approval.
+    if lease.constraints().schema == "sigrund.constraints.namespace-experimental.v1" {
+        let namespaces = lease.namespace_files()?;
+        let userns = namespaces
+            .get(6)
+            .ok_or_else(|| invalid("missing target user namespace"))?;
+        let mut owner = u32::MAX;
+        if unsafe { libc::ioctl(userns.as_raw_fd(), 0xb704, &mut owner) } != 0 {
+            return Err(invalid("cannot establish target user namespace owner"));
+        }
+        reject_namespace_owner(request.requester_uid, owner, lease.owner_uid())?;
     }
     let numeric = if let sigrund_core::host::Account::Numeric {
         uid,
@@ -177,7 +205,8 @@ pub(crate) fn prepare(
         PathBuf::from(&original.command.cwd),
         |credentials| scoped_policy(request, context, signer, &lease, Some(credentials)),
         || request.check(),
-    )?;
+    )
+    .map_err(|error| invalid(format!("destination preparation: {error}")))?;
     let credentials = &result.evidence.credentials;
     request.hello.requested_execution_context = Some(original.execution_context.resolve(
         credentials.uid,
@@ -308,7 +337,7 @@ fn check_scoped_policy(
     let intent = request.hello.original_intent().map_err(io::Error::other)?;
     let profile_sha256 = constraints.sha256().map_err(io::Error::other)?;
     let unsupported_numeric = matches!(&intent.account, sigrund_core::host::Account::Numeric { uid, supplementary_gids, .. } if *uid == 0 || !supplementary_gids.is_empty());
-    if constraints.schema == "sigrund.constraints.namespace-experimental.v1"
+    if constraints.executes()
         && (unsupported_numeric || credentials.is_some_and(|c| c.uid == 0 || !c.groups.is_empty()))
     {
         return Err(invalid(
@@ -393,6 +422,16 @@ pub(crate) fn finish(
         .as_ref()
         .ok_or_else(|| invalid("missing process owner"))?;
     state.lease.revalidate()?;
+    if let Some(guard) = state.lease.policy_guard() {
+        guard.verify_domain(&state.lease.constraints().selinux.context)?;
+        let image = &request
+            .snapshots
+            .as_ref()
+            .ok_or_else(|| invalid("missing executable"))?
+            .executable;
+        crate::lsm::image_label(image, state.lease.constraints(), true)
+            .map_err(|error| invalid(format!("sealed executable SELinux label: {error}")))?;
+    }
     let mut review = ProcessReview {
         schema: if state.lease.registration_record().is_some() {
             "sigrund.process-review.v1"
@@ -477,7 +516,7 @@ pub(crate) fn verify_final(
         .as_ref()
         .ok_or_else(|| invalid("missing process owner"))?;
     state.lease.revalidate()?;
-    if state.lease.constraints().schema == "sigrund.constraints.namespace-experimental.v1" {
+    if state.lease.constraints().executes() {
         crate::access::domain()?;
         use std::os::fd::AsRawFd;
         let mut stat = unsafe { std::mem::zeroed::<libc::statx>() };
@@ -495,9 +534,7 @@ pub(crate) fn verify_final(
         }
         let flag = libc::STATX_ATTR_MOUNT_ROOT as u64;
         if stat.stx_attributes_mask & flag == 0 || stat.stx_attributes & flag == 0 {
-            return Err(invalid(
-                "experimental namespace execution requires a mount-point root",
-            ));
+            return Err(invalid("namespace execution requires a mount-point root"));
         }
     }
     let prepared = request
@@ -603,6 +640,9 @@ pub(crate) fn verify_final(
     if now < w.policy.not_before as u64 || w.policy.not_after.is_none_or(|end| now > end as u64) {
         return Err(invalid("process warrant expired"));
     }
+    if state.lease.constraints().is_production() {
+        crate::lsm::image_label(&snapshots.executable, state.lease.constraints(), false)?;
+    }
     state.lease.revalidate()?;
     request.check()?;
     let mut environment = w.execution_context.env_exact.clone();
@@ -627,20 +667,19 @@ pub(crate) fn verify_final(
             })
             .cloned()
             .collect();
-    let launcher_resources =
-        if state.lease.constraints().schema == "sigrund.constraints.namespace-experimental.v1" {
-            state.lease.namespace_files()?;
-            Some(
-                state
-                    .lease
-                    .reserve_resources(sigrund_core::host_budget::Charge {
-                        helpers: 1,
-                        ..Default::default()
-                    })?,
-            )
-        } else {
-            None
-        };
+    let launcher_resources = if state.lease.constraints().executes() {
+        state.lease.namespace_files()?;
+        Some(
+            state
+                .lease
+                .reserve_resources(sigrund_core::host_budget::Charge {
+                    helpers: 1,
+                    ..Default::default()
+                })?,
+        )
+    } else {
+        None
+    };
     Ok(VerifiedProcess {
         authorized: crate::authorization::Authorized {
             warrant: warrant.clone(),
@@ -788,14 +827,21 @@ pub(crate) fn verify_execution(
     File::open(format!("/proc/{pid}/status"))?
         .take(65537)
         .read_to_string(&mut status)?;
+    let production = state.lease.constraints().is_production();
+    let seccomp = if production { "2" } else { "0" };
     if status.len() > 65536
         || !status.lines().any(|line| {
             line.strip_prefix("Seccomp:")
-                .is_some_and(|value| value.trim() == "0")
+                .is_some_and(|value| value.trim() == seccomp)
         })
+        || (production
+            && !status.lines().any(|line| {
+                line.strip_prefix("Seccomp_filters:")
+                    .is_some_and(|value| value.trim() == "1")
+            }))
     {
         return Err(invalid(
-            "experimental child has an undeclared seccomp filter",
+            "final child seccomp state differs from the approved profile",
         ));
     }
     let mut label = String::new();
@@ -808,9 +854,49 @@ pub(crate) fn verify_execution(
         Ok(_) => return Err(invalid("oversized observed LSM context")),
         Err(error) => serde_json::json!({"state":"unreadable", "errno":error.raw_os_error()}),
     };
+    if let Some(guard) = state.lease.policy_guard() {
+        if lsm.get("context").and_then(|value| value.as_str())
+            != Some(state.lease.constraints().selinux.context.as_str())
+        {
+            return Err(invalid(
+                "actual workload SELinux context differs from the approved profile",
+            ));
+        }
+        guard.verify_domain(&state.lease.constraints().selinux.context)?;
+    }
     state.lease.revalidate()?;
     check()?;
     Ok(
-        serde_json::json!({"child_pid":pid,"namespaces":observed,"root":root,"cwd":cwd,"host_credentials":state.evidence.credentials,"job_placement_verified":true,"setup_descriptors_closed":true,"private_run_verified":true,"seccomp":0,"ambient_lsm":lsm}),
+        serde_json::json!({"child_pid":pid,"namespaces":observed,"root":root,"cwd":cwd,"host_credentials":state.evidence.credentials,"job_placement_verified":true,"setup_descriptors_closed":true,"private_run_verified":true,"seccomp":if production {2} else {0},"exact_seccomp_program_verified":production,"ambient_lsm":lsm,"selinux_policy_token":state.lease.policy_guard().map(|guard|guard.token())}),
     )
+}
+
+fn reject_namespace_owner(
+    requester: u32,
+    namespace_owner: u32,
+    declared_owner: u32,
+) -> io::Result<()> {
+    // Host root is the trusted administrative authority, outside requester
+    // isolation. All nonroot requesters need an independently verified guard.
+    if namespace_owner == u32::MAX
+        || (requester != 0 && (requester == namespace_owner || requester == declared_owner))
+    {
+        return Err(invalid(
+            "requester namespace-owner injection authority is not confined",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::reject_namespace_owner;
+    #[test]
+    fn different_workload_uid_does_not_remove_namespace_owner_authority() {
+        assert!(reject_namespace_owner(1000, 1000, 2000).is_err());
+        assert!(reject_namespace_owner(1000, 2000, 1000).is_err());
+        assert!(reject_namespace_owner(1000, u32::MAX, 2000).is_err());
+        assert!(reject_namespace_owner(3000, 1000, 2000).is_ok());
+        assert!(reject_namespace_owner(0, 1000, 2000).is_ok());
+    }
 }

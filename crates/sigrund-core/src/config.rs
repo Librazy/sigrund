@@ -665,7 +665,7 @@ impl DaemonConfig {
         self.host_limits.validate()?;
         validate_namespace_policy(&self.namespace_profiles, &self.namespace_rules)?;
         for profile in &self.namespace_profiles {
-            if profile.schema == "sigrund.constraints.namespace-experimental.v1"
+            if profile.executes()
                 && (profile.memory_max > self.job_memory_max_bytes
                     || profile.memory_swap_max > self.job_memory_swap_max_bytes
                     || u64::from(profile.pids_max) > self.job_pids_max)

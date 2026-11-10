@@ -16,6 +16,7 @@ pub mod host_registry;
 pub mod host_target;
 mod jobs;
 pub mod linux;
+mod lsm;
 pub mod memfd;
 mod preparation;
 pub mod reaper;

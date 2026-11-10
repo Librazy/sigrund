@@ -15,7 +15,8 @@
 
 /* The CLI forks before starting relay threads. Only resident syscall code runs
  * in its dedicated connector; all caller descriptors close before capture. */
-static void anchor_exit(void) {
+extern int sigrun_authenticate_host_peer(int socket, unsigned role);
+static _Noreturn void anchor_exit(void) {
     syscall(SYS_exit_group, 127);
     __builtin_unreachable();
 }
@@ -60,7 +61,9 @@ static void connector(int control, const struct sockaddr_un *public, const struc
         syscall(SYS_getppid) != parent) anchor_exit();
     int64_t deadline = now_ns() + 10000000000LL;
     int stream = connect_stream(public, deadline);
+    if (sigrun_authenticate_host_peer(stream, 0) < 0) anchor_exit();
     int peer = connect_stream(anchor, deadline);
+    if (sigrun_authenticate_host_peer(peer, 2) < 0) anchor_exit();
     char byte = 'S';
     struct iovec iov = {.iov_base=&byte, .iov_len=1};
     union { struct cmsghdr alignment; char bytes[CMSG_SPACE(sizeof(int))]; } ancillary = {0};
@@ -101,4 +104,25 @@ int sigrun_spawn_self_connector(const struct sockaddr_un *public, const struct s
     else *control=pair[0];
     errno=saved;
     return pid;
+}
+
+/* Installed dedicated anchor: only the authenticated rendezvous survives H.
+ * Successful capture holds the task at unshare's syscall exit until disposal. */
+int sigrun_run_dedicated_anchor(const struct sockaddr_un *address) {
+    int peer = connect_stream(address, now_ns() + 10000000000LL);
+    if (sigrun_authenticate_host_peer(peer, 2) < 0) {
+        int saved = errno; syscall(SYS_close, peer); errno = saved; return -1;
+    }
+    int retained = syscall(SYS_fcntl, peer, F_DUPFD_CLOEXEC, 10);
+    if (retained < 0 || syscall(SYS_dup3, retained, 3, O_CLOEXEC) < 0) return -1;
+    if (syscall(SYS_close_range, 0U, 2U, 0U) < 0 ||
+        syscall(SYS_close_range, 4U, ~0U, 0U) < 0 ||
+        syscall(SYS_fcntl, 3, F_SETFL, 0) < 0) anchor_exit();
+    char byte = 'H';
+    if (syscall(SYS_write, 3, &byte, 1) != 1) anchor_exit();
+    long count;
+    do { count = syscall(SYS_read, 3, &byte, 1); } while (count < 0 && errno == EINTR);
+    if (count != 1 || byte != 'G') anchor_exit();
+    syscall(SYS_unshare, CLONE_FS | CLONE_FILES);
+    anchor_exit();
 }

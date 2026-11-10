@@ -389,6 +389,7 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<Spawned> {
                     fds,
                     NamespaceTarget {
                         namespaces: process.lease.namespace_files()?,
+                        constraints: process.lease.constraints(),
                         root: process.lease.root().as_raw_fd(),
                         cwd: process.cwd.as_raw_fd(),
                     },

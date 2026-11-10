@@ -1,0 +1,94 @@
+policy_module(sigrund_workload, 1.0.0)
+gen_require(`
+    type sigrund_daemon_t;
+    type sigrund_runtime_t;
+    type init_t;
+    type unconfined_t;
+    attribute domain;
+    attribute file_type;
+    role system_r;
+')
+# Do not add domain or unconfined attributes. Generic requester-domain ptrace
+# rules must not authorize injection into this explicitly transitioned workload.
+type sigrund_workload_t;
+role system_r types sigrund_workload_t;
+type sigrund_workload_exec_t;
+files_type(sigrund_workload_exec_t)
+fs_associate_tmpfs(sigrund_workload_exec_t)
+allow sigrund_daemon_t sigrund_runtime_t:file relabelfrom;
+allow sigrund_daemon_t sigrund_workload_exec_t:file { create read write open getattr setattr relabelfrom relabelto execute map };
+allow sigrund_daemon_t sigrund_workload_t:process { transition ptrace signal sigkill sigstop getattr sigchld };
+allow sigrund_daemon_t sigrund_workload_t:dir { search read open getattr };
+allow sigrund_daemon_t sigrund_workload_t:file { read open getattr };
+allow sigrund_daemon_t sigrund_workload_t:lnk_file { read getattr };
+allow sigrund_daemon_t sigrund_workload_t:process2 { nnp_transition nosuid_transition };
+allow sigrund_workload_t sigrund_workload_exec_t:file { entrypoint execute read open getattr map };
+allow sigrund_workload_t sigrund_daemon_t:fd use;
+allow sigrund_workload_t { sigrund_daemon_t init_t }:process sigchld;
+allow init_t sigrund_workload_t:process { signal sigkill sigstop signull getattr getsched };
+allow sigrund_workload_t domain:file { read write append getattr ioctl };
+allow sigrund_workload_t domain:fd use;
+allow sigrund_workload_t domain:fifo_file rw_fifo_file_perms;
+allow sigrund_workload_t self:process { fork sigchld getcap getsched signal signull };
+allow sigrund_workload_t self:fifo_file rw_fifo_file_perms;
+allow sigrund_workload_t self:dir { search read open getattr };
+allow sigrund_workload_t self:file { read open getattr };
+allow sigrund_workload_t self:lnk_file { read getattr };
+neverallow { domain -sigrund_daemon_t } sigrund_workload_t:process { ptrace transition dyntransition };
+neverallow sigrund_workload_t *:process { transition dyntransition };
+
+files_search_all(sigrund_workload_t)
+files_read_all_files(sigrund_workload_t)
+files_read_all_symlinks(sigrund_workload_t)
+libs_use_ld_so(sigrund_workload_t)
+libs_use_shared_libs(sigrund_workload_t)
+kernel_read_system_state(sigrund_workload_t)
+dev_rw_null(sigrund_workload_t)
+miscfiles_read_localization(sigrund_workload_t)
+# Deliberate service data and denial-test labels, neither has broad file attrs.
+type sigrund_workload_data_t;
+type sigrund_workload_secret_t;
+fs_associate(sigrund_workload_data_t)
+fs_associate(sigrund_workload_secret_t)
+allow unconfined_t { sigrund_workload_data_t sigrund_workload_secret_t }:file { create read write open getattr setattr relabelto relabelfrom };
+allow unconfined_t { sigrund_workload_data_t sigrund_workload_secret_t }:dir { search read write open getattr setattr add_name remove_name relabelto relabelfrom };
+allow sigrund_workload_t sigrund_workload_data_t:dir { search read open getattr write add_name remove_name };
+allow sigrund_workload_t sigrund_workload_data_t:file manage_file_perms;
+allow sigrund_daemon_t { sigrund_workload_data_t sigrund_workload_secret_t }:dir { search read open getattr };
+allow sigrund_daemon_t { sigrund_workload_data_t sigrund_workload_secret_t }:file { read open getattr };
+neverallow sigrund_workload_t sigrund_workload_secret_t:file { read write execute };
+
+# Host execution keeps its existing host contract and ambient LSM semantics,
+# but may never run approved command bytes in the reserved producer domain.
+# This type has no domain/unconfined attributes or outgoing transitions.
+type sigrund_host_workload_t;
+role system_r types sigrund_host_workload_t;
+allow sigrund_daemon_t sigrund_host_workload_t:process { transition ptrace signal sigkill sigstop signull getattr sigchld };
+allow sigrund_daemon_t sigrund_host_workload_t:process2 { nnp_transition nosuid_transition };
+allow sigrund_daemon_t sigrund_host_workload_t:dir { search read open getattr };
+allow sigrund_daemon_t sigrund_host_workload_t:file { read open getattr };
+allow sigrund_daemon_t sigrund_host_workload_t:lnk_file { read getattr };
+allow init_t sigrund_host_workload_t:process { signal sigkill sigstop signull getattr getsched };
+allow sigrund_host_workload_t { init_t sigrund_daemon_t }:process sigchld;
+allow sigrund_host_workload_t sigrund_daemon_t:fd use;
+allow sigrund_host_workload_t sigrund_daemon_t:file { entrypoint execute read open getattr map };
+allow sigrund_host_workload_t file_type:file { entrypoint execute execute_no_trans read write append open getattr map ioctl lock setattr };
+allow sigrund_host_workload_t self:process { fork sigchld signal sigkill sigstop signull getcap getsched };
+allow sigrund_host_workload_t self:capability { net_bind_service };
+allow sigrund_host_workload_t self:dir { read open search getattr };
+allow sigrund_host_workload_t self:file { read open getattr };
+allow sigrund_host_workload_t self:lnk_file { read getattr };
+allow sigrund_host_workload_t self:fifo_file rw_fifo_file_perms;
+allow sigrund_host_workload_t domain:fd use;
+allow sigrund_host_workload_t domain:fifo_file rw_fifo_file_perms;
+allow sigrund_host_workload_t domain:file { read write append getattr ioctl };
+neverallow sigrund_host_workload_t *:process { transition dyntransition };
+neverallow sigrund_host_workload_t sigrund_daemon_t:process ptrace;
+files_search_all(sigrund_host_workload_t)
+files_read_all_files(sigrund_host_workload_t)
+files_read_all_symlinks(sigrund_host_workload_t)
+libs_use_ld_so(sigrund_host_workload_t)
+libs_use_shared_libs(sigrund_host_workload_t)
+kernel_read_system_state(sigrund_host_workload_t)
+dev_rw_null(sigrund_host_workload_t)
+miscfiles_read_localization(sigrund_host_workload_t)

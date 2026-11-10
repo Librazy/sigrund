@@ -70,6 +70,20 @@ impl BoundSocket {
     }
 
     pub(crate) fn bind(path: &Path, mode: u32) -> io::Result<Self> {
+        Self::bind_role(path, mode, None)
+    }
+    pub(crate) fn bind_public(
+        path: &Path,
+        mode: u32,
+        role: crate::client::PeerRole,
+    ) -> io::Result<Self> {
+        Self::bind_role(path, mode, Some(role))
+    }
+    fn bind_role(
+        path: &Path,
+        mode: u32,
+        role: Option<crate::client::PeerRole>,
+    ) -> io::Result<Self> {
         validate_absolute_path(path)?;
         if path.as_os_str().as_bytes().len() >= 108 {
             return Err(invalid("Unix socket path is too long"));
@@ -96,17 +110,21 @@ impl BoundSocket {
                 "refusing to replace an existing socket path",
             ));
         }
-        let raw = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
+        let fd = if let Some(role) = role {
+            crate::lsm::public_socket(role)?
+        } else {
+            let raw = unsafe {
+                libc::socket(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                )
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { OwnedFd::from_raw_fd(raw) }
         };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         disable_ancillary_credentials(fd.as_raw_fd())?;
         let mut address: libc::sockaddr_un = unsafe { zeroed() };
         address.sun_family = libc::AF_UNIX as _;
@@ -939,6 +957,16 @@ impl ForegroundDaemon {
         authorization_only: bool,
     ) -> io::Result<Self> {
         config.validate().map_err(|e| invalid(e.to_string()))?;
+        if authorization_only
+            && config
+                .namespace_profiles
+                .iter()
+                .any(|profile| profile.is_production())
+        {
+            return Err(invalid(
+                "production namespace profiles require execution startup probes",
+            ));
+        }
         signers
             .validate_against(&config)
             .map_err(|e| invalid(e.to_string()))?;
@@ -1012,6 +1040,25 @@ impl ForegroundDaemon {
             crate::execution::trace_available(),
             last_cap,
         )?;
+        if config
+            .namespace_profiles
+            .iter()
+            .any(|profile| profile.is_production())
+        {
+            let _policy_probe = target_budget
+                .reserve(
+                    0,
+                    sigrund_core::host_budget::Charge {
+                        helpers: 1,
+                        target_fds: 1,
+                        ..Default::default()
+                    },
+                )
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            target_budget
+                .with_transient_fd_copies(0, || crate::lsm::startup(&config.namespace_profiles))
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))??;
+        }
         // Startup recovery/orphan records may themselves cross high water.
         // Recheck before publishing either listener, retaining those records.
         if !resources.storage.check(&config)? {
@@ -1072,8 +1119,10 @@ impl ForegroundDaemon {
         if context_path == approval_socket {
             return Err(invalid("context and approval sockets must differ"));
         }
-        let mut context_listener = BoundSocket::bind(&context_path, 0o666)?;
-        let mut client = BoundSocket::bind(socket, 0o666)?;
+        let mut context_listener =
+            BoundSocket::bind_public(&context_path, 0o666, crate::client::PeerRole::Context)?;
+        let mut client =
+            BoundSocket::bind_public(socket, 0o666, crate::client::PeerRole::Execution)?;
         let mut approval = BoundSocket::bind(approval_socket, 0o600)?;
         let disposal = SocketDisposal::new()?;
         context_listener.disposal = Some(disposal.reserve().expect("new pool listener capacity"));
@@ -1222,7 +1271,7 @@ impl ForegroundDaemon {
         let mut stop_notified = false;
         let mut listeners_registered = true;
         let mut storage_pressure_reported = false;
-        service.ready();
+        service.ready()?;
         loop {
             let now = Instant::now();
             let timeout = connections

@@ -1,0 +1,39 @@
+# Fedora x86-64 production candidate; install daemon, workload and requester
+# SELinux modules first. Untrusted sources must remain in sigrund_requester_t;
+# unconfined host accounts are trusted administrators. See the packaged guide.
+# Explicitly choose requester IDs, registrations and ceilings before use.
+[[namespace_profiles]]
+apparmor = "unsupported"
+capabilities = []
+executable_model = "digest_memfd"
+join_namespaces = ["cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"]
+memory_max = 268435456
+memory_swap_max = 0
+no_new_privs = true
+pids_max = 32
+private_cgroup = true
+private_mount = true
+profile_id = "namespace-selinux-v1"
+schema = "sigrund.constraints.namespace-selinux.v1"
+seccomp = {audit_arch = 3221225534, errno = 13, kind = "deny_syscalls", syscalls = [110]}
+securebits = 15
+selinux = {context = "system_u:system_r:sigrund_workload_t:s0:c1,c2", enforcing = true, executable_context = "system_u:object_r:sigrund_workload_exec_t:s0", policy_change = "detect_and_terminate"}
+verify_exec_stop = true
+
+[[namespace_rules]]
+requester_uids = [1000]
+target_scope = "registered:container-b"
+target_uids = [12001]
+target_gids = [12001]
+supplementary_gids = []
+profile_sha256 = "93dd67ada6a40da69e0688227283bf380ef10ae46dedfdb0f63b86d16a66fbf4"
+cross_owner = true
+
+[[namespace_rules]]
+requester_uids = [1000]
+target_scope = "self"
+target_uids = [12001]
+target_gids = [12001]
+supplementary_gids = []
+profile_sha256 = "93dd67ada6a40da69e0688227283bf380ef10ae46dedfdb0f63b86d16a66fbf4"
+cross_owner = false

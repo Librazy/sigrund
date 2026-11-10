@@ -143,7 +143,17 @@ fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Result<()> {
     }
     Ok(())
 }
-pub(crate) fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum PeerRole {
+    Execution = 0,
+    Context = 1,
+    Anchor = 2,
+    // Approval and other administrative endpoints only admit initial-userns
+    // host-root authentication. Never accept a public endpoint label for them.
+    HostOnly = 3,
+}
+pub(crate) fn connect(path: &Path, signals: &Signals, role: PeerRole) -> io::Result<OwnedFd> {
     let bytes = path.as_os_str().as_bytes();
     if bytes.len() >= 108 || bytes.contains(&0) {
         return Err(io::Error::other("invalid socket path"));
@@ -221,21 +231,25 @@ pub(crate) fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
             return Err(io::Error::from_raw_os_error(error));
         }
     }
-    verify_daemon_peer(&fd)?;
+    verify_daemon_peer(&fd, role)?;
     Ok(fd)
 }
-fn verify_daemon_peer(fd: &OwnedFd) -> io::Result<()> {
+fn verify_daemon_peer(fd: &OwnedFd, role: PeerRole) -> io::Result<()> {
     transport::disable_ancillary_credentials(fd.as_raw_fd())?;
-    if transport::daemon_peer_credentials(fd.as_raw_fd())?.uid != 0 {
+    if unsafe { sigrun_authenticate_host_peer(fd.as_raw_fd(), role as u32) } != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "daemon peer is not UID 0",
+            format!(
+                "cannot authenticate host daemon: {}",
+                io::Error::last_os_error()
+            ),
         ));
     }
     Ok(())
 }
 
 unsafe extern "C" {
+    fn sigrun_authenticate_host_peer(socket: i32, role: u32) -> i32;
     fn sigrun_spawn_self_connector(
         public: *const libc::sockaddr_un,
         anchor: *const libc::sockaddr_un,
@@ -313,7 +327,7 @@ fn connect_self(path: &Path, signals: &Signals) -> io::Result<(OwnedFd, SelfConn
                 ));
             }
             let socket = received.rights.remove(0);
-            verify_daemon_peer(&socket)?;
+            verify_daemon_peer(&socket, PeerRole::Execution)?;
             return Ok((socket, connector));
         }
         let mut fds = [
@@ -538,7 +552,7 @@ fn public_context(
     path: &Path,
     signals: &Signals,
 ) -> io::Result<sigrund_core::protocol::PublicContext> {
-    let socket = connect(&context_path(path), signals)?;
+    let socket = connect(&context_path(path), signals, PeerRole::Context)?;
     let deadline = Instant::now() + transport::FRAME_TIMEOUT;
     let mut writer = FrameWriter::control(
         FrameType::ClientContextQuery,
@@ -824,7 +838,7 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
         let (socket, connector) = connect_self(path, &signals)?;
         (socket, Some(connector))
     } else {
-        (connect(path, &signals)?, None)
+        (connect(path, &signals, PeerRole::Execution)?, None)
     };
     let wake_raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     if wake_raw < 0 {
@@ -1047,6 +1061,27 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
         ];
         poll(&mut fds, deadline)?;
     }
+}
+
+/// Connect a disposable, single-threaded anchor to an authenticated host peer.
+/// Successful capture holds this process until the daemon disposes the target.
+pub fn run_dedicated_anchor(path: &Path) -> io::Result<()> {
+    unsafe extern "C" {
+        fn sigrun_run_dedicated_anchor(address: *const libc::sockaddr_un) -> i32;
+    }
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { zeroed() };
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::other("invalid rendezvous path"));
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    if unsafe { sigrun_run_dedicated_anchor(&address) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Err(io::Error::other("anchor unexpectedly returned"))
 }
 
 #[cfg(test)]

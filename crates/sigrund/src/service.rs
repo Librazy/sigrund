@@ -50,11 +50,11 @@ impl Service {
             last: Instant::now(),
         })
     }
-    pub fn ready(&self) {
-        self.send(b"READY=1\nSTATUS=Accepting requests");
+    pub fn ready(&self) -> io::Result<()> {
+        self.send(b"READY=1\nSTATUS=Accepting requests")
     }
     pub fn stopping(&self) {
-        self.send(b"STOPPING=1\nSTATUS=Reconciling and cleaning up; admission closed");
+        let _ = self.send(b"STOPPING=1\nSTATUS=Reconciling and cleaning up; admission closed");
     }
     pub fn watchdog_wait(&self, now: Instant) -> Option<Duration> {
         self.interval
@@ -65,20 +65,50 @@ impl Service {
             .interval
             .is_some_and(|interval| self.last.elapsed() >= interval)
         {
-            self.send(b"WATCHDOG=1");
+            let _ = self.send(b"WATCHDOG=1");
             self.last = Instant::now();
         }
     }
-    fn send(&self, message: &[u8]) {
+    fn send(&self, message: &[u8]) -> io::Result<()> {
         if let Some((socket, address)) = &self.socket {
-            let _ = socket.send_to_addr(message, address);
+            let sent = socket.send_to_addr(message, address)?;
+            if sent != message.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "incomplete service notification",
+                ));
+            }
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_fails_when_configured_delivery_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notify");
+        let service = Service {
+            socket: Some((
+                UnixDatagram::unbound().unwrap(),
+                SocketAddr::from_pathname(&path).unwrap(),
+            )),
+            interval: None,
+            last: Instant::now(),
+        };
+        assert!(service.ready().is_err());
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        service.ready().unwrap();
+        let mut bytes = [0u8; 128];
+        let size = receiver.recv(&mut bytes).unwrap();
+        assert_eq!(&bytes[..size], b"READY=1\nSTATUS=Accepting requests");
+    }
 
     #[test]
     fn watchdog_wait_tracks_remaining_interval() {

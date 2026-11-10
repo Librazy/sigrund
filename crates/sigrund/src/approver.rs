@@ -365,7 +365,11 @@ fn connect_broker(path: &Path, signals: &Signals) -> io::Result<UnixStream> {
             "untrusted broker socket",
         ));
     }
-    let socket = UnixStream::from(crate::client::connect(&pinned, signals)?);
+    let socket = UnixStream::from(crate::client::connect(
+        &pinned,
+        signals,
+        crate::client::PeerRole::HostOnly,
+    )?);
     socket.set_nonblocking(true)?;
     disable_ancillary_credentials(socket.as_raw_fd())?;
     if peer_credentials(socket.as_raw_fd())?.uid != 0 {
@@ -621,7 +625,12 @@ fn render_process_request(
     let key = PublicKey::from_openssh(&signer.public_key)
         .map_err(|_| invalid("invalid configured SSH key"))?;
     let mut out = format!(
-        "\nPhase 2 private review\nexec_id = {}\nsigner_id = {}\nkey_fingerprint = {}\n",
+        "\n{}\nexec_id = {}\nsigner_id = {}\nkey_fingerprint = {}\n",
+        if review.constraints.executes() {
+            "Namespace execution request"
+        } else {
+            "Namespace private review (execution disabled)"
+        },
         quote(&request.exec_id),
         quote(&signer.signer_id),
         key.fingerprint(HashAlg::Sha256)

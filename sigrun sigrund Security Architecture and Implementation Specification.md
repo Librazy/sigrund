@@ -2520,6 +2520,19 @@ mapped UIDs and requester user-namespace authority, or verified pre-authorizatio
 rejection of that combination. Document the deployment's policy-change guarantee
 under Section 5.5; a final observation cannot serialize policy replacement.
 
+The qualified Phase 4 profile extends the first installed host-to-B gate with
+real rootless A to registered B, host and self on Fedora 44 x86-64 with enforcing
+SELinux. Its [scope and evidence record](docs/NAMESPACE_PHASE4.md) includes genuine
+and counterfeit endpoint checks, different-UID owner injection control/denial,
+lifecycle, consumption and matching host regression evidence. The
+[operator recipe](docs/NAMESPACE_PHASE4_OPERATOR.md) requires locked untrusted
+accounts in the enforcing requester domain and trusted unconfined host
+administrators. This does not qualify arbitrary unconfined containers, other
+namespace topologies or the independent later gates. Current experimental
+execution rejects nonroot requesters with known destination namespace-owner authority, including
+self, before review; the historical Phase 3 result does not qualify that current
+path.
+
 A thin-only production profile MUST reject namespace full and standalone signed
 input without fallback, consumption or spawn. Full-only/export MUST NOT invoke
 privileged preparation. Verify these exclusions against the CLI and raw protocol;

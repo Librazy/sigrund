@@ -56,6 +56,7 @@ fi
 %files -n sigrund
 /usr/bin/sigrund-approve
 /usr/bin/sigrundctl
+/usr/bin/sigrund-anchor
 /usr/libexec/sigrund
 /usr/lib/systemd/system/sigrund.service
 %dir /etc/sigrund

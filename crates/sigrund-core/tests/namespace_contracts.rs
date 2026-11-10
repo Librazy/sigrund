@@ -234,3 +234,61 @@ fn experimental_profile_requires_a_distinct_exact_contract() {
     old.selinux.enforcing = false;
     assert!(old.validate().is_err());
 }
+
+#[test]
+fn selinux_profile_binds_complete_confinement_and_independent_digests() {
+    use sigrund_core::host::{ExecutionBinding, Record};
+    let bytes = include_bytes!("fixtures/v3-namespace/selinux-constraints.json");
+    let profile = Constraints::parse(bytes).unwrap();
+    assert!(profile.is_production() && profile.executes());
+    assert_eq!(profile.canonical().unwrap(), bytes);
+    let hashes: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/v3-namespace/selinux-sha256.json"))
+            .unwrap();
+    assert_eq!(profile.sha256().unwrap(), hashes["constraints"]);
+    let binding = ExecutionBinding::parse(include_bytes!(
+        "fixtures/v3-namespace/selinux-execution-binding.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        binding.security_constraints.profile_sha256,
+        profile.sha256().unwrap()
+    );
+    assert_eq!(binding.sha256().unwrap(), hashes["execution_binding"]);
+    let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    for (pointer, value) in [
+        (
+            "/schema",
+            serde_json::json!("sigrund.constraints.namespace-selinux.v2"),
+        ),
+        (
+            "/profile_id",
+            serde_json::json!("namespace-experimental-v1"),
+        ),
+        ("/selinux/enforcing", serde_json::json!(false)),
+        (
+            "/selinux/context",
+            serde_json::json!("system_u:system_r:sigrund_workload_t:s0"),
+        ),
+        ("/selinux/executable_context", serde_json::Value::Null),
+        ("/selinux/policy_change", serde_json::json!("unmanaged")),
+        ("/seccomp/syscalls", serde_json::json!([39])),
+        ("/seccomp/errno", serde_json::json!(1)),
+        ("/executable_model", serde_json::json!("digest_direct")),
+        ("/no_new_privs", serde_json::json!(false)),
+        ("/verify_exec_stop", serde_json::json!(false)),
+    ] {
+        let mut substituted = raw.clone();
+        *substituted.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            Constraints::parse(&serde_json::to_vec(&substituted).unwrap()).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut old: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/v3-namespace/experimental-constraints.json"
+    ))
+    .unwrap();
+    old["selinux"]["executable_context"] = serde_json::Value::Null;
+    assert!(Constraints::parse(&serde_json::to_vec(&old).unwrap()).is_err());
+}

@@ -468,31 +468,40 @@ manager resolvers in Phase 5.
 
 ### Phase 4 — First production namespace profile
 
-**Status: planned.** The first release candidate is one host requester running a
-thin, one-time SSH/stdio command as a named nonroot service account in an
-already-running, explicitly registered rootless B. Use the Phase 3 host → B
-topology as the starting point. Passing Phase 3 on that topology did not qualify
-production confinement or an installed operator workflow.
+**Status: the first thin-only production gate is qualified on Fedora 44 x86-64.**
+The [Phase 4 record](NAMESPACE_PHASE4.md) and
+[sanitized evidence](evidence/namespace-phase4-fedora44-20261110.json) cover the
+installed host → registered rootless B route and real rootless A → B, A → host
+and A → self. The explicit `namespace-selinux-v1` profile requires enforcing
+requester/producer/workload domains, locked untrusted accounts and trusted
+unconfined host administrators. Follow the
+[installed operator recipe](NAMESPACE_PHASE4_OPERATOR.md). Qualification applies
+to this named deployment and thin one-time SSH/stdio scope. The independent later
+gates below remain closed until separately qualified.
 
 **Carry forward two Phase 3 security checks:**
 
-- **Client authentication (NS-01).** The current client can send intent and
+- **Client authentication (NS-01).** The Phase 3 client could send intent and
   finite stdin to a substitute socket whose unprivileged host owner appears
   as UID 0 to a rootless requester. Reject an unprovable peer before sending
   a query, request or rights. Test counterfeit context and execution listeners
   independently, and retain a genuine host-peer positive control. This is a
   client disclosure, not evidence of host authorization bypass. Supporting a
   rootless requester is a separate gate from running *into* rootless B.
+  The installed qualification passes genuine rootless endpoints on all four
+  routes and rejects counterfeit context, execution and anchor listeners before
+  data or rights. The exact requester-domain prerequisite is part of that scope.
 - **Requester injection (NS-05).** Exercise a requester with a different mapped
   UID from the workload but ownership of, or tracing authority over, B's user
   namespace. Attempt attachment after exec-stop release; include a control that
   demonstrates the attempted trace can succeed without the claimed guard. This
-  is an open evidence gap. If injection succeeds, or prevention cannot be
-  established, reject that combination before authorization in the current
-  experimental profile. Qualify only combinations that exclude this authority.
+  is qualified for the enforcing production profile: the different-UID owner
+  control attaches successfully, while attachment to the released self workload
+  is denied. The experimental profile rejects known nonroot namespace-owner
+  authority before destination preparation/review, including self.
 
-**First production gate (NS-16).** Deliver and qualify all of the following on
-one named deployment, from installed packages:
+**First production gate (NS-16), passed for the deployment above.** The
+qualification records all of the following from installed packages:
 
 1. **Bring B online.** Document the exact OS, kernel, namespace ownership and
    mappings, delegation, socket exposure and LSM prerequisites. Provision fresh
@@ -532,7 +541,7 @@ one named deployment, from installed packages:
 | Capability | Evidence required before enabling it |
 | --- | --- |
 | Namespace client-full, export and offline redemption (G-05) | Trusted epoch binding distribution, requester-limited destination access, cloned ComposeFS/PrivateMounts evidence where applicable, preserved provenance, signed mismatch and replay rejection. |
-| Additional sources and routes | Establish host authority in each source user namespace; test real and substitute endpoints, original-connector attribution and applicable self/anchor lifetimes. Never accept overflow or mapped UID zero alone as host-root proof. |
+| Other source topologies and routes | Establish host authority in each source user namespace; test real and substitute endpoints, original-connector attribution and applicable self/anchor lifetimes. Never accept overflow or mapped UID zero alone as host-root proof. |
 | Other LSM stacks, executable models or policy-change guarantees (G-04) | Qualify each combination on its enforcing system with NNP and tracing intact. For a claim that no instruction runs under concurrently replaced policy, demonstrate serialization for the complete job lifetime; final token sampling is insufficient. Keep the strict combination blocked otherwise. |
 
 Manager-backed identity and teardown remain Phase 5. A manager-free profile

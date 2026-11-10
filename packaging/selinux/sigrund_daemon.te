@@ -1,0 +1,120 @@
+policy_module(sigrund_daemon, 1.0.0)
+
+type sigrund_daemon_t;
+type sigrund_daemon_exec_t;
+# Do not add the generic domain attribute: Fedora's unconfined domains may
+# dynamically transition to generic domains. Such a producer could forge the
+# client trust labels from a rootless filesystem before daemon main runs.
+files_type(sigrund_daemon_exec_t)
+gen_require(`
+    type init_t;
+    attribute domain;
+    attribute file_type;
+    role system_r;
+')
+role system_r types sigrund_daemon_t;
+domtrans_pattern(init_t, sigrund_daemon_exec_t, sigrund_daemon_t)
+allow sigrund_daemon_t sigrund_daemon_exec_t:file entrypoint;
+allow sigrund_daemon_t init_t:process sigchld;
+allow init_t sigrund_daemon_t:process { signal sigkill sigstop signull getattr getsched };
+allow domain sigrund_daemon_t:process sigchld;
+allow domain sigrund_daemon_t:unix_stream_socket { connectto read write getattr getopt setopt shutdown ioctl };
+neverallow { domain -init_t } sigrund_daemon_t:process { transition dyntransition };
+# Host entry must stay a secure, untraced exec from the initial authority.
+# Rootless capabilities must not make guest loaders or an attached tracer a
+# producer for the reserved client-authentication labels.
+neverallow domain sigrund_daemon_t:process { dyntransition ptrace noatsecure };
+neverallow domain sigrund_daemon_t:process2 { nnp_transition nosuid_transition };
+
+# Reserved socket object SIDs, deliberately without broad type attributes.
+type sigrund_execution_socket_t;
+type sigrund_context_socket_t;
+type sigrund_anchor_socket_t;
+allow sigrund_daemon_t self:process { fork sigchld sigkill sigstop signal signull setexec setsockcreate getsched setsched getcap setcap ptrace getattr getpgid setpgid getsession };
+allow sigrund_daemon_t self:capability { chown dac_override dac_read_search fowner fsetid kill setgid setuid setpcap sys_admin sys_chroot sys_ptrace sys_resource };
+allow sigrund_daemon_t self:capability2 { checkpoint_restore };
+allow sigrund_daemon_t self:unix_stream_socket create_stream_socket_perms;
+allow sigrund_daemon_t self:unix_dgram_socket create_socket_perms;
+allow sigrund_daemon_t self:fifo_file rw_fifo_file_perms;
+allow sigrund_daemon_t self:fd use;
+allow sigrund_daemon_t self:dir { search read open getattr };
+allow sigrund_daemon_t self:lnk_file { read getattr };
+allow sigrund_daemon_t self:file { create open read write getattr setattr ioctl map execute execute_no_trans relabelfrom };
+allow sigrund_daemon_t self:anon_inode { create read write getattr ioctl };
+allow sigrund_daemon_t self:cap_userns { sys_admin sys_chroot setuid setgid setpcap sys_ptrace dac_override dac_read_search fowner kill };
+gen_require(`
+    type security_t;
+    type nsfs_t;
+')
+allow sigrund_daemon_t security_t:file map;
+allow sigrund_daemon_t nsfs_t:file { open read getattr ioctl };
+
+allow sigrund_daemon_t { sigrund_execution_socket_t sigrund_context_socket_t sigrund_anchor_socket_t }:unix_stream_socket create_stream_socket_perms;
+allow domain { sigrund_execution_socket_t sigrund_context_socket_t sigrund_anchor_socket_t }:unix_stream_socket { connectto read write getattr getopt setopt shutdown ioctl };
+neverallow { domain -sigrund_daemon_t } { sigrund_execution_socket_t sigrund_context_socket_t sigrund_anchor_socket_t }:unix_stream_socket { create relabelto relabelfrom };
+
+# Capture and verification deliberately inspect authenticated destination tasks.
+allow sigrund_daemon_t domain:process { ptrace signal sigkill sigstop signull getattr getsched };
+allow sigrund_daemon_t domain:fd use;
+allow sigrund_daemon_t domain:fifo_file rw_fifo_file_perms;
+allow sigrund_daemon_t domain:unix_stream_socket { read write getattr getopt setopt shutdown ioctl };
+domain_read_all_domains_state(sigrund_daemon_t)
+kernel_read_all_proc(sigrund_daemon_t)
+kernel_read_all_sysctls(sigrund_daemon_t)
+files_read_all_files(sigrund_daemon_t)
+files_read_all_symlinks(sigrund_daemon_t)
+files_search_all(sigrund_daemon_t)
+files_list_all(sigrund_daemon_t)
+files_getattr_all_dirs(sigrund_daemon_t)
+files_getattr_all_files(sigrund_daemon_t)
+files_mounton_non_security(sigrund_daemon_t)
+files_mmap_exec_all_files(sigrund_daemon_t)
+allow sigrund_daemon_t file_type:file execute_no_trans;
+libs_use_ld_so(sigrund_daemon_t)
+libs_use_shared_libs(sigrund_daemon_t)
+corecmd_exec_bin(sigrund_daemon_t)
+can_exec(sigrund_daemon_t, sigrund_daemon_exec_t)
+
+type sigrund_etc_t;
+files_config_file(sigrund_etc_t)
+read_files_pattern(sigrund_daemon_t, sigrund_etc_t, sigrund_etc_t)
+type sigrund_state_t;
+files_type(sigrund_state_t)
+manage_dirs_pattern(sigrund_daemon_t, sigrund_state_t, sigrund_state_t)
+manage_files_pattern(sigrund_daemon_t, sigrund_state_t, sigrund_state_t)
+type sigrund_log_t;
+logging_log_file(sigrund_log_t)
+manage_dirs_pattern(sigrund_daemon_t, sigrund_log_t, sigrund_log_t)
+manage_files_pattern(sigrund_daemon_t, sigrund_log_t, sigrund_log_t)
+type sigrund_runtime_t;
+files_pid_file(sigrund_runtime_t)
+manage_dirs_pattern(sigrund_daemon_t, sigrund_runtime_t, sigrund_runtime_t)
+manage_sock_files_pattern(sigrund_daemon_t, sigrund_runtime_t, sigrund_runtime_t)
+manage_files_pattern(sigrund_daemon_t, sigrund_runtime_t, sigrund_runtime_t)
+
+fs_getattr_all_fs(sigrund_daemon_t)
+fs_manage_cgroup_dirs(sigrund_daemon_t)
+fs_manage_cgroup_files(sigrund_daemon_t)
+fs_mount_cgroup(sigrund_daemon_t)
+fs_remount_cgroup(sigrund_daemon_t)
+fs_mounton_cgroup(sigrund_daemon_t)
+fs_mount_tmpfs(sigrund_daemon_t)
+fs_remount_tmpfs(sigrund_daemon_t)
+fs_unmount_tmpfs(sigrund_daemon_t)
+fs_read_tmpfs_files(sigrund_daemon_t)
+fs_manage_tmpfs_dirs(sigrund_daemon_t)
+fs_manage_tmpfs_files(sigrund_daemon_t)
+fs_manage_tmpfs_sockets(sigrund_daemon_t)
+fs_tmpfs_filetrans(sigrund_daemon_t, sigrund_runtime_t, { dir file sock_file })
+selinux_get_enforce_mode(sigrund_daemon_t)
+selinux_compute_access_vector(sigrund_daemon_t)
+selinux_validate_context(sigrund_daemon_t)
+selinux_read_security_files(sigrund_daemon_t)
+dev_read_urand(sigrund_daemon_t)
+dev_rw_null(sigrund_daemon_t)
+dev_read_sysfs(sigrund_daemon_t)
+init_use_fds(sigrund_daemon_t)
+init_use_notify(sigrund_daemon_t)
+logging_send_syslog_msg(sigrund_daemon_t)
+logging_stream_connect_syslog(sigrund_daemon_t)
+miscfiles_read_localization(sigrund_daemon_t)

@@ -61,7 +61,7 @@ pub(crate) fn verify(
         {
             return Err(policy());
         }
-        if process.lease.constraints().schema == "sigrund.constraints.namespace-experimental.v1" {
+        if process.lease.constraints().executes() {
             if gid != request.requester_gid {
                 return Err(policy());
             }

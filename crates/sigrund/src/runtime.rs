@@ -434,6 +434,24 @@ impl Execution {
             let task = {
                 let job = self.jobs.get_mut(&token).expect("registered tracee");
                 if job.checkpoint
+                    && stop.status == (libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8))
+                    && job.owner.as_ref().is_some_and(|owner| {
+                        owner
+                            .job
+                            .lease
+                            .request()
+                            .process
+                            .as_ref()
+                            .is_some_and(|process| process.lease.constraints().is_production())
+                    })
+                    && let Err(error) = crate::lsm::verify_filter(stop.pid)
+                {
+                    job.failure_status = "EXEC_FAILED";
+                    job.failure = Some(error.to_string());
+                    job.lifecycle.cancel();
+                    continue;
+                }
+                if job.checkpoint
                     && !job.exec_verified
                     && !job.task
                     && Instant::now() < job.deadline.expect("spawn deadline")

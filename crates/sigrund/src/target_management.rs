@@ -326,7 +326,8 @@ impl Management {
         );
         let disposal = crate::socket_disposal::SocketDisposal::new()?;
         let control = BoundSocket::bind(&management_path(socket), 0o600)?;
-        let mut anchors = BoundSocket::bind(&anchor_path(socket), 0o666)?;
+        let mut anchors =
+            BoundSocket::bind_public(&anchor_path(socket), 0o666, crate::client::PeerRole::Anchor)?;
         anchors.protect_close(
             disposal
                 .reserve()

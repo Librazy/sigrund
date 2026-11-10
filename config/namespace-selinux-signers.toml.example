@@ -1,0 +1,19 @@
+# Append to the one selected [[signers]] entry; independently restrict its
+# allowed_requester_uids, executable roots, TTL and capabilities as usual.
+[[signers.namespace_rules]]
+requester_uids = [1000]
+target_scope = "registered:container-b"
+target_uids = [12001]
+target_gids = [12001]
+supplementary_gids = []
+profile_sha256 = "93dd67ada6a40da69e0688227283bf380ef10ae46dedfdb0f63b86d16a66fbf4"
+cross_owner = true
+
+[[signers.namespace_rules]]
+requester_uids = [1000]
+target_scope = "self"
+target_uids = [12001]
+target_gids = [12001]
+supplementary_gids = []
+profile_sha256 = "93dd67ada6a40da69e0688227283bf380ef10ae46dedfdb0f63b86d16a66fbf4"
+cross_owner = false

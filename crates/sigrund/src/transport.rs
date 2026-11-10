@@ -30,13 +30,6 @@ pub fn peer_credentials(fd: RawFd) -> io::Result<PeerCredentials> {
     read_peer_credentials(fd, true)
 }
 
-/// A host daemon can be outside a client's PID namespace. Linux then reports
-/// PID zero while still authenticating its credentials in the client's userns.
-/// Server admission continues to require a visible, positive connector PID.
-pub(crate) fn daemon_peer_credentials(fd: RawFd) -> io::Result<PeerCredentials> {
-    read_peer_credentials(fd, false)
-}
-
 fn read_peer_credentials(fd: RawFd, visible_pid: bool) -> io::Result<PeerCredentials> {
     let mut credentials: libc::ucred = unsafe { zeroed() };
     let mut length = size_of::<libc::ucred>() as libc::socklen_t;

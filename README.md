@@ -13,7 +13,9 @@ immutable security profile. Phase 2 adds registered process environments and
 private destination preparation/review. Phase 3 adds opt-in experimental native
 execution for registered/process and authenticated self targets, with an actual
 final-child exec checkpoint. Historical namespace preview profiles retain their
-scheduled TIMEOUT without consumption or execution. See the
+scheduled TIMEOUT without consumption or execution. Phase 4 adds an explicitly
+selected, enforcing SELinux namespace profile for thin one-time approval on the
+[qualified Fedora deployment](docs/NAMESPACE_PHASE4.md). See the
 [Phase 3 workflow and platform scope](docs/NAMESPACE_PHASE3.md),
 [Phase 2 operator and qualification guide](docs/NAMESPACE_PHASE2.md), the
 [Phase 1 implementation and qualification record](docs/NAMESPACE_PHASE1.md),
@@ -151,11 +153,16 @@ The runtime executes host jobs. The explicit `namespace-experimental-v1` profile
 enables thin requests for `registered:ID`, `process:DAEMON_PID` and `self`.
 Root registers/revokes dedicated anchors; self captures its authenticated
 connector through the `.anchor` endpoint. The qualified experimental topology
-and constraints are in the [Phase 3 guide](docs/NAMESPACE_PHASE3.md). The
-[Phase 4 roadmap](docs/NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
-targets one installed, thin-only host → registered rootless container workflow.
-A rootless *requester* is outside current qualification: a substitute server can
-appear as UID 0 in its user namespace. Run the client on the host for this route.
+and constraints are in the [Phase 3 guide](docs/NAMESPACE_PHASE3.md). The explicit `namespace-selinux-v1` production profile is qualified on Fedora 44
+x86-64 for installed thin one-time SSH/stdio: host → registered rootless B,
+real rootless A → B, A → host and A → self. Follow the
+[installed operator recipe](docs/NAMESPACE_PHASE4_OPERATOR.md) and
+[scope/evidence record](docs/NAMESPACE_PHASE4.md). Untrusted accounts must remain
+in the enforcing requester domain; all unconfined host accounts are trusted
+administrators. Arbitrary unconfined containers and other platforms/topologies
+are not qualified. The client authenticates each host endpoint before disclosure.
+Experimental execution excludes known namespace-owner injection authority;
+nonroot experimental self rejects before review.
 The [fresh provisioning and binding export procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export)
 explains the cutover, private bundle distribution and offline signing.
 

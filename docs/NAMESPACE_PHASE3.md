@@ -2,6 +2,12 @@
 
 ## Implementation status
 
+The record below describes the qualified Phase 3 snapshot. Subsequent
+[Phase 4 security gates](NAMESPACE_PHASE4.md) reject counterfeit rootless peers
+and nonroot requesters with known namespace-owner injection authority, including
+experimental self. Do not use the historical four-route result as qualification
+for the current restricted self path or for a real rootless source.
+
 Phase 3 is complete for the declared experimental profile and topology. The
 constraint contract, exact-warrant
 verification record, acquisition-time namespace FD handoff, staged native
@@ -182,20 +188,22 @@ and private namespaces/root. Cross-owner B and same-owner self rules are distinc
 
 The qualified A can see peer PID zero when the daemon is outside A's PID
 namespace; daemon admission still requires a visible original connector. Do
-not use this client from a rootless user namespace to submit secrets or grants:
-the current client checks peer UID zero **as seen by the caller**. A genuine
+not use that historical client from a rootless user namespace to submit secrets
+or grants: that snapshot checked peer UID zero **as seen by the caller**. A genuine
 host daemon can appear unmapped and be refused, while a substituted socket
 owned by mapped root can be accepted and receive request data and stdin.
 This concerns client disclosure; a substitute cannot approve a job at the real
 daemon. Host → registered B uses a host-side client.
 
 The [Phase 4 roadmap](NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
-tracks that client correction and the outstanding post-release injection test
-for a requester with authority in the target user namespace. Different mapped
-UIDs alone do not establish protection against tracing. Nested/mixed ownership,
+records the subsequent client correction and qualified post-release injection
+guard in its enforcing production profile. The installed Phase 4 recipe supports
+real rootless sources under its explicit requester-domain prerequisite. Different
+mapped UIDs alone do not establish protection against tracing. Nested/mixed ownership,
 idmapped mounts, other runtime architectures and manager-specific deployments
-remain unqualified. The first production gate will exercise installation and
-operation of a dedicated anchor; the fixture recipe above is experimental.
+remain unqualified. The installed Phase 4 operator recipe qualifies a dedicated
+anchor on its named deployment; the fixture recipe above remains historical
+experimental evidence.
 
 The whole workspace also passes an ARM64 compile check, including the connector's
 portable wait syscall. Namespace runtime qualification remains limited to the

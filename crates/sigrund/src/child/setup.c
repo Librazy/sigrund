@@ -22,25 +22,10 @@
 /* All storage, including mountinfo/group read-back buffers, is allocated by
  * the parent. No allocator, parser library, stdio, Rust, or destructor runs
  * between the child return of clone3 and execveat/_exit. */
-struct child_spec {
-    int input, output, error, executable, sync;
-    uint32_t uid, gid, mask, last_cap;
-    uint64_t capabilities;
-    const uint32_t *groups;
-    size_t groups_len;
-    const char *cwd;
-    const char *direct_path;
-    const char *const *argv;
-    const char *const *envp;
-    char *mountinfo;
-    size_t mountinfo_capacity;
-    uint32_t *group_check;
-    int isolated;
-    int gate_read, gate_write, checkpoint;
-    int namespace_mode;
-};
+#include "launcher_abi.h"
+#include "namespace_filter.h"
 struct setup_frame { uint32_t step; int32_t error; };
-_Static_assert(sizeof(struct setup_frame) == 8, "sync ABI");
+_Static_assert(sizeof(struct setup_frame) == SG_EVENT_BYTES, "sync ABI");
 
 static void die(int sync, unsigned step, int error) {
     const struct setup_frame frame = { step, error > 0 ? error : EIO };
@@ -51,6 +36,14 @@ static void die(int sync, unsigned step, int error) {
 }
 #define CHECK(step, expr) do { if ((expr) < 0) die(sync, step, errno); } while (0)
 #define ASSERT(step, expr) do { if (!(expr)) die(sync, step, EPERM); } while (0)
+
+static const char host_workload_context[] = "system_u:system_r:sigrund_host_workload_t:s0";
+static void set_exec_context(const char *context, size_t length, int sync) {
+    int attr = syscall(SYS_openat, AT_FDCWD, "/proc/self/attr/exec", O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+    CHECK(22, attr);
+    ASSERT(22, syscall(SYS_write, attr, context, length) == (ssize_t)length);
+    CHECK(22, syscall(SYS_close, attr));
+}
 
 /* Allocation-free mountinfo parser. A line is split into at most 128 fields;
  * reject truncation, escaped/bad mount names, unexpected tags and overflow.
@@ -141,6 +134,11 @@ static void lock_mounts(const struct child_spec *spec, int sync) {
 
 static void run_child(const struct child_spec *s) {
     int sync = s->sync;
+    /* A nonroot host command must not inherit the reserved socket producer's
+     * authority. Set exec_sid before any private mounts or credential changes.
+     * Namespace launchers establish it before entering the destination. */
+    if (s->producer_guard && !s->namespace_mode)
+        set_exec_context(host_workload_context, sizeof(host_workload_context)-1, sync);
     if (s->checkpoint) {
         syscall(SYS_close, s->gate_write);
         char byte;
@@ -240,6 +238,11 @@ static void run_child(const struct child_spec *s) {
         observed = syscall(SYS_prctl, PR_CAPBSET_READ, cap, 0, 0, 0);
         CHECK(10, observed); ASSERT(10, observed == wanted);
     }
+    if (s->production) {
+        struct sock_fprog program = {.len = sizeof(sigrund_namespace_filter) / sizeof(struct sock_filter),
+                                    .filter = (struct sock_filter *)sigrund_namespace_filter};
+        CHECK(22, syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program));
+    }
     struct setup_frame ready = {0,0};
     if (syscall(SYS_write, sync, &ready, sizeof(ready)) != sizeof(ready)) {
         syscall(SYS_exit_group, 127);
@@ -265,11 +268,6 @@ int sigrund_spawn(const struct child_spec *spec, int cgroup_fd, int *pidfd) {
 /* Every message is exactly two native u32 values. Only the final-child message
  * carries a single kernel-created pidfd. The coordinator grants the clone only
  * after setup has finished and its short reaper barrier has been reserved. */
-struct namespace_spec {
-    int namespaces[8];
-    uint32_t enter_mask;
-    int root, cwd, control;
-};
 static void namespace_message(int control, uint32_t kind, uint32_t value, int fd, int sync) {
     uint32_t words[2] = {kind, value};
     struct iovec iov = {.iov_base = words, .iov_len = sizeof(words)};
@@ -325,10 +323,18 @@ void sigrund_run_namespace_launcher(const struct child_spec *original, const str
     struct namespace_spec n = *source;
     int sync = s.sync;
     CHECK(12, syscall(SYS_prctl, PR_SET_DUMPABLE, 0, 0, 0, 0));
-    namespace_message(n.control, 3, 0, -1, sync);
+    namespace_message(n.control, SG_EVENT_BOOTSTRAP, 0, -1, sync);
     char bootstrap; long received;
     do { received = syscall(SYS_read, n.control, &bootstrap, 1); } while (received < 0 && errno == EINTR);
     ASSERT(12, received == 1 && bootstrap == 'B');
+    if (s.production) {
+        /* Set the exec transition while procfs is still the trusted host tree.
+         * fork preserves exec_sid; the launcher itself never execs again. */
+        static const char context[] = "system_u:system_r:sigrund_workload_t:s0:c1,c2";
+        set_exec_context(context, sizeof(context)-1, sync);
+    } else if (s.producer_guard) {
+        set_exec_context(host_workload_context, sizeof(host_workload_context)-1, sync);
+    }
     CHECK(13, syscall(SYS_setgroups, 0, NULL));
     static const unsigned order[8] = {6,0,1,2,3,7,5,4};
     for (unsigned i=0;i<8;++i) {
@@ -366,7 +372,7 @@ void sigrund_run_namespace_launcher(const struct child_spec *original, const str
     CHECK(21, syscall(SYS_close, visible));
     /* Close all retained source roots/namespaces before creating the workload. */
     CHECK(14, syscall(SYS_close_range, 16U, 25U, 0U));
-    namespace_message(n.control, 1, 0, -1, sync);
+    namespace_message(n.control, SG_EVENT_READY, 0, -1, sync);
     char byte; long count;
     do { count=syscall(SYS_read,n.control,&byte,1); } while (count<0 && errno==EINTR);
     ASSERT(15, count==1 && byte=='C');
@@ -377,7 +383,7 @@ void sigrund_run_namespace_launcher(const struct child_spec *original, const str
         syscall(SYS_close,n.control);
         run_child(&s);
     }
-    namespace_message(n.control,2,(uint32_t)pid,child_pidfd,sync);
+    namespace_message(n.control,SG_EVENT_CHILD,(uint32_t)pid,child_pidfd,sync);
     syscall(SYS_close,child_pidfd);
     syscall(SYS_exit_group,0);
     __builtin_unreachable();

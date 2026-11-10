@@ -47,6 +47,7 @@ struct Instance {
     authenticated_source: Option<sigrund_core::namespace::ConnectorObservation>,
     owner_uid: u32,
     constraints: Constraints,
+    policy: Option<Arc<crate::lsm::PolicyGuard>>,
     revoked: AtomicBool,
     _resources: Reservation,
     // Separate from the outer Arc: stay live while field destructors close/reap.
@@ -59,6 +60,9 @@ impl Instance {
     fn check(&self) -> io::Result<()> {
         if self.revoked.load(Ordering::Acquire) {
             return Err(invalid("target registration revoked"));
+        }
+        if let Some(policy) = &self.policy {
+            policy.check()?;
         }
         self.anchor.revalidate()?;
         if self.revoked.load(Ordering::Acquire) {
@@ -136,7 +140,12 @@ impl TargetWatch {
     // Called while the committed request lease still owns this instance.
     pub fn valid(&self) -> bool {
         self.0.upgrade().is_some_and(|instance| {
-            !instance.revoked.load(Ordering::Acquire) && instance.anchor.alive()
+            !instance.revoked.load(Ordering::Acquire)
+                && instance
+                    .policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.check().is_ok())
+                && instance.anchor.alive()
         })
     }
 }
@@ -162,6 +171,9 @@ impl TargetLease {
     }
 
     pub fn check_lifecycle(&self) -> io::Result<()> {
+        if let Some(policy) = &self.instance.policy {
+            policy.check()?;
+        }
         if self.instance.revoked.load(Ordering::Acquire) {
             return Err(invalid("target registration revoked"));
         }
@@ -215,6 +227,9 @@ impl TargetLease {
     }
     pub(crate) fn registration_record(&self) -> Option<&Registration> {
         self.instance.registration.as_ref()
+    }
+    pub(crate) fn policy_guard(&self) -> Option<&crate::lsm::PolicyGuard> {
+        self.instance.policy.as_deref()
     }
     pub(crate) fn owner_uid(&self) -> u32 {
         self.instance.owner_uid
@@ -566,6 +581,7 @@ impl RegistrationSlot {
         peer: impl std::os::fd::AsRawFd,
         check: impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        let _policy_guard = crate::lsm::for_profile(&constraints)?;
         let registration = Registration {
             schema: "sigrund.registration.phase0.v1".into(),
             id,
@@ -641,6 +657,7 @@ impl RegistrationSlot {
                 registration: None,
                 authenticated_source: Some(source),
                 owner_uid: self.owner,
+                policy: crate::lsm::for_profile(&constraints)?,
                 constraints,
                 revoked: AtomicBool::new(false),
                 _resources: self.resources.take().expect("self capture resources"),
@@ -676,6 +693,7 @@ impl RegistrationSlot {
         {
             return Err(invalid("registration differs from captured owner"));
         }
+        let policy = crate::lsm::for_profile(&constraints)?;
         anchor.revalidate()?;
         // The caller must generate a fresh unpredictable revision before capture
         // so the acquisition digest binds that same value.
@@ -698,6 +716,7 @@ impl RegistrationSlot {
             owner_uid: registration.owner_uid,
             registration: Some(registration),
             authenticated_source: None,
+            policy,
             constraints,
             revoked: AtomicBool::new(false),
             _resources: self.resources.take().expect("registration resource owner"),

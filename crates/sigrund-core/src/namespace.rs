@@ -320,6 +320,17 @@ pub struct Selinux {
     pub context: String,
     pub enforcing: bool,
     pub policy_change: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_executable_context"
+    )]
+    pub executable_context: Option<String>,
+}
+fn present_executable_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -331,11 +342,21 @@ pub enum Seccomp {
         syscalls: Vec<u32>,
     },
 }
+impl Constraints {
+    pub fn is_production(&self) -> bool {
+        self.schema == "sigrund.constraints.namespace-selinux.v1"
+    }
+    pub fn executes(&self) -> bool {
+        self.is_production() || self.schema == "sigrund.constraints.namespace-experimental.v1"
+    }
+}
 impl Contract for Constraints {
     fn validate(&self) -> Result<()> {
         if !matches!(
             self.schema.as_str(),
-            "sigrund.constraints.phase0.v1" | "sigrund.constraints.namespace-experimental.v1"
+            "sigrund.constraints.phase0.v1"
+                | "sigrund.constraints.namespace-experimental.v1"
+                | "sigrund.constraints.namespace-selinux.v1"
         ) {
             return Err(invalid("wrong constraint schema"));
         }
@@ -369,10 +390,26 @@ impl Contract for Constraints {
         {
             return Err(invalid("unsupported phase0 constraint combination"));
         }
-        if self.schema == "sigrund.constraints.namespace-experimental.v1" {
+        if self.is_production() {
+            if self.profile_id != "namespace-selinux-v1"
+                || !self.capabilities.is_empty()
+                || self.executable_model != crate::executable::TrustModel::DigestMemfd
+                || !self.selinux.enforcing
+                || self.selinux.context != "system_u:system_r:sigrund_workload_t:s0:c1,c2"
+                || self.selinux.executable_context.as_deref()
+                    != Some("system_u:object_r:sigrund_workload_exec_t:s0")
+                || self.selinux.policy_change != "detect_and_terminate"
+                || !matches!(&self.seccomp, Seccomp::DenySyscalls { audit_arch: 0xc000003e, errno: 13, syscalls } if syscalls == &[110])
+            {
+                return Err(invalid(
+                    "unsupported production namespace constraint combination",
+                ));
+            }
+        } else if self.schema == "sigrund.constraints.namespace-experimental.v1" {
             if self.profile_id != "namespace-experimental-v1"
                 || !self.capabilities.is_empty()
                 || self.executable_model != crate::executable::TrustModel::DigestMemfd
+                || self.selinux.executable_context.is_some()
                 || self.selinux.enforcing
                 || !self.selinux.context.is_empty()
                 || self.selinux.policy_change != "unmanaged"
@@ -382,7 +419,8 @@ impl Contract for Constraints {
             }
         } else {
             text(&self.selinux.context, 4096)?;
-            if !self.selinux.enforcing
+            if self.selinux.executable_context.is_some()
+                || !self.selinux.enforcing
                 || self.selinux.policy_change != "reject"
                 || self.selinux.context.splitn(4, ':').count() != 4
             {
@@ -677,8 +715,7 @@ impl Contract for ProcessReview {
             (None, "sigrund.self-review.v1")
                 if self.acquisition.lifecycle.registration_id.is_none()
                     && self.acquisition.lifecycle.registration_revision.is_none()
-                    && self.constraints.schema
-                        == "sigrund.constraints.namespace-experimental.v1" => {}
+                    && self.constraints.executes() => {}
             _ => return Err(invalid("review schema and registration dependency differ")),
         }
         Ok(())
@@ -740,7 +777,7 @@ impl ProcessReview {
             }
             _ => false,
         };
-        if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1"
+        if self.constraints.executes()
             && (w.execution_context.target_uid == 0
                 || !w.execution_context.supplementary_gids.is_empty())
         {
@@ -796,7 +833,9 @@ impl ProcessReview {
             "prepared_cwd": self.prepared_cwd,
             "prepared_executable": self.prepared_executable,
             "security_constraints": self.constraints,
-            "execution_availability": if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
+            "execution_availability": if self.constraints.is_production() {
+                "SELinux-constrained execution; final-child checkpoint required"
+            } else if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
                 "Experimental execution; final-child checkpoint required"
             } else { "Phase 2 private review; execution is disabled" },
             "workload_lsm_transition": if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {

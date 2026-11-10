@@ -1,5 +1,5 @@
-//! Client runtime probes use a strict fake UID-0 peer in a disposable user
-//! namespace. They exercise the real binary, without claiming daemon execution.
+//! Counterfeit peers in a user namespace must receive no request. Positive
+//! runtime probes require an initial-user-namespace root listener.
 use sigrund::transport::{ControlFrame, ControlReader};
 use sigrund_core::{
     framing::{FrameType, encode_frame},
@@ -240,6 +240,118 @@ fn client_gate_in_user_namespace() {
 #[ignore = "invoked by the namespace gate"]
 fn client_namespace_fixture() {
     assert_eq!(std::env::var("SIGRUND_CLIENT_NAMESPACE").unwrap(), "1");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fake.sock");
+    let context = UnixListener::bind(format!("{}.context", path.display())).unwrap();
+    let request = UnixListener::bind(&path).unwrap();
+    request.set_nonblocking(true).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sigrun"))
+        .arg("--socket")
+        .arg(&path)
+        .args([
+            "--target",
+            "registered:demo",
+            "--account",
+            "service",
+            "--security-profile",
+            "namespace-experimental-v1",
+            "--stdin",
+            "sha256",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"must not escape")
+        .unwrap();
+    let (mut peer, _) = context.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        peer.read(&mut byte).unwrap(),
+        0,
+        "counterfeit context got data"
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("authenticate host daemon"));
+    assert!(
+        matches!(request.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    // Signed submissions skip .context and must authenticate execution directly.
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sigrund_core::{
+        protocol::{DsseEnvelope, DsseSignature},
+        warrant::CanonicalWarrant,
+    };
+    let warrant = CanonicalWarrant::parse(include_bytes!(
+        "../../sigrund-core/tests/fixtures/v3-host/warrant.json"
+    ))
+    .unwrap();
+    let envelope = DsseEnvelope::from_warrant(
+        &warrant,
+        vec![DsseSignature {
+            keyid: "fixture".into(),
+            sig: STANDARD.encode(include_bytes!(
+                "../../sigrund-core/tests/fixtures/v3-host/warrant.sshsig"
+            )),
+        }],
+    )
+    .unwrap();
+    let signed = dir.path().join("signed.json");
+    fs::write(&signed, envelope.to_jcs().unwrap()).unwrap();
+    request.set_nonblocking(false).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_sigrun"))
+        .arg("--socket")
+        .arg(&path)
+        .arg("--warrant")
+        .arg(signed)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut peer, _) = request.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        peer.read(&mut byte).unwrap(),
+        0,
+        "counterfeit execution peer got signed data"
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("authenticate host daemon"));
+
+    let anchor_path = dir.path().join("fake.anchor");
+    let anchor = UnixListener::bind(&anchor_path).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_sigrund-anchor"))
+        .arg("--socket")
+        .arg(anchor_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut peer, _) = anchor.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        peer.read(&mut byte).unwrap(),
+        0,
+        "counterfeit anchor peer got handshake"
+    );
+    assert!(!child.wait_with_output().unwrap().status.success());
+}
+
+#[test]
+#[ignore = "requires root in the initial user namespace; run by the Phase 4 privileged gate"]
+fn client_host_fixture() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
     let (output, reports) = case(
         |mut socket, frame| {
             let hello = ClientHello::parse_request(&frame.payload).unwrap();

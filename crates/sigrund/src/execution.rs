@@ -60,33 +60,7 @@ pub struct PreparedChild {
     group_check: Vec<u32>,
 }
 
-#[repr(C)]
-struct ChildSpec {
-    input: i32,
-    output: i32,
-    error: i32,
-    executable: i32,
-    sync: i32,
-    uid: u32,
-    gid: u32,
-    mask: u32,
-    last_cap: u32,
-    capabilities: u64,
-    groups: *const u32,
-    groups_len: usize,
-    cwd: *const libc::c_char,
-    direct_path: *const libc::c_char,
-    argv: *const *const libc::c_char,
-    envp: *const *const libc::c_char,
-    mountinfo: *mut u8,
-    mountinfo_capacity: usize,
-    group_check: *mut u32,
-    isolated: i32,
-    gate_read: i32,
-    gate_write: i32,
-    checkpoint: i32,
-    namespace_mode: i32,
-}
+include!(concat!(env!("OUT_DIR"), "/launcher_abi.rs"));
 unsafe extern "C" {
     fn sigrund_spawn(spec: *const ChildSpec, cgroup: i32, pidfd: *mut i32) -> i32;
     fn sigrund_spawn_namespace_launcher(
@@ -111,6 +85,8 @@ struct NamespacePayload {
     cwd: String,
     argv: Vec<String>,
     envp: Vec<String>,
+    constraints: sigrund_core::namespace::Constraints,
+    producer_guard: bool,
 }
 
 /// Internal fresh-exec entry, reached before loading daemon configuration or
@@ -137,7 +113,7 @@ pub fn namespace_launcher_main() -> io::Result<()> {
         return Err(io::Error::other("oversize namespace launcher payload"));
     }
     let payload: NamespacePayload = serde_json::from_slice(&bytes)?;
-    if payload.version != 1
+    if payload.version != SG_PAYLOAD_VERSION
         || payload.uid == 0
         || payload.uid == u32::MAX
         || payload.gid == u32::MAX
@@ -154,6 +130,12 @@ pub fn namespace_launcher_main() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    use sigrund_core::namespace::Contract;
+    payload.constraints.validate().map_err(io::Error::other)?;
+    if !payload.constraints.executes() {
+        return Err(io::Error::other("nonexecuting launcher profile"));
+    }
+    let production = i32::from(payload.constraints.is_production());
     let strings = |values: Vec<String>| -> io::Result<Vec<CString>> {
         values
             .into_iter()
@@ -192,6 +174,8 @@ pub fn namespace_launcher_main() -> io::Result<()> {
         gate_write: -1,
         checkpoint: 1,
         namespace_mode: 1,
+        production,
+        producer_guard: i32::from(payload.producer_guard),
     };
     let namespace = NamespaceSpec {
         namespaces: [16, 17, 18, 19, 20, 21, 22, 23],
@@ -214,16 +198,9 @@ pub struct ChildProcess {
     pub gate: Option<OwnedFd>,
 }
 
-#[repr(C)]
-struct NamespaceSpec {
-    namespaces: [i32; 8],
-    enter_mask: u32,
-    root: i32,
-    cwd: i32,
-    control: i32,
-}
 pub(crate) struct NamespaceTarget<'a> {
     pub namespaces: &'a [std::fs::File],
+    pub constraints: &'a sigrund_core::namespace::Constraints,
     pub root: i32,
     pub cwd: i32,
 }
@@ -366,25 +343,33 @@ impl NamespaceLauncher {
                 header = libc::CMSG_NXTHDR(&message, header);
             }
         }
-        if count != 8 || !valid || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+        if count != SG_EVENT_BYTES as isize
+            || !valid
+            || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+        {
             return Err(io::Error::other("malformed namespace launcher response"));
         }
         let kind = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
         let value = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
         match kind {
-            3 if value == 0 && rights.is_empty() && !self.protected && !self.ready => {
+            SG_EVENT_BOOTSTRAP
+                if value == 0 && rights.is_empty() && !self.protected && !self.ready =>
+            {
                 Ok(Some(NamespaceEvent::Bootstrap))
             }
-            1 if value == 0
-                && rights.is_empty()
-                && self.protected
-                && !self.ready
-                && !self.granted =>
+            SG_EVENT_READY
+                if value == 0
+                    && rights.is_empty()
+                    && self.protected
+                    && !self.ready
+                    && !self.granted =>
             {
                 self.ready = true;
                 Ok(Some(NamespaceEvent::Ready))
             }
-            2 if self.granted && rights.len() == 1 && value > 0 && value <= i32::MAX as u32 => {
+            SG_EVENT_CHILD
+                if self.granted && rights.len() == 1 && value > 0 && value <= i32::MAX as u32 =>
+            {
                 let pidfd = rights.remove(0);
                 let info =
                     std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
@@ -543,6 +528,12 @@ impl PreparedChild {
             gate_write: gate.as_ref().map_or(-1, |g| g.1.as_raw_fd()),
             checkpoint: i32::from(checkpoint),
             namespace_mode: i32::from(target.is_some()),
+            production: i32::from(
+                target
+                    .as_ref()
+                    .is_some_and(|target| target.constraints.is_production()),
+            ),
+            producer_guard: i32::from(crate::lsm::producer_active()),
         };
         let mut pidfd = -1;
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -596,7 +587,7 @@ impl PreparedChild {
                     .collect()
             };
             let payload = NamespacePayload {
-                version: 1,
+                version: SG_PAYLOAD_VERSION,
                 uid: self.uid,
                 gid: self.gid,
                 mask: self.mask,
@@ -605,6 +596,8 @@ impl PreparedChild {
                 cwd: self.cwd.to_str().map_err(io::Error::other)?.to_owned(),
                 argv: as_strings(&self.argv)?,
                 envp: as_strings(&self.envp)?,
+                constraints: target.constraints.clone(),
+                producer_guard: crate::lsm::producer_active(),
             };
             let bytes = serde_json::to_vec(&payload)?;
             if bytes.len() > 1_048_576 {
