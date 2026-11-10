@@ -1040,10 +1040,8 @@ impl ForegroundDaemon {
             crate::execution::trace_available(),
             last_cap,
         )?;
-        if config
-            .namespace_profiles
-            .iter()
-            .any(|profile| profile.is_production())
+        // Detect the reserved producer domain even in a host-only configuration:
+        // no approved command may inherit its socket-label authority.
         {
             let _policy_probe = target_budget
                 .reserve(

@@ -167,6 +167,19 @@ passes its stream to a host-root writer, then kills only a captured self
 connector while its relay remains alive. Actual forked descendants are identified
 with kernel pidfd information and their exit is observed through retained pidfds.
 
+After draining and stopping the disposable daemon, also check the host-only
+producer guard using an existing trusted administrator login (here `lab`):
+
+```sh
+python3 /usr/share/doc/sigrund/namespace-phase4/verify-host-only.py \
+  --owner lab --artifacts /var/tmp/NEW-host-only-evidence
+```
+
+This removes namespace profiles/rules temporarily, approves commands as UID 0
+and 65534 through the real TTY, and checks both the host workload context and
+reserved-label denials. It restores the original configuration bytes and leaves
+the service stopped.
+
 For consumption/audit/collector digest equality, run the shipped
 `verify-bindings.py` with `--collector` pointing at the collector binary from the
 same checked source/build and a new `--artifacts` directory. This validates the
