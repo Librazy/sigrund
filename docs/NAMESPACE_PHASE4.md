@@ -53,7 +53,15 @@ syscall and attempted to read an independently labeled denial sentinel. Sealing
 the ELF does not bind libraries or scripts subsequently loaded from B.
 
 The client obtains its own user namespace using a kernel-created self pidfd and
-`PIDFD_GET_USER_NAMESPACE`, independently of container-controlled procfs. Initial
+`PIDFD_GET_USER_NAMESPACE`, independently of container-controlled procfs. When
+older kernels report that ioctl as unsupported, a genuine nsfs network-namespace
+descriptor is an untrusted hint. The kernel's `NS_GET_USERNS`/`NS_GET_PARENT`
+ancestry checks must yield the initial user namespace before the UID-0 shortcut
+is available. A retained or substituted initial-netns FD in a child user namespace
+cannot satisfy this proof; ordinary files and wrong namespace types also reject.
+The proof follows the [kernel's owner-scope check](https://github.com/torvalds/linux/blob/v6.8/kernel/user_namespace.c#L1373-L1389)
+and [nsfs ioctl dispatch](https://github.com/torvalds/linux/blob/v6.8/fs/nsfs.c#L195-L202),
+with bounded parent traversal. Other pidfd errors still fail closed. Initial
 user-namespace peers require host UID 0. Rootless clients require their exact
 requester label, global and per-domain enforcement, genuine selinuxfs status/AV
 queries and an endpoint-specific kernel socket label. Execution, context and
@@ -138,6 +146,31 @@ required domains and global SELinux to enforcing mode.
 | NS-09, NS-10, NS-12 | Actual placement/isolation, production entry failure, malformed handoffs, whole-job revocation and matching host resource/shutdown regressions pass. Only the recorded single-child-userns topology is qualified. |
 | NS-13 | Manager resolvers are not enabled and remain Phase 5. |
 | NS-14, NS-15, NS-16 | Frozen vectors, exact private review, canonical consumption/audit/collector equality, fresh installed provisioning, reproducible operator steps and matching release/host artifacts pass within this scope. |
+
+## Review follow-up
+
+The evidence JSON above identifies the initial qualification snapshot. Follow-up
+review found that host-only configuration skipped producer detection, and that
+client authentication unnecessarily required a newer pidfd ioctl. Both were
+reproduced and corrected. The producer check now runs before listener publication
+for every configuration. `verify-host-only.py` removes namespace profiles and
+rules, then verifies the context and reserved-label denials for approved UID 0
+and UID 65534 commands through the real TTY; configuration bytes are restored.
+
+The compatibility regression uses real nsfs descriptors: inherited ancestor
+namespaces, child-owned namespaces, wrong types/filesystems, and a host caller
+holding a maximum-depth descendant-owned netns. A selective seccomp override
+returns ENOTTY for only the newer pidfd ioctl; other errors remain fatal. The
+privileged client runner exercises the actual CLI relay fixture and every peer
+role under that override. These cases and the actual approver suite pass on
+Ubuntu 24.04, kernel `6.8.0-142-generic`, where the original client failed with
+ENOTTY before sending its context query. The ordinary release checks pass too.
+
+On the enforcing Fedora deployment, the four normal routes pass after the
+changes. Genuine confined rootless clients also pass host and registered-B
+requests with the pidfd ioctl disabled, retaining their consumption and cleanup
+checks. These Ubuntu results qualify host authentication compatibility; they do
+not qualify the production namespace profile on Ubuntu or another LSM stack.
 
 ## Independent later gates
 

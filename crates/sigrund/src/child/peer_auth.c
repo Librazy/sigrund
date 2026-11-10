@@ -4,6 +4,9 @@
 #include <errno.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <linux/magic.h>
+#include <linux/nsfs.h>
+#include <linux/sched.h>
 #include <sys/mman.h>
 #include <sys/vfs.h>
 #include <sys/ioctl.h>
@@ -19,6 +22,49 @@ static const char requester_context[] = "system_u:system_r:sigrund_requester_t:s
 static const char producer_context[] = "system_u:system_r:sigrund_daemon_t:s0";
 static const char host_context[] = "system_u:system_r:sigrund_host_workload_t:s0";
 static const char workload_context[] = "system_u:system_r:sigrund_workload_t:s0:c1,c2";
+#define INITIAL_USERNS_INO 0xeffffffdULL
+
+/* Older pidfds cannot return a namespace FD. Treat procfs as an untrusted hint:
+ * only nsfs may implement these ioctls (a FUSE ioctl can return an arbitrary FD
+ * number). NS_GET_USERNS and NS_GET_PARENT enforce current_user_ns() ancestry
+ * in ns_get_owner(). Obtaining init_user_ns through them
+ * therefore proves the caller is initial-userns, even with substituted genuine
+ * namespace files. A child retaining an initial netns FD gets EPERM.
+ * See Linux kernel/user_namespace.c and fs/nsfs.c, present in Linux 6.8.
+ */
+static int initial_userns_from_hint(int hint) {
+    struct statfs fs;
+    int valid = syscall(SYS_fstatfs, hint, &fs) == 0 && fs.f_type == NSFS_MAGIC &&
+                syscall(SYS_ioctl, hint, NS_GET_NSTYPE, 0) == CLONE_NEWNET;
+    int userns = valid ? syscall(SYS_ioctl, hint, NS_GET_USERNS, 0) : -1;
+    if (userns < 0) return 0;
+    /* A host task may have joined a descendant-owned netns. Linux permits a
+     * child of a level-32 parent: include level 33 and the initial namespace. */
+    for (unsigned level = 0; level <= 33; ++level) {
+        struct stat identity;
+        if (syscall(SYS_fstatfs, userns, &fs) < 0 || fs.f_type != NSFS_MAGIC ||
+            syscall(SYS_ioctl, userns, NS_GET_NSTYPE, 0) != CLONE_NEWUSER ||
+            syscall(SYS_fstat, userns, &identity) < 0) break;
+        if ((uint64_t)identity.st_ino == INITIAL_USERNS_INO) {
+            syscall(SYS_close, userns);
+            return 1;
+        }
+        int parent = syscall(SYS_ioctl, userns, NS_GET_PARENT, 0);
+        syscall(SYS_close, userns);
+        userns = parent;
+        if (userns < 0) return 0;
+    }
+    syscall(SYS_close, userns);
+    return 0;
+}
+static int initial_userns_compat(void) {
+    int hint = syscall(SYS_openat, AT_FDCWD, "/proc/thread-self/ns/net",
+                       O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY, 0);
+    if (hint < 0) return 0;
+    int initial = initial_userns_from_hint(hint);
+    syscall(SYS_close, hint);
+    return initial;
+}
 static int kernel_file(const char *path, int flags) {
     int fd = syscall(SYS_openat, AT_FDCWD, path, flags | O_CLOEXEC | O_NOFOLLOW, 0);
     if (fd < 0) return -1;
@@ -128,13 +174,19 @@ int sigrun_authenticate_host_peer(int socket, unsigned role) {
     int userns = syscall(SYS_ioctl, pidfd, PIDFD_GET_USER_NAMESPACE, 0);
     int saved = errno;
     syscall(SYS_close, pidfd);
-    if (userns < 0) { errno = saved; return -1; }
-    struct stat identity;
-    int result = syscall(SYS_fstat, userns, &identity);
-    saved = errno;
-    syscall(SYS_close, userns);
-    if (result < 0) { errno = saved; return -1; }
-    if ((uint64_t)identity.st_ino != 0xeffffffdULL) return labeled_peer(socket, role);
+    int initial;
+    if (userns < 0) {
+        if (saved != ENOTTY) { errno = saved; return -1; }
+        initial = initial_userns_compat();
+    } else {
+        struct stat identity;
+        int result = syscall(SYS_fstat, userns, &identity);
+        saved = errno;
+        syscall(SYS_close, userns);
+        if (result < 0) { errno = saved; return -1; }
+        initial = (uint64_t)identity.st_ino == INITIAL_USERNS_INO;
+    }
+    if (!initial) return labeled_peer(socket, role);
     struct ucred peer;
     socklen_t length = sizeof(peer);
     if (syscall(SYS_getsockopt, socket, SOL_SOCKET, SO_PEERCRED, &peer, &length) < 0) return -1;

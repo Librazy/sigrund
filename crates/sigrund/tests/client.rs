@@ -23,6 +23,62 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn compatibility_driver(directory: &std::path::Path) -> std::path::PathBuf {
+    let binary = directory.join("peer-auth-compat");
+    let status = Command::new("cc")
+        .args(["-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/namespace/peer-auth-compat.c"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    binary
+}
+
+#[test]
+fn old_kernel_namespace_proof_rejects_substituted_ancestors() {
+    let directory = tempfile::tempdir().unwrap();
+    let driver = compatibility_driver(directory.path());
+    assert!(
+        Command::new(driver)
+            .arg("proof")
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+#[ignore = "requires initial-userns root; run by the privileged client gate"]
+fn client_host_compat_fixture() {
+    let directory = tempfile::tempdir().unwrap();
+    let driver = compatibility_driver(directory.path());
+    for mode in ["host-user", "host-root", "denied", "deep-proof"] {
+        assert!(Command::new(&driver).arg(mode).status().unwrap().success());
+    }
+    // Run the actual CLI relay/CSR/status cases with the newer ioctl disabled,
+    // including on newer CI kernels. The seccomp override survives exec/fork.
+    assert!(
+        Command::new(driver)
+            .arg("exec")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client_host_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 fn wait(mut f: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs(8);
     while !f() {
