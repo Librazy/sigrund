@@ -20,6 +20,12 @@ const MAX_LINE: usize = 65_536;
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
+fn idle(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
 
 pub(crate) struct Endpoint {
     parent: File,
@@ -106,7 +112,16 @@ impl Endpoint {
         let request = format!(
             "GET {target} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
         );
-        stream.write_all(request.as_bytes())?;
+        let mut remaining = request.as_bytes();
+        while !remaining.is_empty() {
+            bounded()?;
+            match stream.write(remaining) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => remaining = &remaining[count..],
+                Err(error) if idle(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
         let mut response = Response {
             reader: BufReader::new(stream),
             kind: Body::Length(0),
@@ -115,7 +130,7 @@ impl Endpoint {
             peer,
             api_version: String::new(),
         };
-        let status = response.raw_line(&bounded)?;
+        let status = response.header_line(&bounded)?;
         if status != b"HTTP/1.1 200 OK" && status != b"HTTP/1.0 200 OK" {
             return Err(invalid("Podman API request rejected"));
         }
@@ -123,7 +138,7 @@ impl Endpoint {
         let mut length = None;
         let mut chunked = false;
         loop {
-            let line = response.raw_line(&bounded)?;
+            let line = response.header_line(&bounded)?;
             total += line.len() + 2;
             if total > MAX_HEADER {
                 return Err(invalid("Podman HTTP headers exceed bound"));
@@ -344,6 +359,15 @@ impl Response {
             }
         }
     }
+    fn header_line(&mut self, check: &dyn Fn() -> io::Result<()>) -> io::Result<Vec<u8>> {
+        loop {
+            check()?;
+            match self.raw_line(check) {
+                Err(error) if idle(&error) => continue,
+                result => return result,
+            }
+        }
+    }
     fn byte(&mut self, check: &dyn Fn() -> io::Result<()>) -> io::Result<Option<u8>> {
         loop {
             match self.kind {
@@ -407,7 +431,14 @@ impl Response {
         check: &dyn Fn() -> io::Result<()>,
     ) -> io::Result<serde_json::Value> {
         let mut bytes = Vec::new();
-        while let Some(byte) = self.byte(check)? {
+        loop {
+            check()?;
+            let byte = match self.byte(check) {
+                Ok(Some(byte)) => byte,
+                Ok(None) => break,
+                Err(error) if idle(&error) => continue,
+                Err(error) => return Err(error),
+            };
             if bytes.len() == MAX_BODY {
                 return Err(invalid("Podman response exceeds bound"));
             }
@@ -515,5 +546,43 @@ mod tests {
         let (stream, _writer) = UnixStream::pair().unwrap();
         let response = response(stream, Body::Length(0));
         assert!(response.require_event_stream().is_err());
+    }
+    #[test]
+    fn finite_headers_and_body_retry_idle_reads_within_total_deadline() {
+        let (stream, mut writer) = UnixStream::pair().unwrap();
+        let thread = std::thread::spawn(move || {
+            writer.write_all(b"HTTP/1.1").unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            writer.write_all(b" 200 OK\r\n{\"ready\":").unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            writer.write_all(b"true}").unwrap();
+        });
+        let mut response = response(stream, Body::Length(14));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let check = || {
+            if Instant::now() < deadline {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::TimedOut.into())
+            }
+        };
+        assert_eq!(response.header_line(&check).unwrap(), b"HTTP/1.1 200 OK");
+        assert_eq!(
+            response.json(&check).unwrap(),
+            serde_json::json!({"ready":true})
+        );
+        thread.join().unwrap();
+        let (stream, _writer) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(80);
+        assert!(response_deadline(stream, deadline).is_err());
+    }
+    fn response_deadline(stream: UnixStream, deadline: Instant) -> io::Result<serde_json::Value> {
+        response(stream, Body::Length(1)).json(&|| {
+            if Instant::now() < deadline {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::TimedOut.into())
+            }
+        })
     }
 }

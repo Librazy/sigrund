@@ -61,7 +61,11 @@ qualified executable/confinement model and manager teardown prerequisites.
 
 The implementation uses a 200 ms refresh interval, a two-second total query
 deadline and a three-second maximum evidence age. Idle stream reads yield every
-100 ms. Loss is permanent for that retained owner, including after name restoration
+100 ms. Finite request/header/body I/O retries idle intervals only within the
+total query deadline, preserving partial framing without extending that deadline.
+The ten-second management acquisition deadline is checked again after resolver
+revalidation and before publication; expiry or shutdown cannot publish a target.
+Loss is permanent for that retained owner, including after name restoration
 or service recovery. The ordinary job supervisor observes the invalidated owner
 and performs cleanup; integrated tests must measure the complete teardown bound.
 HTTP headers are limited to 16 KiB, a finite inspect response or chunk to 1 MiB,

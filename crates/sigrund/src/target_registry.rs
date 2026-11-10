@@ -645,7 +645,7 @@ impl RegistrationSlot {
         } else {
             Box::new(anchor)
         };
-        self.publish(registration, constraints, anchor)
+        self.publish_checked(registration, constraints, anchor, &check)
     }
 
     pub(crate) fn capture_self(
@@ -701,11 +701,21 @@ impl RegistrationSlot {
     /// Publish only coherent live resources. A replacement atomically revokes
     /// its predecessor while old leases retain that predecessor for cleanup.
     pub fn publish(
-        mut self,
+        self,
         registration: Registration,
         constraints: Constraints,
         anchor: Box<dyn CapturedAnchor>,
     ) -> io::Result<()> {
+        self.publish_checked(registration, constraints, anchor, &|| Ok(()))
+    }
+    fn publish_checked(
+        mut self,
+        registration: Registration,
+        constraints: Constraints,
+        anchor: Box<dyn CapturedAnchor>,
+        check: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        check()?;
         registration.validate().map_err(io::Error::other)?;
         constraints.validate().map_err(io::Error::other)?;
         let acquisition = anchor.acquisition();
@@ -726,6 +736,9 @@ impl RegistrationSlot {
         }
         let policy = crate::lsm::for_profile(&constraints)?;
         anchor.revalidate()?;
+        // Resolver revalidation performs bounded I/O. Expiry/shutdown during
+        // that work must veto publication, even when its snapshot was valid.
+        check()?;
         // The caller must generate a fresh unpredictable revision before capture
         // so the acquisition digest binds that same value.
         let mut entries = self
@@ -809,6 +822,7 @@ mod tests {
         acquisition: Acquisition,
         closed: Arc<AtomicUsize>,
         root: std::fs::File,
+        cancel_on_revalidate: Option<Arc<AtomicBool>>,
     }
     impl CapturedAnchor for Anchor {
         fn alive(&self) -> bool {
@@ -821,6 +835,9 @@ mod tests {
             &self.acquisition
         }
         fn revalidate(&self) -> io::Result<()> {
+            if let Some(cancelled) = &self.cancel_on_revalidate {
+                cancelled.store(true, Ordering::Release);
+            }
             Ok(())
         }
     }
@@ -861,8 +878,48 @@ mod tests {
                 acquisition: a,
                 closed: closed.clone(),
                 root: std::fs::File::open("/").unwrap(),
+                cancel_on_revalidate: None,
             }),
         )
+    }
+    #[test]
+    fn cancellation_during_revalidation_vetoes_publication_and_releases_resources() {
+        let budget = Budget::new(Default::default()).unwrap();
+        let registry = Arc::new(
+            TargetRegistry::new(
+                sigrund_core::crypto::new_uuidv7().to_string(),
+                budget.clone(),
+            )
+            .unwrap(),
+        );
+        let closed = Arc::new(AtomicUsize::new(0));
+        let (registration, constraints, original) = fixture(&registry, &closed);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let anchor = Anchor {
+            acquisition: original.acquisition().clone(),
+            closed: closed.clone(),
+            root: std::fs::File::open("/").unwrap(),
+            cancel_on_revalidate: Some(cancelled.clone()),
+        };
+        drop(original);
+        let result = registry
+            .reserve_registration(1000, 20)
+            .unwrap()
+            .publish_checked(registration, constraints, Box::new(anchor), &|| {
+                if cancelled.load(Ordering::Acquire) {
+                    Err(io::ErrorKind::TimedOut.into())
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(result.is_err());
+        assert!(
+            registry
+                .lease(&Selector::Registered { id: "B".into() }, 1001, true)
+                .is_err()
+        );
+        assert_eq!(closed.load(Ordering::SeqCst), 2);
+        assert_eq!(budget.usage(1000).0, Charge::default());
     }
     #[test]
     fn replacement_and_revocation_never_redirect_pending_leases() {
@@ -1036,6 +1093,7 @@ mod tests {
             acquisition: observed,
             closed: closed.clone(),
             root: std::fs::File::open("/").unwrap(),
+            cancel_on_revalidate: None,
         };
         registry
             .reserve_registration(1002, 20)

@@ -531,7 +531,9 @@ impl Guard {
     }
     pub(crate) fn verify_anchor(&self, anchor: &dyn CapturedAnchor) -> io::Result<()> {
         let result = (|| {
-            self.state.check(&|| Ok(()))?;
+            if !self.state.valid() {
+                return Err(invalid("Podman lifecycle evidence lost"));
+            }
             // Supplementary association only: G-01 owns the destination.
             let root = anchor.root().metadata()?;
             let namespaces = anchor
