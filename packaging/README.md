@@ -13,11 +13,15 @@ successful **Packages** workflow run. Each archive contains two packages,
 | Package | Installed components | Runtime dependencies |
 | --- | --- | --- |
 | `sigrun` | `/usr/bin/sigrun`, documentation and license | Native shared libraries; no daemon, systemd or SSH dependency |
-| `sigrund` | `/usr/libexec/sigrund/sigrund`, `/usr/bin/sigrund-approve`, `/usr/bin/sigrundctl`, systemd unit and configuration examples | Native shared libraries, systemd and OpenSSH client |
+| `sigrund` | `/usr/libexec/sigrund/sigrund`, `/usr/bin/sigrund-approve`, `/usr/bin/sigrundctl`, `/usr/bin/sigrund-anchor`, systemd unit and configuration examples | Native shared libraries, systemd and OpenSSH client |
 
 Neither package depends on the other. Install both on a machine that will host
 the daemon and run requests locally. The diagnostic-only collector binary is
 not packaged as a working collector service.
+
+Follow the [Quick Start](https://github.com/Librazy/sigrund/blob/main/QUICK_START.md)
+for setup and the five host/container routes. The daemon package also installs it
+at `/usr/share/doc/sigrund/QUICK_START.md`.
 
 ## Install
 

@@ -12,6 +12,10 @@ process and namespace handles, destination account/path resolution, explicit
 security profiles and supervised job cgroups. An optional local Podman adapter
 binds a registration to a container's configuration and lifecycle.
 
+Start with the [Quick Start](QUICK_START.md) for installation, configuration and
+host-only, host-to-container, inside-container, container-to-host and
+container-to-container examples.
+
 ## Components
 
 | Component | Purpose |
@@ -48,8 +52,7 @@ watchdog supervision and whole-service cleanup.
 ## Request and approve
 
 Configure identities, independent daemon/signer policy and a fresh state/log set
-using the [configuration examples](config/sigrund.toml.example) and
-[setup instructions](packaging/README.md#configure-the-daemon). For a disposable
+using the [Quick Start](QUICK_START.md). For a disposable
 demonstration with generated software signing keys, use the
 [operator lab](IMPLEMENTATION_NOTES.md#operator-lab).
 

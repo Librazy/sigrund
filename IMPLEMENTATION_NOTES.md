@@ -4,6 +4,7 @@ This document describes the local v3 SSH/stdio workflow, namespace execution,
 operator setup and test layout. The
 [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
 defines the broader protocol and security requirements.
+For installation and the five host/container routes, use the [Quick Start](QUICK_START.md).
 
 ## V3 implementation and validation
 
@@ -185,57 +186,24 @@ actual close/reap. Blocked cleanup remains charged; the local broker allows one 
 
 ### Installed SELinux setup
 
-On a disposable Fedora host, install matching packages plus `gcc`, `glibc-static`,
-`make`, `selinux-policy-devel`, `policycoreutils-python-utils`, `setools-console`,
-`shadow-utils` and `util-linux`. Choose unused UIDs and nonoverlapping subordinate
-ranges. The following lab recipe generates a software signing key and scoped
-policy; review both before use. It refuses existing or partial configuration/state.
-Commands below run as host root; `NS_DOCS` names the installed helper directory.
+The [Quick Start](QUICK_START.md#3-prepare-the-container-demo) contains the complete
+fresh-host provisioning and five-route walkthrough. It uses the installed helpers
+under `/usr/share/doc/sigrund/namespace/selinux/`, locked source/destination owners,
+a root-only software signing key and independently scoped daemon/signer rules.
+The recipe is disposable; generated state/configuration must not replace an
+existing deployment. Its transient services have a ten-minute lifetime.
 
-```sh
-export NS_DOCS=/usr/share/doc/sigrund/namespace
-useradd --uid 1200 --create-home --shell /usr/sbin/nologin nsrequester
-useradd --uid 1300 --create-home --shell /usr/sbin/nologin nsowner
-python3 "$NS_DOCS/selinux/prepare-installed.py" --requester nsrequester \
-  --state-dir /var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl
-systemctl start sigrund.service
-cc -static -O2 -DDESTINATION='"host"' "$NS_DOCS/selinux/workload.c" \
-  -o /usr/local/libexec/sigrund-namespace/tool
-cc -static -O2 -DDESTINATION='"A"' "$NS_DOCS/selinux/workload.c" -o /var/tmp/tool-a
-cc -static -O2 -DDESTINATION='"B"' "$NS_DOCS/selinux/workload.c" -o /var/tmp/tool-b
-restorecon -RF /usr/local/libexec/sigrund-namespace
-python3 "$NS_DOCS/selinux/environment.py" create a --owner nsrequester --workload /var/tmp/tool-a
-python3 "$NS_DOCS/selinux/environment.py" create b --owner nsowner --workload /var/tmp/tool-b
-python3 "$NS_DOCS/selinux/environment.py" init b
-python3 "$NS_DOCS/selinux/environment.py" anchor b --registration container-b
-sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
-  --epoch-file /var/lib/sigrund-v3/host-epoch.json \
-  --identity /var/lib/sigrund-namespace-lab/approver
-```
+B's init starts independently before its disposable anchor is registered. The
+source helper enters its actual rootless environment and runs the installed client
+under the enforcing requester domain. Requests use exact destination account,
+root/cwd, executable and profile evidence. Root reviews the complete private
+record; APPROVED confirms consumption, followed by readiness and exit separately.
 
-B's init runs independently of its disposable anchor. In a separate root terminal,
-submit a host → B request in the restricted source domain:
-
-```sh
-systemd-run --wait --pipe --collect --uid=nsrequester \
-  --property=SELinuxContext=system_u:system_r:sigrund_requester_t:s0 \
-  /usr/bin/sigrun --socket /run/sigrund/client.sock --target registered:container-b \
-  --security-profile namespace-selinux-v1 --account ns_service --cwd /srv/service \
-  -- /usr/local/libexec/sigrund-namespace/tool
-```
-
-For A → B, use `python3 "$NS_DOCS/selinux/environment.py" client a --` followed by
-the same target/profile/account/cwd/command options. Select `self` for A → self;
-use `host`, `host-baseline`, numeric UID/GID 65534 and cwd `/` for A → host.
-Review the complete private evidence before confirming. The example command
-reports UID/GID 12001, empty groups, NNP, workload SID and denial of the configured
-syscall/secret read. `wait` keeps it and a descendant running for cancellation tests.
-
-Withdraw with `sigrundctl target revoke container-b --socket /run/sigrund/client.sock`.
-After restart or policy changes, restart init/container to expose the new socket
-directory, then register a fresh anchor. Stop `sigrund-namespace-*-client`,
-`*-anchor` and `*-init` units before removing trees. Unmount their `run/sigrund`,
-`sys/fs/selinux` and `dev/null` binds first. Preserve config, state and logs together.
+Revocation invalidates review and kills supervised jobs while retaining any
+consumption. Start a fresh anchor before retrying. After daemon restart, refresh
+the environment's bind of the recreated socket directory before reacquisition.
+Stop transient services and unmount runtime/selinuxfs/device binds before removing
+roots; preserve configuration, keys, state and audit together.
 
 ### Optional Podman lifecycle binding
 
@@ -250,7 +218,8 @@ Host and real rootless A can request B as nonroot UID/GID 12001 with empty group
 For this deployment, install Podman and container-selinux, then provision a fresh
 host with `python3 "$NS_DOCS/podman/prepare-installed.py" --requester nsrequester`.
 It loads the optional `sigrund_podman` module for producer API access only. Build
-the host/A/B workloads and create source A as above. Start `sigrund.service` and
+the host/A/B workloads and create source A using the
+[Quick Start](QUICK_START.md#3-prepare-the-container-demo). Start `sigrund.service` and
 `podman.socket`, run `restorecon -RF /run/podman`, and require a root:root socket
 with mode 0660 or stricter and `container_var_run_t`. Start B independently:
 
@@ -666,3 +635,54 @@ Beyond the implemented workflow, independent deferred features include:
 Broader namespace deployment claims require separate integration coverage.
 No v2 compatibility layer or automatic state migration is planned. Interpreter
 artifact binding remains separate deferred work.
+
+## Proposed setup experience
+
+This is a design direction; the commands below are **not implemented**. The
+[Quick Start](QUICK_START.md) documents today's supported commands. The next
+usability improvement should remove repeated manual configuration without
+expanding target authority or supported deployment scope.
+
+A proposed host workflow is:
+
+```text
+sigrundctl doctor
+sigrundctl setup host --requester USER --identity /root/.ssh/KEY \
+  --target-account root --executable /usr/bin/id --plan /root/sigrund-setup.json
+sigrundctl setup apply --plan /root/sigrund-setup.json
+```
+
+`doctor` should report host prerequisites, current installation/state and exact
+profile availability without changing persistent state. Planning should resolve
+explicit identities, render complete daemon/signer configuration and show file,
+service and credential effects. Applying should revalidate those inputs, refuse
+unrelated existing/partial state, publish root-owned files atomically and provision
+once. Service startup should be a distinct explicit option. Retrying must report
+verified completed steps; interruption needs an inspected recovery path that never
+replaces identities or resets consumption. Existing deployments require a separate
+inspected update operation.
+
+The initial preset should select local audit, one-time SSH/stdio, sealed finite
+input and digest-memfd with explicit requester, destination and executable scope.
+Unused remote-collector settings/files should become unnecessary through an
+explicit configuration-validation change; fake TLS credentials must not become
+an ordinary setup requirement. Existing state/audit guarantees remain unchanged.
+Use an existing SSH identity by default; generating a disposable software key
+should require an explicit demo choice. Configure an approver launch command
+without transferring signing authority to the daemon.
+
+Namespace setup should be a separate explicit operation that checks the enforcing
+requester/workload policy, mappings, mounts and endpoint access before producing
+a plan. A later target setup wrapper can coordinate dedicated anchors and the
+existing administrator registration operations, including the qualified scoped
+Podman adapter. Keep public `registered:ID`/`self` semantics and the exact private
+review. Never infer host privilege from manager access, weaken enforcement,
+automatically enable an experimental profile, or revive stale registrations.
+Root-controlled client presets may fill repetitive options only if the complete
+requested/resolved fields remain visible and signed.
+
+Before implementation, settle the plan's versioned format, stale-plan detection,
+secret handling, partial-apply recovery and host-only defaults. Deliver a native
+host setup/diagnosis path first, then enforcing namespace/manager setup with its
+own integration coverage. None of this requires a development-phase CLI or new
+public target-discovery service.

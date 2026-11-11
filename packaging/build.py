@@ -37,15 +37,16 @@ def stage(root, package, kind):
     if package == 'sigrund':
         (root / 'etc/sigrund').mkdir(parents=True, mode=0o755)
         install(REPO / 'packaging/sigrund.service', root / 'usr/lib/systemd/system/sigrund.service')
-        install(REPO / 'IMPLEMENTATION_NOTES.md', docs / 'IMPLEMENTATION_NOTES.md')
-        notes = docs / 'IMPLEMENTATION_NOTES.md'
-        text = notes.read_text().replace('(packaging/README.md', '(README.md')
         upstream = 'https://github.com/Librazy/sigrund/blob/main/'
-        for target in ('docs/PRIVILEGED_INTERPRETERS.md', 'MAINTENANCE.md'):
-            text = text.replace('](' + target + ')', '](' + upstream + target + ')')
         specification = 'sigrun sigrund Security Architecture and Implementation Specification.md'
-        text = text.replace('](<' + specification + '>)', '](' + upstream + specification.replace(' ', '%20') + ')')
-        notes.write_text(text)
+        for name in ('IMPLEMENTATION_NOTES.md', 'QUICK_START.md'):
+            guide = docs / name
+            install(REPO / name, guide)
+            text = guide.read_text().replace('(packaging/README.md', '(README.md')
+            for target in ('docs/PRIVILEGED_INTERPRETERS.md', 'MAINTENANCE.md'):
+                text = text.replace('](' + target + ')', '](' + upstream + target + ')')
+            text = text.replace('](<' + specification + '>)', '](' + upstream + specification.replace(' ', '%20') + ')')
+            guide.write_text(text)
         for source in sorted((REPO / 'packaging/selinux').iterdir()):
             if source.suffix in ('.te', '.fc', '.md') or source.name == 'Makefile':
                 install(source, docs / 'selinux' / source.name)
