@@ -1,10 +1,10 @@
-/* Fixture-only wrappers around the historical producer, never production code. */
-#include "../../../../../scripts/namespace-phase1-5/anchor.c"
+/* Review fixture with deliberate handshake delay and seccomp forgery. */
+#include "anchor.h"
 ssize_t write(int fd, const void *data, size_t count) {
     if (count == 1 && *(const char *)data == 'H') {
         const char *mode = getenv("SIGRUND_TEST_ANCHOR");
         if (mode && !strcmp(mode, "delay")) {
-            MUST(prctl(PR_SET_NAME, "phase2-delay", 0, 0, 0) == 0);
+            MUST(prctl(PR_SET_NAME, "ns-review-delay", 0, 0, 0) == 0);
             sleep(2);
         }
         if (mode && !strcmp(mode, "spoof")) {
@@ -21,4 +21,13 @@ ssize_t write(int fd, const void *data, size_t count) {
         }
     }
     return syscall(SYS_write, fd, data, count);
+}
+
+int main(int argc, char **argv) {
+    MUST(argc == 3 && !strcmp(argv[1], "init") && getpid() == 1);
+    MUST(chdir("/") == 0);
+    pid_t child = fork(); MUST(child >= 0);
+    if (child == 0) anchor(argv[2]);
+    int status; MUST(waitpid(child, &status, 0) == child);
+    return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 0 : 1;
 }

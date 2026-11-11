@@ -6,14 +6,12 @@ supervises execution in explicitly selected local environments. Full/thin
 provenance, confidential outcomes, executable evidence, durable authorization,
 hooks and audit replication remain part of this contract.
 
-The implemented local one-time SSH/stdio runtime uses **v3**. The host,
-experimental namespace and qualified production namespace profiles have separate
-qualification records (Section 8.3). A target requirement is not a support
-claim. The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md)
-tracks requirements, feasibility gates and release evidence. Requirements marked
-NS-01–NS-16 are normative obligations; unresolved mechanisms in Section 8.4 are
-release blockers, not permission to weaken those obligations. Schema examples
-are draft v3 contracts and must gain independent fixtures before runtime release.
+The implemented local one-time SSH/stdio runtime uses **v3**. Its supported
+host, namespace and optional Podman profiles are described in
+[implementation notes](IMPLEMENTATION_NOTES.md#namespace-execution). A target
+requirement is not a support claim. NS-01–NS-16 remain normative obligations;
+the design gates in Section 8.4 must be satisfied for every enabled combination.
+Schema examples require independent fixtures before runtime release.
 
 V3 is a clean break. Wire formats, configuration, CLI, signatures, database,
 audit/ratchet state and collector contracts may change together. Reject v2 and
@@ -439,8 +437,8 @@ Capture applicable `SO_PEERSEC` and process attributes with their observation
 source/time in private audit; socket security attributes are not complete live
 process confinement. Validate UID/GID mappings and overflow/unmapped results.
 `self` requires a stronger, race-checked acquisition contract tying the selected
-environment to the authenticated source. Before enabling it, Phase 0 must choose
-and specify connector capture or authenticated message-sender attribution,
+environment to the authenticated source. Specify connector capture or
+authenticated message-sender attribution,
 including inherited/passed sockets, connector exit, exec, credential and
 namespace changes. Reading procfs for a connection-time PID later is insufficient.
 No undocumented per-message authentication is inferred from the existing stream.
@@ -469,7 +467,7 @@ proc reference, namespace/root FDs, ownership relationships and mapping evidence
 under one documented race-resistant acquisition contract. Protect lookup against
 PID reuse and mixed observations. Repeated procfs reads alone do not prove an
 atomic capture or detect change-and-restore races. Unsupported acquisitions fail
-closed; the Phase 0 gate must prove the supported mechanism.
+closed; the acquisition design gate must prove the supported mechanism.
 
 Keep a private bounded instance registry scoped to a fresh daemon epoch. IDs
 without retained resources provide no authority. Reject on anchor exit,
@@ -528,13 +526,12 @@ changed policy cannot silently expand an existing grant. Captured generations
 retain resource limits, but do not bypass mandatory revocation or LSM-policy
 revalidation.
 
-The base configuration in Section 1.4 remains applicable. Phase 0 must specify
-bounded registration/profile schemas, management CLI, revocation and dependency
-metadata before those interfaces ship. The syntax is not inferred from the
-conceptual examples in the roadmap. Aggregate quotas must include pinned target
+The base configuration in Section 1.4 remains applicable. Registration/profile
+schemas, management CLI, revocation and dependency metadata must be bounded and
+versioned. The implemented syntax is defined by the core validators and
+configuration examples, not inferred from conceptual examples. Aggregate quotas must include pinned target
 FDs, registrations, helpers, launcher processes, pending review and cleanup;
-Phase 1 must supply concrete limits and exhaustion tests within the existing
-admission ceilings. Cancellation releases a reservation only after actual cleanup.
+Supply concrete limits and exhaustion tests within the existing admission ceilings. Cancellation releases a reservation only after actual cleanup.
 
 The backend is a native Linux namespace executor. Manager APIs are optional
 resolvers, not universal execution backends. Direct runc/crun access underneath
@@ -544,13 +541,11 @@ of manager execution policy (NS-13).
 
 ## 2. Wire Protocol, Request Shapes, and Job Lifecycle
 
-The [Phase 0 contract supplement](docs/NAMESPACE_PHASE0.md) fixes the initial
-constrained-anchor source-attribution mechanism, bounded private acquisition and
-constraint records, target-scoped policy/management grammar, binding distribution
-and quota defaults. Its experimental validators and fixtures are the concrete
-schema reference for the prototype. See Section 3.2.1 for the distinct
-experimental execution contract. Prototype results alone cannot qualify a
-runtime profile; strict concurrent SELinux policy replacement remains blocked.
+The [implementation notes](IMPLEMENTATION_NOTES.md#namespace-execution) describe
+constrained-anchor acquisition, bounded records, target policy/management,
+binding distribution and quotas. Production validators and independently checked
+fixtures are the schema reference. Strict concurrent SELinux policy replacement
+is outside the detection-and-termination profile's guarantee.
 
 ### 2.1 Binary Framing & Public Outcome Contract
 
@@ -722,8 +717,8 @@ without execution submission (and implies full-only). It may query public contex
 it never requests privileged expansion. Offline `sigrundctl csr-pae --csr PATH`
 and `pack-warrant` consume those bytes, sign/package without rewriting fields,
 and refuse overwrites. Thin requests have no export/redemption path. The
-[host workflow](docs/NAMESPACE_PHASE1.md) implements full/export; the experimental
-namespace profile accepts only thin requests. Full preparation/export requires
+[host workflow](IMPLEMENTATION_NOTES.md#host-bindings-and-provisioning) implements full/export; namespace
+profiles accept only thin requests. Full preparation/export requires
 an already trustworthy destination binding obtainable without privileged public target discovery (NS-07).
 
 ### 2.2.1 Preparation, Access Validation, and Exact Binding
@@ -1428,17 +1423,17 @@ fallback. Explicit numeric selection uses exactly its requested groups.
 IDs/groups retain existing numeric bounds; account/profile/registration strings
 are sanitized UTF-8, 1..128 bytes. Reject unknown tags, mixed forms and extra
 fields. Process PID is in `1..=2147483647`; it is never used as a substitute for
-the instance binding on redemption. Manager-name selector syntax is deferred to
-Phase 5 and requires a schema revision before exposure; examples are not aliases
-that an implementation may guess.
+the instance binding on redemption. Public manager-name selectors are unsupported. Manager integration uses
+administrator-created registrations; examples are not aliases an implementation
+may guess.
 
 `target_binding` has exactly `kind` (`host` or `process_environment`),
 `daemon_epoch` and `instance_id` (UUIDv7), `description` (sanitized UTF-8,
 1..1024 bytes), and `context_sha256` (64 lowercase hex digits). The digest binds
 the canonical private acquisition record: pinned process identity, namespace
 identities/ownership, root identity, composed UID/GID mappings and setgroups
-state, and required lifecycle/resolver scope. Phase 0 must finalize that bounded
-record schema and coherent acquisition procedure before any binding is issued.
+state, and required lifecycle/resolver scope. The core namespace/manager validators
+define these bounded records and their acquisition contract.
 The digest/IDs are not authority without a matching live retained target.
 
 `security_constraints` has exactly `profile_id` (same identifier as the intent)
@@ -1447,7 +1442,7 @@ canonical resolved constraint object, including namespace/isolation rules,
 capability/securebits/NNP rules, cgroup ceilings, LSM requirements, seccomp and
 verification obligations. This immutable object must be available to the daemon
 and trusted approver; missing versions fail closed, never resolve to a current
-same-named profile. Phase 0 must freeze its bounded schema. Display its complete
+same-named profile. Its bounded schema is defined by the core validators. Display its complete
 meaning before signing; a digest alone is not an adequate approval UI.
 
 All targets, including host, are epoch-bound. Full/offline preparation needs a
@@ -1459,11 +1454,11 @@ approval. Reusable grants, when separately implemented, remain limited to the
 same live instance and epoch; they never follow a registration to its replacement.
 The sample context/profile digests are illustrative, not usable registrations.
 
-#### Phase 3 experimental namespace contract
+#### Namespace execution contracts
 
 The opt-in `sigrund.constraints.namespace-experimental.v1` record is distinct
-from the frozen Phase 0 constraints. Its canonical record is
-[`experimental-constraints.json`](crates/sigrund-core/tests/fixtures/v3-namespace/experimental-constraints.json).
+from the preview constraint schema. Its canonical record is
+[`experimental-constraints.json`](crates/sigrund-core/tests/fixtures/namespace/experimental-constraints.json).
 It requires all eight declared namespace inputs, private mount/cgroup views,
 digest-memfd, a final-child exec stop, securebits 15, NNP, finite memory/pids
 limits and empty capability sets. Destination UID must be nonzero and requested
@@ -1471,7 +1466,9 @@ supplementary groups empty. SELinux fields declare no requested transition
 (`context=""`, `enforcing=false`, `policy_change="unmanaged"`); AppArmor is
 unsupported and seccomp is explicitly none. Ambient kernel LSM policy still
 applies. This experimental profile does not qualify production confinement or
-relax any historical profile. Phase 4 owns those additional obligations.
+relax the enforcing production profile. The latter uses
+`sigrund.constraints.namespace-selinux.v1`, exact workload/executable SIDs and
+explicit seccomp; see the [configured constraints](config/namespace-selinux-profiles.toml.example).
 
 Registered/process bindings retain `sigrund.process-context.v1`: exactly the
 acquisition and pinned executable-root map. Self uses
@@ -1494,7 +1491,7 @@ self requires null, an authenticated source, and null registration lifecycle
 fields. A registered review requires its exact registration/revision and no
 self source. Both must verify the exact CSR, resolved credentials, complete
 constraints, executable/cwd identities and context digest before rendering or
-signing. Namespace requests remain thin-only in this phase; full/signed namespace
+signing. Namespace requests remain thin-only; full/signed namespace
 input is rejected without fallback.
 
 The actual execution lease survives authorization, complete APPROVED delivery,
@@ -1620,7 +1617,7 @@ allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]
 The numeric ceilings above are scoped to explicitly permitted execution targets
 and immutable security profiles (Section 1.6), never global namespace-independent
 UIDs. The draft entry illustrates the base fields; target-scope/profile policy
-syntax is a Phase 0 schema gate. Requester IDs remain host-observed. A signature
+syntax is defined by the core configuration validators. Requester IDs remain host-observed. A signature
 must satisfy one complete signer policy; ownership and multiple partial signers
 do not combine to authorize cross-owner execution (NS-06).
 
@@ -2014,10 +2011,10 @@ if ((stv.f_flag & req) != req)
 view; it does not move a process. Preserve finite memory/PID limits and lifecycle
 ownership in host-controlled per-job cgroups. Do not blindly migrate into
 manager-owned cgroups or assume `CLONE_INTO_CGROUP` permissions survive userns
-entry. The initial candidate is a trusted launcher placed in the job cgroup
-before namespace entry, with final children inheriting placement. Phase 0 must
-verify this against supported userns ownership/delegation, visible cgroup roots,
-manager teardown and escape paths before it becomes a supported recipe.
+entry. A trusted launcher is placed in the job cgroup before namespace entry,
+with final children inheriting placement. Verify supported userns ownership/
+delegation, visible cgroup roots, manager teardown and escape paths for each
+supported recipe.
 Account for launchers and helpers in process limits. Refuse profiles whose
 required containment/placement cannot be enforced.
 
@@ -2522,83 +2519,29 @@ state diagrams must have independently checkable fixtures before runtime release
 
 ### 8.3 Implementation Status and Release Gate (NS-16)
 
-The [host qualification](docs/NAMESPACE_PHASE1.md) covers the v3 one-time
-SSH/stdio workflow. [Phase 3](docs/NAMESPACE_PHASE3.md) covers experimental
-namespace execution on its declared topology. Its four CLI routes used an A
-source in the initial user namespace and do not qualify a rootless requester,
-production workload confinement or arbitrary manager deployments.
+The [implementation notes](IMPLEMENTATION_NOTES.md#namespace-execution) state the
+supported profiles, topology, operator prerequisites and exclusions. The enforcing
+namespace profile is thin-only, uses `digest_memfd`, and requires locked untrusted
+accounts in the enforcing requester domain on Fedora 44 x86-64. Namespace
+full/export/offline redemption and production process-PID targets remain excluded.
+The optional adapter supports a local root-owned Podman 5.8.1 API in the default
+Libpod namespace; native entry supplies no Podman exec-policy equivalence.
+Ubuntu kernel 6.8 host compatibility and ARM64 builds do not establish namespace
+runtime support there. Broader combinations require their own integrated coverage.
 
-The [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md#phase-4--first-production-namespace-profile)
-defines the first candidate production profile: a host requester, one registered
-rootless B, and thin one-time approval. Release requires installed-package
-evidence for all applicable V-01–V-20 and NS cases below, including actual
-confinement, private/public outcomes, durable authorization, revocation and
-cleanup. NS-05 requires an adversarial post-release attach test with different
-mapped UIDs and requester user-namespace authority, or verified pre-authorization
-rejection of that combination. Document the deployment's policy-change guarantee
-under Section 5.5; a final observation cannot serialize policy replacement.
+Every advertised combination MUST satisfy its applicable V/NS requirements using
+matching source, package, binary and policy inputs. Test CLI and raw-protocol
+exclusions without fallback, consumption or spawn. Include actual confinement,
+private/public outcomes, durable authorization, lifecycle cancellation, owner
+injection controls and descendant cleanup. Partial reruns, helper-only tests and
+namespace-root fixtures do not replace installed native integration. Keep generated
+manifests, private reviews and logs outside the source tree. Policy-change handling
+under Section 5.5 is detection and termination, without an atomic replacement interlock.
 
-The qualified Phase 4 profile extends the first installed host-to-B gate with
-real rootless A to registered B, host and self on Fedora 44 x86-64 with enforcing
-SELinux. Its [scope and evidence record](docs/NAMESPACE_PHASE4.md) includes genuine
-and counterfeit endpoint checks, different-UID owner injection control/denial,
-lifecycle, consumption and matching host regression evidence. The
-[operator recipe](docs/NAMESPACE_PHASE4_OPERATOR.md) requires locked untrusted
-accounts in the enforcing requester domain and trusted unconfined host
-administrators. This does not qualify arbitrary unconfined containers, other
-namespace topologies or the independent later gates. Current experimental
-execution rejects nonroot requesters with known destination namespace-owner authority, including
-self, before review; the historical Phase 3 result does not qualify that current
-path.
-
-A thin-only production profile MUST reject namespace full and standalone signed
-input without fallback, consumption or spawn. Full-only/export MUST NOT invoke
-privileged preparation. Verify these exclusions against the CLI and raw protocol;
-positive namespace full/export, additional source routes, LSM stacks, executable
-models and optional manager resolvers require their own qualification before
-being advertised. The comprehensive matrix below remains the target across
-profiles; these exclusions do not waive any requirement for an enabled path.
-
-Final-candidate release qualification and optional manager integration are
-separate milestones in the [Phase 5 plan](docs/NAMESPACE_PHASE5.md). A manager-free
-release MAY ship before any adapter is enabled. It MUST identify the exact
-candidate revision, package/binary/policy artifacts and advertised combinations,
-and supply matching integrated evidence for every applicable V/NS requirement.
-Preserve historical results as historical snapshots; review-fix regressions and
-partial reruns MUST NOT be presented as a complete final-candidate acceptance run.
-Record the relationship between source, tested and installed artifacts, including
-any packaging transformations or documentation-only revision differences.
-
-The Phase 4 follow-up establishes host authentication compatibility on Ubuntu
-24.04 kernel 6.8; it does not qualify production namespace execution there.
-ARM64 cross-build evidence is not runtime qualification. Additional deployment
-claims require their own applicable cases. Optional manager adapters MUST pass
-NS-13 scope, generation, dishonest/stale metadata, replacement, required-evidence
-loss/restart and teardown cases on the actual installed integration before being
-advertised. The selected [Phase 5B Podman contract](docs/NAMESPACE_PHASE5B.md)
-restricts the first adapter to a local root-owned API, the default Libpod
-namespace, systemd cgroup v2 and a private PID-1 init. Its
-[installed qualification](docs/NAMESPACE_PHASE5B.md#installed-candidate-qualification)
-passes on the named enforcing Fedora deployment, separately from the manager-free
-candidate. Host and real rootless A sources to Podman B, scoped engine identity,
-required-evidence loss, teardown, ownership/quotas and matching regressions pass.
-Other managers, versions, scopes and topologies retain independent gates. Native
-entry supplies no manager exec-policy equivalence.
-
-The [Phase 5A qualification](docs/NAMESPACE_PHASE5A.md) closes the manager-free
-candidate gate for `77ed109` on the named Fedora deployment, with fresh installed
-packages, all four routes and complete matching host acceptance. Its evidence
-also records the separate Ubuntu host compatibility and ARM64 build-only results.
-The completion documentation does not change runtime artifacts or expand the
-profile's exclusions. Its historical manager-free evidence does not qualify the
-new optional Podman integration.
-
-Keep PTY, hooks, collector/remote ACK, reload, reusable grants, scripts and extra
-signing adapters independently deferred until their integrated cases pass. They
-remain target requirements, not mandatory scope for the namespace implementation
-milestones. Hardware FIDO claims still require physical acceptance. Full v3
-conformance requires all claimed target features and applicable V/NS cases;
-a subset must name its supported profile and exclusions explicitly.
+PTY, hooks, remote collector/ACK, policy reload, reusable grants, scripts and extra
+signing adapters remain independently deferred. Physical FIDO claims require
+hardware acceptance. Full v3 conformance requires all claimed target features and
+applicable cases; every subset must name its profile and exclusions explicitly.
 
 | Requirement | Integrated acceptance scenario and required result |
 | --- | --- |
@@ -2617,8 +2560,8 @@ a subset must name its supported profile and exclusions explicitly.
 
 ### 8.4 Release-Blocking Design Gates
 
-Phase 0 must produce reviewable decisions, bounded schemas and prototype evidence
-for the following before dependent runtime features are enabled:
+Each supported execution profile must satisfy these design gates with reviewable
+decisions, bounded schemas and integration tests before enabling dependent features:
 
 | Gate | Required decision/evidence | Blocked capability |
 | --- | --- | --- |

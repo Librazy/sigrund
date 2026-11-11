@@ -120,7 +120,7 @@ mod tests {
         std::fs::write(directory.path().join("bin/tool"), b"destination bytes").unwrap();
         let root = File::open(directory.path()).unwrap();
         let acquisition = Acquisition::parse(include_bytes!(
-            "../../sigrund-phase0/tests/fixtures/acquisition.json"
+            "../../sigrund-core/tests/fixtures/namespace/acquisition.json"
         ))
         .unwrap();
         let account = Account::Name {

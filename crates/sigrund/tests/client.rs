@@ -405,7 +405,7 @@ fn client_namespace_fixture() {
 }
 
 #[test]
-#[ignore = "requires root in the initial user namespace; run by the Phase 4 privileged gate"]
+#[ignore = "requires root in the initial user namespace; run by the privileged namespace gate"]
 fn client_host_fixture() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let (output, reports) = case(

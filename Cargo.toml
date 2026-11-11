@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sigrund-core", "crates/sigrund", "crates/sigrund-phase0"]
+members = ["crates/sigrund-core", "crates/sigrund"]
 # Prefer dependencies compatible with the declared MSRV when updating the lockfile.
 resolver = "3"
 

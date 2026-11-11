@@ -262,7 +262,7 @@ fn require_live(file: &File) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
+    #[ignore = "requires initial-userns root; included in the privileged host gate"]
     fn epoch_registry_requires_live_owner_and_exact_private_review() {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         let dir = tempfile::tempdir().unwrap();

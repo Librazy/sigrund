@@ -54,7 +54,7 @@ impl Fixture {
 }
 
 #[test]
-#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
+#[ignore = "requires initial-userns root; included in the privileged host gate"]
 fn exit_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")

@@ -54,7 +54,7 @@ def main():
         ('python', [sys.executable, '-c', "from pathlib import Path; [compile(p.read_bytes(), str(p), 'exec') for p in Path('scripts').rglob('*.py')]"]),
         ('harness-tests', [sys.executable, '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-v']),
         ('host-vectors', [sys.executable, 'scripts/verify-host-vectors.py']),
-        ('namespace-vectors', [sys.executable, 'scripts/namespace-phase0/verify-vectors.py']),
+        ('namespace-vectors', [sys.executable, 'scripts/namespace/verify-vectors.py']),
         ('privileged-build', ['cargo', 'test', '-p', 'sigrund', '--lib', '--test', 'daemon', '--test', 'client', *profile, '--locked', '--no-run', '--message-format=json']),
         ('platform-build', ['cargo', 'test', '-p', 'sigrund', '--test', 'cgroup', *profile, '--locked', '--no-run', '--message-format=json']),
     ]

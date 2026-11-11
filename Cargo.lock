@@ -878,20 +878,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sigrund-phase0"
-version = "0.0.0"
-dependencies = [
- "base64",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sigrund-core",
- "ssh-key",
- "tempfile",
- "uuid",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

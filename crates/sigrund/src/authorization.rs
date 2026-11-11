@@ -73,7 +73,7 @@ pub(crate) fn verify(
                 .clone());
         }
         return Err(Denial::new(
-            "PHASE2_EXECUTION_DISABLED",
+            "NAMESPACE_EXECUTION_DISABLED",
             "private process approval verified; execution is disabled",
         ));
     }

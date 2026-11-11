@@ -1,61 +1,39 @@
-# Phase 4 Fedora SELinux candidate
+# SELinux policy
 
-Build all three modules with `make`, then load them in one transaction:
+Build the daemon, workload and requester modules with `make`, then load them
+in one transaction:
 
 ```sh
 semodule -i sigrund_daemon.pp sigrund_workload.pp sigrund_requester.pp
 restorecon -RF /etc/sigrund /usr/libexec/sigrund/sigrund
 ```
 
-The daemon and workload policies remain separate. The requester policy defines
-the untrusted actor in the qualified deployment. It deliberately has neither the
-generic `domain` attribute nor any process transition permission. All untrusted
-code, including namespace owners and mapping helpers, must stay in
-`system_u:system_r:sigrund_requester_t:s0`, with that domain enforcing. The
-root-owned systemd recipe provides its entry. Requester accounts are locked,
-have a nologin shell, have no sudo access and have no alternate execution path.
-Unconfined host accounts must be trusted administrators. The modules do not make
-an unconfined, non-administrative host account safe: Fedora permits unconfined
-subjects to enter `init_t`, which can enter the daemon producer domain.
+Untrusted code, including namespace owners and mapping helpers, must stay in
+enforcing `system_u:system_r:sigrund_requester_t:s0`. The root-owned systemd
+recipe supplies entry; requester accounts require locked passwords, nologin shells
+and no sudo or alternate execution path. Unconfined host accounts are trusted
+administrators. These modules do not constrain an unconfined host account.
 
-The client checks its source label through a kernel socket pair, checks the
-requester, producer and both workload domain enforcement flags through the kernel AV API, and
-checks the endpoint's reserved socket label. Each SELinux file must belong to
-selinuxfs. The `/access` query uses a write/read transaction, so the source's
-selinuxfs view must permit that operation. `compute_av` grants no policy-loading
-or enforcement-changing authority. The policy assertions separately prohibit
-requester entry into another domain, workload ptrace, and reserved socket SID
-creation/relabeling. Administrative approval uses initial-user-namespace host
-root authentication.
+Clients authenticate reserved socket labels and check producer/requester/workload
+enforcement through genuine selinuxfs. Its `/access` query needs a write/read
+transaction; `compute_av` supplies no policy-loading permission. Policy assertions
+prohibit requester domain transitions, workload ptrace and reserved-label creation.
+Administrative approval additionally requires initial-user-namespace host root.
 
-Approved host commands also leave the producer domain. The executor arms the
-`sigrund_host_workload_t` transition while the host procfs view is trusted, before
-credentials or mounts change. This applies whenever the daemon runs in its
-reserved producer context, including host-only configurations. Namespace
-launchers carry this obligation through their sealed, versioned payload; the
-production namespace profile still enters its own exact workload context.
-Host constraints retain their existing ambient-LSM contract. Neither workload
-type can create reserved socket labels or transition into a producer. An
-unconfined host command must never inherit the producer's reserved-label powers.
+Approved host commands transition to `sigrund_host_workload_t`, including host-only
+configurations. Production namespace jobs enter their exact workload SID. Neither
+workload may create reserved socket labels or transition into the producer domain.
+Policy-generation changes invalidate owners and terminate jobs. Drain jobs before
+replacement and acquire fresh registrations afterward; this provides detection
+and termination without an atomic replacement interlock.
 
-Drain jobs before replacing policy. The daemon pins a policy-generation token;
-observed changes invalidate targets and terminate jobs. This is detection and
-termination, without an atomic interlock against concurrent policy replacement.
-Restart the daemon and register a fresh anchor after any policy change.
+For the optional local rootful Podman adapter, build `make podman`, load
+`sigrund_podman.pp`, start the root-owned API socket and run `restorecon -RF
+/run/podman`. The module labels the path `container_var_run_t` and permits only
+the producer to connect to runtime/systemd listeners. Requesters and workloads
+receive no manager API access.
 
-The installed operator guide is `../NAMESPACE_PHASE4_OPERATOR.md`. Qualification
-status and platform limits are recorded in `docs/NAMESPACE_PHASE4.md` in the
-source repository; installing these sources does not itself qualify a deployment.
-
-## Optional Podman resolver policy
-
-The default build installs no manager API permission. For the separately
-qualified local rootful Podman deployment, build `make podman`, load
-`sigrund_podman.pp`, and run `restorecon -RF /run/podman` after starting the
-standard root-owned socket. The optional file-context rule labels that directory
-and socket `container_var_run_t`; the module permits only the producer to connect
-to the container runtime or systemd-activated listener. Requester and workload
-domains receive no manager API access. Follow
-[the Podman operator recipe](../NAMESPACE_PHASE5B_OPERATOR.md) for scope,
-administrator trust, lifecycle and confinement prerequisites. When reading this
-file in the source tree, use [the source recipe](../../docs/NAMESPACE_PHASE5B_OPERATOR.md).
+See the [implementation notes](../../IMPLEMENTATION_NOTES.md#namespace-execution)
+for scope and setup. Packages install those notes at
+`/usr/share/doc/sigrund/IMPLEMENTATION_NOTES.md`, with disposable recipes under
+`/usr/share/doc/sigrund/namespace/{selinux,podman}/`.

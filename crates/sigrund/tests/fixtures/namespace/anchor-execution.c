@@ -1,8 +1,5 @@
-/* Execution fixture with a bind-mounted root in util-linux unshare's already
- * private mount tree. Historical Phase 0 and Phase 1.5 producers stay unchanged. */
-#define main phase0_probe_main
-#include "../../../../../scripts/namespace-phase0/probe.c"
-#undef main
+/* Bind-mounted root in the private mount tree created by unshare. */
+#include "anchor.h"
 int main(int argc, char **argv) {
     MUST(argc >= 4 && getpid() == 1);
     MUST(mount(argv[2], argv[2], NULL, MS_BIND | MS_REC, NULL) == 0);
@@ -21,7 +18,7 @@ int main(int argc, char **argv) {
             MUST(setgroups(0, NULL) == 0 && setgid(65534) == 0 && setuid(65534) == 0);
             execv(argv[4], &argv[4]); perror("source fixture exec"); _exit(126);
         }
-        anchor(argv[3], 0); _exit(1);
+        anchor(argv[3]); _exit(1);
     }
     int status; MUST(waitpid(child, &status, 0) == child);
     if (source) return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);

@@ -1,6 +1,5 @@
-# Opt-in Phase 3 experimental execution. Append deliberately to a v3 daemon
-# configuration; this does not provide the Phase 4 LSM/seccomp confinement.
-# Read docs/NAMESPACE_PHASE3.md before granting either scope.
+# Opt-in experimental namespace execution without LSM/seccomp confinement.
+# See IMPLEMENTATION_NOTES.md#namespace-execution before granting either scope.
 
 [[namespace_profiles]]
 apparmor = "unsupported"

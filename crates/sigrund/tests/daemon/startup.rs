@@ -244,7 +244,7 @@ pub(super) fn verify_audit_directory_replacement() {
 }
 
 #[test]
-#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
+#[ignore = "requires initial-userns root; included in the privileged host gate"]
 fn stale_audit_temporary_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")
@@ -339,7 +339,7 @@ fn stale_audit_temporary_namespace_fixture() {
 }
 
 #[test]
-#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
+#[ignore = "requires initial-userns root; included in the privileged host gate"]
 fn v3_provisioning_set_gate() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     for (role, sidecar) in [

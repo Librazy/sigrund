@@ -1,8 +1,7 @@
-# Append to a configured v3 daemon file. Phase 2 performs private review only;
-# these prospective constraints are never treated as enforced workload state.
-# The rootless topology and preparation limits are documented in
-# docs/NAMESPACE_PHASE2.md. All configured executable roots must exist in B.
-# Host profiles/rules remain required independently.
+# Private-review-only preview profile; these constraints never authorize execution.
+# See IMPLEMENTATION_NOTES.md#namespace-execution. Use the separate SELinux
+# profile for execution. All configured executable roots must exist in B.
+# Schema/context names below are retained for canonical compatibility.
 
 [[namespace_profiles]]
 apparmor = "unsupported"

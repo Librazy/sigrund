@@ -70,5 +70,4 @@ pub mod target_management;
 pub mod destination_helper;
 
 mod podman;
-mod podman_api;
 mod process_request;

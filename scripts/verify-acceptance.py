@@ -479,7 +479,7 @@ def thin_input_before_private_lookup(parent, binaries, evidence):
             source = f.base/('input-'+uuid.uuid4().hex)
             content = b'finite-private-lookup-input' * 512
             source.write_bytes(content)
-            output = os.memfd_create('phase1-private-lookup-output',os.MFD_CLOEXEC)
+            output = os.memfd_create('account-private-lookup-output',os.MFD_CLOEXEC)
             try:
                 with source.open('rb') as input_file, open('/dev/null','r+b') as null:
                     message = SHARED['frame'](1,{'version':'3.0','mode':'thin_csr','tty_mode':'stdio','caller_env':{},'intent':intent})
@@ -525,11 +525,11 @@ def _host_account_profile_child(parent, binaries, artifacts):
     try:
         passwd = f.base/'passwd'
         groups = f.base/'group'
-        name = 'sigrund-phase1-target'
+        name = 'sigrund-account-target'
         original_passwd = Path('/etc/passwd').read_text()
         original_groups = Path('/etc/group').read_text()
         passwd.write_text(original_passwd + name+':x:33:33::/:/bin/false\n')
-        groups.write_text(original_groups + 'sigrund-phase1-group:x:104:'+name+'\n')
+        groups.write_text(original_groups + 'sigrund-account-group:x:104:'+name+'\n')
         passwd.chmod(0o644)
         groups.chmod(0o644)
         for source,target in ((passwd,'/etc/passwd'),(groups,'/etc/group')):
@@ -545,7 +545,7 @@ def _host_account_profile_child(parent, binaries, artifacts):
         peer=socket.socket(socket.AF_UNIX)
         peer.settimeout(10)
         peer.connect(str(f.client))
-        output=os.memfd_create('phase1-account-observed',os.MFD_CLOEXEC)
+        output=os.memfd_create('account-observed',os.MFD_CLOEXEC)
         descriptors.append(output)
         body=SHARED['frame'](1,{'version':'3.0','mode':'thin_csr','tty_mode':'stdio','caller_env':{},'intent':intent})
         with open('/dev/null','r+b') as null:
@@ -928,7 +928,7 @@ def inside(args):
             raise RuntimeError('strace disappeared after prerequisite validation')
         tests = evidence.manifest['ordinary_checks']['privileged_test_binaries']
         for label, command in (
-            ('privileged-rust', [sys.executable, REPO / 'scripts/verify-phase1-rust.py',
+            ('privileged-rust', [sys.executable, REPO / 'scripts/verify-privileged-rust.py',
                                  '--daemon-tests', tests['daemon'], '--library-tests', tests['library'],
                                  '--client-tests', tests['client'],
                                  '--artifacts', args.artifacts / 'privileged-rust']),

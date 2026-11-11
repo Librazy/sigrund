@@ -1,8 +1,8 @@
 //! Optional Podman identity/lifecycle dependency around a normal captured anchor.
-use crate::{
-    podman_api::{Endpoint, Response},
-    target_registry::CapturedAnchor,
-};
+mod api;
+
+use crate::target_registry::CapturedAnchor;
+use api::{Endpoint, Response};
 use sigrund_core::{
     crypto::sha256_hex,
     host_budget::{Budget, Charge, Reservation},
@@ -712,7 +712,7 @@ mod tests {
             endpoint: "/run/podman/podman.sock".into(),
             owner_uid: 0,
             manager_namespace: "default".into(),
-            container_name: "sigrund-phase5b-probe".into(),
+            container_name: "sigrund-podman-probe".into(),
         };
         let budget = Budget::new(Default::default()).unwrap();
         assert!(
@@ -726,11 +726,7 @@ mod tests {
         guard.state.check(&|| Ok(())).unwrap();
         assert!(guard.state.valid());
         let status = std::process::Command::new("podman")
-            .args([
-                "rename",
-                "sigrund-phase5b-probe",
-                "sigrund-phase5b-probe-old",
-            ])
+            .args(["rename", "sigrund-podman-probe", "sigrund-podman-probe-old"])
             .status()
             .unwrap();
         assert!(status.success());
@@ -748,11 +744,7 @@ mod tests {
         );
         assert!(
             std::process::Command::new("podman")
-                .args([
-                    "rename",
-                    "sigrund-phase5b-probe-old",
-                    "sigrund-phase5b-probe"
-                ])
+                .args(["rename", "sigrund-podman-probe-old", "sigrund-podman-probe"])
                 .status()
                 .unwrap()
                 .success()

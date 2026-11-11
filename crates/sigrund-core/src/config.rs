@@ -1078,7 +1078,7 @@ mod tests {
         use crate::namespace::Contract;
         let mut config = valid();
         let profile = crate::namespace::Constraints::parse(include_bytes!(
-            "../tests/fixtures/v3-namespace/experimental-constraints.json"
+            "../tests/fixtures/namespace/experimental-constraints.json"
         ))
         .unwrap();
         config.namespace_profiles = vec![profile];
@@ -1108,7 +1108,7 @@ mod tests {
         use crate::namespace::Contract;
         let mut config = valid();
         let profile = crate::namespace::Constraints::parse(include_bytes!(
-            "../../sigrund-phase0/tests/fixtures/constraints.json"
+            "../tests/fixtures/namespace/constraints.json"
         ))
         .unwrap();
         let hash = profile.sha256().unwrap();
@@ -1138,7 +1138,7 @@ mod tests {
         use crate::namespace::Contract;
         let mut config = valid();
         let profile = crate::namespace::Constraints::parse(include_bytes!(
-            "../../sigrund-phase0/tests/fixtures/constraints.json"
+            "../tests/fixtures/namespace/constraints.json"
         ))
         .unwrap();
         let rule = crate::namespace::ScopedRule {

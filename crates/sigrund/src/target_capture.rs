@@ -905,7 +905,7 @@ mod tests {
             namespaces: Vec::new(),
             _namespace_resources: None,
             acquisition: Acquisition::parse(include_bytes!(
-                "../../sigrund-phase0/tests/fixtures/acquisition.json"
+                "../../sigrund-core/tests/fixtures/namespace/acquisition.json"
             ))
             .unwrap(),
             roots: vec![PathBuf::from("/usr/bin")],

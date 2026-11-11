@@ -1,13 +1,14 @@
+#[path = "namespace/signing.rs"]
+mod signing;
+
 use sigrund_core::namespace::{Acquisition, Constraints, Contract, Registration};
 
 #[test]
 fn production_records_match_independent_frozen_vectors() {
-    let acquisition = include_bytes!("../../sigrund-phase0/tests/fixtures/acquisition.json");
-    let constraints = include_bytes!("../../sigrund-phase0/tests/fixtures/constraints.json");
-    let hashes: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../sigrund-phase0/tests/fixtures/sha256.json"
-    ))
-    .unwrap();
+    let acquisition = include_bytes!("fixtures/namespace/acquisition.json");
+    let constraints = include_bytes!("fixtures/namespace/constraints.json");
+    let hashes: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/namespace/sha256.json")).unwrap();
     let a = Acquisition::parse(acquisition).unwrap();
     let c = Constraints::parse(constraints).unwrap();
     assert_eq!(a.canonical().unwrap(), acquisition);
@@ -18,7 +19,7 @@ fn production_records_match_independent_frozen_vectors() {
 
 #[test]
 fn registration_and_acquisition_reject_ambiguous_records() {
-    let raw = include_bytes!("../../sigrund-phase0/tests/fixtures/acquisition.json");
+    let raw = include_bytes!("fixtures/namespace/acquisition.json");
     let mut value: serde_json::Value = serde_json::from_slice(raw).unwrap();
     value["pid"] = 0.into();
     assert!(Acquisition::parse(&serde_json::to_vec(&value).unwrap()).is_err());
@@ -40,14 +41,10 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
         namespace::ProcessReview,
         warrant::{Csr, Warrant},
     };
-    let acquisition = Acquisition::parse(include_bytes!(
-        "../../sigrund-phase0/tests/fixtures/acquisition.json"
-    ))
-    .unwrap();
-    let constraints = Constraints::parse(include_bytes!(
-        "../../sigrund-phase0/tests/fixtures/constraints.json"
-    ))
-    .unwrap();
+    let acquisition =
+        Acquisition::parse(include_bytes!("fixtures/namespace/acquisition.json")).unwrap();
+    let constraints =
+        Constraints::parse(include_bytes!("fixtures/namespace/constraints.json")).unwrap();
     let registration = Registration {
         schema: "sigrund.registration.phase0.v1".into(),
         id: acquisition.lifecycle.registration_id.clone().unwrap(),
@@ -96,7 +93,7 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
     review.verify_csr(&csr).unwrap();
     let display = review.render(&csr).unwrap();
     assert!(display.contains("verified_acquisition"));
-    assert!(display.contains("Phase 2 private review"));
+    assert!(display.contains("Private namespace review"));
     {
         let mut managed = review.clone();
         managed.schema = "sigrund.podman-review.v1".into();
@@ -141,7 +138,7 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
         own.acquisition.lifecycle.registration_id = None;
         own.acquisition.lifecycle.registration_revision = None;
         own.constraints = Constraints::parse(include_bytes!(
-            "fixtures/v3-namespace/experimental-constraints.json"
+            "fixtures/namespace/experimental-constraints.json"
         ))
         .unwrap();
         let binding = own.binding().unwrap();
@@ -217,10 +214,8 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
 #[test]
 fn experimental_profile_requires_a_distinct_exact_contract() {
     use sigrund_core::{executable::TrustModel, namespace::Seccomp};
-    let historical = Constraints::parse(include_bytes!(
-        "../../sigrund-phase0/tests/fixtures/constraints.json"
-    ))
-    .unwrap();
+    let historical =
+        Constraints::parse(include_bytes!("fixtures/namespace/constraints.json")).unwrap();
     let mut profile = historical.clone();
     profile.schema = "sigrund.constraints.namespace-experimental.v1".into();
     profile.profile_id = "namespace-experimental-v1".into();
@@ -237,7 +232,7 @@ fn experimental_profile_requires_a_distinct_exact_contract() {
             .unwrap(),
         profile.sha256().unwrap()
     );
-    let vector = include_bytes!("fixtures/v3-namespace/experimental-constraints.json");
+    let vector = include_bytes!("fixtures/namespace/experimental-constraints.json");
     assert_eq!(profile.canonical().unwrap(), vector);
     // Independent Python sorted-key ASCII JSON and hashlib SHA-256 vector.
     assert_eq!(
@@ -269,16 +264,15 @@ fn experimental_profile_requires_a_distinct_exact_contract() {
 #[test]
 fn selinux_profile_binds_complete_confinement_and_independent_digests() {
     use sigrund_core::host::{ExecutionBinding, Record};
-    let bytes = include_bytes!("fixtures/v3-namespace/selinux-constraints.json");
+    let bytes = include_bytes!("fixtures/namespace/selinux-constraints.json");
     let profile = Constraints::parse(bytes).unwrap();
     assert!(profile.is_production() && profile.executes());
     assert_eq!(profile.canonical().unwrap(), bytes);
     let hashes: serde_json::Value =
-        serde_json::from_slice(include_bytes!("fixtures/v3-namespace/selinux-sha256.json"))
-            .unwrap();
+        serde_json::from_slice(include_bytes!("fixtures/namespace/selinux-sha256.json")).unwrap();
     assert_eq!(profile.sha256().unwrap(), hashes["constraints"]);
     let binding = ExecutionBinding::parse(include_bytes!(
-        "fixtures/v3-namespace/selinux-execution-binding.json"
+        "fixtures/namespace/selinux-execution-binding.json"
     ))
     .unwrap();
     assert_eq!(
@@ -317,7 +311,7 @@ fn selinux_profile_binds_complete_confinement_and_independent_digests() {
         );
     }
     let mut old: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "fixtures/v3-namespace/experimental-constraints.json"
+        "fixtures/namespace/experimental-constraints.json"
     ))
     .unwrap();
     old["selinux"]["executable_context"] = serde_json::Value::Null;

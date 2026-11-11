@@ -1233,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires root in the initial user namespace; included in the privileged Phase 1 gate"]
+    #[ignore = "requires root in the initial user namespace; included in the privileged host gate"]
     fn final_authorization_rechecks_retained_policy_and_identity() {
         let mut fixture = Fixture::new();
         Arc::make_mut(&mut fixture.config)

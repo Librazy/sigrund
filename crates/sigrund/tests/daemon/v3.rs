@@ -3,7 +3,7 @@ use super::*;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 #[test]
-#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
+#[ignore = "requires initial-userns root; included in the privileged host gate"]
 fn confidentiality_gate() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")

@@ -276,7 +276,7 @@ impl Contract for Acquisition {
         }
         if !self.lifecycle.anchor_required || self.lifecycle.resolver.is_some() {
             return Err(invalid(
-                "phase0 requires a live anchor; resolvers are deferred",
+                "acquisition requires a live anchor without an embedded resolver",
             ));
         }
         match (
@@ -388,7 +388,7 @@ impl Contract for Constraints {
                     | crate::executable::TrustModel::DigestMemfd
             )
         {
-            return Err(invalid("unsupported phase0 constraint combination"));
+            return Err(invalid("unsupported preview constraint combination"));
         }
         if self.is_production() {
             if self.profile_id != "namespace-selinux-v1"
@@ -853,7 +853,7 @@ impl ProcessReview {
                 "SELinux-constrained execution; final-child checkpoint required"
             } else if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
                 "Experimental execution; final-child checkpoint required"
-            } else { "Phase 2 private review; execution is disabled" },
+            } else { "Private namespace review; execution is disabled" },
             "workload_lsm_transition": if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
                 "none requested; ambient LSM policy still applies"
             } else {

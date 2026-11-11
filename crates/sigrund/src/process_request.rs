@@ -1,4 +1,4 @@
-//! Thin process-environment preparation and the Phase 2 authorization boundary.
+//! Thin process-environment preparation and namespace authorization boundaries.
 use crate::{
     destination_helper::{self, Evidence},
     preparation::{self, Context, Document, FileIdentity, Pending, Prepared},
@@ -508,7 +508,7 @@ pub(crate) fn finish(
 }
 
 /// A successful result proves final private authorization checks. The caller
-/// still must enforce Phase 2's stop before consumption or public approval.
+/// still must enforce the preview stop before consumption or public approval.
 pub(crate) fn verify_final(
     request: &ValidatedRequest,
     context: &Context,

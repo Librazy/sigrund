@@ -851,11 +851,11 @@ mod tests {
         closed: &Arc<AtomicUsize>,
     ) -> (Registration, Constraints, Box<dyn CapturedAnchor>) {
         let mut a = Acquisition::parse(include_bytes!(
-            "../../sigrund-phase0/tests/fixtures/acquisition.json"
+            "../../sigrund-core/tests/fixtures/namespace/acquisition.json"
         ))
         .unwrap();
         let c = Constraints::parse(include_bytes!(
-            "../../sigrund-phase0/tests/fixtures/constraints.json"
+            "../../sigrund-core/tests/fixtures/namespace/constraints.json"
         ))
         .unwrap();
         let revision = fresh_revision().unwrap();
