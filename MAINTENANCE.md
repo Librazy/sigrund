@@ -112,8 +112,8 @@ for both crates and native packages. Update it and the workspace entries in
 and push a matching `vX.Y.Z` tag, for example:
 
 ```sh
-git tag -a v0.3.0 -m 'Release 0.3.0'
-git push origin v0.3.0
+git tag -a v0.3.1 -m 'Release 0.3.1'
+git push origin v0.3.1
 ```
 
 The Release workflow rejects tags that do not match the workspace version,
