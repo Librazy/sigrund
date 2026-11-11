@@ -181,7 +181,7 @@ def main():
             execution = api.execution_id(review)
             assert select.select([process.stdout], [], [], 10)[0]
             assert b'destination=A' in os.read(process.stdout.fileno(), 4096)
-            evidence = json.loads(Path('/var/lib/sigrund-v3/host-epoch.json').read_text())['process_review']
+            evidence = json.loads(Path('/var/lib/sigrund/host-epoch.json').read_text())['process_review']
             connector = os.pidfd_open(evidence['authenticated_source']['pid'])
             pids = api.workload_descendants(execution)
             descriptors = [os.pidfd_open(int(pid)) for pid in pids]

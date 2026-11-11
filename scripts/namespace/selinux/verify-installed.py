@@ -35,7 +35,7 @@ class Approver:
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execv('/usr/bin/sigrund-approve', ['sigrund-approve', '--socket', '/run/sigrund/approve.sock',
-                     '--epoch-file', '/var/lib/sigrund-v3/host-epoch.json', '--identity', str(identity)])
+                     '--epoch-file', '/var/lib/sigrund/host-epoch.json', '--identity', str(identity)])
         self.transcript = bytearray()
         fcntl.ioctl(self.fd, termios.TIOCPKT, struct.pack('i', 1))
         self.connections = 0
@@ -114,7 +114,7 @@ def client(route, owner):
 
 
 def records():
-    return [json.loads(line) for line in Path('/var/log/sigrund-v3/audit.jsonl').read_text().splitlines()]
+    return [json.loads(line) for line in Path('/var/log/sigrund/audit.jsonl').read_text().splitlines()]
 
 
 def wait_for(predicate, description):
@@ -136,7 +136,7 @@ def audit(execution):
 
 
 def consumed(execution):
-    with closing(sqlite3.connect('file:/var/lib/sigrund-v3/state.sqlite?mode=ro', uri=True)) as connection:
+    with closing(sqlite3.connect('file:/var/lib/sigrund/state.sqlite?mode=ro', uri=True)) as connection:
         return connection.execute('SELECT count(*) FROM consumed_grants WHERE exec_id=?', (execution,)).fetchone()[0]
 
 
@@ -461,7 +461,7 @@ def security(args, approver, result):
     context = Path('/proc/self/attr/current').read_text().strip('\0\n')
     dropin.write_text('[Service]\nSELinuxContext=' + context + '\nExecStart=\n'
                       "ExecStart=/usr/bin/sh -c 'exec /usr/libexec/sigrund/sigrund --foreground "
-                      '--state-dir /var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl '
+                      '--state-dir /var/lib/sigrund --log-path /var/log/sigrund/audit.jsonl '
                       "--socket /run/sigrund/client.sock --approval-socket /run/sigrund/approve.sock'\n")
     try:
         subprocess.run(['systemctl', 'daemon-reload'], check=True)

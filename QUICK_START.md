@@ -91,7 +91,7 @@ is used by this workflow. Validate, then provision once:
 ```sh
 /usr/libexec/sigrund/sigrund --check-config
 (umask 077; set -C; sigrundctl init-host \
-  --state-dir /var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl \
+  --state-dir /var/lib/sigrund --log-path /var/log/sigrund/audit.jsonl \
   > /root/sigrund-initial-anchor.json)
 systemctl enable --now sigrund.service
 ```
@@ -102,7 +102,7 @@ In a separate **host-root terminal**, start the approver:
 
 ```sh
 sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
-  --identity /etc/sigrund/approver --epoch-file /var/lib/sigrund-v3/host-epoch.json
+  --identity /etc/sigrund/approver --epoch-file /var/lib/sigrund/host-epoch.json
 ```
 
 In the **requester's terminal**, run:
@@ -144,7 +144,7 @@ Provision the demo, allow two minutes for interactive approval, and validate:
 
 ```sh
 python3 "$NS_DOCS/selinux/prepare-installed.py" --requester nsrequester \
-  --state-dir /var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl
+  --state-dir /var/lib/sigrund --log-path /var/log/sigrund/audit.jsonl
 sed -i 's/^authorization_timeout_ms = 5000$/authorization_timeout_ms = 120000/' /etc/sigrund/config.toml
 /usr/libexec/sigrund/sigrund --check-config
 ```
@@ -179,7 +179,7 @@ In a separate **host-root terminal**, start the approver and leave it running:
 ```sh
 sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
   --identity /var/lib/sigrund-namespace-lab/approver \
-  --epoch-file /var/lib/sigrund-v3/host-epoch.json
+  --epoch-file /var/lib/sigrund/host-epoch.json
 ```
 
 ## 4. Try the four container routes

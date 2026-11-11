@@ -86,13 +86,13 @@ model. Insufficient local evidence preserves the same thin intent for ordinary
 submission; full-only/export fails locally. Signed mismatches never fall back.
 
 Provision a new, coherent v3 state/log set using `sigrundctl init-host --state-dir
-/var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl`. Preserve the printed
+/var/lib/sigrund --log-path /var/log/sigrund/audit.jsonl`. Preserve the printed
 audit anchor privately and retain older state separately. Root exports a live host
 binding into a new mode-0600 file:
 
 ```sh
 sigrundctl target export-binding host --security-profile host-baseline \
-  --epoch-file /var/lib/sigrund-v3/host-epoch.json \
+  --epoch-file /var/lib/sigrund/host-epoch.json \
   --output /root/host-baseline-binding.json
 ```
 
@@ -469,8 +469,8 @@ In the requester login, source the same environment and run:
 ```
 
 Select numeric UID/GID 33 for the service-user example. The lab exports its own
-sockets; packages use `/run/sigrund/{client,approve}.sock`, while bare defaults
-are `/run/sigrund.sock` and `/run/sigrund-approve.sock`.
+sockets; the binaries and packages default to `/run/sigrund/{client,approve}.sock`,
+with state under `/var/lib/sigrund` and audit logs under `/var/log/sigrund`.
 
 For offline signing, root first exports a live binding and deliberately distributes
 it to the requester as described in [host bindings and provisioning](#host-bindings-and-provisioning).

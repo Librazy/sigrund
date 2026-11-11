@@ -8,11 +8,11 @@ use std::{
     path::PathBuf,
 };
 
-pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
-pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
+pub const CLIENT_SOCKET: &str = "/run/sigrund/client.sock";
+pub const APPROVAL_SOCKET: &str = "/run/sigrund/approve.sock";
 pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nExecution startup requires a dedicated delegated cgroup service.\n       --authorization-only provides the non-executing authorization diagnostic profile.";
 pub const CLIENT_HELP: &str = "Usage: sigrun --target host|self|registered:ID|process:DAEMON_PID --security-profile ID (--account NAME | --target-uid UID --target-gid GID) [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --binding-bundle PATH --full-only --export-csr PATH\n         --socket PATH --supplementary-gid GID --capability CAP\n         --cwd PATH --env NAME=VALUE --umask OCTAL --stdin null|sha256\n         --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nAPPROVED confirms durable authorization; separate readiness reports unknown or exec_event_observed, followed by an execution result.";
-pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] [--epoch-file PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty, /etc/sigrund/signers.toml and /var/lib/sigrund/host-epoch.json.\nOnly UID 0 with a controlling TTY may approve and sign. Private evidence must match the live daemon epoch and exact CSR.";
+pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] [--epoch-file PATH] --identity PATH\nDefaults: /run/sigrund/approve.sock, /dev/tty, /etc/sigrund/signers.toml and /var/lib/sigrund/host-epoch.json.\nOnly UID 0 with a controlling TTY may approve and sign. Private evidence must match the live daemon epoch and exact CSR.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonMode {

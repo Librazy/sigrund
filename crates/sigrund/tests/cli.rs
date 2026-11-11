@@ -7,6 +7,58 @@ fn args(values: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn packaged_service_and_command_defaults_select_the_same_endpoints_and_state() {
+    let service = include_str!("../../../packaging/sigrund.service");
+    let command = service
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .unwrap();
+    let packaged = DaemonArgs::parse(
+        &command
+            .split_whitespace()
+            .skip(1)
+            .map(String::from)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let defaults = DaemonArgs::parse(&[]).unwrap();
+    assert_eq!(packaged, defaults);
+    assert_eq!(defaults.state_dir.to_str(), Some("/var/lib/sigrund"));
+    assert_eq!(
+        defaults.log_path.to_str(),
+        Some("/var/log/sigrund/audit.jsonl")
+    );
+    assert_eq!(defaults.socket.to_str(), Some("/run/sigrund/client.sock"));
+    assert_eq!(
+        defaults.approval_socket.to_str(),
+        Some("/run/sigrund/approve.sock")
+    );
+    for (setting, directory) in [
+        ("StateDirectory=", defaults.state_dir.as_path()),
+        ("LogsDirectory=", defaults.log_path.parent().unwrap()),
+        ("RuntimeDirectory=", defaults.socket.parent().unwrap()),
+    ] {
+        let name = service
+            .lines()
+            .find_map(|line| line.strip_prefix(setting))
+            .unwrap();
+        assert_eq!(directory.file_name().unwrap(), name);
+    }
+    let approver = ApprovalArgs::parse(&args(&["--identity", "/root/.ssh/id_ed25519"])).unwrap();
+    assert_eq!(approver.socket, defaults.approval_socket);
+    assert_eq!(
+        approver.epoch_file,
+        defaults.state_dir.join("host-epoch.json")
+    );
+    let ClientArgs::Run { socket, .. } =
+        ClientArgs::parse(&client_args(&["--", "/usr/bin/id"])).unwrap()
+    else {
+        panic!("expected a command request");
+    };
+    assert_eq!(socket, defaults.socket);
+}
+
+#[test]
 fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
     let daemon = DaemonArgs::parse(&args(&[
         "--foreground",
@@ -18,12 +70,18 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
         "/tmp/config.toml",
         "--signers",
         "/tmp/signers.toml",
+        "--state-dir",
+        "/tmp/state",
+        "--log-path",
+        "/tmp/log/audit.jsonl",
     ]))
     .unwrap();
     assert_eq!(daemon.mode, DaemonMode::Foreground);
     assert_eq!(daemon.socket.to_str(), Some("/tmp/client.sock"));
     assert_eq!(daemon.approval_socket.to_str(), Some("/tmp/approve.sock"));
     assert_eq!(daemon.config.unwrap().to_str(), Some("/tmp/config.toml"));
+    assert_eq!(daemon.state_dir.to_str(), Some("/tmp/state"));
+    assert_eq!(daemon.log_path.to_str(), Some("/tmp/log/audit.jsonl"));
     let approver = ApprovalArgs::parse(&args(&[
         "--socket",
         "/tmp/approve.sock",
@@ -31,10 +89,16 @@ fn mvp_command_forms_capture_socket_overrides_and_command_arguments() {
         "/dev/pts/1",
         "--identity",
         "/root/.ssh/id_ed25519",
+        "--epoch-file",
+        "/tmp/state/host-epoch.json",
     ]))
     .unwrap();
     assert_eq!(approver.socket.to_str(), Some("/tmp/approve.sock"));
     assert_eq!(approver.tty.to_str(), Some("/dev/pts/1"));
+    assert_eq!(
+        approver.epoch_file.to_str(),
+        Some("/tmp/state/host-epoch.json")
+    );
     let client = ClientArgs::parse(&client_args(&[
         "--socket",
         "/tmp/client.sock",

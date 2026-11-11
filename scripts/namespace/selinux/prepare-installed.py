@@ -37,7 +37,7 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('root required on a fresh disposable Fedora host')
-    if args.state_dir != Path('/var/lib/sigrund-v3') or args.log_path != Path('/var/log/sigrund-v3/audit.jsonl'):
+    if args.state_dir != Path('/var/lib/sigrund') or args.log_path != Path('/var/log/sigrund/audit.jsonl'):
         parser.error('paths must match the installed sigrund.service provisioning set')
     if subprocess.check_output(['getenforce'], text=True).strip() != 'Enforcing':
         parser.error('enforcing SELinux is required')
