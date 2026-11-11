@@ -108,6 +108,34 @@ def wait_for_lease_cleanup(path):
     wait_for(writable, 'executable read lease cleanup')
 
 
+def connect_approval(fixture, timeout=6):
+    # A successful request can finish before its prior broker is retired. The
+    # single-broker listener may therefore close this connection. Retry only
+    # pre-request EOF; never resend a request/signature or extend the deadline.
+    deadline = time.monotonic() + timeout
+    before = fixture.diagnostics.read_text().count('"broker":true')
+    while time.monotonic() < deadline:
+        broker = socket.socket(socket.AF_UNIX)
+        try:
+            broker.settimeout(max(0.001, deadline - time.monotonic()))
+            broker.connect(str(fixture.approval))
+            while time.monotonic() < deadline:
+                if fixture.diagnostics.read_text().count('"broker":true') > before:
+                    broker.settimeout(6)
+                    return broker
+                if select.select([broker], [], [], min(0.01, max(0, deadline - time.monotonic())))[0]:
+                    if not broker.recv(1, socket.MSG_PEEK):
+                        break
+            else:
+                raise AssertionError('timed out: trust approval broker registered')
+        except BaseException:
+            broker.close()
+            raise
+        broker.close()
+        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+    raise AssertionError('timed out: trust approval broker registered')
+
+
 class OnlineApproval:
     """Keep the real approval broker connected throughout a guarded request."""
     def __init__(self, fixture, program, **kwargs):
@@ -117,13 +145,8 @@ class OnlineApproval:
 
     def __enter__(self):
         f = self.fixture
-        self.broker = socket.socket(socket.AF_UNIX)
-        self.broker.settimeout(6)
         try:
-            before = f.diagnostics.read_text().count('"broker":true')
-            self.broker.connect(str(f.approval))
-            wait_for(lambda: f.diagnostics.read_text().count('"broker":true') > before,
-                     'trust approval broker registered')
+            self.broker = connect_approval(f)
             self.child, self.output = request(f, command=self.program, **self.kwargs)
             def exact(size):
                 result = b''

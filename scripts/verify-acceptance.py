@@ -479,7 +479,7 @@ def thin_input_before_private_lookup(parent, binaries, evidence):
             source = f.base/('input-'+uuid.uuid4().hex)
             content = b'finite-private-lookup-input' * 512
             source.write_bytes(content)
-            output = os.memfd_create('phase1-private-lookup-output',os.MFD_CLOEXEC)
+            output = os.memfd_create('account-private-lookup-output',os.MFD_CLOEXEC)
             try:
                 with source.open('rb') as input_file, open('/dev/null','r+b') as null:
                     message = SHARED['frame'](1,{'version':'3.0','mode':'thin_csr','tty_mode':'stdio','caller_env':{},'intent':intent})
@@ -525,11 +525,11 @@ def _host_account_profile_child(parent, binaries, artifacts):
     try:
         passwd = f.base/'passwd'
         groups = f.base/'group'
-        name = 'sigrund-phase1-target'
+        name = 'sigrund-account-target'
         original_passwd = Path('/etc/passwd').read_text()
         original_groups = Path('/etc/group').read_text()
         passwd.write_text(original_passwd + name+':x:33:33::/:/bin/false\n')
-        groups.write_text(original_groups + 'sigrund-phase1-group:x:104:'+name+'\n')
+        groups.write_text(original_groups + 'sigrund-account-group:x:104:'+name+'\n')
         passwd.chmod(0o644)
         groups.chmod(0o644)
         for source,target in ((passwd,'/etc/passwd'),(groups,'/etc/group')):
@@ -545,7 +545,7 @@ def _host_account_profile_child(parent, binaries, artifacts):
         peer=socket.socket(socket.AF_UNIX)
         peer.settimeout(10)
         peer.connect(str(f.client))
-        output=os.memfd_create('phase1-account-observed',os.MFD_CLOEXEC)
+        output=os.memfd_create('account-observed',os.MFD_CLOEXEC)
         descriptors.append(output)
         body=SHARED['frame'](1,{'version':'3.0','mode':'thin_csr','tty_mode':'stdio','caller_env':{},'intent':intent})
         with open('/dev/null','r+b') as null:
@@ -765,6 +765,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
         run([sys.executable, lab, 'start', '--directory', base], capture_output=True)
         run([sys.executable, lab, 'status', '--directory', base], capture_output=True)
         master, slave = pty.openpty()
+        SHARED['enable_confirmation_packets'](master)
         masters.extend([master, slave])
         def operator_tty():
             os.setsid()
@@ -807,13 +808,7 @@ def operator_workflow(binaries, requester, evidence, supervisor_unit):
                 if stdin_bytes is not None:
                     child.stdin.write(stdin_bytes)
                 child.stdin.close()
-                prompt = b''
-                deadline = time.monotonic() + 8
-                while b'Approve and sign? [y/yes/n/no] ' not in prompt:
-                    assert time.monotonic() < deadline and child.poll() is None, prompt
-                    if select.select([master], [], [], 0.1)[0]:
-                        prompt += os.read(master, 8192)
-                    assert len(prompt) < 1048576
+                prompt = SHARED['read_confirmation_prompt'](master)
                 assert str(account.pw_uid).encode() in prompt
                 if stdin_bytes is not None:
                     assert hashlib.sha256(stdin_bytes).hexdigest().encode() in prompt
@@ -890,7 +885,8 @@ def prerequisites(binaries, platform_binary):
     problems = []
     if os.geteuid() != 0:
         problems.append('run this entry point as root in the disposable VM')
-    for command in ('systemd-run', 'systemctl', 'cc', 'ssh-keygen', 'strace'):
+    for command in ('systemd-run', 'systemctl', 'cc', 'ssh-keygen', 'strace',
+                    'setfacl', 'setcap', 'fsverity', 'mkfs.ext4', 'mount', 'umount', 'unshare'):
         import shutil
         if shutil.which(command) is None:
             problems.append('missing command: ' + command)
@@ -932,8 +928,9 @@ def inside(args):
             raise RuntimeError('strace disappeared after prerequisite validation')
         tests = evidence.manifest['ordinary_checks']['privileged_test_binaries']
         for label, command in (
-            ('privileged-rust', [sys.executable, REPO / 'scripts/verify-phase1-rust.py',
+            ('privileged-rust', [sys.executable, REPO / 'scripts/verify-privileged-rust.py',
                                  '--daemon-tests', tests['daemon'], '--library-tests', tests['library'],
+                                 '--client-tests', tests['client'],
                                  '--artifacts', args.artifacts / 'privileged-rust']),
             ('platform', [sys.executable, REPO / 'scripts/verify-platform.py', args.platform_binary, '--cgroup-parent', parent]),
             ('runtime', [sys.executable, REPO / 'scripts/verify-runtime.py', '--cgroup-parent', parent,
@@ -987,7 +984,7 @@ def main():
     for name, expected in checks['binaries'].items():
         if hashlib.sha256((args.binaries / name).read_bytes()).hexdigest() != expected:
             parser.error('binary changed after ordinary checks: ' + name)
-    for label in ('daemon', 'library'):
+    for label in ('daemon', 'library', 'client'):
         path = Path(checks['privileged_test_binaries'][label]).resolve(strict=True)
         if hashlib.sha256(path.read_bytes()).hexdigest() != checks['privileged_test_sha256'][label]:
             parser.error('privileged test binary changed after ordinary checks: ' + label)

@@ -7,6 +7,29 @@ use sigrund_core::config::{DaemonConfig, SignerPolicyFile};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args == ["--internal-namespace-launcher"] {
+        return if sigrund::execution::namespace_launcher_main().is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(77)
+        };
+    }
+    if args == ["--internal-destination-helper"] {
+        return if sigrund::destination_helper::helper_main().is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(77)
+        };
+    }
+    if args == ["--internal-target-helper"] {
+        return match sigrund::target_capture::helper_main() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("sigrund target capture: {error}");
+                ExitCode::from(77)
+            }
+        };
+    }
     if args == ["--internal-access-helper"] {
         return if sigrund::access::helper_main().is_ok() {
             ExitCode::SUCCESS

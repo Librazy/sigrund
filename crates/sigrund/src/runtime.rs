@@ -1,6 +1,6 @@
 //! Coordinator-owned execution lifecycle. No cgroup I/O or caller-FD disposal.
 use crate::{
-    execution::{Handshake, SyncOutcome},
+    execution::{ChildProcess, Handshake, NamespaceEvent, NamespaceLauncher, SyncOutcome},
     jobs::{JobSupervisor, PreparedJob, SpawnOutcome, Task},
     reaper::{ChildExit, Reaper},
     sequencer::{self, CommittedJob},
@@ -31,6 +31,10 @@ pub(crate) enum Notice {
 }
 struct Active {
     owner: Option<PreparedJob>,
+    namespace: Option<NamespaceLauncher>,
+    namespace_child: Option<ChildProcess>,
+    launcher_exited: bool,
+    target_watch: Option<crate::target_registry::TargetWatch>,
     cleaned: Option<Box<CommittedJob>>,
     lifecycle: Arc<sigrund_core::lifecycle::Lifecycle>,
     fields: serde_json::Value,
@@ -108,6 +112,15 @@ impl Execution {
             fields: job.commit_fields.clone(),
             limit: job.lease.request().policy.audit_record_max_bytes as usize,
             owner: None,
+            namespace: None,
+            namespace_child: None,
+            launcher_exited: false,
+            target_watch: job
+                .lease
+                .request()
+                .process
+                .as_ref()
+                .map(|process| process.lease.watch()),
             cleaned: None,
             pid: None,
             spawn_reserved: false,
@@ -138,6 +151,7 @@ impl Execution {
             let active = self.jobs.get_mut(&token).unwrap();
             active.owner = Some(PreparedJob {
                 inherited_target_fds: None,
+                namespace_resources: None,
                 job: *job,
                 cgroup: None,
             });
@@ -167,8 +181,12 @@ impl Execution {
                         let token = owner.job.token;
                         let job = self.jobs.get_mut(&token).expect("exec checkpoint owner");
                         job.task = false;
+                        let mut observed = serde_json::Value::Null;
                         let result = result
-                            .and_then(|()| crate::jobs::eligible_for_release(&owner.job))
+                            .and_then(|facts| {
+                                observed = facts;
+                                crate::jobs::eligible_for_release(&owner.job)
+                            })
                             .and_then(|()| {
                                 if job.failure.is_some()
                                     || Instant::now()
@@ -199,6 +217,7 @@ impl Execution {
                         } else {
                             self.reaper.detached(job.pid.expect("tracee"));
                             job.exec_verified = true;
+                            job.fields["execution_observed"] = observed;
                             job.fields["observed_post_exec_capabilities"] = serde_json::to_value(
                                 owner
                                     .job
@@ -220,50 +239,30 @@ impl Execution {
                         job.failure = failure;
                         self.ready.push_back(token);
                     }
+                    SpawnOutcome::Launched {
+                        owner,
+                        mut launcher,
+                    } => {
+                        let token = owner.job.token;
+                        self.reaper.complete_launcher(
+                            token,
+                            launcher.pid,
+                            launcher.pidfd.take().expect("launcher pidfd"),
+                        );
+                        let job = self.jobs.get_mut(&token).expect("namespace launch owner");
+                        job.task = false;
+                        job.checkpoint = true;
+                        job.deadline = Some(launcher.deadline);
+                        job.namespace = Some(launcher);
+                        job.owner = Some(*owner);
+                    }
                     SpawnOutcome::Spawned { owner, child } => {
                         let token = owner.job.token;
                         let job = self.jobs.get_mut(&token).expect("pending spawn");
                         job.task = false;
                         job.owner = Some(*owner);
                         match child {
-                            Ok(mut child) => {
-                                let pid = child.pid;
-                                // Register before releasing the barrier, even during shutdown.
-                                assert!(
-                                    self.reaper
-                                        .complete(token, Some((pid, child.pidfd)))
-                                        .is_ok()
-                                );
-                                job.checkpoint = child.gate.is_some();
-                                if let Some(gate) = child.gate.take() {
-                                    match crate::execution::attach_checkpoint(pid, &gate) {
-                                        Ok(()) => self.reaper.traced(pid),
-                                        Err(error) => {
-                                            job.failure_status = "EXEC_FAILED";
-                                            job.failure = Some(format!(
-                                                "exec checkpoint attach failed: {error}"
-                                            ))
-                                        }
-                                    }
-                                }
-                                job.pid = Some(pid);
-                                job.deadline = Some(child.deadline);
-                                job.sync = Some(child.sync);
-                                assert!(job.lifecycle.transition(Phase::Spawning, Phase::Running));
-                                watch(
-                                    epoll,
-                                    job.sync.as_ref().unwrap().as_raw_fd(),
-                                    token | SYNC_TAG,
-                                )?;
-                                watch(
-                                    epoll,
-                                    self.reaper.registered_fd(pid).unwrap(),
-                                    token | PID_TAG,
-                                )?;
-                                if job.lifecycle.cancelled.load(Ordering::Acquire) {
-                                    job.lifecycle.cancel();
-                                }
-                            }
+                            Ok(child) => install_child(&mut self.reaper, job, token, child, epoll)?,
                             Err(error) => {
                                 assert!(self.reaper.complete(token, None).is_ok());
                                 assert!(job.lifecycle.finish_spawn(
@@ -435,6 +434,24 @@ impl Execution {
             let task = {
                 let job = self.jobs.get_mut(&token).expect("registered tracee");
                 if job.checkpoint
+                    && stop.status == (libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8))
+                    && job.owner.as_ref().is_some_and(|owner| {
+                        owner
+                            .job
+                            .lease
+                            .request()
+                            .process
+                            .as_ref()
+                            .is_some_and(|process| process.lease.constraints().is_production())
+                    })
+                    && let Err(error) = crate::lsm::verify_filter(stop.pid)
+                {
+                    job.failure_status = "EXEC_FAILED";
+                    job.failure = Some(error.to_string());
+                    job.lifecycle.cancel();
+                    continue;
+                }
+                if job.checkpoint
                     && !job.exec_verified
                     && !job.task
                     && Instant::now() < job.deadline.expect("spawn deadline")
@@ -473,6 +490,76 @@ impl Execution {
             if let Some(task) = task {
                 self.dispatch(token, task)?;
             }
+        }
+        let namespace_tokens: Vec<_> = self
+            .jobs
+            .iter()
+            .filter_map(|(token, job)| job.namespace.as_ref().map(|_| *token))
+            .collect();
+        for token in namespace_tokens {
+            let job = self.jobs.get_mut(&token).unwrap();
+            if job.namespace_child.is_some() {
+                if Instant::now() >= job.namespace.as_ref().unwrap().deadline {
+                    assert!(self.reaper.complete(token, None).is_ok());
+                    job.namespace_child = None;
+                    job.namespace = None;
+                    job.failure = Some("namespace launcher adoption timed out".into());
+                    job.outcome = Some(SyncOutcome::SpawnFailed);
+                    job.lifecycle.finish_spawn(Decision::Rejected);
+                }
+                continue;
+            }
+            match job.namespace.as_mut().unwrap().poll() {
+                Ok(Some(NamespaceEvent::Bootstrap)) => {
+                    if let Err(error) = job.namespace.as_mut().unwrap().protect() {
+                        job.failure =
+                            Some(format!("namespace bootstrap protection failed: {error}"));
+                        job.lifecycle.cancel();
+                    }
+                }
+                Ok(Some(NamespaceEvent::Ready)) => self.ready.push_back(token),
+                Ok(Some(NamespaceEvent::Child(child))) => {
+                    // A PID-namespace child cannot use CLONE_PARENT for this
+                    // topology. Keep its gate closed until the trusted launcher
+                    // exits and the host subreaper adopts the final child.
+                    job.namespace_child = Some(child);
+                }
+                Ok(None) => (),
+                Err(error) => {
+                    if job.namespace.as_ref().unwrap().granted {
+                        assert!(self.reaper.complete(token, None).is_ok());
+                    }
+                    job.failure = Some(format!("namespace launcher failed: {error}"));
+                    job.outcome = Some(SyncOutcome::SpawnFailed);
+                    job.namespace = None;
+                    job.lifecycle.finish_spawn(Decision::Rejected);
+                }
+            }
+        }
+        for exit in self.reaper.take_launcher_exits() {
+            if let Some(token) = exit.token
+                && let Some(job) = self.jobs.get_mut(&token)
+            {
+                job.launcher_exited = true;
+                if exit.code != libc::CLD_EXITED || exit.status != 0 {
+                    job.failure
+                        .get_or_insert_with(|| "namespace launcher died".into());
+                    job.lifecycle.cancel();
+                }
+            }
+        }
+        let adopted: Vec<_> = self
+            .jobs
+            .iter()
+            .filter_map(|(token, job)| {
+                (job.launcher_exited && job.namespace_child.is_some()).then_some(*token)
+            })
+            .collect();
+        for token in adopted {
+            let job = self.jobs.get_mut(&token).unwrap();
+            let child = job.namespace_child.take().expect("adopted namespace child");
+            install_child(&mut self.reaper, job, token, child, epoll)?;
+            job.namespace = None;
         }
         let tokens: Vec<_> = self.jobs.keys().copied().collect();
         for token in tokens {
@@ -517,6 +604,20 @@ impl Execution {
                 if job.outcome.is_some() {
                     job.outcome = Some(SyncOutcome::SpawnFailed);
                 }
+            }
+            if let Some(owner) = &job.owner
+                && owner.job.lease.request().process.is_some()
+                && owner.job.lease.request().check().is_err()
+            {
+                job.lifecycle.cancel();
+            }
+            if !job.cleanup
+                && job
+                    .target_watch
+                    .as_ref()
+                    .is_some_and(|watch| !watch.valid())
+            {
+                job.lifecycle.cancel();
             }
             let cancelled = job.lifecycle.cancelled.load(Ordering::Acquire);
             let failed = job.failure.is_some()
@@ -645,6 +746,16 @@ impl Execution {
                 self.ready.push_front(token);
                 break;
             }
+            if let Some(launcher) = &mut job.namespace {
+                if let Err(error) = launcher.grant() {
+                    assert!(self.reaper.complete(token, None).is_ok());
+                    job.failure = Some(format!("namespace clone gate failed: {error}"));
+                    job.outcome = Some(SyncOutcome::SpawnFailed);
+                    job.namespace = None;
+                    job.lifecycle.finish_spawn(Decision::Rejected);
+                }
+                break;
+            }
             if !job.lifecycle.transition(Phase::Approved, Phase::Spawning) {
                 assert!(self.reaper.complete(token, None).is_ok());
                 continue;
@@ -664,6 +775,41 @@ impl Execution {
         }
         Ok(())
     }
+}
+fn install_child(
+    reaper: &mut Reaper,
+    job: &mut Active,
+    token: u64,
+    mut child: ChildProcess,
+    epoll: RawFd,
+) -> io::Result<()> {
+    let pid = child.pid;
+    // Register before releasing the barrier, even during shutdown.
+    assert!(reaper.complete(token, Some((pid, child.pidfd))).is_ok());
+    job.checkpoint = child.gate.is_some();
+    if let Some(gate) = child.gate.take() {
+        match crate::execution::attach_checkpoint(pid, &gate) {
+            Ok(()) => reaper.traced(pid),
+            Err(error) => {
+                job.failure_status = "EXEC_FAILED";
+                job.failure = Some(format!("exec checkpoint attach failed: {error}"))
+            }
+        }
+    }
+    job.pid = Some(pid);
+    job.deadline = Some(child.deadline);
+    job.sync = Some(child.sync);
+    assert!(job.lifecycle.transition(Phase::Spawning, Phase::Running));
+    watch(
+        epoll,
+        job.sync.as_ref().unwrap().as_raw_fd(),
+        token | SYNC_TAG,
+    )?;
+    watch(epoll, reaper.registered_fd(pid).unwrap(), token | PID_TAG)?;
+    if job.lifecycle.cancelled.load(Ordering::Acquire) {
+        job.lifecycle.cancel();
+    }
+    Ok(())
 }
 fn wire_exit(exit: ChildExit) -> protocol::ChildExit {
     match exit.code {

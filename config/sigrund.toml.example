@@ -95,3 +95,6 @@ target_gids = [0, 33]
 supplementary_gids = [33, 104]
 profile_sha256 = "6135f3b7915f316b816bc26eed46aaa0d2028966850bc769cb69ab169981ffb5"
 cross_owner = true
+
+# Optional namespace execution: see namespace-selinux-profiles.toml.example and
+# IMPLEMENTATION_NOTES.md#namespace-execution. Configure independent signer rules.

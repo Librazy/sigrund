@@ -6,13 +6,12 @@ supervises execution in explicitly selected local environments. Full/thin
 provenance, confidential outcomes, executable evidence, durable authorization,
 hooks and audit replication remain part of this contract.
 
-The implemented local one-time SSH/stdio runtime is **v2**; see
-[implementation notes](IMPLEMENTATION_NOTES.md). This rewrite does not enable
-v3 or establish conformance. The [phased roadmap](docs/NAMESPACE_AWARE_EXECUTION.md)
-tracks requirements, feasibility gates and release evidence. Requirements marked
-NS-01–NS-16 are normative obligations; unresolved mechanisms in Section 8.4 are
-release blockers, not permission to weaken those obligations. Schema examples
-are draft v3 contracts and must gain independent fixtures before runtime release.
+The implemented local one-time SSH/stdio runtime uses **v3**. Its supported
+host, namespace and optional Podman profiles are described in
+[implementation notes](IMPLEMENTATION_NOTES.md#namespace-execution). A target
+requirement is not a support claim. NS-01–NS-16 remain normative obligations;
+the design gates in Section 8.4 must be satisfied for every enabled combination.
+Schema examples require independent fixtures before runtime release.
 
 V3 is a clean break. Wire formats, configuration, CLI, signatures, database,
 audit/ratchet state and collector contracts may change together. Reject v2 and
@@ -409,12 +408,23 @@ policy, root-TTY approval, durable authorization and supervision:
 | 3 | Container A | Existing container B | In B |
 
 Execution is local; no remote-host or delegated proxy authentication is implied.
-Operators expose the client socket and its `.context` companion with their path
-relationship intact. No socket injection, container modification or container
-creation is performed. Approval sockets, state and management credentials stay
-host-controlled. DAC and SELinux/AppArmor must permit connection; reachability
+For unsigned requests, expose the execution socket and its `.context` companion
+to the requester with their path relationship intact. Self also requires the
+`.anchor` rendezvous there. For a registered target, expose the rendezvous to
+its dedicated anchor; receiving a workload does not require exposing the
+execution or context socket in the destination. No socket injection, container
+modification or container creation is performed. Approval sockets, state and
+management credentials stay host-controlled. DAC and SELinux/AppArmor must permit connection; reachability
 only permits submission. Mapping a source container account into a host account
 is a separate deferred selection mode.
+
+The client MUST establish the host daemon's authority independently on each
+connection used for context or submission, including signed submissions that
+skip context. It MUST do so before sending the query, intent, warrant, stdin or
+stdio rights. In a noninitial user namespace, a peer UID of zero may identify
+an unprivileged host user. Neither that observation alone nor an overflow UID
+authenticates the host daemon. If no trusted mechanism exists for the source
+topology, fail locally without sending; do not fall back to thin submission.
 
 **NS-02 — Authenticated source contract.** The baseline attributes requests to
 kernel-authenticated connection credentials (`SO_PEERCRED`, `SO_PEERGROUPS`) as
@@ -427,8 +437,8 @@ Capture applicable `SO_PEERSEC` and process attributes with their observation
 source/time in private audit; socket security attributes are not complete live
 process confinement. Validate UID/GID mappings and overflow/unmapped results.
 `self` requires a stronger, race-checked acquisition contract tying the selected
-environment to the authenticated source. Before enabling it, Phase 0 must choose
-and specify connector capture or authenticated message-sender attribution,
+environment to the authenticated source. Specify connector capture or
+authenticated message-sender attribution,
 including inherited/passed sockets, connector exit, exec, credential and
 namespace changes. Reading procfs for a connection-time PID later is insufficient.
 No undocumented per-message authentication is inferred from the existing stream.
@@ -457,7 +467,7 @@ proc reference, namespace/root FDs, ownership relationships and mapping evidence
 under one documented race-resistant acquisition contract. Protect lookup against
 PID reuse and mixed observations. Repeated procfs reads alone do not prove an
 atomic capture or detect change-and-restore races. Unsupported acquisitions fail
-closed; the Phase 0 gate must prove the supported mechanism.
+closed; the acquisition design gate must prove the supported mechanism.
 
 Keep a private bounded instance registry scoped to a fresh daemon epoch. IDs
 without retained resources provide no authority. Reject on anchor exit,
@@ -486,6 +496,24 @@ behavior. Native runtime IDs may outlive execution generations. Exact manager
 exec semantics require separately validated configuration integration; neither
 OCI state nor direct runc/crun invocation supplies that equivalence automatically.
 
+For a manager-backed binding, retain authenticated execution-generation evidence
+in addition to the acquired process resources. A same-name replacement MUST
+invalidate the old binding even if its original anchor remains alive. Required
+configuration changes, stop/delete, generation uncertainty and loss of required
+resolver evidence MUST invalidate pending authorization and cancel active jobs
+under NS-12. Define event-gap and manager/resolver restart behavior; reconnecting
+MUST NOT silently rebind or revive a stale grant. Recovery requires fresh
+acquisition and approval. Observation and cancellation bounds are part of the
+declared integration contract, not a claim of atomic manager-event delivery.
+
+Manager selectors and required acquisition evidence need bounded, versioned
+schemas and independent binding fixtures before exposure. Their scope and
+generation/configuration meaning MUST be available in private approval and audit
+without introducing a public target-existence oracle. A manager-free release
+requires none of this optional manager identity, but MUST describe its target as
+a retained process environment and make no manager-generation or manager-exec
+claim.
+
 ### 1.6 Target and Security Policy Configuration
 
 Target registrations and named security profiles are root-controlled policy,
@@ -498,13 +526,12 @@ changed policy cannot silently expand an existing grant. Captured generations
 retain resource limits, but do not bypass mandatory revocation or LSM-policy
 revalidation.
 
-The base configuration in Section 1.4 remains applicable. Phase 0 must specify
-bounded registration/profile schemas, management CLI, revocation and dependency
-metadata before those interfaces ship. The syntax is not inferred from the
-conceptual examples in the roadmap. Aggregate quotas must include pinned target
+The base configuration in Section 1.4 remains applicable. Registration/profile
+schemas, management CLI, revocation and dependency metadata must be bounded and
+versioned. The implemented syntax is defined by the core validators and
+configuration examples, not inferred from conceptual examples. Aggregate quotas must include pinned target
 FDs, registrations, helpers, launcher processes, pending review and cleanup;
-Phase 1 must supply concrete limits and exhaustion tests within the existing
-admission ceilings. Cancellation releases a reservation only after actual cleanup.
+Supply concrete limits and exhaustion tests within the existing admission ceilings. Cancellation releases a reservation only after actual cleanup.
 
 The backend is a native Linux namespace executor. Manager APIs are optional
 resolvers, not universal execution backends. Direct runc/crun access underneath
@@ -514,14 +541,11 @@ of manager execution policy (NS-13).
 
 ## 2. Wire Protocol, Request Shapes, and Job Lifecycle
 
-The [Phase 0 contract supplement](docs/NAMESPACE_PHASE0.md) fixes the initial
-constrained-anchor source-attribution mechanism, bounded private acquisition and
-constraint records, target-scoped policy/management grammar, binding distribution
-and quota defaults. Its experimental validators and fixtures are the concrete
-draft schema reference for the initial profile. These are not production v2
-interfaces. Unsupported combinations and the concurrent-SELinux-policy-replacement
-limitation remain blocked; later runtime gates must implement and validate the
-same contracts before issuing bindings or making support claims.
+The [implementation notes](IMPLEMENTATION_NOTES.md#namespace-execution) describe
+constrained-anchor acquisition, bounded records, target policy/management,
+binding distribution and quotas. Production validators and independently checked
+fixtures are the schema reference. Strict concurrent SELinux policy replacement
+is outside the detection-and-termination profile's guarantee.
 
 ### 2.1 Binary Framing & Public Outcome Contract
 
@@ -622,8 +646,8 @@ client and daemon derive it from their configured execution socket path; startup
 checks the resulting Unix-socket path bound and trusted parent. Publish it only
 after the same startup/recovery gates as the execution listener. On this socket
 send exactly `{"version":"3.0"}` as `CLIENT_CONTEXT_QUERY`. The daemon accepts no path, intent or rights and performs
-no request-dependent filesystem inspection. Authenticate the daemon through its
-trusted socket location and root peer credentials. Context queries do not consume
+no request-dependent filesystem inspection. Use the trusted socket location
+and verify the peer on the context connection itself as required by Section 1.5. Context queries do not consume
 approval slots or execution-request rate counters. Limit them to 8 active global,
 2 per UID, and 64 global/8 per UID per existing admission window; these fixed
 ceilings share the total Unix-socket disposal budget. Assemble/send within five
@@ -692,10 +716,10 @@ V3 `sigrun --export-csr PATH -- ...` prepares and exports a full canonical CSR
 without execution submission (and implies full-only). It may query public context;
 it never requests privileged expansion. Offline `sigrundctl csr-pae --csr PATH`
 and `pack-warrant` consume those bytes, sign/package without rewriting fields,
-and refuse overwrites. Thin requests have no export/redemption path. These are
-v3 target semantics; runnable v2 commands remain documented in implementation
-notes. Full preparation/export requires an already trustworthy destination
-binding obtainable without privileged public target discovery (NS-07).
+and refuse overwrites. Thin requests have no export/redemption path. The
+[host workflow](IMPLEMENTATION_NOTES.md#host-bindings-and-provisioning) implements full/export; namespace
+profiles accept only thin requests. Full preparation/export requires
+an already trustworthy destination binding obtainable without privileged public target discovery (NS-07).
 
 ### 2.2.1 Preparation, Access Validation, and Exact Binding
 
@@ -1399,17 +1423,17 @@ fallback. Explicit numeric selection uses exactly its requested groups.
 IDs/groups retain existing numeric bounds; account/profile/registration strings
 are sanitized UTF-8, 1..128 bytes. Reject unknown tags, mixed forms and extra
 fields. Process PID is in `1..=2147483647`; it is never used as a substitute for
-the instance binding on redemption. Manager-name selector syntax is deferred to
-Phase 5 and requires a schema revision before exposure; examples are not aliases
-that an implementation may guess.
+the instance binding on redemption. Public manager-name selectors are unsupported. Manager integration uses
+administrator-created registrations; examples are not aliases an implementation
+may guess.
 
 `target_binding` has exactly `kind` (`host` or `process_environment`),
 `daemon_epoch` and `instance_id` (UUIDv7), `description` (sanitized UTF-8,
 1..1024 bytes), and `context_sha256` (64 lowercase hex digits). The digest binds
 the canonical private acquisition record: pinned process identity, namespace
 identities/ownership, root identity, composed UID/GID mappings and setgroups
-state, and required lifecycle/resolver scope. Phase 0 must finalize that bounded
-record schema and coherent acquisition procedure before any binding is issued.
+state, and required lifecycle/resolver scope. The core namespace/manager validators
+define these bounded records and their acquisition contract.
 The digest/IDs are not authority without a matching live retained target.
 
 `security_constraints` has exactly `profile_id` (same identifier as the intent)
@@ -1418,7 +1442,7 @@ canonical resolved constraint object, including namespace/isolation rules,
 capability/securebits/NNP rules, cgroup ceilings, LSM requirements, seccomp and
 verification obligations. This immutable object must be available to the daemon
 and trusted approver; missing versions fail closed, never resolve to a current
-same-named profile. Phase 0 must freeze its bounded schema. Display its complete
+same-named profile. Its bounded schema is defined by the core validators. Display its complete
 meaning before signing; a digest alone is not an adequate approval UI.
 
 All targets, including host, are epoch-bound. Full/offline preparation needs a
@@ -1429,6 +1453,76 @@ private failure path. Redemption after restart requires fresh preparation and
 approval. Reusable grants, when separately implemented, remain limited to the
 same live instance and epoch; they never follow a registration to its replacement.
 The sample context/profile digests are illustrative, not usable registrations.
+
+#### Namespace execution contracts
+
+The opt-in `sigrund.constraints.namespace-experimental.v1` record is distinct
+from the preview constraint schema. Its canonical record is
+[`experimental-constraints.json`](crates/sigrund-core/tests/fixtures/namespace/experimental-constraints.json).
+It requires all eight declared namespace inputs, private mount/cgroup views,
+digest-memfd, a final-child exec stop, securebits 15, NNP, finite memory/pids
+limits and empty capability sets. Destination UID must be nonzero and requested
+supplementary groups empty. SELinux fields declare no requested transition
+(`context=""`, `enforcing=false`, `policy_change="unmanaged"`); AppArmor is
+unsupported and seccomp is explicitly none. Ambient kernel LSM policy still
+applies. This experimental profile does not qualify production confinement or
+relax the enforcing production profile. The latter uses
+`sigrund.constraints.namespace-selinux.v1`, exact workload/executable SIDs and
+explicit seccomp; see the [configured constraints](config/namespace-selinux-profiles.toml.example).
+
+Registered/process bindings retain `sigrund.process-context.v1`: exactly the
+acquisition and pinned executable-root map. Self uses
+`sigrund.self-context.v1`, adding `authenticated_source` with the original
+public connector's positive host PID, UID, GID, sorted supplementary GIDs and
+required nullable `security_label`. These are the host daemon's kernel socket
+observations, distinct from live acquisition process attributes. Self acquisition
+must match that connector via its original peer pidfd and the dedicated `.anchor`
+rendezvous. The single thread is traced through successful `unshare(CLONE_FS |
+CLONE_FILES)` and held at syscall exit; namespace/root/mapping observations are
+then pinned. Connector death, exec, credential or namespace changes invalidate
+capture. Relaying an inherited/passed public stream never changes attribution.
+The CLI uses a dedicated syscall-only connector and keeps its pidfd through
+completion; the parent relays the stream. Exposing self requires the `.anchor`
+endpoint alongside the public socket and target-independent `.context` endpoint.
+
+Root-controlled review records are `sigrund.process-review.v1` for registrations
+and `sigrund.self-review.v1` for self. The `registration` key is mandatory;
+self requires null, an authenticated source, and null registration lifecycle
+fields. A registered review requires its exact registration/revision and no
+self source. Both must verify the exact CSR, resolved credentials, complete
+constraints, executable/cwd identities and context digest before rendering or
+signing. Namespace requests remain thin-only; full/signed namespace
+input is rejected without fallback.
+
+The actual execution lease survives authorization, complete APPROVED delivery,
+launcher/final-child handoff, exec-stop verification and cleanup. Destination
+I/O and capture exchanges stay off the durable sequencer. Capture helpers wait
+for an explicit acquisition grant after fresh exec, so inherited-descriptor
+copies close before target-pin reservations begin; each stage reserves before
+its own acquisition. No timeout or cancellation refunds live resources. Durable
+consumption survives all post-commit failures, including incomplete APPROVED
+delivery and a commit whose completion is observed after the request deadline.
+
+The namespace launcher MUST fresh-exec before entering destination authority,
+carrying only a bounded sealed per-job configuration and the explicit descriptor
+allowlist. It MUST NOT carry the live daemon's address space, environment, keys
+or unrelated requests into a target user namespace. The host coordinator attaches
+its EXITKILL tracer before granting namespace entry. Initial host mappings and
+`fs.suid_dumpable` 0 or 2 are required for credential transitions; value 1 is
+rejected before review and checked again before execution. Dumpability is
+disabled before namespace entry and after credential changes. Concurrent host
+security-policy replacement is not qualified by this experimental profile.
+
+Null stdin MUST use a verified retained host null-device descriptor; output
+rights are never an input fallback. Configured experimental limits MUST fit the
+daemon's job ceilings before admission. Requested cwd beneath the covered `/run`
+tree is rejected before approval, and the completed private tree MUST resolve
+the approved cwd to the same inode and mount as the actual inherited cwd before
+final-child creation. Anchor and helper death MUST remain observable without
+acquiring the capture IPC mutex. Transient spawn descriptors and inherited
+duplicates remain charged through actual close or reap. Self connection retries
+have an independent deadline, bounded backoff and parent-death protection;
+their capture handshake retains the constrained read-to-unshare sequence.
 
 
 ### 3.3 Strict JCS Round-Trip & String Sanitization Rules
@@ -1523,7 +1617,7 @@ allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]
 The numeric ceilings above are scoped to explicitly permitted execution targets
 and immutable security profiles (Section 1.6), never global namespace-independent
 UIDs. The draft entry illustrates the base fields; target-scope/profile policy
-syntax is a Phase 0 schema gate. Requester IDs remain host-observed. A signature
+syntax is defined by the core configuration validators. Requester IDs remain host-observed. A signature
 must satisfy one complete signer policy; ownership and multiple partial signers
 do not combine to authorize cross-owner execution (NS-06).
 
@@ -1917,10 +2011,10 @@ if ((stv.f_flag & req) != req)
 view; it does not move a process. Preserve finite memory/PID limits and lifecycle
 ownership in host-controlled per-job cgroups. Do not blindly migrate into
 manager-owned cgroups or assume `CLONE_INTO_CGROUP` permissions survive userns
-entry. The initial candidate is a trusted launcher placed in the job cgroup
-before namespace entry, with final children inheriting placement. Phase 0 must
-verify this against supported userns ownership/delegation, visible cgroup roots,
-manager teardown and escape paths before it becomes a supported recipe.
+entry. A trusted launcher is placed in the job cgroup before namespace entry,
+with final children inheriting placement. Verify supported userns ownership/
+delegation, visible cgroup roots, manager teardown and escape paths for each
+supported recipe.
 Account for launchers and helpers in process limits. Refuse profiles whose
 required containment/placement cannot be enforced.
 
@@ -2110,8 +2204,9 @@ signature cannot resume evaluation. Details remain in protected audit only.
 The `[mvp]` profile replaces hook dispatch with one authenticated root approver.
 It uses the same full/thin preparation, provenance, deadlines, durable gates and
 public outcomes. Signed client-full warrants bypass review, not authorization.
-This is the v3 target for local root-TTY approval. The existing implementation
-supports a v2 local profile; this document does not claim v3 availability.
+The v3 host profile implements local root-TTY approval. For experimental
+namespace targets only the active thin request can proceed after approval
+(Section 3.2.1).
 
 **Configuration:** Exact fields are `tty_mode = "stdio"`, `hooks_enabled = false`,
 `pty_enabled = false`, `max_active_approval_requests = 1`, and a nonempty
@@ -2424,28 +2519,33 @@ state diagrams must have independently checkable fixtures before runtime release
 
 ### 8.3 Implementation Status and Release Gate (NS-16)
 
-The current implementation is the **v2 local one-time SSH/stdio profile**, as
-recorded in [implementation notes](IMPLEMENTATION_NOTES.md). No v3 runtime or
-namespace support is established by this specification update. Preserve that
-status until integrated evidence demonstrates each claimed capability.
+The [implementation notes](IMPLEMENTATION_NOTES.md#namespace-execution) state the
+supported profiles, topology, operator prerequisites and exclusions. The enforcing
+namespace profile is thin-only, uses `digest_memfd`, and requires locked untrusted
+accounts in the enforcing requester domain on Fedora 44 x86-64. Namespace
+full/export/offline redemption and production process-PID targets remain excluded.
+The optional adapter supports a local root-owned Podman 5.8.1 API in the default
+Libpod namespace; native entry supplies no Podman exec-policy equivalence.
+Ubuntu kernel 6.8 host compatibility and ARM64 builds do not establish namespace
+runtime support there. Broader combinations require their own integrated coverage.
 
-The [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) defines six dependency-ordered
-phases, requirement traceability and their acceptance gates. All applicable
-V-01–V-20 cases above remain required under v3; add the namespace matrix below.
-Phases 2–3 can yield experimental execution, not production support. No profile
-ships before its applicable confinement, packaging and lifecycle gates pass.
-Manager resolvers are optional and cannot delay a validated manager-free profile.
+Every advertised combination MUST satisfy its applicable V/NS requirements using
+matching source, package, binary and policy inputs. Test CLI and raw-protocol
+exclusions without fallback, consumption or spawn. Include actual confinement,
+private/public outcomes, durable authorization, lifecycle cancellation, owner
+injection controls and descendant cleanup. Partial reruns, helper-only tests and
+namespace-root fixtures do not replace installed native integration. Keep generated
+manifests, private reviews and logs outside the source tree. Policy-change handling
+under Section 5.5 is detection and termination, without an atomic replacement interlock.
 
-Keep PTY, hooks, collector/remote ACK, reload, reusable grants, scripts and extra
-signing adapters independently deferred until their integrated cases pass. They
-remain target requirements, not mandatory scope for the namespace implementation
-milestones. Hardware FIDO claims still require physical acceptance. Full v3
-conformance requires all claimed target features and applicable V/NS cases;
-a subset must name its supported profile and exclusions explicitly.
+PTY, hooks, remote collector/ACK, policy reload, reusable grants, scripts and extra
+signing adapters remain independently deferred. Physical FIDO claims require
+hardware acceptance. Full v3 conformance requires all claimed target features and
+applicable cases; every subset must name its profile and exclusions explicitly.
 
 | Requirement | Integrated acceptance scenario and required result |
 | --- | --- |
-| NS-01 | All four routes, rootful/rootless, same-owner/cross-owner; destination account and explicit policy/approval are correct; both client endpoints function |
+| NS-01 | All four routes, rootful/rootless, same-owner/cross-owner; destination account and explicit policy/approval are correct; route-specific endpoints function and the client authenticates the host daemon |
 | NS-02 | Shared/unshared namespaces, inherited/passed sockets, connector exit, exec/credential/context races; adhere to declared attribution or reject |
 | NS-03–NS-04 | PID reuse, anchor death, change-and-restore races, restart/replacement, daemon restart while reviewing; stale binding rejects without retargeting |
 | NS-05–NS-06 | Nested/unmapped IDs, setgroups restrictions, cross-owner requests, equal numeric IDs in different namespaces and different IDs mapping to one kernel UID; no authority confusion or injection bypass |
@@ -2454,14 +2554,14 @@ a subset must name its supported profile and exclusions explicitly.
 | NS-09–NS-10 | Userns entry, PID/time child creation, root/mount isolation, idmapped mounts, cgroup placement and delegation; actual final context and descendant supervision match profile |
 | NS-11 | Real SELinux/AppArmor enforcement including stacks/ranges, disabled/permissive/complain/unreadable states, policy reload/reuse, seccomp, NNP/ptrace/direct/memfd; require declared actual constraints before release |
 | NS-12 | Disconnect/cancel, target deletion, resolver/helper/tracer death, exhausted quotas and blocked cleanup; bounded ownership, correct disclosure timing and consumption |
-| NS-13 | Scoped manager names/owners/endpoints, stale or dishonest metadata and lifecycle loss; validate resources under unchanged host authorization |
+| NS-13 | Scoped manager names/owners/endpoints/namespaces, stale or dishonest metadata, same-name replacement with the old anchor alive, required configuration changes and resolver loss/restart/event gaps; invalidate stale generations, supervise teardown and retain unchanged host authorization |
 | NS-14–NS-15 | Independent schema/JCS/PAE/signature vectors, altered bindings/intent/profile, approval rendering, fresh-state rejection and audit/collector equality; no downgrade, hidden field or incompatible-state adoption |
-| NS-16 | Reproducible integrated results for each advertised platform/profile; no helper-only or namespace-root fixture substituted for a release gate |
+| NS-16 | Candidate revision and matching package/binary/policy evidence for each advertised platform/profile/route; explicit exclusions and historical-result boundaries; no helper-only or namespace-root fixture substituted for a release gate |
 
 ### 8.4 Release-Blocking Design Gates
 
-Phase 0 must produce reviewable decisions, bounded schemas and prototype evidence
-for the following before dependent runtime features are enabled:
+Each supported execution profile must satisfy these design gates with reviewable
+decisions, bounded schemas and integration tests before enabling dependent features:
 
 | Gate | Required decision/evidence | Blocked capability |
 | --- | --- | --- |

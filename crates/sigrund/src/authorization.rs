@@ -38,6 +38,7 @@ fn policy() -> Denial {
 
 /// Includes immutable command bytes and the deterministic environment for the
 /// later child setup. Success is not a durable grant or readiness decision.
+#[derive(Clone)]
 pub(crate) struct Authorized {
     pub warrant: CanonicalWarrant,
     pub signer_ids: Vec<String>,
@@ -52,6 +53,30 @@ pub(crate) fn verify(
     request
         .check()
         .map_err(|_| Denial::new("REQUEST_TIMEOUT", "authorization cancelled"))?;
+    if let Some(process) = &request.process {
+        if !process
+            .verified
+            .as_ref()
+            .is_some_and(|proof| proof.matches(request))
+        {
+            return Err(policy());
+        }
+        if process.lease.constraints().executes() {
+            if gid != request.requester_gid {
+                return Err(policy());
+            }
+            return Ok(process
+                .verified
+                .as_ref()
+                .ok_or_else(policy)?
+                .authorized
+                .clone());
+        }
+        return Err(Denial::new(
+            "NAMESPACE_EXECUTION_DISABLED",
+            "private process approval verified; execution is disabled",
+        ));
+    }
     request
         .policy
         .mvp
@@ -251,7 +276,7 @@ pub(crate) fn verify(
     })
 }
 
-fn verify_snapshot(
+pub(crate) fn verify_snapshot(
     snapshot: &SealedSnapshot,
     expected: &str,
     maximum: u64,

@@ -9,15 +9,22 @@ GitHub Actions builds native **x86-64** packages in Fedora 44/45 and Ubuntu
 dependencies. Download the `packages-<distribution>-x86_64` artifact from a
 successful **Packages** workflow run. Each archive contains two packages,
 `SHA256SUMS`, and source/toolchain/image information in `build-info.txt`.
+Version tags also create a draft GitHub Release with all eight packages,
+per-distribution build information and a combined `SHA256SUMS` file. Releases
+become publicly downloadable after a maintainer reviews and publishes the draft.
 
 | Package | Installed components | Runtime dependencies |
 | --- | --- | --- |
 | `sigrun` | `/usr/bin/sigrun`, documentation and license | Native shared libraries; no daemon, systemd or SSH dependency |
-| `sigrund` | `/usr/libexec/sigrund/sigrund`, `/usr/bin/sigrund-approve`, `/usr/bin/sigrundctl`, systemd unit and configuration examples | Native shared libraries, systemd and OpenSSH client |
+| `sigrund` | `/usr/libexec/sigrund/sigrund`, `/usr/bin/sigrund-approve`, `/usr/bin/sigrundctl`, `/usr/bin/sigrund-anchor`, systemd unit and configuration examples | Native shared libraries, systemd and OpenSSH client |
 
 Neither package depends on the other. Install both on a machine that will host
 the daemon and run requests locally. The diagnostic-only collector binary is
 not packaged as a working collector service.
+
+Follow the [Quick Start](https://github.com/Librazy/sigrund/blob/main/QUICK_START.md)
+for setup and the five host/container routes. The daemon package also installs it
+at `/usr/share/doc/sigrund/QUICK_START.md`.
 
 ## Install
 
@@ -41,11 +48,12 @@ apt install ./sigrun_*.deb
 apt install ./sigrund_*.deb
 ```
 
-These are unsigned CI snapshot artifacts, not a signed RPM/APT repository or
-GitHub Release. Checksums detect corruption; they do not independently establish
-authenticity. The upstream Cargo version is combined with a timestamp, commit,
-distribution and build revision so snapshots can be upgraded normally. Only
-install artifacts from a source revision and workflow run you trust.
+Packages are unsigned; there is no signed RPM/APT repository. Checksums detect
+corruption; they do not independently establish authenticity. Both native
+packages and Cargo crates derive their version from `workspace.package.version`
+in the root `Cargo.toml`. Snapshot revisions include a timestamp, commit and
+distribution; tagged builds use `1.<distribution>.1`, which sorts after snapshots
+of the same version. Only install packages from a release or workflow you trust.
 
 ## Configure the daemon
 

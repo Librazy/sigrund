@@ -87,8 +87,10 @@ Both CI and Packages call `.github/workflows/should-run.yml` before their checks
 For branch pushes, it queries open PRs and skips the checks if the head branch
 belongs to this repository and matches the pushed branch. Only the small
 selection job runs for these duplicate push events. Branches without an open PR,
-tag pushes, pull request events (including forks) and manual dispatches run their
-normal jobs. Failure to query PRs fails the selection job.
+pull request events (including forks) and manual dispatches run their normal jobs.
+CI also runs on tag pushes; version tags run package checks through Release
+instead of starting a duplicate Packages run. Failure to query PRs fails the
+selection job.
 
 Concurrency groups include the workflow name and either the PR number or branch
 ref, with `cancel-in-progress: true`. This keeps at most one current run per
@@ -101,3 +103,22 @@ Lint workflow changes with:
 ```sh
 actionlint .github/workflows/*.yml
 ```
+
+## Release packages
+
+`workspace.package.version` in the root `Cargo.toml` is the single version source
+for both crates and native packages. Update it and the workspace entries in
+`Cargo.lock`, then commit the change. After the desired commit passes CI, create
+and push a matching `vX.Y.Z` tag, for example:
+
+```sh
+git tag -a v0.3.0 -m 'Release 0.3.0'
+git push origin v0.3.0
+```
+
+The Release workflow rejects tags that do not match the workspace version,
+builds and smoke-tests the client and daemon packages on all four distributions,
+then creates a **draft** GitHub Release. It attaches eight x86-64 RPM/DEB packages,
+four distribution build-info files and a combined `SHA256SUMS`. Review the draft
+and its checks before publishing it. Creating the tag does not publish the
+release publicly or upload crates to crates.io.

@@ -35,6 +35,7 @@ pub(crate) struct ValidatedRequest {
     // Shared control ownership retains its separate bounded disposal permit
     // through the actual final close, including unread queued SCM_RIGHTS.
     pub deferred_cleanup: Vec<Socket>,
+    pub source: Option<Socket>,
     pub failure: Option<io::Error>,
     pub exec_id: String,
     pub requester_gid: u32,
@@ -52,6 +53,7 @@ pub(crate) struct ValidatedRequest {
     pub cancelled: Arc<AtomicBool>,
     pub host_profile: Option<sigrund_core::host::Constraints>,
     pub host_bundle: Option<sigrund_core::host::BindingBundle>,
+    pub process: Option<crate::process_request::ProcessState>,
     pub host_lease: Option<crate::host_target::HostLease>,
 }
 pub(crate) struct MeasuredSnapshots {
@@ -64,6 +66,11 @@ impl ValidatedRequest {
             check(&self.cancelled, self.deadline)?;
         } else if self.cancelled.load(Ordering::Acquire) {
             return Err(io::ErrorKind::Interrupted.into());
+        }
+        if let Some(process) = &self.process {
+            process.lease.check_lifecycle().map_err(|error| {
+                crate::preparation::fail("TARGET_INVALIDATED", error.to_string())
+            })?;
         }
         if let Some(snapshots) = &self.snapshots {
             snapshots.executable.check_ctime_guard()?;
@@ -316,9 +323,18 @@ fn read_request(
             .err();
     }
     let mut request = ValidatedRequest {
+        source: if hello
+            .original_intent()
+            .is_ok_and(|intent| matches!(intent.target, sigrund_core::host::Selector::Self_ {}))
+        {
+            Some(socket.clone())
+        } else {
+            None
+        },
         host_profile: None,
         host_bundle: None,
         host_lease: None,
+        process: None,
         deferred_cleanup: vec![],
         failure,
         exec_id: String::new(),

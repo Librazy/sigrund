@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Match tag to workspace version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 packaging/release.py --tag "$RELEASE_TAG"
+
+  packages:
+    name: Build and smoke tests
+    needs: validate
+    uses: ./.github/workflows/packages-jobs.yml
+
+  draft:
+    name: Create draft release
+    needs: packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download tested packages and prepare release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'packages-*' --dir "$RUNNER_TEMP/artifacts"
+          python3 packaging/release.py --tag "$RELEASE_TAG" \
+            --artifacts "$RUNNER_TEMP/artifacts" --output "$RUNNER_TEMP/release"
+      - name: Attach all packages to an unpublished release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/release/"* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "$RELEASE_TAG" --generate-notes

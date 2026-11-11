@@ -74,7 +74,7 @@ pub fn openat2_executable(root_fd: RawFd, relative_path: &Path) -> io::Result<Ow
     )
 }
 
-fn open_relative(
+pub(crate) fn open_relative(
     root_fd: RawFd,
     relative_path: &Path,
     flags: i32,

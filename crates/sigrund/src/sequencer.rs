@@ -333,7 +333,12 @@ pub(crate) fn request_provenance(request: &crate::workers::ValidatedRequest) -> 
         "full_csr" | "signed" => Some("client_full"),
         _ => None,
     };
-    let intent = request.hello.intent().ok().and_then(|i| i.sha256().ok());
+    use sigrund_core::host::Record;
+    let intent = request
+        .hello
+        .original_intent()
+        .ok()
+        .and_then(|i| i.sha256().ok());
     serde_json::json!({"request_origin":origin,"intent_sha256":intent,
         "approval_exec_id":if origin==Some("daemon_expanded_thin") {Some(request.exec_id.as_str())} else {None}})
 }
@@ -350,12 +355,34 @@ fn authorize(
         Ok(verified) => verified,
         Err(denial) => {
             publish_denial(completed, wake, task.token, &denial)?;
+            let mut fields = serde_json::json!({"exec_id":task.exec_id,
+                "requester_uid":request.requester_uid, "status":denial.status});
+            if let Some(process) = &request.process {
+                let review = process
+                    .review
+                    .as_ref()
+                    .ok_or("missing process review at authorization")?;
+                use sigrund_core::host::Record;
+                let binding = review.binding().map_err(|error| error.to_string())?;
+                fields["source_authenticated"] = serde_json::json!({
+                    "uid":request.requester_uid, "gid":request.requester_gid,
+                    "supplementary_gids":request.requester_groups,"connector_observations":process.lease.authenticated_source()});
+                fields["approved_target"] = serde_json::json!({
+                    "binding":binding.target_binding,
+                    "security_constraints":binding.security_constraints,
+                    "execution_binding_sha256":binding.sha256().map_err(|error| error.to_string())?,
+                    "numeric_credentials":process.evidence.credentials});
+                if let Some(manager) = process.lease.manager_evidence() {
+                    fields["approved_target"]["manager"] =
+                        serde_json::to_value(manager).map_err(|error| error.to_string())?;
+                }
+                fields["execution_observed"] = serde_json::Value::Null;
+            }
             append_event(
                 resources,
                 &request.policy,
                 "AUTH_REJECTED",
-                serde_json::json!({"exec_id":task.exec_id,
-                "requester_uid":request.requester_uid, "status":denial.status}),
+                fields,
                 request.policy.audit_record_max_bytes as usize,
             )
             .map_err(|e| e.to_string())?;
@@ -427,7 +454,7 @@ fn authorize(
         )
         .map_err(|e| format!("authorization database failed; reconciliation required: {e}"))?;
     let limit = request.policy.audit_record_max_bytes as usize;
-    let fields = serde_json::json!({"exec_id":task.exec_id,"request_origin":w.request_origin,"intent_sha256":w.intent_sha256,"approval_exec_id":w.approval_exec_id, "grant_id":w.grant_id,
+    let mut fields = serde_json::json!({"exec_id":task.exec_id,"request_origin":w.request_origin,"intent_sha256":w.intent_sha256,"approval_exec_id":w.approval_exec_id, "grant_id":w.grant_id,
         "execution_binding_sha256": binding_digest,
         "target_binding":w.target_binding,"security_constraints":w.security_constraints,
         "payload_sha256":sha256_hex(verified.warrant.as_bytes()), "signer_id":signer_id,
@@ -441,6 +468,15 @@ fn authorize(
         "post_exec_capabilities":w.execution_context.expected_capabilities(),
         "stdin_sha256":w.command.stdin_sha256,
         "tty_mode":w.command.tty_mode,"environment_entries":verified.envp.len()});
+    if let Some(process) = &request.process {
+        fields["source_authenticated"] = serde_json::json!({"uid":request.requester_uid,"gid":request.requester_gid,"supplementary_gids":request.requester_groups,"connector_observations":process.lease.authenticated_source()});
+        fields["approved_target"] = serde_json::json!({"binding":w.target_binding,"security_constraints":w.security_constraints,"numeric_credentials":process.evidence.credentials});
+        if let Some(manager) = process.lease.manager_evidence() {
+            fields["approved_target"]["manager"] =
+                serde_json::to_value(manager).map_err(|error| error.to_string())?;
+        }
+        fields["execution_observed"] = serde_json::Value::Null;
+    }
     if result == AuthorizationResult::Allowed {
         if !task
             .lifecycle

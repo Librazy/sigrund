@@ -68,6 +68,7 @@ if [[ "$scenario" == daemon-only ]]; then
 fi
 /usr/libexec/sigrund/sigrund --help
 sigrund-approve --help
+sigrund-anchor --help
 sigrundctl --validate-uuid "$(sigrundctl uuidv7)"
 systemd-analyze verify /usr/lib/systemd/system/sigrund.service
 test ! -e /etc/sigrund/config.toml
@@ -87,7 +88,7 @@ if [[ "$scenario" == daemon-only ]]; then
 fi
 sha256sum --check /tmp/preserved.sha256
 test ! -e /etc/systemd/system/multi-user.target.wants/sigrund.service
-executables=(/usr/bin/sigrundctl /usr/bin/sigrund-approve /usr/libexec/sigrund/sigrund)
+executables=(/usr/bin/sigrund-anchor /usr/bin/sigrundctl /usr/bin/sigrund-approve /usr/libexec/sigrund/sigrund)
 if [[ "$scenario" == combined ]]; then
   executables+=(/usr/bin/sigrun)
 fi

@@ -16,6 +16,7 @@ pub mod host_registry;
 pub mod host_target;
 mod jobs;
 pub mod linux;
+mod lsm;
 pub mod memfd;
 mod preparation;
 pub mod reaper;
@@ -57,3 +58,16 @@ pub(crate) fn synchronize_test_intent(w: &mut sigrund_core::warrant::Warrant) {
     w.intent.caller_env = w.caller_env.clone();
     w.intent_sha256 = w.intent.sha256().unwrap();
 }
+
+pub mod target_registry;
+
+pub mod destination;
+
+pub mod target_capture;
+
+pub mod target_management;
+
+pub mod destination_helper;
+
+mod podman;
+mod process_request;

@@ -32,6 +32,7 @@ pub struct Executable {
     direct_digest_limit: u64,
     admin_trusted_composefs_mount: Option<u64>,
     ctime_guard: Option<CtimeGuard>,
+    allow_file_capabilities: bool,
 }
 impl From<SealedSnapshot> for Executable {
     fn from(sealed: SealedSnapshot) -> Self {
@@ -47,6 +48,7 @@ impl From<SealedSnapshot> for Executable {
             direct_digest_limit: 0,
             admin_trusted_composefs_mount: None,
             ctime_guard: None,
+            allow_file_capabilities: false,
         }
     }
 }
@@ -135,7 +137,7 @@ impl Executable {
             source,
             &metadata,
             &context.requested(),
-            context.post_exec_capabilities.is_some(),
+            self.allow_file_capabilities && context.post_exec_capabilities.is_some(),
         )?;
         if observed_profile.as_ref() != Some(&context.expected_capabilities()) {
             return Err(invalid("direct executable is no longer eligible"));
@@ -192,13 +194,19 @@ impl Executable {
         context: &ExecutionContext,
         check: impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.verify_evidence(context, true, &check)?;
+        if let Some(sealed) = &self.sealed {
+            crate::authorization::verify_snapshot(
+                sealed,
+                &self.digest.sha256,
+                self.digest.bytes,
+                true,
+                &check,
+            )?;
+        } else {
+            self.verify_evidence(context, true, &check)?;
+        }
         let actual = std::fs::metadata(format!("/proc/{pid}/exe"))?;
-        let source = self
-            .source
-            .as_ref()
-            .expect("direct executable")
-            .metadata()?;
+        let source = File::from(self.as_fd().try_clone_to_owned()?).metadata()?;
         if (actual.dev(), actual.ino()) != (source.dev(), source.ino()) {
             return Err(invalid("exec loaded a different inode"));
         }
@@ -372,6 +380,7 @@ pub fn prepare(
                 direct_digest_limit: config.max_direct_digest_bytes,
                 admin_trusted_composefs_mount,
                 ctime_guard,
+                allow_file_capabilities: selection.allow_file_capabilities,
             };
             let mut context: ExecutionContext = selection.context.clone().into();
             context.post_exec_capabilities = executable.post_exec_capabilities.clone();
@@ -444,6 +453,7 @@ pub(crate) fn client_evidence(
     source: &File,
     context: &RequestedExecutionContext,
     public: &sigrund_core::protocol::PublicContext,
+    admin_trusted_composefs_mounts: &[u64],
     purpose: EvidencePurpose,
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<(ExecutableTrust, CapabilitySets)> {
@@ -476,7 +486,7 @@ pub(crate) fn client_evidence(
             &selection,
             public.limits.max_executable_bytes,
             public.limits.max_direct_digest_bytes,
-            &public.features.admin_trusted_composefs_mounts,
+            admin_trusted_composefs_mounts,
         )?
         else {
             continue;

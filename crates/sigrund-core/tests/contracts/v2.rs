@@ -49,7 +49,7 @@ fn provenance_is_immutable_and_thin_approvals_are_not_standalone_warrants() {
         assert!(ClientHello::parse_request(&serde_json::to_vec(&value).unwrap()).is_err());
     }
     thin.policy.mode = "time_range".into();
-    thin.intent_sha256 = thin.intent().unwrap().sha256().unwrap();
+    thin.intent_sha256 = sigrund_core::host::Record::sha256(&thin.intent).unwrap();
     assert!(CanonicalWarrant::new(thin).is_err());
     let mut full = original;
     full.approval_exec_id = Some(EXEC_ID.into());

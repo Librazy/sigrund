@@ -27,6 +27,10 @@ pub struct PeerCredentials {
 }
 
 pub fn peer_credentials(fd: RawFd) -> io::Result<PeerCredentials> {
+    read_peer_credentials(fd, true)
+}
+
+fn read_peer_credentials(fd: RawFd, visible_pid: bool) -> io::Result<PeerCredentials> {
     let mut credentials: libc::ucred = unsafe { zeroed() };
     let mut length = size_of::<libc::ucred>() as libc::socklen_t;
     if unsafe {
@@ -41,7 +45,10 @@ pub fn peer_credentials(fd: RawFd) -> io::Result<PeerCredentials> {
     {
         return Err(io::Error::last_os_error());
     }
-    if length as usize != size_of::<libc::ucred>() || credentials.pid <= 0 {
+    if length as usize != size_of::<libc::ucred>()
+        || credentials.pid < 0
+        || (visible_pid && credentials.pid == 0)
+    {
         return Err(invalid("invalid SO_PEERCRED result"));
     }
     Ok(PeerCredentials {
@@ -81,6 +88,41 @@ pub fn peer_groups(fd: RawFd) -> io::Result<Vec<u32>> {
     Ok(groups)
 }
 
+pub(crate) fn peer_security_label(fd: RawFd) -> io::Result<Option<String>> {
+    let mut bytes = vec![0u8; 4097];
+    let mut length = bytes.len() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERSEC,
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOPROTOOPT) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if length as usize > bytes.len() {
+        return Err(invalid("oversized peer security label"));
+    }
+    bytes.truncate(length as usize);
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err(invalid("unrenderable peer security label"));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| invalid("non-UTF8 peer security label"))
+}
+
 pub fn disable_ancillary_credentials(fd: RawFd) -> io::Result<()> {
     let disabled: libc::c_int = 0;
     // SO_PASSPIDFD is Linux UAPI 76; older kernels return ENOPROTOOPT.
@@ -107,12 +149,16 @@ pub fn disable_ancillary_credentials(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-struct Received {
-    length: usize,
-    rights: Vec<OwnedFd>,
+pub(crate) struct Received {
+    pub(crate) length: usize,
+    pub(crate) rights: Vec<OwnedFd>,
 }
 
-fn receive(fd: RawFd, bytes: &mut [u8], allow_rights: bool) -> io::Result<Option<Received>> {
+pub(crate) fn receive(
+    fd: RawFd,
+    bytes: &mut [u8],
+    allow_rights: bool,
+) -> io::Result<Option<Received>> {
     // usize storage supplies cmsghdr alignment. Expose exactly CMSG_SPACE(3
     // ints), including padding in which a fourth delivered FD can fit.
     let mut control = [0usize; 8];

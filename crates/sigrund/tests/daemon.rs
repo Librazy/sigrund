@@ -1,5 +1,5 @@
 //! Daemon gates run as initial-userns root inside private mount namespaces.
-//! The privileged Phase 1 supervisor owns their bounded lifetime and cleanup.
+//! The privileged host supervisor owns their bounded lifetime and cleanup.
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sigrund_core::{
     audit::entry_hmac,
@@ -570,7 +570,7 @@ impl Drop for DaemonChild {
 }
 
 #[test]
-#[ignore = "requires initial-userns root; included in the privileged Phase 1 gate"]
+#[ignore = "requires initial-userns root; included in the privileged host gate"]
 fn daemon_gate_in_user_namespace() {
     let _gate = namespace_gate();
     let output = Command::new("unshare")

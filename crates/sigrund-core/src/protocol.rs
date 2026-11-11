@@ -198,16 +198,15 @@ pub struct RequestedPolicy {
     pub ttl_secs: u64,
 }
 
-/// Immutable execution intent, excluding all measured evidence.
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Intent {
+/// Resolved internal preparation view. The signed intent is `v3::Intent`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedIntent {
     pub command: RequestedCommand,
     pub execution_context: RequestedExecutionContext,
     pub policy: RequestedPolicy,
     pub caller_env: BTreeMap<String, String>,
 }
-impl Intent {
+impl ResolvedIntent {
     pub fn validate(&self) -> Result<()> {
         validate_unsigned_request(
             &self.command,
@@ -221,12 +220,6 @@ impl Intent {
             ));
         }
         Ok(())
-    }
-    pub fn sha256(&self) -> Result<String> {
-        self.validate()?;
-        Ok(crate::crypto::sha256_hex(&crate::json::canonical_bytes(
-            self,
-        )?))
     }
 }
 
@@ -244,72 +237,44 @@ pub struct ClientHello {
     pub requested_execution_context: Option<RequestedExecutionContext>,
     pub requested_policy: Option<RequestedPolicy>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "mode", deny_unknown_fields)]
-enum WireHello {
-    #[serde(rename = "thin_csr")]
-    Thin {
-        version: String,
-        tty_mode: String,
-        caller_env: BTreeMap<String, String>,
-        intent: Box<crate::v3::Intent>,
-    },
-    #[serde(rename = "full_csr")]
-    Full {
-        version: String,
-        tty_mode: String,
-        caller_env: BTreeMap<String, String>,
-        csr_payload: String,
-    },
-    #[serde(rename = "signed")]
-    Signed {
-        version: String,
-        tty_mode: String,
-        caller_env: BTreeMap<String, String>,
-        dsse_envelope: DsseEnvelope,
-    },
-}
+use crate::v3::Hello as WireHello;
 impl TryFrom<WireHello> for ClientHello {
     type Error = CoreError;
     fn try_from(wire: WireHello) -> Result<Self> {
-        let (version, mut hello) = match wire {
+        wire.validate()?;
+        let (_, mut hello) = match wire {
             WireHello::Thin {
                 version,
                 tty_mode,
                 caller_env,
                 intent,
-            } => {
-                if caller_env != intent.caller_env {
-                    return Err(CoreError::Protocol("caller environment mismatch".into()));
-                }
-                (
-                    version,
-                    Self {
-                        original_intent: Some((*intent).clone()),
-                        caller_env,
-                        tty_mode,
-                        mode: "thin_csr".into(),
-                        csr_payload: None,
-                        dsse_envelope: None,
-                        requested_command: Some(intent.command.clone()),
-                        requested_execution_context: Some(match &intent.account {
-                            crate::host::Account::Numeric {
-                                uid,
-                                gid,
-                                supplementary_gids,
-                            } => intent.execution_context.resolve(
-                                *uid,
-                                *gid,
-                                supplementary_gids.clone(),
-                            ),
-                            crate::host::Account::Name { .. } => {
-                                intent.execution_context.resolve(0, 0, vec![])
-                            }
-                        }),
-                        requested_policy: Some(intent.policy),
-                    },
-                )
-            }
+            } => (
+                version,
+                Self {
+                    original_intent: Some((*intent).clone()),
+                    caller_env,
+                    tty_mode,
+                    mode: "thin_csr".into(),
+                    csr_payload: None,
+                    dsse_envelope: None,
+                    requested_command: Some(intent.command.clone()),
+                    requested_execution_context: Some(match &intent.account {
+                        crate::host::Account::Numeric {
+                            uid,
+                            gid,
+                            supplementary_gids,
+                        } => {
+                            intent
+                                .execution_context
+                                .resolve(*uid, *gid, supplementary_gids.clone())
+                        }
+                        crate::host::Account::Name { .. } => {
+                            intent.execution_context.resolve(0, 0, vec![])
+                        }
+                    }),
+                    requested_policy: Some(intent.policy),
+                },
+            ),
             WireHello::Full {
                 version,
                 tty_mode,
@@ -349,9 +314,6 @@ impl TryFrom<WireHello> for ClientHello {
                 },
             ),
         };
-        if version != "3.0" {
-            return Err(CoreError::Protocol("unsupported wire version".into()));
-        }
         if let Some(payload) = &hello.csr_payload {
             let csr = crate::warrant::Csr::parse(payload.as_bytes())?;
             hello.original_intent = Some(csr.warrant().intent.clone());
@@ -396,7 +358,26 @@ impl From<ClientHello> for WireHello {
     }
 }
 impl ClientHello {
-    pub fn intent(&self) -> Result<Intent> {
+    /// Recover the complete original selection for private provenance records.
+    /// Signed requests always take it from the canonical signed payload.
+    pub fn original_intent(&self) -> Result<crate::v3::Intent> {
+        use crate::host::Record;
+        let intent = if let Some(envelope) = &self.dsse_envelope {
+            envelope.warrant()?.warrant().intent.clone()
+        } else if let Some(payload) = &self.csr_payload {
+            crate::warrant::Csr::parse(payload.as_bytes())?
+                .warrant()
+                .intent
+                .clone()
+        } else {
+            self.original_intent
+                .clone()
+                .ok_or_else(|| CoreError::Protocol("missing original intent".into()))?
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+    pub fn intent(&self) -> Result<ResolvedIntent> {
         if let Some(envelope) = &self.dsse_envelope {
             return envelope.warrant()?.warrant().intent();
         }
@@ -405,7 +386,7 @@ impl ClientHello {
                 .warrant()
                 .intent();
         }
-        let intent = Intent {
+        let intent = ResolvedIntent {
             command: self
                 .requested_command
                 .clone()
@@ -444,59 +425,28 @@ impl ClientHello {
         crate::json::preflight_with_string_limits(&bytes, 8, &Self::string_limit)
     }
     pub fn validate_shape(&self) -> Result<()> {
-        if self.mode == "thin_csr" {
-            use crate::host::Record;
-            self.original_intent
-                .as_ref()
-                .ok_or_else(|| CoreError::Protocol("missing explicit v3 intent".into()))?
-                .validate()?;
-        }
-        let intent = self.intent()?;
-        if self.tty_mode != intent.command.tty_mode || self.caller_env != intent.caller_env {
-            return Err(CoreError::Protocol("hello intent mismatch".into()));
-        }
+        // Normalized preparation fields are private and may hold resolved named
+        // credentials. Public syntax and immutable intent have one validator.
         match self.mode.as_str() {
-            "thin_csr" if self.dsse_envelope.is_none() && self.csr_payload.is_none() => (),
-            "full_csr" if self.dsse_envelope.is_none() && self.csr_payload.is_some() => {
-                let csr =
-                    crate::warrant::Csr::parse(self.csr_payload.as_ref().unwrap().as_bytes())?;
-                csr.warrant().require_client_full()?;
-            }
+            "thin_csr"
+                if self.dsse_envelope.is_none()
+                    && self.csr_payload.is_none()
+                    && self.original_intent.is_some() => {}
+            "full_csr" if self.dsse_envelope.is_none() && self.csr_payload.is_some() => (),
             "signed"
                 if self.dsse_envelope.is_some()
                     && self.csr_payload.is_none()
                     && self.requested_command.is_none()
                     && self.requested_execution_context.is_none()
-                    && self.requested_policy.is_none() =>
-            {
-                self.dsse_envelope
-                    .as_ref()
-                    .unwrap()
-                    .warrant()?
-                    .warrant()
-                    .require_client_full()?;
-            }
+                    && self.requested_policy.is_none() => {}
             _ => return Err(CoreError::Protocol("inconsistent request mode".into())),
         }
-        Ok(())
+        self.intent()?.validate()?;
+        WireHello::from(self.clone()).validate()
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ContextQuery {
-    pub version: String,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PublicContext {
-    pub version: String,
-    pub host_id: String,
-    pub policy_generation: u64,
-    pub executable_trust_models: Vec<crate::executable::TrustModel>,
-    pub limits: ContextLimits,
-    pub features: ContextFeatures,
-}
+pub use crate::v3::{ContextFeatures, ContextQuery, PublicContext};
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextLimits {
@@ -507,19 +457,6 @@ pub struct ContextLimits {
     pub max_ttl_secs: u64,
     pub max_onetime_window_secs: u64,
     pub authorization_timeout_ms: u32,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ContextFeatures {
-    /// Private local eligibility input. V3 public context carries only the
-    /// specified feature keys; target evidence is supplied in trusted bundles.
-    #[serde(skip)]
-    pub admin_trusted_composefs_mounts: Vec<u64>,
-    pub direct_exec_checkpoint: bool,
-    pub host_file_capabilities: bool,
-    pub tty_modes: Vec<String>,
-    pub stdin_policies: Vec<String>,
-    pub grant_modes: Vec<String>,
 }
 impl ProtocolSchema for ContextQuery {}
 impl ProtocolSchema for PublicContext {}
@@ -992,7 +929,7 @@ pub trait ProtocolSchema {
     }
 }
 
-impl ProtocolSchema for ClientHello {
+impl ProtocolSchema for crate::v3::Hello {
     fn string_limit(path: &[String]) -> usize {
         let path: Vec<_> = path.iter().map(String::as_str).collect();
         match path.as_slice() {
@@ -1002,6 +939,12 @@ impl ProtocolSchema for ClientHello {
             ["dsse_envelope", "signatures", "*", "keyid"] => 128,
             _ => 4096,
         }
+    }
+}
+
+impl ProtocolSchema for ClientHello {
+    fn string_limit(path: &[String]) -> usize {
+        <crate::v3::Hello as ProtocolSchema>::string_limit(path)
     }
 }
 

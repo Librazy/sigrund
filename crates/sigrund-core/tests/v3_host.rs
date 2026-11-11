@@ -257,3 +257,79 @@ fn private_binding_retains_bounded_composefs_enrollment() {
     bundle.admin_trusted_composefs_mounts = vec![1234, 5678];
     assert!(bundle.validate().is_err());
 }
+
+#[test]
+fn production_hello_paths_share_wire_bytes_and_reject_the_same_substitutions() {
+    use sigrund_core::protocol::ClientHello;
+    let warrant = Warrant::parse_canonical(PAYLOAD).unwrap();
+    let envelope = json!({
+        "payloadType":sigrund_core::host::PAYLOAD_TYPE,
+        "payload":STANDARD.encode(PAYLOAD),
+        "signatures":[{"keyid":"root-test","sig":STANDARD.encode(b"signature")}]
+    });
+    for document in [
+        json!({"version":"3.0","mode":"thin_csr","tty_mode":"stdio","caller_env":{},"intent":warrant.intent}),
+        json!({"version":"3.0","mode":"full_csr","tty_mode":"stdio","caller_env":{},"csr_payload":std::str::from_utf8(PAYLOAD).unwrap()}),
+        json!({"version":"3.0","mode":"signed","tty_mode":"stdio","caller_env":{},"dsse_envelope":envelope}),
+    ] {
+        let bytes = sigrund_core::json::canonical_bytes(&document).unwrap();
+        let wire = Hello::parse(&bytes).unwrap();
+        let normalized = ClientHello::parse_request(&bytes).unwrap();
+        assert_eq!(
+            normalized.original_intent().unwrap().sha256().unwrap(),
+            warrant.intent_sha256
+        );
+        assert_eq!(sigrund_core::json::canonical_bytes(&wire).unwrap(), bytes);
+        assert_eq!(
+            sigrund_core::json::canonical_bytes(&normalized).unwrap(),
+            bytes
+        );
+        for (field, value) in [
+            ("version", json!("4.0")),
+            ("tty_mode", json!("pty")),
+            ("caller_env", json!({"X":"substituted"})),
+            ("extra", json!(true)),
+        ] {
+            let mut changed = document.clone();
+            changed[field] = value;
+            let changed = serde_json::to_vec(&changed).unwrap();
+            assert!(Hello::parse(&changed).is_err(), "{field}");
+            assert!(ClientHello::parse_request(&changed).is_err(), "{field}");
+        }
+        let duplicate = [b"{\"version\":\"3.0\",".as_slice(), &bytes[1..]].concat();
+        assert!(Hello::parse(&duplicate).is_err());
+        assert!(ClientHello::parse_request(&duplicate).is_err());
+    }
+}
+
+#[test]
+fn public_context_uses_one_schema_and_rejects_private_preparation_inputs() {
+    use sigrund_core::protocol::{PublicContext, parse_strict};
+    let context = json!({"version":"3.0","host_id":format!("sigrun-host:sha256:{}", "1".repeat(64)),"policy_generation":1,"executable_trust_models":["digest_memfd"],"limits":{"max_executable_bytes":67108864,"max_direct_digest_bytes":268435456,"direct_digest_timeout_ms":5000,"max_stdin_bytes":16777216,"max_ttl_secs":3600,"max_onetime_window_secs":3600,"authorization_timeout_ms":120000},"features":{"direct_exec_checkpoint":false,"host_file_capabilities":false,"tty_modes":["stdio"],"stdin_policies":["null","sha256"],"grant_modes":["one_time"]}});
+    let bytes = serde_json::to_vec(&context).unwrap();
+    let production: PublicContext = parse_strict(&bytes).unwrap();
+    production.validate().unwrap();
+    let contract: v3::PublicContext = production;
+    assert_eq!(serde_json::to_value(contract).unwrap(), context);
+    // Models express policy eligibility. Runtime checkpoint availability is a
+    // separate input to local preparation and must preserve thin fallback.
+    let mut independent_ttl = context.clone();
+    independent_ttl["limits"]["max_ttl_secs"] = json!(600);
+    independent_ttl["limits"]["max_onetime_window_secs"] = json!(3600);
+    PublicContext::parse(&serde_json::to_vec(&independent_ttl).unwrap()).unwrap();
+    let mut unavailable_checkpoint = context.clone();
+    unavailable_checkpoint["executable_trust_models"] = json!(["ctime", "digest_memfd"]);
+    PublicContext::parse(&serde_json::to_vec(&unavailable_checkpoint).unwrap()).unwrap();
+    let mut private = context.clone();
+    private["features"]["admin_trusted_composefs_mounts"] = json!([1234]);
+    assert!(parse_strict::<PublicContext>(&serde_json::to_vec(&private).unwrap()).is_err());
+    for (pointer, value) in [
+        ("/limits/max_executable_bytes", json!(0)),
+        ("/limits/authorization_timeout_ms", json!(999)),
+        ("/features/tty_modes", json!(["pty"])),
+    ] {
+        let mut changed = context.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(PublicContext::parse(&serde_json::to_vec(&changed).unwrap()).is_err());
+    }
+}

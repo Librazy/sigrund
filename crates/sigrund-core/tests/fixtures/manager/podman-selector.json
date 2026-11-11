@@ -1,0 +1,1 @@
+{"container_name":"service-b","endpoint":"/run/podman/podman.sock","manager_namespace":"default","owner_uid":0,"schema":"sigrund.podman-selector.v1"}

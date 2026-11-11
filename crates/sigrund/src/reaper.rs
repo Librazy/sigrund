@@ -50,11 +50,23 @@ pub struct Reaper {
     pending: Option<u64>,
     needs_sweep: bool,
     primaries: HashMap<libc::pid_t, (u64, OwnedFd)>,
+    launchers: HashMap<libc::pid_t, (u64, OwnedFd)>,
+    launcher_exits: Vec<ChildExit>,
     traced: std::collections::HashSet<libc::pid_t>,
     stops: Vec<ChildExit>,
 }
 
 impl Reaper {
+    pub fn complete_launcher(&mut self, token: u64, pid: i32, pidfd: OwnedFd) {
+        assert!(
+            pid > 0 && !self.launchers.contains_key(&pid) && !self.primaries.contains_key(&pid)
+        );
+        assert!(self.complete(token, None).is_ok());
+        self.launchers.insert(pid, (token, pidfd));
+    }
+    pub fn take_launcher_exits(&mut self) -> Vec<ChildExit> {
+        std::mem::take(&mut self.launcher_exits)
+    }
     pub fn traced(&mut self, pid: libc::pid_t) {
         self.traced.insert(pid);
     }
@@ -131,6 +143,37 @@ impl Reaper {
                 Err(error) => return Err(ReapError { exits, error }),
             }
         }
+        let launchers: Vec<_> = self.launchers.keys().copied().collect();
+        for pid in launchers {
+            let (token, fd) = &self.launchers[&pid];
+            match wait(libc::P_PIDFD, fd.as_raw_fd() as u32, true) {
+                Ok(Some(info)) => {
+                    if matches!(info.si_code, libc::CLD_TRAPPED | libc::CLD_STOPPED) {
+                        // A protected launcher has no expected ptrace stops.
+                        // Keep its pidfd registered until actual terminal exit.
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                fd.as_raw_fd(),
+                                libc::SIGKILL,
+                                0,
+                                0,
+                            );
+                        }
+                        continue;
+                    }
+                    self.launcher_exits.push(ChildExit {
+                        pid,
+                        token: Some(*token),
+                        code: info.si_code,
+                        status: unsafe { info.si_status() },
+                    });
+                    self.launchers.remove(&pid);
+                }
+                Ok(None) => (),
+                Err(error) => return Err(ReapError { exits, error }),
+            }
+        }
         let helpers = HELPERS.lock().expect("helper registry");
         if *helpers != 0 || self.pending.is_some() {
             return Ok(exits);
@@ -146,9 +189,30 @@ impl Reaper {
                     // WSTOPPED. An exec event may arrive between the pidfd
                     // pass and this sweep: never retire its live owner.
                     if matches!(info.si_code, libc::CLD_TRAPPED | libc::CLD_STOPPED) {
+                        if let Some((_, fd)) = self.launchers.get(&pid) {
+                            unsafe {
+                                libc::syscall(
+                                    libc::SYS_pidfd_send_signal,
+                                    fd.as_raw_fd(),
+                                    libc::SIGKILL,
+                                    0,
+                                    0,
+                                );
+                            }
+                            continue;
+                        }
                         self.stops.push(ChildExit {
                             pid,
                             token: self.primaries.get(&pid).map(|(token, _)| *token),
+                            code: info.si_code,
+                            status: unsafe { info.si_status() },
+                        });
+                        continue;
+                    }
+                    if let Some((token, _)) = self.launchers.remove(&pid) {
+                        self.launcher_exits.push(ChildExit {
+                            pid,
+                            token: Some(token),
                             code: info.si_code,
                             status: unsafe { info.si_status() },
                         });
@@ -183,7 +247,10 @@ impl Reaper {
         self.pending.is_some()
     }
     pub fn is_idle(&self) -> bool {
-        self.pending.is_none() && self.primaries.is_empty() && !self.needs_sweep
+        self.pending.is_none()
+            && self.primaries.is_empty()
+            && self.launchers.is_empty()
+            && !self.needs_sweep
     }
     pub fn sweep_required(&self) -> bool {
         self.needs_sweep

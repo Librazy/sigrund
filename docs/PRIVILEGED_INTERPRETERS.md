@@ -55,13 +55,12 @@ claim or a substitute for reviewing the complete request.
 
 ## Execution environment
 
-The current local profile executes in the daemon's configured domain; it does
-not automatically follow requester namespaces or cross container boundaries.
-The draft v3 specification and its [namespace roadmap](NAMESPACE_AWARE_EXECUTION.md)
-plan one host daemon authorizing execution in explicitly selected environments;
-this is not implemented by the current v2 runtime.
-The destination and security constraints determine the authority delegated to
-an interpreter. Container root and host root must be distinguished at approval.
+Host execution uses the daemon's retained environment; namespace execution requires
+explicit selection of a registered target or authenticated self environment and
+an enabled security profile. The destination and exact constraints determine the
+authority delegated to an interpreter. Distinguish container root from host root
+at approval. See [namespace execution](../IMPLEMENTATION_NOTES.md#namespace-execution)
+for confinement prerequisites and supported deployment limits.
 
 ## Follow-on verification
 

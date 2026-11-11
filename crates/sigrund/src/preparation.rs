@@ -29,6 +29,7 @@ pub(crate) struct PinnedRoot {
     pub directory: std::sync::Arc<File>,
 }
 pub(crate) struct Context {
+    pub targets: Option<std::sync::Arc<crate::target_registry::TargetRegistry>>,
     pub epoch: Option<std::sync::Arc<crate::host_registry::EpochOwner>>,
     pub host_target: Option<std::sync::Arc<crate::host_target::HostTarget>>,
     pub roots: Vec<PinnedRoot>,
@@ -46,7 +47,7 @@ impl std::fmt::Display for Failure {
     }
 }
 impl std::error::Error for Failure {}
-fn fail(status: &'static str, message: impl Into<String>) -> io::Error {
+pub(crate) fn fail(status: &'static str, message: impl Into<String>) -> io::Error {
     io::Error::other(Failure {
         status,
         message: message.into(),
@@ -65,7 +66,7 @@ pub(crate) struct FileIdentity {
     pub inode: u64,
 }
 impl FileIdentity {
-    fn read(file: &File) -> io::Result<Self> {
+    pub(crate) fn read(file: &File) -> io::Result<Self> {
         let m = file.metadata()?;
         Ok(Self {
             device: m.dev(),
@@ -90,11 +91,40 @@ pub(crate) struct Prepared {
 
 /// Retained preparation state handed back before the coordinator starts hashing.
 pub(crate) struct Pending {
-    signed: Option<(CanonicalWarrant, Vec<String>)>,
-    root_path: PathBuf,
-    root_identity: FileIdentity,
-    source_identity: FileIdentity,
-    null_stdin: Option<OwnedFd>,
+    pub(crate) signed: Option<(CanonicalWarrant, Vec<String>)>,
+    pub(crate) root_path: PathBuf,
+    pub(crate) root_identity: FileIdentity,
+    pub(crate) source_identity: FileIdentity,
+    pub(crate) null_stdin: Option<OwnedFd>,
+}
+
+/// Pin the host null device before any destination transition. Output rights
+/// are never an alternative source of unsigned input.
+pub(crate) fn null_stdin(policy: &str) -> io::Result<Option<OwnedFd>> {
+    if policy == "sha256" {
+        return Ok(None);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/dev/null")?;
+    let fd = file.into();
+    verify_null_stdin(&fd)?;
+    Ok(Some(fd))
+}
+
+pub(crate) fn verify_null_stdin(fd: &OwnedFd) -> io::Result<()> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFCHR
+        || stat.st_rdev != libc::makedev(1, 3)
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE != libc::O_RDONLY
+    {
+        return Err(fail("INVALID_REQUEST", "invalid null device"));
+    }
+    Ok(())
 }
 
 fn verify_full_account(csr: &Csr) -> io::Result<()> {
@@ -111,6 +141,14 @@ fn verify_full_account(csr: &Csr) -> io::Result<()> {
 }
 
 fn capture_target(request: &mut ValidatedRequest, context: &Context) -> io::Result<()> {
+    let original = request.hello.original_intent().map_err(io::Error::other)?;
+    if !matches!(original.target, sigrund_core::host::Selector::Host {}) {
+        return Err(fail(
+            "POLICY_VIOLATION",
+            "destination preparation is not yet connected",
+        ));
+    }
+
     if request.host_lease.is_none() {
         request.host_lease = Some(
             context
@@ -317,6 +355,16 @@ pub(crate) fn prepare(
     } else {
         None
     };
+    if !matches!(
+        request
+            .hello
+            .original_intent()
+            .map_err(io::Error::other)?
+            .target,
+        sigrund_core::host::Selector::Host {}
+    ) {
+        return crate::process_request::prepare(request, context, budget, gid, stdin);
+    }
     capture_target(request, context)?;
     if request.hello.mode != "signed" && !request.unsigned_policy_checked {
         check_unsigned_policy(request, context, gid)?;
@@ -495,19 +543,7 @@ pub(crate) fn prepare(
     )
     .map_err(|e| snapshot_error(e, "EXECUTABLE_MUTATED_OR_TOO_LARGE"))?;
     request.snapshots = Some(MeasuredSnapshots { executable, stdin });
-    let null_stdin = if command.stdin_policy == "sha256" {
-        None
-    } else {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open("/dev/null")?;
-        let m = file.metadata()?;
-        if m.mode() & libc::S_IFMT != libc::S_IFCHR || m.rdev() != libc::makedev(1, 3) {
-            return Err(fail("INVALID_REQUEST", "invalid null device"));
-        }
-        Some(file.into())
-    };
+    let null_stdin = null_stdin(&command.stdin_policy)?;
     request.check()?;
     request.pending_preparation = Some(Pending {
         signed,
@@ -538,6 +574,9 @@ pub(crate) fn hash_and_finish(
     let result = snapshots.executable.finish_digest(|| request.check());
     request.snapshots = Some(snapshots);
     result.map_err(|e| snapshot_error(e, "EXECUTABLE_MUTATED_OR_TOO_LARGE"))?;
+    if request.process.is_some() {
+        return crate::process_request::finish(request, context, gid);
+    }
     finish_document(request, context, gid)
 }
 
@@ -821,18 +860,22 @@ pub(crate) fn approve(
         .iter()
         .find(|s| s.signer_id == approval.signer_id)
         .ok_or_else(|| fail("POLICY_VIOLATION", "approval signer unavailable"))?;
-    if !static_policy(
-        signer,
-        warrant.warrant(),
-        request.requester_uid,
-        gid,
-        &context.host_id,
-        &request.policy,
-    ) {
-        return Err(fail(
-            "POLICY_VIOLATION",
-            "approved request exceeds captured signer policy",
-        ));
+    if request.process.is_some() {
+        crate::process_request::policy(request, context, signer)?;
+    } else {
+        if !static_policy(
+            signer,
+            warrant.warrant(),
+            request.requester_uid,
+            gid,
+            &context.host_id,
+            &request.policy,
+        ) {
+            return Err(fail(
+                "POLICY_VIOLATION",
+                "approved request exceeds captured signer policy",
+            ));
+        }
     }
     let sig = &dsse_envelope.signatures[0];
     verify_ssh_signature(
@@ -867,6 +910,14 @@ pub(crate) fn approve(
         warrant,
         signer_ids: vec![signer.signer_id.clone()],
     };
+    let verified = request
+        .process
+        .as_ref()
+        .map(|_| crate::process_request::verify_final(request, context))
+        .transpose()?;
+    if let Some(process) = &mut request.process {
+        process.verified = verified;
+    }
     Ok(())
 }
 
@@ -999,6 +1050,7 @@ mod tests {
             signers.validate_against(&config).unwrap();
             let context = Context {
                 epoch: None,
+                targets: None,
                 host_target: Some(
                     crate::host_target::HostTarget::acquire(
                         &[dir.path().to_owned()],
@@ -1053,9 +1105,11 @@ mod tests {
                 );
             }
             ValidatedRequest {
+                source: None,
                 host_profile: None,
                 host_bundle: None,
                 host_lease: None,
+                process: None,
                 failure: None,
                 exec_id: new_uuidv7().to_string(),
                 requester_gid: 1001,
@@ -1179,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires root in the initial user namespace; included in the privileged Phase 1 gate"]
+    #[ignore = "requires root in the initial user namespace; included in the privileged host gate"]
     fn final_authorization_rechecks_retained_policy_and_identity() {
         let mut fixture = Fixture::new();
         Arc::make_mut(&mut fixture.config)

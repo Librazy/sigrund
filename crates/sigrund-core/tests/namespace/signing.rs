@@ -1,0 +1,110 @@
+//! Independent namespace signing vectors and binding-substitution regressions.
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
+use sigrund_core::crypto::{pae, verify_ssh_signature};
+use ssh_key::{HashAlg, PublicKey, SshSig, encoding::Encode};
+
+#[test]
+fn v3_openssh_fixture_binds_intent_target_and_profile_and_rejects_v2() {
+    let payload = include_bytes!("../fixtures/namespace/warrant.json");
+    let expected_pae = include_bytes!("../fixtures/namespace/warrant.pae");
+    let payload_type = "application/vnd.sigrun.warrant.v3+json";
+    assert_eq!(payload_type.len(), 38);
+    assert_eq!(pae(payload_type, payload), expected_pae);
+    let key_text = include_str!("../fixtures/namespace/signer.pub");
+    let key = PublicKey::from_openssh(key_text).unwrap();
+    let signature =
+        SshSig::from_pem(include_bytes!("../fixtures/namespace/warrant.sshsig")).unwrap();
+    assert_eq!(signature.hash_alg(), HashAlg::Sha512);
+    assert!(signature.reserved().is_empty());
+    key.verify("sigrun.warrant.v3", expected_pae, &signature)
+        .unwrap();
+    assert!(
+        key.verify("sigrun.warrant.v2", expected_pae, &signature)
+            .is_err()
+    );
+    assert!(
+        key.verify(
+            "sigrun.warrant.v3",
+            &pae("application/vnd.sigrun.warrant.v2+json", payload),
+            &signature
+        )
+        .is_err()
+    );
+    assert!(
+        verify_ssh_signature(
+            "ssh-ed25519",
+            key_text,
+            &STANDARD.encode(signature.encode_vec().unwrap()),
+            payload_type,
+            payload,
+            false,
+            false
+        )
+        .is_ok()
+    );
+    let parsed = sigrund_core::warrant::CanonicalWarrant::parse(payload).unwrap();
+    // Production now recognizes self intent. The historical acquisition-only
+    // binding still cannot substitute for the live process-context domain,
+    // which additionally binds the pinned executable-root identity map.
+    use sigrund_core::namespace::Contract as ProductionContract;
+    let acquisition = sigrund_core::namespace::Acquisition::parse(include_bytes!(
+        "../fixtures/namespace/acquisition.json"
+    ))
+    .unwrap();
+    let production = sigrund_core::namespace::ProcessContext {
+        manager: None,
+        schema: "sigrund.process-context.v1".into(),
+        authenticated_source: None,
+        executable_roots: std::collections::BTreeMap::from([(
+            "/usr/bin".into(),
+            acquisition.root.clone(),
+        )]),
+        acquisition,
+    };
+    assert_ne!(
+        parsed.warrant().target_binding.context_sha256,
+        production.sha256().unwrap()
+    );
+
+    let warrant: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    let binding = serde_json::json!({"target_binding": warrant["target_binding"], "security_constraints": warrant["security_constraints"]});
+    let bytes = sigrund_core::json::canonical_bytes(&binding).unwrap();
+    assert_eq!(
+        bytes,
+        include_bytes!("../fixtures/namespace/execution-binding.json")
+    );
+    let hashes: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../fixtures/namespace/sha256.json")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        hashes["execution-binding"]
+    );
+    let intent = sigrund_core::json::canonical_bytes(&warrant["intent"]).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(intent)),
+        warrant["intent_sha256"]
+    );
+    let bundle: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../fixtures/namespace/bundle.json")).unwrap();
+    assert_eq!(warrant["target_binding"], bundle["target_binding"]);
+    assert_eq!(
+        warrant["security_constraints"]["profile_sha256"],
+        bundle["profile_sha256"]
+    );
+    for pointer in [
+        "/target_binding/instance_id",
+        "/target_binding/daemon_epoch",
+        "/target_binding/context_sha256",
+        "/security_constraints/profile_sha256",
+        "/intent/security_profile",
+    ] {
+        let mut changed = warrant.clone();
+        *changed.pointer_mut(pointer).unwrap() = serde_json::json!("substitution");
+        let bytes = sigrund_core::json::canonical_bytes(&changed).unwrap();
+        assert!(
+            key.verify("sigrun.warrant.v3", &pae(payload_type, &bytes), &signature)
+                .is_err()
+        );
+    }
+}

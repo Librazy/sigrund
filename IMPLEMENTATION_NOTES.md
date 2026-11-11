@@ -1,13 +1,10 @@
 # sigrun/sigrund implementation notes
 
-The production local one-time SSH/stdio workflow now uses **v3 host bindings**.
-See the [Phase 1 record](docs/NAMESPACE_PHASE1.md) for exact scope, fresh
-provisioning, binding export and current qualification evidence. Container,
-process, registered and `self` targets remain unavailable. The
+This document describes the local v3 SSH/stdio workflow, namespace execution,
+operator setup and test layout. The
 [security specification](<sigrun sigrund Security Architecture and Implementation Specification.md>)
-and [roadmap](docs/NAMESPACE_AWARE_EXECUTION.md) retain later namespace and
-confinement requirements. The independent [Phase 0 experiments](docs/NAMESPACE_PHASE0.md)
-do not establish integrated runtime support.
+defines the broader protocol and security requirements.
+For installation and the five host/container routes, use the [Quick Start](QUICK_START.md).
 
 ## V3 implementation and validation
 
@@ -45,79 +42,231 @@ Wire/warrant version 3.0, v3 signature/ratchet domains, and versioned database,
 audit and ratchet state reject legacy formats. Explicitly provision a fresh,
 coherent state set; startup never migrates or deletes old records.
 
-The regression suites cover v3 schemas, local preparation, deadlines, provenance,
-state rejection and the existing execution profile. `scripts/verify-v3.py` adds
-native raw-socket DAC/ACL/ancestor/supplementary-group checks and compares hidden
-thin failures, output endpoint behavior, exact outcomes and private audit.
-The complete applicable V-01–V-20 acceptance matrix remains the release gate;
-passing a subset does not establish full v3 conformance.
-
 ## Supported workflow and limits
 
-An unprivileged requester runs `sigrun`; a foreground root approver reviews the
-complete request on its own controlling TTY and signs with an explicitly chosen
-SSH key. The daemon verifies the signature and policy, consumes the one-time
-grant, persists local audit, executes the retained executable and sealed finite stdin, and returns
-separate stdout/stderr and the primary child's exit status. Pre-signed warrants
-use the same authorization and execution gates without an online approver.
+The `[mvp]` local profile requires an explicit `approval_signer_id` naming one SSH
+signer. It supports `ssh-ed25519`/`sk-ssh-ed25519`, one-time grants, stdio, and
+null or hashed finite stdin. It excludes direct scripts, caller environment
+forwarding, same-UID execution, PTY, hooks and remote audit ACK. Collector config
+remains mandatory even when remote acknowledgements are disabled.
 
-Execution requires the `[mvp]` daemon profile and a configured
-`approval_signer_id` naming exactly one SSH signer. This profile supports
-`ssh-ed25519` and `sk-ssh-ed25519`, one-time grants, `stdio`, and null or hashed
-finite stdin. It rejects direct scripts, caller environment forwarding,
-same-UID execution, PTY, hooks and remote audit acknowledgements. Collector
-configuration is still mandatory and validated. The approval capacity is one;
-busy requests silently time out. Absent approvers, invalid requests, broker
-loss and thin refusal remain silent until `authorization_timeout_ms` from
-admission (120 seconds by default; configurable from 1 to 300 seconds).
-Thin mandator refusal produces the generic public TIMEOUT. Explicit refusal
-of a validated full CSR produces immediate REJECTED, with the refusal reason
-kept private.
-No unsuccessful pre-commit outcome consumes a grant.
+Clients select an explicit target/profile and either `--account NAME` or numeric
+UID/GID with exact supplementary groups. Defaults are no capabilities, captured
+absolute cwd, `LANG=C.UTF-8`, `PATH=/usr/sbin:/usr/bin`, umask `077`, null stdin
+and a 900-second TTL within daemon/signer ceilings. Executables use canonical
+absolute paths under configured roots; arguments have no shell/PATH evaluation.
+`--stdin sha256` snapshots finite file/pipe input; TTY stdin is rejected.
+`--status-fd` must not alias command output. Denial exits 255, protocol/disconnect
+failure 254, usage error 64; execution returns the child's status.
 
-The client requires `--target host`, `--security-profile ID` and either
-`--account NAME` or both `--target-uid UID --target-gid GID`. Numeric selection
-preserves exactly the requested supplementary groups. The remaining defaults are
-no capabilities, its captured absolute cwd, exact environment `LANG=C.UTF-8` and
-`PATH=/usr/sbin:/usr/bin`, umask `077`, null stdin and a 900-second TTL subject
-to daemon/signer bounds. Executables require absolute canonical paths beneath
-configured roots. Arguments are exact values without shell evaluation or PATH
-search. `--stdin sha256` snapshots finite file/pipe input; TTY stdin is rejected.
-`--status-fd` must be separate from command output, including descriptor aliases.
-Authorization denial defaults to exit 255, protocol/disconnect failure to 254,
-and usage errors to 64; successful execution returns the child's status.
+The single-slot broker displays the complete CSR, escaped/indexed arguments and
+key fingerprint on root's controlling TTY. Enter `y`/`yes` to approve or `n`/`no`
+to refuse; invalid input reprompts within the original admission deadline.
+Pending input is discarded between prompts. Timeout/disconnect aborts the exchange
+and reconnects the watcher. Signals, TTY loss or trust failures stop it. OpenSSH
+signs DSSE PAE with namespace `sigrun.warrant.v3` and SHA-512 using a root-owned
+identity or root's agent; askpass is disabled and terminal state is restored.
+Software/encrypted/agent fixtures do not establish physical FIDO support.
 
-Root approves only with `y` or `yes` after every CSR field and the selected key
-fingerprint are displayed with escaped arguments. Confirmation requires Enter;
-`n` or `no` rejects. Pending TTY input is discarded after each prompt. Blank,
-invalid and overlong answers reprompt within the admission-based authorization deadline.
-Timeout or broker disconnect aborts that exchange and reconnects the watcher
-for future requests, discarding unfinished confirmation. Local signals, TTY
-loss and trust/protocol failures still stop it. The root-owned identity may
-be a private key or a public key backed by root's SSH agent. Signing uses
-OpenSSH SSHSIG over DSSE PAE, with namespace `sigrun.warrant.v3` and SHA-512.
-Passphrases stay on the verified TTY; askpass is disabled, and terminal settings
-are restored after helper cancellation. Software, encrypted-key and agent paths
-have fixtures; simulated security-key signatures do not prove physical FIDO
-operation.
+Busy, absent-approver and failed thin requests retain the generic admission-based
+TIMEOUT (default 120 seconds, configurable 1–300 seconds). Validated full refusal
+returns immediate REJECTED with its reason private. Pre-commit failures consume
+nothing; post-commit failures retain consumption. Complete APPROVED delivery
+precedes spawn; readiness and final results follow separately.
 
-Interpreter approval grants programmable authority within the selected
-credentials. An executable digest does not bind mutable script files, libraries
-or imports. Jobs execute in the daemon's configured domain; requester namespaces
-are not followed automatically. Cross-container/host routing is unimplemented.
-See [privileged interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md) and the
-[namespace-aware execution roadmap](docs/NAMESPACE_AWARE_EXECUTION.md).
+Interpreter approval grants programmable authority within the selected credentials.
+A digest binds the executable, without binding later script, import or library
+reads. See [interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md).
 
-### Host binding and later namespace execution
+## Host bindings and provisioning
 
-Full preparation/export requires an explicitly supplied administrator-distributed
-binding bundle. `.context` contains no target records. The immutable profile
-fixes the executable model; insufficient local evidence preserves the same thin
-intent for ordinary submission, while full-only/export fail locally. A signed
-model/profile mismatch is rejected without fallback or consumption. Host roots,
-identity mappings and namespace FDs belong to one retained generation; strings
-and signed IDs cannot reacquire it. Namespace-entry and cloned-mount destination
-workflows remain later-phase requirements.
+Full preparation/export requires an administrator-distributed binding bundle;
+`.context` contains no target records. Each immutable profile fixes one executable
+model. Insufficient local evidence preserves the same thin intent for ordinary
+submission; full-only/export fails locally. Signed mismatches never fall back.
+
+Provision a new, coherent v3 state/log set using `sigrundctl init-host --state-dir
+/var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl`. Preserve the printed
+audit anchor privately and retain older state separately. Root exports a live host
+binding into a new mode-0600 file:
+
+```sh
+sigrundctl target export-binding host --security-profile host-baseline \
+  --epoch-file /var/lib/sigrund-v3/host-epoch.json \
+  --output /root/host-baseline-binding.json
+```
+
+Distribute that private target evidence deliberately to the intended requester,
+who selects it with `--binding-bundle PATH`. The client checks its host authority,
+acquisition/profile digests and local root/namespace/mapping evidence. Public
+context cannot refresh a stale epoch; redemption rejects it. Restart invalidates
+all bindings and warrants, even unused/unexpired ones. Export a fresh bundle after
+restart or profile changes. See [package setup](packaging/README.md#configure-the-daemon)
+and [offline signing](#operator-lab).
+
+## Namespace execution
+
+The host daemon authenticates the original connector through kernel credentials,
+groups, pidfd and applicable security label. Passing a stream does not change
+attribution to its later writer. Host clients have a kernel-authenticated
+compatibility path when `PIDFD_GET_USER_NAMESPACE` is unavailable; namespace
+capture still requires its supported kernel operations.
+
+| Target/profile | Supported behavior |
+| --- | --- |
+| `host` / configured host profile | Thin, full and offline one-time SSH/stdio; daemon's retained execution environment. The packaged producer transitions commands to `sigrund_host_workload_t`, including host-only configurations. |
+| `registered:ID`, `self` / `namespace-selinux-v1` | Thin online approval, sealed executable/input, exact SELinux workload transition, explicit seccomp and final-child exec verification. |
+| `registered:ID`, `process:DAEMON_PID`, `self` / `namespace-experimental-v1` | Opt-in native execution without a requested LSM transition or seccomp filter. Known nonroot namespace-owner injection authority rejects before review, including experimental self. |
+| Preview constraint schema | Private review only; generic TIMEOUT without consumption or execution. |
+
+The enforcing deployment is Fedora 44 x86-64 with cgroup v2/systemd and SELinux.
+Manager-free routes are host → registered rootless B and real rootless A → B,
+A → host and A → self. A rootless environment has one child user namespace owning
+all eight selected namespaces, coherent UID/GID maps and a mount-point root.
+Untrusted requester/owner accounts must have locked passwords, nologin shells,
+no sudo or alternate execution path, and remain in enforcing
+`system_u:system_r:sigrund_requester_t:s0`. All unconfined host accounts are trusted
+administrators. Exposing sockets to an arbitrary unconfined container is insufficient.
+
+Production namespace full/export/offline redemption and process-PID targets are
+excluded. Other namespace topologies, idmapped mounts, target root/capability
+grants, AppArmor/stacked LSMs, executable models and platforms require separate
+integration coverage. Ubuntu kernel 6.8 host authentication and ARM64 builds do
+not establish namespace runtime support on those platforms.
+
+### Acquisition, approval and execution
+
+Root registers a disposable, single-threaded, unfiltered anchor inside an already
+running environment. Capture authenticates its rendezvous, verifies the original
+pidfd before enabling EXITKILL, forces successful `unshare(CLONE_FS | CLONE_FILES)`
+and retains it at syscall exit. It pins root/cwd, all eight namespace handles,
+namespace ownership, mapping/setgroups evidence and configured executable roots.
+`self` captures its original public connector through the `.anchor` rendezvous;
+the syscall-only connector and parent relay retain connection-time attribution.
+
+Strict bounded records bind the daemon epoch, instance, registration revision,
+acquisition and executable-root identities. Self additionally binds authenticated
+source observations. Existing `*.phase0.v1` schema identifiers remain stable wire
+identifiers; they do not require the retired development crate. Records are at
+most 64 KiB, depth 16, with at most eight mapping layers and 64 extents per map;
+kernel u64 identities use canonical decimal strings. Namespace, manager and host
+vectors live under `crates/sigrund-core/tests/fixtures/`.
+
+Fresh-exec destination workers resolve bounded account files, executable and cwd
+beneath pinned roots, without host NSS fallback. Numeric accounts retain exact
+requested groups; named accounts resolve destination primary/supplementary groups.
+Daemon and signer independently authorize scope, cross-owner access, mapped
+credentials and the exact constraint digest. Root's private TTY review binds the
+complete intent, resolved evidence and CSR. Public failures retain the original
+admission-based TIMEOUT and disclose no target-existence information.
+
+One retained owner lease survives review, durable consumption, complete APPROVED
+delivery, fresh-exec launcher handoff and cleanup. Only explicit FDs and a sealed
+bounded configuration cross launcher exec; daemon memory, keys and environment
+never enter the destination. The host tracer gates namespace entry, adopts the
+final child through pidfd handoff, and verifies its exec stop before release:
+credentials/groups, capabilities, NNP, namespaces/root/cwd, private mounts,
+actual job cgroup, FD table, executable and declared LSM/seccomp state.
+
+Production constraints require a labeled sealed ELF, the exact enforcing workload
+SID, empty capabilities/groups, nonzero destination UID, securebits 15, NNP and
+an explicit native-ABI seccomp deny list. Startup rejects unavailable enforcement,
+permissive domains or incompatible profiles before serving. Policy-generation
+changes invalidate owners and terminate jobs. Drain jobs before replacing policy;
+this detection/termination contract provides no atomic policy-replacement interlock.
+
+Anchor/helper death, revocation, cancellation and lost required evidence invalidate
+the retained owner. Names or matching inodes never reacquire authority. Pending
+failure consumes nothing; every post-commit failure retains consumption and tears
+down the whole job, including descendants. Recovery needs a fresh anchor and approval.
+Hard ceilings are 64 registrations, and global/per-UID limits of 64/4 leases,
+2048/128 target FDs, 16/2 helpers and 16/2 reviews, plus one launcher per job.
+Reserve before acquisition, charge transient duplicates, and refund only after
+actual close/reap. Blocked cleanup remains charged; the local broker allows one review.
+
+### Installed SELinux setup
+
+The [Quick Start](QUICK_START.md#3-prepare-the-container-demo) contains the complete
+fresh-host provisioning and five-route walkthrough. It uses the installed helpers
+under `/usr/share/doc/sigrund/namespace/selinux/`, locked source/destination owners,
+a root-only software signing key and independently scoped daemon/signer rules.
+The recipe is disposable; generated state/configuration must not replace an
+existing deployment. Its transient services have a ten-minute lifetime.
+
+B's init starts independently before its disposable anchor is registered. The
+source helper enters its actual rootless environment and runs the installed client
+under the enforcing requester domain. Requests use exact destination account,
+root/cwd, executable and profile evidence. Root reviews the complete private
+record; APPROVED confirms consumption, followed by readiness and exit separately.
+
+Revocation invalidates review and kills supervised jobs while retaining any
+consumption. Start a fresh anchor before retrying. After daemon restart, refresh
+the environment's bind of the recreated socket directory before reacquisition.
+Stop transient services and unmount runtime/selinuxfs/device binds before removing
+roots; preserve configuration, keys, state and audit together.
+
+### Optional Podman lifecycle binding
+
+The adapter supports local rootful Podman 5.8.1, a root-owned Unix API in the
+default Libpod namespace, systemd cgroup v2, an initial-user-namespace destination
+and a single private PID namespace whose init is PID 1. Its read-only rootfs and
+init are administrator controlled. API/Podman-exec access and the socket's root
+group are trusted host authority. Rootless/nonroot services, remote APIs,
+nondefault manager namespaces and untrusted rootful container-root sources are excluded.
+Host and real rootless A can request B as nonroot UID/GID 12001 with empty groups.
+
+For this deployment, install Podman and container-selinux, then provision a fresh
+host with `python3 "$NS_DOCS/podman/prepare-installed.py" --requester nsrequester`.
+It loads the optional `sigrund_podman` module for producer API access only. Build
+the host/A/B workloads and create source A using the
+[Quick Start](QUICK_START.md#3-prepare-the-container-demo). Start `sigrund.service` and
+`podman.socket`, run `restorecon -RF /run/podman`, and require a root:root socket
+with mode 0660 or stricter and `container_var_run_t`. Start B independently:
+
+```sh
+python3 "$NS_DOCS/podman/prepare-rootfs.py" --workload /var/tmp/tool-b
+podman run --detach --name sigrund-podman-b --rootfs --read-only --network none \
+  --security-opt label=level:s0 --volume /run/sigrund:/run/sigrund \
+  /var/lib/sigrund-podman-rootfs /usr/bin/sleep infinity
+python3 "$NS_DOCS/podman/register-podman.py"
+```
+
+The registration helper pins namespace/root handles before starting a dedicated
+anchor. The daemon independently matches those resources to the API init's exact
+`/machine.slice/libpod-FULL_ID.scope/container` cgroup and PID-1 identity. The
+underlying root-only operation is:
+
+```sh
+sigrundctl target register-podman container-b --pid DAEMON_ANCHOR_PID --owner-uid 0 \
+  --security-profile namespace-selinux-v1 --socket /run/sigrund/client.sock \
+  --podman-endpoint /run/podman/podman.sock --podman-owner-uid 0 \
+  --podman-namespace default --podman-container sigrund-podman-b
+```
+
+Requesters still select `registered:container-b`; there is no public manager-name
+lookup. Versioned manager context/review binds endpoint identity, owner/namespace,
+full container ID, init/start identity, configuration digest and authenticated
+peer. The required configuration covers Config, HostConfig, Mounts, ProcessLabel,
+MountLabel, AppArmorProfile, Namespace, Image, Rootfs and Dependencies. Manager
+metadata never expands daemon/signer authority or supplies Podman exec-policy equivalence.
+
+A provisional lookup supplies a full-ID filter hint; acknowledge the filtered
+chunked event stream before authoritative inspect and process capture. The fresh
+snapshot must agree. Retain init/peer pidfds, endpoint directory and stream for
+the binding lifetime. Relevant events, generation/configuration changes, malformed
+or excessive replies, EOF/event gaps, endpoint replacement and failed revalidation
+permanently invalidate it. Equal names in another engine confer no authority.
+Never reconnect or revive an old binding; recovery requires fresh acquisition/approval.
+
+Refresh every 200 ms with a two-second total query deadline, 100 ms idle I/O
+quanta and three-second maximum evidence age. Management acquisition is bounded
+to ten seconds and rechecks expiry/shutdown before publication. Headers are at
+most 16 KiB; finite bodies/chunks 1 MiB; event lines 64 KiB and 256 events/second.
+Manager acquisition reserves 20 FD slots and one helper before opening resources,
+in addition to normal capture. The two-helper per-UID ceiling permits one managed
+registration for owner UID 0 in this recipe. Loss cancels supervised descendants
+without refunding consumption; observation is bounded detection, not atomic
+serialization of manager operations with workload instructions.
 
 ## Code ownership and security boundaries
 
@@ -127,50 +276,35 @@ workflows remain later-phase requirements.
 | `cli`, `client`, `approver`, `warrant_tools` | Options, requester output/status and signal handling, root-TTY signing, and byte-preserving offline packaging. |
 | `daemon`, `transport`, `admission`, `workers`, `socket_disposal` | Coordinator transitions, credential checks, bounded socket/worker ownership, deadlines, framing and off-loop disposal. |
 | `linux`, `memfd`, `snapshot`, `preparation`, `authorization` | Pinned executable-root resolution, sealed snapshots, digest/signature binding and final authorization predicates. |
+| `podman`, `podman::api` | Authenticated scoped manager evidence, bounded HTTP/event I/O and sticky lifecycle invalidation around normal capture. |
+| `target_registry`, `target_capture`, `target_management`, `destination`, `destination_helper`, `process_request` | Epoch-local registered/self owners, root management, fresh-exec acquisition/preparation, mapped policy, private review and actual namespace-context verification. |
 | `sequencer`, `storage` | Serialized durable consumption/audit, retained denial-audit leases, poison handling and sticky storage-pressure admission gates. |
 | `startup`, `cgroup`, `jobs`, `execution`, `reaper`, `runtime`, `service` | Verified provisioning/startup, cgroup limits, syscall-only child transition, readiness, reaping, shutdown and service-manager supervision. |
 
-The coordinator owns request transitions and the single authorization decision.
-Workers return owned results; FDs, snapshots, captured policy and quota charges
-move together. Caller-controlled metadata, reads, final descriptor/socket closes
-and filesystem persistence run off-loop. Timeout or disconnect cannot release a
-worker/RAM/audit reservation until its owner actually finishes cleanup. Sockets
-are unregistered from epoll before retirement, including when a worker retains
-a duplicate. Unmappable peer credentials reject only that connection.
+The coordinator owns transitions and the single authorization decision. Workers
+return owned results; FDs, snapshots, captured policy and quota charges move
+together. Caller-controlled I/O, persistence and final closes run off-loop.
+Cancellation never refunds resources before actual cleanup. Sockets retire from
+epoll before disposal, including when workers retain duplicates.
 
-Executable preparation and stdin snapshots share the same bounded worker path for
-signed and unsigned requests. Root pinning permits mount crossings; executable
-resolution beneath a pinned root uses stricter `openat2` restrictions. Final
-authorization rechecks retained root identity, sealed bytes, policy, validity and
-revocation. Multi-signature envelopes select an eligible unrevoked signer under
-the serialized revocation gate. One-time consumption stores the raw SHA-256
-payload digest; database failures are distinguished from replay conflicts.
+Signed/unsigned preparation shares bounded workers. Final authorization rechecks
+retained root identity, executable/input evidence, policy, validity and revocation.
+One-time consumption records the raw payload digest. Commit/spawn reservations
+reconcile irreversible outcomes before cancellation completes; unpublished-child
+barriers keep reaping correct. Pre-commit denial delivery is independent of durable
+audit I/O; its audit lease remains retained. Storage pressure latches admission.
 
-Pre-commit denials have bounded delivery independent of durable audit I/O;
-a separate bounded audit lease remains owned until persistence or fatal shutdown.
-Storage pressure latches after an append crosses the threshold. Commit/spawn
-reservations defer cancellation results until the operation is reconciled.
-Returned children are registered before the reaper's unpublished-spawn barrier
-opens; known children remain serviceable. The child tracks its actual error-pipe
-FD through remapping rather than assuming inherited FD 4 is safe. Readiness
-confirms setup, with exec outcome still unknown.
+Startup verifies root-owned inputs, locks state, recovers audit and probes kernel/
+credential operations before listeners. Job cgroups enforce memory, swap and PID
+limits. Shutdown stops admission, reconciles work, kills/reaps jobs and retains
+cleanup ownership. Systemd supplies watchdog and whole-service cleanup.
+`--authorization-only` is an explicit non-executing diagnostic mode.
 
-Startup pins and verifies trusted root-owned files/directories, locks state,
-recovers audit through verified descriptors, and probes required kernel and
-credential operations before exposing listeners. Each job enforces memory,
-swap and PID limits. Shutdown stops admission, reconciles reserved work, kills
-and reaps jobs, and retains cleanup ownership. Systemd supplies the final
-whole-service kill boundary for stalled cleanup; watchdog deadlines bound idle
-polling. `--authorization-only` is an explicit non-executing diagnostic mode.
-
-Provisioning uses private files, trusted directories, atomic ratchet-state
-publication and file/parent-directory fsync barriers. Audit recovery streams
-bounded records and verifies HMACs, sequence, host and hash links. It permits a
-partial tail only at a synchronized checkpoint, or one complete record ahead
-of state with no partial tail. Failed state publication poisons the writer until
-verified recovery. Retaining `initial_key_hex` enables history verification but
-provides neither forward secrecy after root/state compromise nor protection
-against whole-state rollback without an external checkpoint.
+Provisioning uses private trusted paths, atomic publication and fsync barriers.
+Recovery verifies bounded HMAC/sequence/host/hash-linked audit records against
+ratchet state. Failed publication poisons the writer until recovery. Retained
+`initial_key_hex` enables history verification but provides no forward secrecy
+after state compromise or whole-state rollback protection without external checkpoints.
 
 ## Executable trust selection
 
@@ -300,14 +434,9 @@ approval, opt-out, backing-store rejection and no downgrade after signing.
 
 ## Operator lab
 
-Use a disposable native Linux systemd host with unified cgroup v2 and the
-required kernel operations. Root in a container alone does not establish
-working delegation, mount visibility or service-manager transport. The startup
-probe is authoritative; the lab does not implement namespace routing.
-
-Build as the workspace user. As root, prepare a fresh directory directly under
-a trusted root-owned parent, using an existing ordinary requester login distinct
-from UID 0, 33 and 65534:
+Use a disposable native systemd host meeting startup's kernel/cgroup requirements.
+Build as an ordinary user; prepare as root with an existing requester distinct
+from UID 0, 33 and 65534. The lab directory must be new under a trusted parent:
 
 ```sh
 export TEST_REPO=/absolute/sigrund
@@ -319,39 +448,32 @@ python3 "$TEST_REPO/scripts/operator-lab.py" start --directory "$TEST_BASE"
 python3 "$TEST_REPO/scripts/operator-lab.py" status --directory "$TEST_BASE"
 ```
 
-The helper copies binaries/native test commands and generates a disposable
-root-owned software signing key, signer policy and isolated state. Collector
-files are inactive placeholders for this local-only profile. It installs only
-a uniquely named temporary unit under `/run/systemd/system`. After stopping the
-service recipe, `foreground --directory "$TEST_BASE"` uses `systemd-run` with
-the same delegation, readiness, watchdog and whole-service cleanup. Use one
-recipe at a time. Packaged sockets are `/run/sigrund/client.sock` and
-`/run/sigrund/approve.sock`; bare binary defaults are `/run/sigrund.sock` and
-`/run/sigrund-approve.sock`. The lab exports its own socket paths.
+The helper generates disposable software keys, isolated state/policy and inactive
+collector placeholders. It installs a unique temporary service under `/run/systemd/system`.
+After stopping it, `foreground --directory "$TEST_BASE"` provides an alternative
+systemd-run recipe with the same supervision. Use one recipe at a time.
 
-In root's separate controlling terminal:
+In root's separate TTY, source `environment.sh` and run:
 
 ```sh
-source /var/lib/sigrund-demo/environment.sh
 "$TEST_BIN/sigrund-approve" --socket "$TEST_APPROVAL_SOCKET" --tty /dev/tty \
   --signers "$TEST_SIGNERS" --identity "$TEST_SSH_IDENTITY" --epoch-file "$TEST_EPOCH"
 ```
 
-In the requester login:
+In the requester login, source the same environment and run:
 
 ```sh
-source /var/lib/sigrund-demo/environment.sh
 "$TEST_BIN/sigrun" --socket "$TEST_SOCKET" --target host --security-profile host-baseline \
   --target-uid 0 --target-gid 0 --cwd / --status-fd 3 \
   -- "$TEST_COMMANDS/id" -u 3>request.status.jsonl
 ```
 
-Approval prints the target UID and returns the child's status. A service-user
-request uses `--target-uid 33 --target-gid 33` instead; `--stdin sha256` binds piped
-or redirected input. Keep status in its own file and inspect it separately.
+Select numeric UID/GID 33 for the service-user example. The lab exports its own
+sockets; packages use `/run/sigrund/{client,approve}.sock`, while bare defaults
+are `/run/sigrund.sock` and `/run/sigrund-approve.sock`.
 
 For offline signing, root first exports a live binding and deliberately distributes
-it to the requester as described in the [Phase 1 procedure](docs/NAMESPACE_PHASE1.md#explicit-v3-provisioning-and-binding-export).
+it to the requester as described in [host bindings and provisioning](#host-bindings-and-provisioning).
 Set `TRUSTED_BINDING` to that distributed file. Run full export as the **requester**
 into a new file in a writable directory:
 
@@ -441,69 +563,53 @@ python3 /absolute/sigrund/scripts/verify-acceptance.py \
   --requester requester --artifacts /tmp/sigrund-acceptance
 ```
 
-The entry point first runs `verify-phase1-rust.py` using the exact test
-executables and hashes recorded by ordinary checks, then supervises `verify-platform.py`, `verify-runtime.py`,
-`verify-trust.py`, `verify-execution.py` and the native `verify-v3.py` gate. It
-then exercises offline signing, live binding/substitution/concurrent replay,
-blocked host-resource cleanup, independent context limits, input privacy,
-account/profile changes, output/limits, post-commit failure, local recovery,
-coordinated-rollback limits and both operator recipes.
-Checks include real root/service credentials, setup and registration races,
-shutdown/restart/escalation, and cancellation while output stays blocked.
-Operator units bind their lifetime to the acceptance service; deadlines and
-whole-service cleanup apply even if Python is killed. Require both suite
-success and supervisor cgroup removal. Namespace fixtures alone do not establish
-privileged runtime behavior. Generated manifests, logs and traces are disposable
-run output; historical results are available through Git history.
+The entry point runs `verify-privileged-rust.py` against the recorded test binaries,
+then supervises platform, runtime, trust, execution and v3 protocol gates. It covers
+actual approval/offline signing, replay/revocation, privacy, resource ownership,
+post-commit failure, recovery and service shutdown. Require success and supervisor
+cgroup removal; namespace-root fixtures alone cannot establish those boundaries.
 
-The separately supervised initial-userns root Rust gates use
-`scripts/verify-phase1-rust.py`. Obtain the daemon integration-test and library
-test executable paths from Cargo's `--no-run --message-format=json` output,
-then pass them as `--daemon-tests` and `--library-tests` with a fresh
-`--artifacts` directory. Run the script inside a dedicated systemd service with
-`Delegate=yes`, `KillMode=control-group` and `RuntimeMaxSec=900s`; the script
-also limits each selected test to 300 seconds and requires one actual pass.
-On enforcing SELinux, use the approved administrative supervisor context for
-the test deployment. The [Phase 1 record](docs/NAMESPACE_PHASE1.md#completed-qualification)
-contains the observed commands, matching executable hashes and additional
-privileged ComposeFS test names.
+For a targeted initial-userns retry, obtain test executables from Cargo JSON and
+pass `--daemon-tests`, `--library-tests`, optional `--client-tests`, and a new
+`--artifacts` directory to `verify-privileged-rust.py`. Run inside a dedicated
+systemd service with `Delegate=yes`, `KillMode=control-group` and
+`RuntimeMaxSec=900s`. Each gate has a 300-second limit. Enforcing SELinux needs
+the deployment's administrative supervisor context. Keep generated output outside
+the checkout.
+
+Namespace checks are grouped under `scripts/namespace/`: `verify-review.py`
+exercises capture/private preview, and `verify-execution.py` exercises the native
+experimental executor. Both require `--binaries DIR --owner USER --artifacts NEW_DIR`
+and supervise their own disposable systemd service. Native fixtures belong to
+`sigrund/tests/fixtures/namespace/`; canonical records/signatures belong to
+`sigrund-core/tests/fixtures/{v3-host,namespace,manager}/`.
+
+Installed SELinux tests use `namespace/selinux/verify-installed.py --artifacts
+NEW_DIR --lifecycle --security --exclusions`, plus `verify-source.py`,
+`verify-host-only.py` and `verify-bindings.py` for attribution, host producer
+transitions and audit/collector digest equality. The host-only runner requires
+`--owner TRUSTED_ADMIN` and temporarily changes config; the binding runner needs
+`--collector MATCHING_BINARY`. Podman tests use `namespace/podman/verify-installed.py`,
+`verify-resolver.py`, `verify-scopes.py` and `verify-ownership.py`, each with a new
+`--artifacts` directory. Run installed suites sequentially on the disposable
+setup above; they deliberately modify policy, containers and API services, and
+require their own unused private working directories. Check cleanup as well as
+case outcomes. Run manifests, traces and private reviews stay outside the repository.
 
 ## Continuous integration
 
-GitHub Actions runs on pushes, pull requests and manual dispatch using disposable
-native Ubuntu 24.04 VMs: `ubuntu-24.04` for x86-64 and `ubuntu-24.04-arm` for
-ARM64. Formatting, builds, Clippy, workspace tests and full privileged acceptance
-run on both architectures using the exact toolchain pinned in
-`rust-toolchain.toml`. CI installs the active toolchain from that file, so
-updating the pin updates these jobs and package
-builds together. Formatting and Clippy run only on the development toolchain;
-Clippy reads the MSRV from the crate manifests and treats warnings as errors.
-A separate x86-64 MSRV job reads `workspace.package.rust-version` from
-`Cargo.toml`, installs the first release of that Rust minor version, builds every workspace
-target and runs workspace tests. All builds and tests use the lockfile, so newer
-APIs, syntax or incompatible locked dependencies fail the MSRV job. Development
-build caches include the architecture and resolved compiler version. Acceptance
-artifacts include the architecture so parallel jobs cannot overwrite each other.
+CI uses disposable Ubuntu 24.04 x86-64 and ARM64 VMs for the pinned development
+toolchain's format, Clippy, workspace tests and privileged host acceptance.
+An independent x86-64 job builds/tests all targets at the manifest's MSRV with
+the lockfile. Clippy respects that MSRV. Caches bind architecture/toolchain;
+unsupported kernel features, failed gates and surviving supervisor cgroups fail CI.
 
-Both CI and Packages use the shared `should-run.yml` workflow to skip push checks
-when the branch already heads an open PR within this repository. Pull requests,
-manual runs and tag pushes still run. Each workflow cancels older runs for the
-same branch ref or PR number. Branch and PR groups are separate so a skipped push
-cannot cancel PR checks; CI and Packages also have separate groups.
-
-Full privileged acceptance follows successful formatting, development checks and
-MSRV tests. It repeats `scripts/check.py` as the unprivileged runner before
-running the root acceptance harness against that exact source/build. Check manifests bind
-the toolchain file and record compiler/Cargo versions. Runner preparation
-installs Linux test tools, configures subordinate IDs and permits the namespace
-fixtures. These changes apply only to disposable hosted VMs. Unsupported kernel
-features, failed acceptance gates and retained supervisor cgroups fail CI.
-
-The acceptance job summary lists gate outcomes and cgroup cleanup. Non-secret
-logs, manifests and syscall traces are uploaded on success or failure as
-seven-day Actions artifacts; signing keys, ratchet state, anchors and databases
-are excluded. Results stay outside the checkout. Automated TTY/SSHSIG tests
-exercise software keys, not physical FIDO interaction.
+CI and Packages share `should-run.yml`: pushes with an open same-repository PR
+skip duplicate checks; PR, manual and tag runs proceed. Each workflow cancels
+older runs in separate branch/PR concurrency groups. Acceptance repeats ordinary
+checks before root integration against the recorded source/build. Logs, manifests
+and traces are seven-day Actions artifacts; keys, ratchet state, anchors and
+databases are excluded. Software-key fixtures make no physical FIDO claim.
 
 ## Remaining specification scope
 
@@ -514,11 +620,6 @@ installation/upgrade/removal tests validate packaging; they do not replace the
 native privileged execution gates. Packages never provision or automatically
 start the daemon, and preserve operator state on removal.
 
-The local v3 host profile passed Phase 1 integrated acceptance on the platform
-recorded in the [Phase 1 evidence](docs/NAMESPACE_PHASE1.md#completed-qualification).
-The v3 specification retains the V-01–V-20 obligations and adds NS-01–NS-16;
-the roadmap records every host applicability disposition separately from later
-namespace requirements.
 Beyond the implemented workflow, independent deferred features include:
 
 - PTY transfer, window relaying, terminal cleanup and unrestricted input.
@@ -531,9 +632,57 @@ Beyond the implemented workflow, independent deferred features include:
 - Real hardware signing acceptance before claiming physical security-key
   interaction, plus qualification of additional deployment platforms.
 
-Additional namespace/container execution domains have a v3 contract and
-[gated roadmap](docs/NAMESPACE_AWARE_EXECUTION.md). Source capture, namespace entry,
-cgroup placement and enforceable confinement remain release-blocking design gates.
-No v2 compatibility layer or automatic state migration is planned; explicit fresh
-v3 provisioning must preserve existing state. Interpreter artifact binding remains
-separate deferred work.
+Broader namespace deployment claims require separate integration coverage.
+No v2 compatibility layer or automatic state migration is planned. Interpreter
+artifact binding remains separate deferred work.
+
+## Proposed setup experience
+
+This is a design direction; the commands below are **not implemented**. The
+[Quick Start](QUICK_START.md) documents today's supported commands. The next
+usability improvement should remove repeated manual configuration without
+expanding target authority or supported deployment scope.
+
+A proposed host workflow is:
+
+```text
+sigrundctl doctor
+sigrundctl setup host --requester USER --identity /root/.ssh/KEY \
+  --target-account root --executable /usr/bin/id --plan /root/sigrund-setup.json
+sigrundctl setup apply --plan /root/sigrund-setup.json
+```
+
+`doctor` should report host prerequisites, current installation/state and exact
+profile availability without changing persistent state. Planning should resolve
+explicit identities, render complete daemon/signer configuration and show file,
+service and credential effects. Applying should revalidate those inputs, refuse
+unrelated existing/partial state, publish root-owned files atomically and provision
+once. Service startup should be a distinct explicit option. Retrying must report
+verified completed steps; interruption needs an inspected recovery path that never
+replaces identities or resets consumption. Existing deployments require a separate
+inspected update operation.
+
+The initial preset should select local audit, one-time SSH/stdio, sealed finite
+input and digest-memfd with explicit requester, destination and executable scope.
+Unused remote-collector settings/files should become unnecessary through an
+explicit configuration-validation change; fake TLS credentials must not become
+an ordinary setup requirement. Existing state/audit guarantees remain unchanged.
+Use an existing SSH identity by default; generating a disposable software key
+should require an explicit demo choice. Configure an approver launch command
+without transferring signing authority to the daemon.
+
+Namespace setup should be a separate explicit operation that checks the enforcing
+requester/workload policy, mappings, mounts and endpoint access before producing
+a plan. A later target setup wrapper can coordinate dedicated anchors and the
+existing administrator registration operations, including the qualified scoped
+Podman adapter. Keep public `registered:ID`/`self` semantics and the exact private
+review. Never infer host privilege from manager access, weaken enforcement,
+automatically enable an experimental profile, or revive stale registrations.
+Root-controlled client presets may fill repetitive options only if the complete
+requested/resolved fields remain visible and signed.
+
+Before implementation, settle the plan's versioned format, stale-plan detection,
+secret handling, partial-apply recovery and host-only defaults. Deliver a native
+host setup/diagnosis path first, then enforcing namespace/manager setup with its
+own integration coverage. None of this requires a development-phase CLI or new
+public target-discovery service.

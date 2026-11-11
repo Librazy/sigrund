@@ -143,7 +143,17 @@ fn poll(fds: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Result<()> {
     }
     Ok(())
 }
-pub(crate) fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum PeerRole {
+    Execution = 0,
+    Context = 1,
+    Anchor = 2,
+    // Approval and other administrative endpoints only admit initial-userns
+    // host-root authentication. Never accept a public endpoint label for them.
+    HostOnly = 3,
+}
+pub(crate) fn connect(path: &Path, signals: &Signals, role: PeerRole) -> io::Result<OwnedFd> {
     let bytes = path.as_os_str().as_bytes();
     if bytes.len() >= 108 || bytes.contains(&0) {
         return Err(io::Error::other("invalid socket path"));
@@ -221,14 +231,119 @@ pub(crate) fn connect(path: &Path, signals: &Signals) -> io::Result<OwnedFd> {
             return Err(io::Error::from_raw_os_error(error));
         }
     }
+    verify_daemon_peer(&fd, role)?;
+    Ok(fd)
+}
+fn verify_daemon_peer(fd: &OwnedFd, role: PeerRole) -> io::Result<()> {
     transport::disable_ancillary_credentials(fd.as_raw_fd())?;
-    if transport::peer_credentials(fd.as_raw_fd())?.uid != 0 {
+    if unsafe { sigrun_authenticate_host_peer(fd.as_raw_fd(), role as u32) } != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "daemon peer is not UID 0",
+            format!(
+                "cannot authenticate host daemon: {}",
+                io::Error::last_os_error()
+            ),
         ));
     }
-    Ok(fd)
+    Ok(())
+}
+
+unsafe extern "C" {
+    fn sigrun_authenticate_host_peer(socket: i32, role: u32) -> i32;
+    fn sigrun_spawn_self_connector(
+        public: *const libc::sockaddr_un,
+        anchor: *const libc::sockaddr_un,
+        pidfd: *mut i32,
+        control: *mut i32,
+    ) -> i32;
+}
+struct SelfConnector {
+    pidfd: OwnedFd,
+}
+impl Drop for SelfConnector {
+    fn drop(&mut self) {
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                0,
+                0,
+            );
+            let mut status = zeroed::<libc::siginfo_t>();
+            // A capture tracer can still own the final wait. Never hold CLI
+            // completion behind privileged target disposal or a stopped tracer.
+            libc::waitid(
+                libc::P_PIDFD,
+                self.pidfd.as_raw_fd() as u32,
+                &mut status,
+                libc::WEXITED | libc::WNOHANG,
+            );
+        }
+    }
+}
+fn connect_self(path: &Path, signals: &Signals) -> io::Result<(OwnedFd, SelfConnector)> {
+    let address = |path: &Path| -> io::Result<libc::sockaddr_un> {
+        let bytes = path.as_os_str().as_bytes();
+        let mut address = unsafe { zeroed::<libc::sockaddr_un>() };
+        if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+            return Err(transport::invalid("invalid self connector endpoint"));
+        }
+        address.sun_family = libc::AF_UNIX as _;
+        for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as _;
+        }
+        Ok(address)
+    };
+    let public = address(path)?;
+    let anchor = address(&crate::target_management::anchor_path(path))?;
+    let mut pidfd = -1;
+    let mut channel = -1;
+    let pid = unsafe { sigrun_spawn_self_connector(&public, &anchor, &mut pidfd, &mut channel) };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    assert!(
+        pid > 0 && pidfd >= 0 && channel >= 0,
+        "self connector clone ABI"
+    );
+    let connector = SelfConnector {
+        pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
+    };
+    let channel = unsafe { OwnedFd::from_raw_fd(channel) };
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if signals.next()?.is_some() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let mut bytes = [0u8; 2];
+        if let Some(mut received) = transport::receive(channel.as_raw_fd(), &mut bytes, true)? {
+            if received.length != 1 || bytes[0] != b'S' || received.rights.len() != 1 {
+                return Err(transport::invalid(
+                    "self connector did not transfer its request socket",
+                ));
+            }
+            let socket = received.rights.remove(0);
+            verify_daemon_peer(&socket, PeerRole::Execution)?;
+            return Ok((socket, connector));
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: channel.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signals.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        poll(&mut fds, Some(deadline))?;
+    }
 }
 
 fn check_input_signals(signals: &Signals, caught: &std::cell::Cell<Option<u8>>) -> io::Result<()> {
@@ -437,7 +552,7 @@ fn public_context(
     path: &Path,
     signals: &Signals,
 ) -> io::Result<sigrund_core::protocol::PublicContext> {
-    let socket = connect(&context_path(path), signals)?;
+    let socket = connect(&context_path(path), signals, PeerRole::Context)?;
     let deadline = Instant::now() + transport::FRAME_TIMEOUT;
     let mut writer = FrameWriter::control(
         FrameType::ClientContextQuery,
@@ -478,34 +593,7 @@ fn public_context(
             Some(deadline),
         )?;
     };
-    if result.version != "3.0"
-        || result.policy_generation == 0
-        || result.executable_trust_models.is_empty()
-        || result.executable_trust_models.len() > 4
-        || result.features.admin_trusted_composefs_mounts.len() > 1
-        || result.features.admin_trusted_composefs_mounts.contains(&0)
-        || result
-            .executable_trust_models
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != result.executable_trust_models.len()
-        || !result
-            .host_id
-            .strip_prefix("sigrun-host:sha256:")
-            .is_some_and(|v| {
-                v.len() == 64
-                    && v.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-        || result.limits.max_executable_bytes > 67_108_864
-        || result.limits.max_direct_digest_bytes > 1_073_741_824
-        || result.limits.max_stdin_bytes > 16_777_216
-        || !(1..=30_000).contains(&result.limits.direct_digest_timeout_ms)
-        || !(1_000..=300_000).contains(&result.limits.authorization_timeout_ms)
-    {
-        return Err(transport::invalid("invalid public preparation context"));
-    }
+    sigrund_core::host::Record::validate(&result).map_err(io::Error::other)?;
     Ok(result)
 }
 fn full_csr(
@@ -547,7 +635,6 @@ fn full_csr(
     {
         return Err(transport::invalid("bound executable model unavailable"));
     }
-    public.features.admin_trusted_composefs_mounts = bundle.admin_trusted_composefs_mounts.clone();
     public.executable_trust_models = vec![bundle.constraints.executable_model];
     let intent = hello
         .intent()
@@ -559,6 +646,7 @@ fn full_csr(
         &source,
         &intent.execution_context,
         &public,
+        &bundle.admin_trusted_composefs_mounts,
         purpose,
         || {
             if Instant::now() >= deadline {
@@ -688,13 +776,24 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
     } else {
         None
     };
+    let cross_domain = !matches!(
+        hello.original_intent().map_err(io::Error::other)?.target,
+        sigrund_core::host::Selector::Host {}
+    );
+    if cross_domain
+        && (options.full_only || options.export_csr.is_some() || options.binding_bundle.is_some())
+    {
+        return Err(transport::invalid(
+            "cross-domain full preparation is unavailable",
+        ));
+    }
     if public.is_none() && options.full_only {
         return Err(transport::invalid(
             "public context required for full preparation",
         ));
     }
     let mut thin_fallback = false;
-    if let Some(public) = &public {
+    if let Some(public) = public.as_ref().filter(|_| !cross_domain) {
         let purpose = if options.export_csr.is_some() {
             crate::executable::EvidencePurpose::OfflineExport
         } else {
@@ -731,7 +830,16 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
             Err(_) => thin_fallback = true,
         }
     }
-    let socket = connect(path, &signals)?;
+    let (socket, _self_connector) = if hello.mode == "thin_csr"
+        && matches!(
+            hello.original_intent().map_err(io::Error::other)?.target,
+            sigrund_core::host::Selector::Self_ {}
+        ) {
+        let (socket, connector) = connect_self(path, &signals)?;
+        (socket, Some(connector))
+    } else {
+        (connect(path, &signals, PeerRole::Execution)?, None)
+    };
     let wake_raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     if wake_raw < 0 {
         return Err(io::Error::last_os_error());
@@ -953,6 +1061,27 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
         ];
         poll(&mut fds, deadline)?;
     }
+}
+
+/// Connect a disposable, single-threaded anchor to an authenticated host peer.
+/// Successful capture holds this process until the daemon disposes the target.
+pub fn run_dedicated_anchor(path: &Path) -> io::Result<()> {
+    unsafe extern "C" {
+        fn sigrun_run_dedicated_anchor(address: *const libc::sockaddr_un) -> i32;
+    }
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { zeroed() };
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::other("invalid rendezvous path"));
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    if unsafe { sigrun_run_dedicated_anchor(&address) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Err(io::Error::other("anchor unexpectedly returned"))
 }
 
 #[cfg(test)]

@@ -55,7 +55,7 @@ const CONTEXT_LISTENER: u64 = 8;
 const CONTEXT_COMPLETE: u64 = 9;
 const FIRST_CONNECTION: u64 = 10;
 
-struct BoundSocket {
+pub(crate) struct BoundSocket {
     fd: Option<OwnedFd>,
     disposal: Option<Permit>,
     parent: File,
@@ -65,7 +65,25 @@ struct BoundSocket {
 }
 
 impl BoundSocket {
-    fn bind(path: &Path, mode: u32) -> io::Result<Self> {
+    pub(crate) fn protect_close(&mut self, permit: crate::socket_disposal::Permit) {
+        self.disposal = Some(permit);
+    }
+
+    pub(crate) fn bind(path: &Path, mode: u32) -> io::Result<Self> {
+        Self::bind_role(path, mode, None)
+    }
+    pub(crate) fn bind_public(
+        path: &Path,
+        mode: u32,
+        role: crate::client::PeerRole,
+    ) -> io::Result<Self> {
+        Self::bind_role(path, mode, Some(role))
+    }
+    fn bind_role(
+        path: &Path,
+        mode: u32,
+        role: Option<crate::client::PeerRole>,
+    ) -> io::Result<Self> {
         validate_absolute_path(path)?;
         if path.as_os_str().as_bytes().len() >= 108 {
             return Err(invalid("Unix socket path is too long"));
@@ -92,17 +110,21 @@ impl BoundSocket {
                 "refusing to replace an existing socket path",
             ));
         }
-        let raw = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
+        let fd = if let Some(role) = role {
+            crate::lsm::public_socket(role)?
+        } else {
+            let raw = unsafe {
+                libc::socket(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                )
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { OwnedFd::from_raw_fd(raw) }
         };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         disable_ancillary_credentials(fd.as_raw_fd())?;
         let mut address: libc::sockaddr_un = unsafe { zeroed() };
         address.sun_family = libc::AF_UNIX as _;
@@ -145,14 +167,14 @@ impl BoundSocket {
         Ok(bound)
     }
 
-    fn listen(&self) -> io::Result<()> {
+    pub(crate) fn listen(&self) -> io::Result<()> {
         if unsafe { libc::listen(self.fd(), 64) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
-    fn fd(&self) -> RawFd {
+    pub(crate) fn fd(&self) -> RawFd {
         self.fd.as_ref().expect("live listener").as_raw_fd()
     }
 
@@ -897,6 +919,8 @@ pub struct ForegroundDaemon {
     _resources: StartupResources,
     host_target: Arc<crate::host_target::HostTarget>,
     _epoch_owner: Arc<crate::host_registry::EpochOwner>,
+    _target_registry: Option<Arc<crate::target_registry::TargetRegistry>>,
+    management: Option<crate::target_management::Management>,
     config: Arc<DaemonConfig>,
     _signers: SignerPolicyFile,
     signals: SignalSource,
@@ -933,6 +957,16 @@ impl ForegroundDaemon {
         authorization_only: bool,
     ) -> io::Result<Self> {
         config.validate().map_err(|e| invalid(e.to_string()))?;
+        if authorization_only
+            && config
+                .namespace_profiles
+                .iter()
+                .any(|profile| profile.is_production())
+        {
+            return Err(invalid(
+                "production namespace profiles require execution startup probes",
+            ));
+        }
         signers
             .validate_against(&config)
             .map_err(|e| invalid(e.to_string()))?;
@@ -1006,6 +1040,23 @@ impl ForegroundDaemon {
             crate::execution::trace_available(),
             last_cap,
         )?;
+        // Detect the reserved producer domain even in a host-only configuration:
+        // no approved command may inherit its socket-label authority.
+        {
+            let _policy_probe = target_budget
+                .reserve(
+                    0,
+                    sigrund_core::host_budget::Charge {
+                        helpers: 1,
+                        target_fds: 1,
+                        ..Default::default()
+                    },
+                )
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            target_budget
+                .with_transient_fd_copies(0, || crate::lsm::startup(&config.namespace_profiles))
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))??;
+        }
         // Startup recovery/orphan records may themselves cross high water.
         // Recheck before publishing either listener, retaining those records.
         if !resources.storage.check(&config)? {
@@ -1038,12 +1089,38 @@ impl ForegroundDaemon {
             .collect::<io::Result<Vec<_>>>()?;
         let epoch_owner =
             crate::host_registry::EpochOwner::publish(&resources.state_directory, bundles)?;
+        let target_registry = if config.namespace_profiles.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                crate::target_registry::TargetRegistry::new_with_roots(
+                    host_target.epoch().into(),
+                    target_budget.clone(),
+                    config.csr_allowed_executable_dirs.clone(),
+                )?,
+            ))
+        };
+        let management = if config.namespace_profiles.is_empty() {
+            None
+        } else {
+            Some(crate::target_management::Management::bind(
+                socket,
+                target_registry
+                    .as_ref()
+                    .expect("namespace profiles require registry")
+                    .clone(),
+                config.namespace_profiles.clone(),
+                target_budget.clone(),
+            )?)
+        };
         let context_path = crate::client::context_path(socket);
         if context_path == approval_socket {
             return Err(invalid("context and approval sockets must differ"));
         }
-        let mut context_listener = BoundSocket::bind(&context_path, 0o666)?;
-        let mut client = BoundSocket::bind(socket, 0o666)?;
+        let mut context_listener =
+            BoundSocket::bind_public(&context_path, 0o666, crate::client::PeerRole::Context)?;
+        let mut client =
+            BoundSocket::bind_public(socket, 0o666, crate::client::PeerRole::Execution)?;
         let mut approval = BoundSocket::bind(approval_socket, 0o600)?;
         let disposal = SocketDisposal::new()?;
         context_listener.disposal = Some(disposal.reserve().expect("new pool listener capacity"));
@@ -1060,6 +1137,8 @@ impl ForegroundDaemon {
             _resources: resources,
             host_target,
             _epoch_owner: epoch_owner,
+            _target_registry: target_registry,
+            management,
             config: Arc::new(config),
             _signers: signers,
             signals,
@@ -1070,6 +1149,7 @@ impl ForegroundDaemon {
     pub fn run(mut self) -> io::Result<()> {
         let context = Arc::new(Context {
             epoch: Some(self._epoch_owner.clone()),
+            targets: self._target_registry.clone(),
             host_target: Some(self.host_target.clone()),
             roots: self
                 .host_target
@@ -1096,7 +1176,6 @@ impl ForegroundDaemon {
                 authorization_timeout_ms: self.config.authorization_timeout_ms,
             },
             features: ContextFeatures {
-                admin_trusted_composefs_mounts: self.config.admin_trusted_composefs_mounts.clone(),
                 direct_exec_checkpoint: crate::execution::trace_available(),
                 host_file_capabilities: crate::execution::trace_available(),
                 tty_modes: vec!["stdio".into()],
@@ -1108,6 +1187,11 @@ impl ForegroundDaemon {
         let budget = SnapshotBudget::default();
         let signals = self.signals;
         crate::startup::CgroupLayout::register_subreaper()?;
+        let management = self
+            .management
+            .take()
+            .map(|server| server.start())
+            .transpose()?;
         // Threads inherit the blocked signal mask, leaving shutdown handling
         // on signalfd even when a metadata syscall cannot be interrupted.
         let mut workers = IoWorkers::new(&self.config)?;
@@ -1185,7 +1269,7 @@ impl ForegroundDaemon {
         let mut stop_notified = false;
         let mut listeners_registered = true;
         let mut storage_pressure_reported = false;
-        service.ready();
+        service.ready()?;
         loop {
             let now = Instant::now();
             let timeout = connections
@@ -1774,6 +1858,9 @@ impl ForegroundDaemon {
                 }
             }
             if stopping.is_some() {
+                if let Some(server) = &management {
+                    server.stop();
+                }
                 if !stop_notified {
                     service.stopping();
                     stop_notified = true;
@@ -1882,7 +1969,8 @@ impl ForegroundDaemon {
                 service.tick();
             }
             if let Some(start) = stopping {
-                if execution.is_idle()
+                if management.as_ref().is_none_or(|server| server.is_idle())
+                    && execution.is_idle()
                     && context_workers.is_idle()
                     && workers.is_idle()
                     && admission.is_idle()
@@ -1996,6 +2084,7 @@ mod approval_tests {
         let context = Arc::new(Context {
             epoch: None,
             host_target: None,
+            targets: None,
             roots: vec![],
             host_id: csr.warrant().host_id.clone(),
             signers: SignerPolicyFile::from_toml(include_bytes!(

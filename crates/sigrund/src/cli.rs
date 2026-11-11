@@ -11,7 +11,7 @@ use std::{
 pub const CLIENT_SOCKET: &str = "/run/sigrund.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund-approve.sock";
 pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nExecution startup requires a dedicated delegated cgroup service.\n       --authorization-only provides the non-executing authorization diagnostic profile.";
-pub const CLIENT_HELP: &str = "Usage: sigrun --target host --security-profile ID (--account NAME | --target-uid UID --target-gid GID) [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --binding-bundle PATH --full-only --export-csr PATH\n         --socket PATH --supplementary-gid GID --capability CAP\n         --cwd PATH --env NAME=VALUE --umask OCTAL --stdin null|sha256\n         --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nAPPROVED confirms durable authorization; separate readiness reports unknown or exec_event_observed, followed by an execution result.";
+pub const CLIENT_HELP: &str = "Usage: sigrun --target host|self|registered:ID|process:DAEMON_PID --security-profile ID (--account NAME | --target-uid UID --target-gid GID) [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --binding-bundle PATH --full-only --export-csr PATH\n         --socket PATH --supplementary-gid GID --capability CAP\n         --cwd PATH --env NAME=VALUE --umask OCTAL --stdin null|sha256\n         --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nAPPROVED confirms durable authorization; separate readiness reports unknown or exec_event_observed, followed by an execution result.";
 pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] [--epoch-file PATH] --identity PATH\nDefaults: /run/sigrund-approve.sock, /dev/tty, /etc/sigrund/signers.toml and /var/lib/sigrund/host-epoch.json.\nOnly UID 0 with a controlling TTY may approve and sign. Private evidence must match the live daemon epoch and exact CSR.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,7 +142,10 @@ impl ClientArgs {
                 .next()
                 .ok_or_else(|| invalid("missing option value"))?;
             match flag.as_str() {
-                "--target" if value == "host" => options.target = Some(value.clone()),
+                "--target" => {
+                    parse_target(value)?;
+                    options.target = Some(value.clone());
+                }
                 "--security-profile" => options.security_profile = Some(value.clone()),
                 "--account" => options.account = Some(value.clone()),
                 "--binding-bundle" => options.binding_bundle = Some(absolute_path(value)?),
@@ -222,8 +225,18 @@ impl ClientArgs {
         if command.is_empty() {
             return Err(invalid("missing -- and absolute command"));
         }
-        if options.target.as_deref() != Some("host") || options.security_profile.is_none() {
-            return Err(invalid("--target host and --security-profile are required"));
+        if options.target.is_none() || options.security_profile.is_none() {
+            return Err(invalid("--target and --security-profile are required"));
+        }
+        let selected_target = parse_target(options.target.as_deref().unwrap())?;
+        if !matches!(selected_target, sigrund_core::host::Selector::Host {})
+            && (options.full_only
+                || options.export_csr.is_some()
+                || options.binding_bundle.is_some())
+        {
+            return Err(invalid(
+                "cross-domain full preparation, binding bundles and CSR export are unavailable",
+            ));
         }
         if options.account.is_some() {
             if !options.supplementary_gids.is_empty()
@@ -360,7 +373,11 @@ impl RequestOptions {
         };
         let requested = hello.requested_execution_context.as_ref().unwrap();
         hello.original_intent = Some(sigrund_core::v3::Intent {
-            target: sigrund_core::host::Selector::Host {},
+            target: parse_target(
+                self.target
+                    .as_deref()
+                    .ok_or_else(|| invalid("explicit target required"))?,
+            )?,
             account: match &self.account {
                 Some(name) => sigrund_core::host::Account::Name { name: name.clone() },
                 None => sigrund_core::host::Account::Numeric {
@@ -387,6 +404,26 @@ impl RequestOptions {
         Ok(hello)
     }
 }
+fn parse_target(value: &str) -> Result<sigrund_core::host::Selector> {
+    use sigrund_core::host::Selector;
+    let target = if value == "host" {
+        Selector::Host {}
+    } else if value == "self" {
+        Selector::Self_ {}
+    } else if let Some(id) = value.strip_prefix("registered:") {
+        Selector::Registered { id: id.into() }
+    } else if let Some(pid) = value.strip_prefix("process:") {
+        Selector::Process {
+            pid: u32::try_from(decimal(pid)?).map_err(|_| invalid("invalid daemon-scope PID"))?,
+            pid_scope: "daemon".into(),
+        }
+    } else {
+        return Err(invalid("unsupported target selector"));
+    };
+    target.validate_selection()?;
+    Ok(target)
+}
+
 fn decimal(value: &str) -> Result<u64> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return Err(invalid("expected unsigned decimal integer"));

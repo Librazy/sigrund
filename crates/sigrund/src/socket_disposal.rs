@@ -21,8 +21,18 @@ struct Shared {
     wake: Arc<OwnedFd>,
 }
 
-pub(crate) struct Permit(Arc<Shared>);
+pub(crate) struct Permit(
+    Arc<Shared>,
+    Option<Arc<sigrund_core::host_budget::Reservation>>,
+);
 impl Permit {
+    pub fn with_resources(
+        mut self,
+        resources: Arc<sigrund_core::host_budget::Reservation>,
+    ) -> Self {
+        self.1 = Some(resources);
+        self
+    }
     pub fn socket(self, fd: OwnedFd) -> Socket {
         Socket(Arc::new(SocketInner {
             fd: Some(fd),
@@ -82,6 +92,16 @@ impl Drop for SocketInner {
 /// only enqueues; only a disposal worker performs the actual close.
 #[derive(Clone)]
 pub(crate) struct Socket(Arc<SocketInner>);
+impl Socket {
+    pub fn set_resources(&mut self, resources: sigrund_core::host_budget::Reservation) {
+        Arc::get_mut(&mut self.0)
+            .expect("unshared accepted socket")
+            .permit
+            .as_mut()
+            .expect("socket permit")
+            .1 = Some(Arc::new(resources));
+    }
+}
 impl AsRawFd for Socket {
     fn as_raw_fd(&self) -> RawFd {
         self.0.fd.as_ref().expect("live socket").as_raw_fd()
@@ -127,7 +147,7 @@ impl SocketDisposal {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Permit(self.0.clone())),
+                Ok(_) => return Some(Permit(self.0.clone(), None)),
                 Err(actual) => used = actual,
             }
         }

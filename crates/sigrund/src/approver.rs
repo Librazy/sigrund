@@ -248,16 +248,23 @@ fn watch_broker(
             return Err(invalid("explicit identity does not match requested signer"));
         }
         let csr = Csr::parse(request.csr_payload.as_bytes()).map_err(io::Error::other)?;
-        let (bundle, admin_trusted_composefs) =
-            crate::host_registry::live_review(epoch_file, &request.exec_id, &csr)?;
-        csr.warrant()
-            .verify_bundle(&bundle)
-            .map_err(io::Error::other)?;
+        let rendered = if matches!(
+            csr.warrant().intent.target,
+            sigrund_core::host::Selector::Host {}
+        ) {
+            let (bundle, composefs) =
+                crate::host_registry::live_review(epoch_file, &request.exec_id, &csr)?;
+            render_request(&request, &csr, signer, &bundle, composefs)?
+        } else {
+            let review =
+                crate::host_registry::live_process_review(epoch_file, &request.exec_id, &csr)?;
+            render_process_request(&request, &csr, signer, &review)?
+        };
         let response = approve(
             tty,
             identity_file,
             signer,
-            (&request, &bundle, admin_trusted_composefs),
+            (&request, rendered.as_str()),
             socket,
             signals,
             deadline,
@@ -358,7 +365,11 @@ fn connect_broker(path: &Path, signals: &Signals) -> io::Result<UnixStream> {
             "untrusted broker socket",
         ));
     }
-    let socket = UnixStream::from(crate::client::connect(&pinned, signals)?);
+    let socket = UnixStream::from(crate::client::connect(
+        &pinned,
+        signals,
+        crate::client::PeerRole::HostOnly,
+    )?);
     socket.set_nonblocking(true)?;
     disable_ancillary_credentials(socket.as_raw_fd())?;
     if peer_credentials(socket.as_raw_fd())?.uid != 0 {
@@ -426,24 +437,18 @@ fn approve(
     tty: &File,
     identity: &File,
     signer: &SignerConfig,
-    review: (&ApprovalRequest, &sigrund_core::host::BindingBundle, bool),
+    review: (&ApprovalRequest, &str),
     socket: &UnixStream,
     signals: &Signals,
     deadline: Instant,
 ) -> io::Result<ApprovalResponse> {
-    let (request, bundle, admin_trusted_composefs) = review;
+    let (request, rendered) = review;
     let csr = Csr::parse(request.csr_payload.as_bytes()).map_err(|e| invalid(e.to_string()))?;
     let refused = |reason: &str| ApprovalResponse::Rejected {
         exec_id: request.exec_id.clone(),
         reason: reason.into(),
     };
-    write_tty(
-        tty,
-        render_request(request, &csr, signer, bundle, admin_trusted_composefs)?.as_bytes(),
-        socket,
-        signals,
-        deadline,
-    )?;
+    write_tty(tty, rendered.as_bytes(), socket, signals, deadline)?;
     if !valid_now(&csr) {
         return Ok(refused("warrant expired or not yet valid"));
     }
@@ -553,6 +558,23 @@ fn confirm(
 /// Every leaf and empty container is rendered; indexed argv and escaped key
 /// names make both argument and environment boundaries visible. Only ASCII
 /// escapes are emitted for request data, including Unicode/BiDi and controls.
+fn walk(path: String, value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            for (i, v) in items.iter().enumerate() {
+                walk(format!("{path}[{i}]"), v, out);
+            }
+        }
+        serde_json::Value::Object(items) if !items.is_empty() => {
+            for (k, v) in items {
+                walk(format!("{path}[{}]", quote(k)), v, out);
+            }
+        }
+        serde_json::Value::String(s) => out.push_str(&format!("{path} = {}\n", quote(s))),
+        v => out.push_str(&format!("{path} = {v}\n")),
+    }
+}
+
 fn render_request(
     request: &ApprovalRequest,
     csr: &Csr,
@@ -560,22 +582,6 @@ fn render_request(
     bundle: &sigrund_core::host::BindingBundle,
     admin_trusted_composefs: bool,
 ) -> io::Result<String> {
-    fn walk(path: String, value: &serde_json::Value, out: &mut String) {
-        match value {
-            serde_json::Value::Array(items) if !items.is_empty() => {
-                for (i, v) in items.iter().enumerate() {
-                    walk(format!("{path}[{i}]"), v, out);
-                }
-            }
-            serde_json::Value::Object(items) if !items.is_empty() => {
-                for (k, v) in items {
-                    walk(format!("{path}[{}]", quote(k)), v, out);
-                }
-            }
-            serde_json::Value::String(s) => out.push_str(&format!("{path} = {}\n", quote(s))),
-            v => out.push_str(&format!("{path} = {v}\n")),
-        }
-    }
     let key = PublicKey::from_openssh(&signer.public_key)
         .map_err(|_| invalid("invalid configured SSH key"))?;
     let mut out = format!(
@@ -609,6 +615,39 @@ fn render_request(
     ));
     Ok(out)
 }
+fn render_process_request(
+    request: &ApprovalRequest,
+    csr: &Csr,
+    signer: &SignerConfig,
+    review: &sigrund_core::namespace::ProcessReview,
+) -> io::Result<String> {
+    let evidence = review.render(csr).map_err(io::Error::other)?;
+    let key = PublicKey::from_openssh(&signer.public_key)
+        .map_err(|_| invalid("invalid configured SSH key"))?;
+    let mut out = format!(
+        "\n{}\nexec_id = {}\nsigner_id = {}\nkey_fingerprint = {}\n",
+        if review.constraints.executes() {
+            "Namespace execution request"
+        } else {
+            "Namespace private review (execution disabled)"
+        },
+        quote(&request.exec_id),
+        quote(&signer.signer_id),
+        key.fingerprint(HashAlg::Sha256)
+    );
+    walk(
+        "csr".into(),
+        &serde_json::from_slice(csr.as_bytes()).map_err(io::Error::other)?,
+        &mut out,
+    );
+    walk(
+        "verified_process".into(),
+        &serde_json::from_str(&evidence).map_err(io::Error::other)?,
+        &mut out,
+    );
+    Ok(out)
+}
+
 fn quote(value: &str) -> String {
     let mut result = String::from("\"");
     for c in value.chars() {

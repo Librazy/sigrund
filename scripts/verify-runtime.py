@@ -19,6 +19,7 @@ import signal
 import socket
 import struct
 import subprocess
+import termios
 import tempfile
 import time
 import uuid
@@ -26,6 +27,31 @@ import uuid
 REPO = Path(__file__).resolve().parent.parent
 SIGNER = 'mandator-alice-yubikey'
 CLIENT_PROGRESS = b'sigrun: waiting for authorization\n'
+
+
+def enable_confirmation_packets(master):
+    """Observe the approver's input flush through Linux PTY control packets."""
+    fcntl.ioctl(master, termios.TIOCPKT, struct.pack('i', 1))
+
+
+def read_confirmation_prompt(master, timeout=8):
+    deadline = time.monotonic() + timeout
+    prompt = bytearray()
+    flushed = False
+    suffix = b'Approve and sign? [y/yes/n/no] '
+    while not (flushed and suffix in prompt):
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, 'confirmation did not reach its post-flush prompt'
+        if not select.select([master], [], [], min(remaining, 0.1))[0]:
+            continue
+        packet = os.read(master, 8192)
+        assert packet, 'confirmation terminal closed'
+        if packet[0] == 0:
+            prompt.extend(packet[1:])
+            assert len(prompt) < 1_048_576, 'oversized confirmation display'
+        else:
+            flushed |= bool(packet[0] & termios.TIOCPKT_FLUSHREAD)
+    return bytes(prompt)
 
 
 def command_source(name):
@@ -364,7 +390,7 @@ class Fixture:
 
 
 class Gate:
-    def __init__(self, fixture, mode, durable=False):
+    def __init__(self, fixture, mode, durable=False, extra_env=None):
         self.fixture = fixture
         self.entered, self.worker_entered = socket.socketpair()
         self.release, self.worker_release = socket.socketpair()
@@ -376,6 +402,7 @@ class Gate:
                         str(REPO / 'crates/sigrund/tests/fixtures' / name), '-ldl'], check=True)
         prefix = 'SIGRUND_DURABLE_' if durable else 'SIGRUND_EXEC_'
         env = dict(os.environ, LD_PRELOAD=str(library))
+        env.update(extra_env or {})
         env[prefix + ('POINT' if durable else 'MODE')] = mode
         env[prefix + 'ARM'] = str(self.arm_path)
         env[prefix + 'ENTERED'] = str(self.worker_entered.fileno())

@@ -1,0 +1,21 @@
+# Separate namespace-only signer policy; select its signer_id in [mvp].
+# Replace the public key and configure real requester IDs and roots.
+# No host rules or numeric host ceilings are granted by this example.
+[[signers]]
+signer_id = "namespace-reviewer"
+type = "ssh-ed25519"
+public_key = "ssh-ed25519 AAAA..."
+allowed_requester_uids = [1001]
+allowed_capabilities = []
+allowed_modes = ["one_time"]
+max_ttl_secs = 120
+allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]
+
+[[signers.namespace_rules]]
+requester_uids = [1001]
+target_scope = "registered:container-b"
+target_uids = [12001]
+target_gids = [12001]
+supplementary_gids = []
+profile_sha256 = "d75771ede07b1e130ae877b42e86fa8bfb2d6b2cc505f3386eddecc32d519eab"
+cross_owner = true

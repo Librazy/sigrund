@@ -22,6 +22,10 @@ const MAX_COLLECTOR_TIMEOUT_MS: u32 = 3_000;
 pub struct DaemonConfig {
     pub version: String,
     pub host_profiles: Vec<crate::host::Constraints>,
+    #[serde(default)]
+    pub namespace_profiles: Vec<crate::namespace::Constraints>,
+    #[serde(default)]
+    pub namespace_rules: Vec<crate::namespace::ScopedRule>,
     pub host_rules: Vec<crate::host::ScopedRule>,
     #[serde(default)]
     pub host_limits: crate::host_budget::Limits,
@@ -229,6 +233,18 @@ impl MvpProfile {
         requester_uid: u32,
     ) -> Result<()> {
         self.validate_hello(hello)?;
+        if !matches!(
+            hello.original_intent()?.target,
+            crate::host::Selector::Host {}
+        ) {
+            return if hello.mode == "thin_csr" {
+                Ok(())
+            } else {
+                Err(CoreError::Protocol(
+                    "cross-domain preparation requires thin intent".into(),
+                ))
+            };
+        }
         if hello.mode == "thin_csr"
             && hello
                 .original_intent
@@ -385,6 +401,9 @@ pub struct SignerPolicyFile {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignerConfig {
+    #[serde(default)]
+    pub namespace_rules: Vec<crate::namespace::ScopedRule>,
+    #[serde(default)]
     pub host_rules: Vec<crate::host::ScopedRule>,
     pub signer_id: String,
     #[serde(rename = "type")]
@@ -395,8 +414,11 @@ pub struct SignerConfig {
     #[serde(default)]
     pub require_user_verification: bool,
     pub allowed_requester_uids: Vec<u32>,
+    #[serde(default)]
     pub allowed_target_uids: Vec<u32>,
+    #[serde(default)]
     pub allowed_target_gids: Vec<u32>,
+    #[serde(default)]
     pub allowed_supplementary_gids: Vec<u32>,
     #[serde(default)]
     pub allow_same_uid_elevation: bool,
@@ -438,10 +460,14 @@ impl SignerPolicyFile {
         }
         let mut signer_ids = BTreeSet::new();
         for signer in &self.signers {
+            validate_namespace_policy(&daemon.namespace_profiles, &signer.namespace_rules)?;
+
             use crate::host::Record;
-            if signer.host_rules.is_empty() || signer.host_rules.len() > 64 {
+            if (signer.host_rules.is_empty() && signer.namespace_rules.is_empty())
+                || signer.host_rules.len() > 64
+            {
                 return Err(CoreError::Config(
-                    "signer requires scoped host rules".into(),
+                    "signer requires scoped host or namespace rules".into(),
                 ));
             }
             for rule in &signer.host_rules {
@@ -637,6 +663,19 @@ impl DaemonConfig {
             ));
         }
         self.host_limits.validate()?;
+        validate_namespace_policy(&self.namespace_profiles, &self.namespace_rules)?;
+        for profile in &self.namespace_profiles {
+            if profile.executes()
+                && (profile.memory_max > self.job_memory_max_bytes
+                    || profile.memory_swap_max > self.job_memory_swap_max_bytes
+                    || u64::from(profile.pids_max) > self.job_pids_max)
+            {
+                return Err(CoreError::Config(
+                    "namespace profile limits exceed daemon job ceilings".into(),
+                ));
+            }
+        }
+
         let mut profiles = BTreeSet::new();
         for profile in &self.host_profiles {
             profile.validate()?;
@@ -1000,13 +1039,147 @@ fn default_authorization_timeout() -> u32 {
     120_000
 }
 
+fn validate_namespace_policy(
+    profiles: &[crate::namespace::Constraints],
+    rules: &[crate::namespace::ScopedRule],
+) -> Result<()> {
+    use crate::namespace::Contract;
+    if profiles.len() > 16 || rules.len() > 64 {
+        return Err(CoreError::Config("namespace policy exceeds bounds".into()));
+    }
+    let mut names = BTreeSet::new();
+    let mut hashes = BTreeSet::new();
+    for profile in profiles {
+        profile.validate()?;
+        if !names.insert(&profile.profile_id) {
+            return Err(CoreError::Config("duplicate namespace profile".into()));
+        }
+        hashes.insert(profile.sha256()?);
+    }
+    for rule in rules {
+        rule.validate()?;
+        if (!rule.target_scope.starts_with("registered:") && rule.target_scope != "self")
+            || !hashes.contains(&rule.profile_sha256)
+        {
+            return Err(CoreError::Config(
+                "namespace rule requires a supported scope and configured profile".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn experimental_namespace_limits_must_fit_daemon_before_admission() {
+        use crate::namespace::Contract;
+        let mut config = valid();
+        let profile = crate::namespace::Constraints::parse(include_bytes!(
+            "../tests/fixtures/namespace/experimental-constraints.json"
+        ))
+        .unwrap();
+        config.namespace_profiles = vec![profile];
+        config.validate().unwrap();
+        for field in ["memory", "swap", "pids"] {
+            let mut changed = config.clone();
+            let profile = &mut changed.namespace_profiles[0];
+            match field {
+                "memory" => profile.memory_max = changed.job_memory_max_bytes + 1,
+                "swap" => profile.memory_swap_max = changed.job_memory_swap_max_bytes + 1,
+                "pids" => changed.job_pids_max = u64::from(profile.pids_max) - 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                changed
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("namespace profile limits"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_policy_requires_exact_configured_profile_and_registered_scope() {
+        use crate::namespace::Contract;
+        let mut config = valid();
+        let profile = crate::namespace::Constraints::parse(include_bytes!(
+            "../tests/fixtures/namespace/constraints.json"
+        ))
+        .unwrap();
+        let hash = profile.sha256().unwrap();
+        config.namespace_profiles.push(profile.clone());
+        config.namespace_rules.push(crate::namespace::ScopedRule {
+            requester_uids: vec![1000],
+            target_scope: "registered:B".into(),
+            target_uids: vec![12001],
+            target_gids: vec![12001],
+            supplementary_gids: vec![],
+            profile_sha256: hash,
+            cross_owner: false,
+        });
+        config.validate().unwrap();
+        config.namespace_rules[0].target_scope = "host".into();
+        assert!(config.validate().is_err());
+        config.namespace_rules[0].target_scope = "registered:B".into();
+        config.namespace_rules[0].profile_sha256 = "00".repeat(32);
+        assert!(config.validate().is_err());
+        config.namespace_rules.clear();
+        config.namespace_profiles.push(profile);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn namespace_only_signer_has_no_implicit_host_authority() {
+        use crate::namespace::Contract;
+        let mut config = valid();
+        let profile = crate::namespace::Constraints::parse(include_bytes!(
+            "../tests/fixtures/namespace/constraints.json"
+        ))
+        .unwrap();
+        let rule = crate::namespace::ScopedRule {
+            requester_uids: vec![1001],
+            target_scope: "registered:B".into(),
+            target_uids: vec![12001],
+            target_gids: vec![12001],
+            supplementary_gids: vec![],
+            profile_sha256: profile.sha256().unwrap(),
+            cross_owner: false,
+        };
+        config.namespace_profiles.push(profile);
+        config.namespace_rules.push(rule.clone());
+        let text = r#"
+            [[signers]]
+            signer_id = "namespace-only"
+            type = "raw-ed25519"
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_requester_uids = [1001]
+            allowed_capabilities = []
+            allowed_modes = ["one_time"]
+            max_ttl_secs = 120
+            allowed_executable_dirs = ["/usr/bin", "/usr/sbin"]
+        "#;
+        let mut policy = SignerPolicyFile::from_toml(text.as_bytes()).unwrap();
+        assert!(policy.validate_against(&config).is_err());
+        policy.signers[0].namespace_rules.push(rule);
+        policy.validate_against(&config).unwrap();
+        assert!(policy.signers[0].host_rules.is_empty());
+        assert!(policy.signers[0].allowed_target_uids.is_empty());
+        assert!(policy.signers[0].allowed_target_gids.is_empty());
+        assert!(policy.signers[0].allowed_supplementary_gids.is_empty());
+        policy.signers[0].namespace_rules[0].target_scope = "host".into();
+        assert!(policy.validate_against(&config).is_err());
+    }
+
     fn valid() -> DaemonConfig {
         DaemonConfig {
             version: "3.0".into(),
+            namespace_profiles: vec![],
+            namespace_rules: vec![],
             host_limits: Default::default(),
             host_profiles: vec![{
                 use crate::host::Record;

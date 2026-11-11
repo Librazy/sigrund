@@ -14,6 +14,10 @@ import tomllib
 REPO = Path(__file__).resolve().parent.parent
 
 
+def workspace_version():
+    return tomllib.loads((REPO / 'Cargo.toml').read_text())['workspace']['package']['version']
+
+
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
 
@@ -25,7 +29,7 @@ def install(source, destination, mode=0o644):
 
 
 def stage(root, package, kind):
-    binaries = {'sigrun': ['sigrun'], 'sigrund': ['sigrund', 'sigrundctl', 'sigrund-approve']}
+    binaries = {'sigrun': ['sigrun'], 'sigrund': ['sigrund', 'sigrundctl', 'sigrund-approve', 'sigrund-anchor']}
     for binary in binaries[package]:
         path = 'usr/libexec/sigrund/sigrund' if binary == 'sigrund' else 'usr/bin/' + binary
         install(REPO / 'target/release' / binary, root / path, 0o755)
@@ -37,7 +41,29 @@ def stage(root, package, kind):
     if package == 'sigrund':
         (root / 'etc/sigrund').mkdir(parents=True, mode=0o755)
         install(REPO / 'packaging/sigrund.service', root / 'usr/lib/systemd/system/sigrund.service')
-        for name in ('sigrund.toml.example', 'signers.toml.example'):
+        upstream = 'https://github.com/Librazy/sigrund/blob/main/'
+        specification = 'sigrun sigrund Security Architecture and Implementation Specification.md'
+        for name in ('IMPLEMENTATION_NOTES.md', 'QUICK_START.md'):
+            guide = docs / name
+            install(REPO / name, guide)
+            text = guide.read_text().replace('(packaging/README.md', '(README.md')
+            for target in ('docs/PRIVILEGED_INTERPRETERS.md', 'MAINTENANCE.md'):
+                text = text.replace('](' + target + ')', '](' + upstream + target + ')')
+            text = text.replace('](<' + specification + '>)', '](' + upstream + specification.replace(' ', '%20') + ')')
+            guide.write_text(text)
+        for source in sorted((REPO / 'packaging/selinux').iterdir()):
+            if source.suffix in ('.te', '.fc', '.md') or source.name == 'Makefile':
+                install(source, docs / 'selinux' / source.name)
+        policy_notes = docs / 'selinux/README.md'
+        policy_notes.write_text(policy_notes.read_text().replace('../../IMPLEMENTATION_NOTES.md', '../IMPLEMENTATION_NOTES.md'))
+        for source in sorted((REPO / 'scripts/namespace/selinux').iterdir()):
+            if source.suffix in ('.py', '.c'):
+                install(source, docs / 'namespace/selinux' / source.name)
+        for source in sorted((REPO / 'scripts/namespace/podman').iterdir()):
+            if source.suffix in ('.py', '.c'):
+                install(source, docs / 'namespace/podman' / source.name)
+        install(REPO / 'crates/sigrund/src/child/launcher_abi.h', docs / 'namespace/selinux/launcher_abi.h')
+        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example'):
             install(REPO / 'config' / name, docs / 'examples' / name)
 
 
@@ -96,7 +122,7 @@ def main():
     parser.add_argument('--release', required=True, help='native package revision, e.g. 0.20261031.gitabc123.ubuntu24.04')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    version = tomllib.loads((REPO / 'crates/sigrund/Cargo.toml').read_text())['package']['version']
+    version = workspace_version()
     if not re.fullmatch(r'\d+\.\d+\.\d+', version) or not re.fullmatch(r'[0-9][a-zA-Z0-9.]*', args.release):
         parser.error('version must be X.Y.Z and release must contain only alphanumerics and dots, starting with a digit')
     output = args.output.resolve()

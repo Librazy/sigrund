@@ -1,4 +1,4 @@
-//! Strict v3 host-only wire and signed-byte contracts. Runtime support must be
+//! Strict v3 wire and signed-byte contracts. Runtime support must be
 //! gated separately: parsing a valid document grants no execution authority.
 use crate::{
     CoreError, Result,
@@ -51,7 +51,7 @@ pub struct Intent {
 }
 impl Record for Intent {
     fn validate(&self) -> Result<()> {
-        self.target.validate_host()?;
+        self.target.validate_selection()?;
         self.account.validate()?;
         host::identifier(&self.security_profile)?;
         let (uid, gid, groups) = match &self.account {
@@ -100,6 +100,13 @@ impl Record for Warrant {
         self.intent.validate()?;
         self.target_binding.validate()?;
         self.security_constraints.validate()?;
+        let expected_kind = match self.intent.target {
+            host::Selector::Host {} => "host",
+            _ => "process_environment",
+        };
+        if self.target_binding.kind != expected_kind {
+            return Err(invalid("selector and target binding domains differ"));
+        }
         if self.version != "3.0"
             || self.intent_sha256 != self.intent.sha256()?
             || self.security_constraints.profile_id != self.intent.security_profile
@@ -187,11 +194,9 @@ impl Record for Warrant {
 }
 impl Warrant {
     pub fn parse_canonical(bytes: &[u8]) -> Result<Self> {
-        let value = Self::parse(bytes)?;
-        if value.canonical()? != bytes {
-            return Err(invalid("warrant is not canonical JCS"));
-        }
-        Ok(value)
+        Ok(crate::warrant::CanonicalWarrant::parse(bytes)?
+            .warrant()
+            .clone())
     }
     pub fn execution_binding(&self) -> Result<host::ExecutionBinding> {
         self.validate()?;
@@ -254,17 +259,7 @@ impl Hello {
         if bytes.len() > 524_288 {
             return Err(invalid("hello exceeds frame ceiling"));
         }
-        crate::json::preflight_with_string_limits(bytes, 16, &|path| {
-            if path
-                .last()
-                .is_some_and(|key| ["csr_payload", "payload", "sig"].contains(&key.as_str()))
-            {
-                131_072
-            } else {
-                4096
-            }
-        })?;
-        let hello: Self = serde_json::from_slice(bytes).map_err(|e| invalid(&e.to_string()))?;
+        let hello: Self = crate::protocol::parse_strict(bytes)?;
         hello.validate()?;
         Ok(hello)
     }
@@ -307,20 +302,7 @@ impl Hello {
     }
 }
 pub fn envelope_warrant(envelope: &crate::protocol::DsseEnvelope) -> Result<Warrant> {
-    if envelope.payload_type != host::PAYLOAD_TYPE || !(1..=4).contains(&envelope.signatures.len())
-    {
-        return Err(invalid("invalid v3 envelope"));
-    }
-    for sig in &envelope.signatures {
-        host::identifier(&sig.keyid)?;
-        if crate::crypto::strict_base64(&sig.sig, 24_576)?.is_empty() {
-            return Err(invalid("empty signature"));
-        }
-    }
-    Warrant::parse_canonical(&crate::crypto::strict_base64(
-        &envelope.payload,
-        host::MAX_RECORD_BYTES,
-    )?)
+    Ok(envelope.warrant()?.warrant().clone())
 }
 
 /// Verifies v3 bytes using only the v3 SSH namespace and payload type. The
@@ -391,28 +373,25 @@ impl Record for PublicContext {
             || self.executable_trust_models.len() > 4
             || f.tty_modes != ["stdio"]
             || f.grant_modes != ["one_time"]
-            || f.stdin_policies != ["null", "sha256"]
+            || !matches!(f.stdin_policies.as_slice(), [null] if null == "null")
+                && f.stdin_policies != ["null", "sha256"]
             || (f.host_file_capabilities && !f.direct_exec_checkpoint)
         {
             return Err(invalid("unsupported public host context"));
         }
         for (i, model) in self.executable_trust_models.iter().enumerate() {
-            if self.executable_trust_models[..i].contains(model)
-                || (!f.direct_exec_checkpoint
-                    && *model != crate::executable::TrustModel::DigestMemfd)
-            {
+            if self.executable_trust_models[..i].contains(model) {
                 return Err(invalid("unsupported or duplicate context trust model"));
             }
         }
         let l = &self.limits;
-        if l.max_executable_bytes == 0
-            || l.max_direct_digest_bytes == 0
-            || l.direct_digest_timeout_ms == 0
-            || l.max_stdin_bytes == 0
+        if !(1..=67_108_864).contains(&l.max_executable_bytes)
+            || !(1..=1_073_741_824).contains(&l.max_direct_digest_bytes)
+            || !(1..=30_000).contains(&l.direct_digest_timeout_ms)
+            || !(1..=16_777_216).contains(&l.max_stdin_bytes)
             || l.max_ttl_secs == 0
             || l.max_onetime_window_secs == 0
-            || l.max_onetime_window_secs > l.max_ttl_secs
-            || !(1..=300_000).contains(&l.authorization_timeout_ms)
+            || !(1_000..=300_000).contains(&l.authorization_timeout_ms)
         {
             return Err(invalid("invalid public context limits"));
         }

@@ -2,6 +2,7 @@ name: Packages
 
 on:
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
