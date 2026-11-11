@@ -1,5 +1,5 @@
 /usr/libexec/sigrund/sigrund -- gen_context(system_u:object_r:sigrund_daemon_exec_t,s0)
 /etc/sigrund(/.*)? gen_context(system_u:object_r:sigrund_etc_t,s0)
-/var/lib/sigrund-v3(/.*)? gen_context(system_u:object_r:sigrund_state_t,s0)
-/var/log/sigrund-v3(/.*)? gen_context(system_u:object_r:sigrund_log_t,s0)
+/var/lib/sigrund(/.*)? gen_context(system_u:object_r:sigrund_state_t,s0)
+/var/log/sigrund(/.*)? gen_context(system_u:object_r:sigrund_log_t,s0)
 /run/sigrund(/.*)? gen_context(system_u:object_r:sigrund_runtime_t,s0)

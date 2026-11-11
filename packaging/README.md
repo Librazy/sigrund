@@ -80,23 +80,24 @@ fixtures explicitly. See the
 for the supported profile and full setup workflow.
 
 Validate configuration, then provision a **new** host exactly once. Retain the
-provisioning output privately; it includes audit anchor material. The shipped
-service explicitly uses the new v3 state/log paths below; existing or partial
-sets, including sidecars, are refused. Preserve older state as a separate set.
+provisioning output privately; it includes audit anchor material. The binaries
+and packaged service use the state/log paths below; existing or partial sets,
+including sidecars, are refused. Preserve older state as a separate set.
 
 ```sh
 /usr/libexec/sigrund/sigrund --check-config
-(umask 077; set -C; sigrundctl init-host --state-dir /var/lib/sigrund-v3 --log-path /var/log/sigrund-v3/audit.jsonl > /root/sigrund-initial-anchor.json)
+(umask 077; set -C; sigrundctl init-host --state-dir /var/lib/sigrund --log-path /var/log/sigrund/audit.jsonl > /root/sigrund-initial-anchor.json)
 systemctl enable --now sigrund.service
 ```
 
-Use the packaged service socket paths explicitly; the bare binaries retain
-their default paths. The context endpoint is the client socket plus `.context`:
+The binaries and packaged service default to `/run/sigrund/client.sock` and
+`/run/sigrund/approve.sock`. The context endpoint is the client socket plus
+`.context`; explicit overrides remain available:
 
 ```sh
 # Root's controlling terminal; choose your actual SSH identity.
 sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
-  --identity /root/.ssh/id_ed25519 --epoch-file /var/lib/sigrund-v3/host-epoch.json
+  --identity /root/.ssh/id_ed25519 --epoch-file /var/lib/sigrund/host-epoch.json
 
 # Ordinary requester's terminal; command must be allowed by configured policy.
 sigrun --socket /run/sigrund/client.sock --target host --security-profile host-baseline \
@@ -110,10 +111,20 @@ delegation, a systemd manager or host/container routing.
 
 ## Upgrade and removal
 
-The v3 host workflow requires matching client/daemon/approver components and a freshly
-provisioned v3 database, audit log and ratchet state. V2, missing, future or mixed state is rejected and is
-never migrated or deleted automatically. Preserve any old state as a complete
-private archive; explicitly choose fresh provisioning paths before startup.
+The host workflow requires matching client/daemon/approver components and a
+coherent v3 database, audit log and ratchet state. V2, missing, future or mixed
+state is rejected and is never migrated or deleted automatically. Preserve
+existing state across upgrades; do not rerun `init-host`.
+
+Version 0.3.0 packages used `/var/lib/sigrund-v3` and `/var/log/sigrund-v3`.
+Before starting 0.3.1, stop the approver, drain and stop the daemon, and back up
+the complete configuration, keys, state and audit set. Relocate the entire state
+and log directories to `/var/lib/sigrund` and `/var/log/sigrund`, preserving
+ownership and permissions. The destinations must be unused; never merge them
+with another deployment or older-schema state. For a deployment using the
+supplied SELinux modules, install the updated file-context rules and run
+`restorecon -RF /var/lib/sigrund /var/log/sigrund`. Restart the updated daemon and
+approver with matching paths. Explicit path overrides remain supported.
 
 Upgrades replace executables and reload systemd's unit definitions. They do not
 restart the daemon automatically: finish active work, stop any old approver, and

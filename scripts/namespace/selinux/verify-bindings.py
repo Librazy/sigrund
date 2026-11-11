@@ -16,8 +16,8 @@ def canonical(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--state-dir', type=Path, default=Path('/var/lib/sigrund-v3'))
-    parser.add_argument('--audit-log', type=Path, default=Path('/var/log/sigrund-v3/audit.jsonl'))
+    parser.add_argument('--state-dir', type=Path, default=Path('/var/lib/sigrund'))
+    parser.add_argument('--audit-log', type=Path, default=Path('/var/log/sigrund/audit.jsonl'))
     parser.add_argument('--collector', type=Path, required=True)
     parser.add_argument('--artifacts', type=Path, required=True)
     args = parser.parse_args()

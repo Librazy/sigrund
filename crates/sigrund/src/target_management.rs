@@ -718,12 +718,12 @@ mod tests {
         assert!(parse_request(br#"{"operation":"register","id":"B","daemon_pid":10,"security_profile":"service"}"#).is_err());
         assert!(parse_request(br#"{"mode":"thin_csr","version":"3.0"}"#).is_err());
         assert_eq!(
-            management_path(Path::new("/run/sigrund.sock")),
-            Path::new("/run/sigrund.sock.management")
+            management_path(Path::new("/run/sigrund/client.sock")),
+            Path::new("/run/sigrund/client.sock.management")
         );
         assert_eq!(
-            anchor_path(Path::new("/run/sigrund.sock")),
-            Path::new("/run/sigrund.sock.anchor")
+            anchor_path(Path::new("/run/sigrund/client.sock")),
+            Path::new("/run/sigrund/client.sock.anchor")
         );
     }
 }

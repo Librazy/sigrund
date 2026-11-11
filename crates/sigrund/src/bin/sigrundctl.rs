@@ -101,7 +101,11 @@ fn target_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             return Err("invalid or duplicate target management option".into());
         }
     }
-    let socket = Path::new(options.remove("--socket").unwrap_or("/run/sigrund.sock"));
+    let socket = Path::new(
+        options
+            .remove("--socket")
+            .unwrap_or(sigrund::cli::CLIENT_SOCKET),
+    );
     sigrund::linux::validate_absolute_path(socket)?;
     let request = match operation.as_str() {
         "register" | "register-podman" => {

@@ -31,7 +31,7 @@ requester socket. Section 2.1 is the exhaustive public outcome contract.
 
 ### 1.1 Explicit Architectural Guarantee Boundaries
 
-`sigrun` and `sigrund` replace PAM and Polkit with a capability-scoped execution architecture over a Unix domain socket (`/run/sigrund.sock`, `0666`, `SOCK_STREAM`). To ensure security claims match what the Linux kernel and external infrastructure can strictly enforce, v3 establishes the following explicit boundaries:
+`sigrun` and `sigrund` replace PAM and Polkit with a capability-scoped execution architecture over a Unix domain socket (`/run/sigrund/client.sock`, `0666`, `SOCK_STREAM`). To ensure security claims match what the Linux kernel and external infrastructure can strictly enforce, v3 establishes the following explicit boundaries:
 
 1. **Non-Root vs. Host-Root Cgroup Containment Boundary:**
 * **Guaranteed Containment (Explicit Safe Capability Profile):** This guarantee applies only when `target_uid != 0` and the granted capability set is a subset of the enumerated safe profile `{ CAP_NET_BIND_SERVICE }` (including the empty set). Every other capability, including capabilities added by future kernels, is outside this profile. The target UID, primary GID, and supplementary GIDs must confer no authority to migrate processes through host services: the workload must have no usable access to host management sockets, APIs, credentials, or delegated cgroup controls, including systemd, D-Bus policy methods that move PIDs, Docker/containerd/CRI, and equivalent privileged helpers. This excludes access conveyed by filesystem ownership, ACLs, group membership, service authorization policy, passed FDs, or inherited credentials. Deployment policy must establish these access restrictions; a read-only cgroup mount alone does not establish them. Under these conditions, the child runs in a new cgroup namespace (`CLONE_NEWCGROUP`) and mount namespace (`CLONE_NEWNS`) where `/sys/fs/cgroup` is recursively read-only, cannot migrate processes out of `job-<exec_id>` directly or through a host control plane, and all descendants remaining there are torn down via `cgroup.kill`.
@@ -128,7 +128,7 @@ proof or a fallback that full-only/export may invoke.
 
 `sigrund.service` runs under systemd with `Delegate=yes` on a unified cgroup v2 hierarchy (`/sys/fs/cgroup`). Under Linux cgroup v2's no-internal-processes rule, domain controllers (`memory`, `pids`) cannot be enabled in `cgroup.subtree_control` while a process resides directly in that cgroup.
 
-Before opening `/run/sigrund.sock`, `sigrund` executes the following mandatory startup sequence and fails closed (exiting with a fatal error) if any step fails:
+Before opening `/run/sigrund/client.sock`, `sigrund` executes the following mandatory startup sequence and fails closed (exiting with a fatal error) if any step fails:
 
 1. **Subreaper Registration:** Calls `prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)` so orphaned descendants of this daemon are reparented to it while it remains alive. This does not adopt processes already reparented to PID 1 or another subreaper after an earlier daemon instance died.
 2. **Directory Creation:** Resolves and pins its own delegated service cgroup path $G$ before migration (e.g., `/sys/fs/cgroup/system.slice/sigrund.service`), using its cgroup membership and the verified cgroup v2 mount rather than a hardcoded unit name, and creates three subdirectories (`0755 root:root`): $G\text{/supervisor}$, $G\text{/jobs}$, and $G\text{/hooks}$.
@@ -641,7 +641,7 @@ rather than emitting a partial alternative outcome.
 ### 2.1.2 Target-Independent Public Context
 
 Use a separate root-owned 0666 context socket whose pathname is the execution
-socket pathname plus `.context` (for example `/run/sigrund.sock.context`). Both
+socket pathname plus `.context` (for example `/run/sigrund/client.sock.context`). Both
 client and daemon derive it from their configured execution socket path; startup
 checks the resulting Unix-socket path bound and trusted parent. Publish it only
 after the same startup/recovery gates as the execution listener. On this socket
@@ -2458,8 +2458,8 @@ On every daemon startup, before creating any public/broker listener, first requi
 
 6. **Case 6 (Remote Collector Checkpoint Reconciliation when `require_remote_audit_ack == true`):**
 * On startup, `sigrund` queries the remote collector for its latest `(collector_last_seq, collector_last_record_sha256)` for `host_id`:
-* If `last_seq < collector_last_seq` (indicating whole-host or audit-log storage rollback behind the collector's committed state) or if the local record at `collector_last_seq` does not match `collector_last_record_sha256`, `sigrund` **fails closed immediately** (`AUDIT_REMOTE_CHECKPOINT_MISMATCH`) and refuses to open `/run/sigrund.sock`.
-* If `last_seq >= collector_last_seq` and the local record at `collector_last_seq` matches `collector_last_record_sha256`, `sigrund` sets `S.remote_acked_seq = collector_last_seq` and replicates any unacknowledged suffix `collector_last_seq + 1 ..= last_seq` before opening `/run/sigrund.sock`, using the bounded chunking and verified per-chunk cursor advancement of Section 4.4 with `target_auth: null` on every chunk. Startup replay ingests historical authorizations without authorizing or consuming them; any chunk failure prevents startup.
+* If `last_seq < collector_last_seq` (indicating whole-host or audit-log storage rollback behind the collector's committed state) or if the local record at `collector_last_seq` does not match `collector_last_record_sha256`, `sigrund` **fails closed immediately** (`AUDIT_REMOTE_CHECKPOINT_MISMATCH`) and refuses to open `/run/sigrund/client.sock`.
+* If `last_seq >= collector_last_seq` and the local record at `collector_last_seq` matches `collector_last_record_sha256`, `sigrund` sets `S.remote_acked_seq = collector_last_seq` and replicates any unacknowledged suffix `collector_last_seq + 1 ..= last_seq` before opening `/run/sigrund/client.sock`, using the bounded chunking and verified per-chunk cursor advancement of Section 4.4 with `target_auth: null` on every chunk. Startup replay ingests historical authorizations without authorizing or consuming them; any chunk failure prevents startup.
 
 
 ---

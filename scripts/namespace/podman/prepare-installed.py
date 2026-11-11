@@ -15,8 +15,8 @@ def main():
     if os.geteuid() != 0:
         parser.error('host root required')
     subprocess.run(['python3', str(HERE.parent / 'selinux/prepare-installed.py'),
-                    '--requester', args.requester, '--state-dir', '/var/lib/sigrund-v3',
-                    '--log-path', '/var/log/sigrund-v3/audit.jsonl'], check=True)
+                    '--requester', args.requester, '--state-dir', '/var/lib/sigrund',
+                    '--log-path', '/var/log/sigrund/audit.jsonl'], check=True)
     config = Path('/etc/sigrund/config.toml')
     policy = Path('/var/lib/sigrund-namespace-lab/policy')
     subprocess.run(['make', '-C', str(policy), 'podman'], check=True)

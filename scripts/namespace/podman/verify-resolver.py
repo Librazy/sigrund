@@ -27,7 +27,7 @@ def load(name, path):
 
 def total():
     import sqlite3
-    with sqlite3.connect('file:/var/lib/sigrund-v3/state.sqlite?mode=ro', uri=True) as connection:
+    with sqlite3.connect('file:/var/lib/sigrund/state.sqlite?mode=ro', uri=True) as connection:
         return connection.execute('SELECT count(*) FROM consumed_grants').fetchone()[0]
 
 

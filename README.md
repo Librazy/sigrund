@@ -62,7 +62,7 @@ On a configured host, run the approver in a **root terminal**:
 
 ```sh
 sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
-  --identity /root/.ssh/id_ed25519 --epoch-file /var/lib/sigrund-v3/host-epoch.json
+  --identity /root/.ssh/id_ed25519 --epoch-file /var/lib/sigrund/host-epoch.json
 ```
 
 In the **requester's terminal**, request a command allowed by policy:
