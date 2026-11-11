@@ -23,7 +23,7 @@ curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
 sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none --no-modify-path
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release --locked -p sigrund \
-  --bin sigrun --bin sigrund --bin sigrundctl --bin sigrund-approve
+  --bin sigrun --bin sigrund --bin sigrundctl --bin sigrund-approve --bin sigrund-anchor
 
 # Two revisions of the same build exercise a real package-manager upgrade.
 python3 packaging/build.py --format "$kind" --release "$PACKAGE_REVISION.0" --output /out/previous
