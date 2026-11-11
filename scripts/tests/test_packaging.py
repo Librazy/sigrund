@@ -2,6 +2,7 @@
 from pathlib import Path
 import runpy
 import shlex
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -12,6 +13,28 @@ PACKAGING = runpy.run_path(str(REPO / 'packaging/build.py'))
 
 
 class PackageBuildTests(unittest.TestCase):
+    def test_native_packages_read_the_workspace_version(self):
+        main = PACKAGING['main']
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / 'Cargo.toml').write_text('[workspace.package]\nversion = "9.8.7"\n')
+
+            def build(work, output, version, release):
+                self.assertEqual(version, '9.8.7')
+                self.assertEqual(release, '1.test.1')
+                for name in ('sigrun', 'sigrund'):
+                    (output / f'{name}.{kind}').write_text(version)
+
+            for kind in ('deb', 'rpm'):
+                with self.subTest(format=kind), mock.patch.dict(main.__globals__, {
+                    'REPO': base, 'deb': build, 'rpm': build,
+                }), mock.patch.object(sys, 'argv', [
+                    'build.py', '--format', kind, '--release', '1.test.1',
+                    '--output', str(base / kind),
+                ]):
+                    main()
+                    self.assertEqual(len((base / kind / 'SHA256SUMS').read_text().splitlines()), 2)
+
     def test_clean_container_build_supplies_both_package_payloads(self):
         script = (REPO / 'packaging/build-container.sh').read_text().replace('\\\n', ' ')
         command = shlex.split(next(line for line in script.splitlines() if line.startswith('cargo build ')))

@@ -14,6 +14,10 @@ import tomllib
 REPO = Path(__file__).resolve().parent.parent
 
 
+def workspace_version():
+    return tomllib.loads((REPO / 'Cargo.toml').read_text())['workspace']['package']['version']
+
+
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
 
@@ -118,7 +122,7 @@ def main():
     parser.add_argument('--release', required=True, help='native package revision, e.g. 0.20261031.gitabc123.ubuntu24.04')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    version = tomllib.loads((REPO / 'crates/sigrund/Cargo.toml').read_text())['package']['version']
+    version = workspace_version()
     if not re.fullmatch(r'\d+\.\d+\.\d+', version) or not re.fullmatch(r'[0-9][a-zA-Z0-9.]*', args.release):
         parser.error('version must be X.Y.Z and release must contain only alphanumerics and dots, starting with a digit')
     output = args.output.resolve()
