@@ -9,6 +9,9 @@ GitHub Actions builds native **x86-64** packages in Fedora 44/45 and Ubuntu
 dependencies. Download the `packages-<distribution>-x86_64` artifact from a
 successful **Packages** workflow run. Each archive contains two packages,
 `SHA256SUMS`, and source/toolchain/image information in `build-info.txt`.
+Version tags also create a draft GitHub Release with all eight packages,
+per-distribution build information and a combined `SHA256SUMS` file. Releases
+become publicly downloadable after a maintainer reviews and publishes the draft.
 
 | Package | Installed components | Runtime dependencies |
 | --- | --- | --- |
@@ -45,11 +48,12 @@ apt install ./sigrun_*.deb
 apt install ./sigrund_*.deb
 ```
 
-These are unsigned CI snapshot artifacts, not a signed RPM/APT repository or
-GitHub Release. Checksums detect corruption; they do not independently establish
-authenticity. The upstream Cargo version is combined with a timestamp, commit,
-distribution and build revision so snapshots can be upgraded normally. Only
-install artifacts from a source revision and workflow run you trust.
+Packages are unsigned; there is no signed RPM/APT repository. Checksums detect
+corruption; they do not independently establish authenticity. Both native
+packages and Cargo crates derive their version from `workspace.package.version`
+in the root `Cargo.toml`. Snapshot revisions include a timestamp, commit and
+distribution; tagged builds use `1.<distribution>.1`, which sorts after snapshots
+of the same version. Only install packages from a release or workflow you trust.
 
 ## Configure the daemon
 

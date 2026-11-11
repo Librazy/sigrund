@@ -52,7 +52,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/packages"
           export SOURCE_COMMIT=$(git rev-parse HEAD)
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-          export PACKAGE_REVISION="0.$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S).git${SOURCE_COMMIT:0:12}.${DISTRIBUTION//-/}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            export PACKAGE_REVISION="1.${DISTRIBUTION//-/}"
+          else
+            export PACKAGE_REVISION="0.$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S).git${SOURCE_COMMIT:0:12}.${DISTRIBUTION//-/}"
+          fi
           docker run --rm --platform linux/amd64 \
             --env SOURCE_COMMIT --env SOURCE_DATE_EPOCH --env PACKAGE_REVISION \
             --env IMAGE_REFERENCE --env IMAGE --env IMAGE_ID \

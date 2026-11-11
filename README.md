@@ -43,6 +43,8 @@ The [Packages workflow](https://github.com/Librazy/sigrund/actions/workflows/pac
 builds separate client and daemon RPMs for Fedora 44/45 and DEBs for Ubuntu
 24.04/26.04 on x86-64. Packages require explicit configuration and provisioning;
 installation does not start the daemon. Follow the [package guide](packaging/README.md).
+Matching version tags create a draft GitHub Release containing all packages;
+see [release maintenance](MAINTENANCE.md#release-packages).
 
 Execution requires unified cgroup v2 with delegated memory/PID and swap controls,
 and the kernel namespace, mount, pidfd, `openat2`, sealed-memfd and `clone3`
