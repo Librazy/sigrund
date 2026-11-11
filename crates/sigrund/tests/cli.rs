@@ -371,3 +371,246 @@ fn client_args(values: &[&str]) -> Vec<String> {
     result.extend(args(values));
     result
 }
+
+fn binaries() -> [&'static str; 6] {
+    [
+        env!("CARGO_BIN_EXE_sigrun"),
+        env!("CARGO_BIN_EXE_sigrund"),
+        env!("CARGO_BIN_EXE_sigrund-approve"),
+        env!("CARGO_BIN_EXE_sigrundctl"),
+        env!("CARGO_BIN_EXE_sigrund-collector"),
+        env!("CARGO_BIN_EXE_sigrund-anchor"),
+    ]
+}
+
+#[test]
+fn all_binaries_offer_generated_help_version_and_usage_errors() {
+    for binary in binaries() {
+        for flag in ["-h", "--help", "-V", "--version"] {
+            let output = Command::new(binary).arg(flag).output().unwrap();
+            assert!(output.status.success(), "{binary} {flag}: {output:?}");
+            assert!(output.stderr.is_empty(), "{binary} {flag}: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            if matches!(flag, "-h" | "--help") {
+                assert!(stdout.contains("Usage:"), "{binary}: {stdout}");
+                assert!(stdout.contains("--version"), "{binary}: {stdout}");
+            } else {
+                assert!(
+                    stdout.contains(env!("CARGO_PKG_VERSION")),
+                    "{binary}: {stdout}"
+                );
+            }
+        }
+        let output = Command::new(binary).arg("--unknown").output().unwrap();
+        assert_eq!(output.status.code(), Some(64), "{binary}: {output:?}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("--unknown") && stderr.contains("--help"),
+            "{binary}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn administrative_commands_offer_help_at_every_level_without_effects() {
+    let ctl = env!("CARGO_BIN_EXE_sigrundctl");
+    for command in [
+        vec!["init-host"],
+        vec!["target"],
+        vec!["target", "register"],
+        vec!["target", "register-podman"],
+        vec!["target", "revoke"],
+        vec!["target", "export-binding"],
+        vec!["target", "export-binding", "host"],
+        vec!["csr-pae"],
+        vec!["pack-warrant"],
+        vec!["uuidv7"],
+        vec!["validate-uuid"],
+    ] {
+        for arguments in [
+            command
+                .iter()
+                .copied()
+                .chain(["--help"])
+                .collect::<Vec<_>>(),
+            ["help"]
+                .into_iter()
+                .chain(command.iter().copied())
+                .collect(),
+        ] {
+            let output = Command::new(ctl).args(&arguments).output().unwrap();
+            assert!(output.status.success(), "{arguments:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+        }
+    }
+}
+
+#[test]
+fn malformed_admin_commands_fail_before_creating_outputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state");
+    let log = directory.path().join("log/audit.jsonl");
+    let ctl = env!("CARGO_BIN_EXE_sigrundctl");
+    for arguments in [
+        vec![
+            "init-host",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--log-path",
+            log.to_str().unwrap(),
+            "--unknown",
+        ],
+        vec!["init-host", "--state-dir", state.to_str().unwrap()],
+        vec![
+            "init-host",
+            "--state-dir",
+            "relative",
+            "--log-path",
+            log.to_str().unwrap(),
+        ],
+        vec![
+            "init-host",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--log-path",
+            log.to_str().unwrap(),
+        ],
+        vec!["target", "register", "example", "--pid", "1"],
+        vec![
+            "target",
+            "register",
+            "example",
+            "--pid",
+            "0",
+            "--owner-uid",
+            "0",
+            "--security-profile",
+            "host-baseline",
+        ],
+        vec![
+            "target",
+            "register-podman",
+            "example",
+            "--pid",
+            "1",
+            "--owner-uid",
+            "0",
+            "--security-profile",
+            "host-baseline",
+        ],
+        vec!["target", "revoke", "example", "--pid", "1"],
+        vec![
+            "target",
+            "export-binding",
+            "host",
+            "--output",
+            log.to_str().unwrap(),
+        ],
+        vec!["csr-pae", "--csr", "/nonexistent"],
+        vec![
+            "pack-warrant",
+            "--csr",
+            "/nonexistent",
+            "--signature",
+            "/nonexistent",
+            "--output",
+            log.to_str().unwrap(),
+        ],
+        vec!["uuidv7", "ignored"],
+        vec!["--validate-uuid"],
+        vec!["uuidv7", "--validate-uuid", "ignored"],
+    ] {
+        let output = Command::new(ctl).args(&arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(64), "{arguments:?}: {output:?}");
+    }
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn uuid_generation_round_trips_through_subcommand_and_legacy_option() {
+    let ctl = env!("CARGO_BIN_EXE_sigrundctl");
+    let output = Command::new(ctl).arg("uuidv7").output().unwrap();
+    assert!(output.status.success());
+    let uuid = String::from_utf8(output.stdout).unwrap();
+    for command in ["validate-uuid", "--validate-uuid"] {
+        assert!(
+            Command::new(ctl)
+                .args([command, uuid.trim()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            Command::new(ctl)
+                .args([command, "invalid"])
+                .output()
+                .unwrap()
+                .status
+                .code(),
+            Some(65)
+        );
+    }
+}
+
+#[test]
+fn clap_equals_syntax_preserves_command_arguments_after_separator() {
+    let command = [
+        "/usr/bin/printf",
+        "--help",
+        "--version",
+        "--target=other",
+        "--",
+        "",
+        "two words",
+        "-1",
+    ];
+    let input = [
+        "--target=host",
+        "--security-profile=host-baseline",
+        "--target-uid=0",
+        "--target-gid=0",
+        "--env=LANG=C",
+        "--",
+    ]
+    .into_iter()
+    .chain(command)
+    .map(String::from)
+    .collect::<Vec<_>>();
+    let ClientArgs::Run {
+        command: actual,
+        options,
+        ..
+    } = ClientArgs::parse(&input).unwrap()
+    else {
+        panic!("expected run")
+    };
+    assert_eq!(actual, command);
+    assert_eq!(options.env_exact["LANG"], "C");
+    let mut duplicate = input.clone();
+    duplicate.insert(0, "--target=host".into());
+    assert!(ClientArgs::parse(&duplicate).is_err());
+    let mut missing_separator = input;
+    missing_separator.remove(5);
+    assert!(ClientArgs::parse(&missing_separator).is_err());
+}
+
+#[test]
+fn protocol_and_privileged_paths_reject_non_utf8_without_panicking() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    for binary in [binaries()[0], binaries()[1], binaries()[2], binaries()[5]] {
+        let output = Command::new(binary)
+            .args([
+                OsString::from("--socket"),
+                OsString::from_vec(vec![b'/', 255]),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(64), "{binary}: {output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+    }
+}

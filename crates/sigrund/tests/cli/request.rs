@@ -112,6 +112,7 @@ fn invalid_client_values_fail_before_connecting() {
         let mut input = args(&["--socket", "/nonexistent/socket"]);
         input.extend(flags);
         input.extend(args(&["--", "/usr/bin/id"]));
+        let input = client_args(&input.iter().map(String::as_str).collect::<Vec<_>>());
         assert!(ClientArgs::parse(&input).is_err(), "{input:?}");
         assert_eq!(
             Command::new(env!("CARGO_BIN_EXE_sigrun"))

@@ -1,4 +1,5 @@
-//! Frozen command forms for the thin MVP. Parsing has no privileged effects.
+//! Command-line definitions and effect-free request validation.
+use clap::{Args, CommandFactory, Parser, error::ErrorKind};
 use sigrund_core::protocol::{
     ClientHello, RequestedCommand, RequestedExecutionContext, RequestedPolicy,
 };
@@ -6,20 +7,25 @@ use sigrund_core::{CoreError, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
+    process::ExitCode,
 };
 
 pub const CLIENT_SOCKET: &str = "/run/sigrund/client.sock";
 pub const APPROVAL_SOCKET: &str = "/run/sigrund/approve.sock";
-pub const DAEMON_HELP: &str = "Usage: sigrund --foreground [--socket PATH] [--approval-socket PATH] [--config PATH] [--signers PATH] [--state-dir PATH] [--log-path PATH]\n       sigrund --check-config [--config PATH] [--signers PATH]\n       sigrund --check-cgroup PATH [--config PATH] [--signers PATH]\nExecution startup requires a dedicated delegated cgroup service.\n       --authorization-only provides the non-executing authorization diagnostic profile.";
-pub const CLIENT_HELP: &str = "Usage: sigrun --target host|self|registered:ID|process:DAEMON_PID --security-profile ID (--account NAME | --target-uid UID --target-gid GID) [OPTIONS] -- /ABSOLUTE/COMMAND ARG...\n       sigrun --warrant /ABSOLUTE/ENVELOPE.json [--socket PATH] [--status-fd N] [--auth-fail-exit-code CODE]\nOptions: --binding-bundle PATH --full-only --export-csr PATH\n         --socket PATH --supplementary-gid GID --capability CAP\n         --cwd PATH --env NAME=VALUE --umask OCTAL --stdin null|sha256\n         --ttl-secs SECONDS --status-fd N --auth-fail-exit-code CODE\nDefaults: cwd=current, LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin,\n          umask=077, stdin=null, ttl=900, denial exit=255.\n       sigrun --validate-hello PATH\n       sigrun --encode-signal NUMBER\nAPPROVED confirms durable authorization; separate readiness reports unknown or exec_event_observed, followed by an execution result.";
-pub const APPROVAL_HELP: &str = "Usage: sigrund-approve [--socket PATH] [--tty PATH] [--signers PATH] [--epoch-file PATH] --identity PATH\nDefaults: /run/sigrund/approve.sock, /dev/tty, /etc/sigrund/signers.toml and /var/lib/sigrund/host-epoch.json.\nOnly UID 0 with a controlling TTY may approve and sign. Private evidence must match the live daemon epoch and exact CSR.";
+
+/// Print generated help/version to stdout, or a usage error to stderr.
+/// Preserve EX_USAGE (64) for invalid command lines.
+pub fn parse_exit(error: clap::Error) -> ExitCode {
+    let code = if error.use_stderr() { 64 } else { 0 };
+    let _ = error.print();
+    ExitCode::from(code)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonMode {
     Foreground,
     CheckConfig,
     CheckCgroup(PathBuf),
-    Help,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,61 +40,87 @@ pub struct DaemonArgs {
     pub log_path: PathBuf,
 }
 
+#[derive(Parser)]
+#[command(
+    name = "sigrund",
+    version,
+    about = "Authorize and supervise signed commands",
+    after_help = "Execution startup requires a dedicated delegated cgroup service."
+)]
+#[command(group(clap::ArgGroup::new("mode").args(["foreground", "check_config", "check_cgroup"])))]
+struct DaemonCli {
+    /// Run the daemon in the foreground (default)
+    #[arg(long)]
+    foreground: bool,
+    /// Validate configuration without starting the daemon
+    #[arg(long)]
+    check_config: bool,
+    /// Check the delegated cgroup at PATH
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    check_cgroup: Option<PathBuf>,
+    /// Use the non-executing authorization diagnostic profile
+    #[arg(long, conflicts_with_all = ["check_config", "check_cgroup"])]
+    authorization_only: bool,
+    /// Client Unix socket
+    #[arg(long, default_value = CLIENT_SOCKET, value_name = "PATH", value_parser = absolute_path)]
+    socket: PathBuf,
+    /// Approval Unix socket
+    #[arg(long, default_value = APPROVAL_SOCKET, value_name = "PATH", value_parser = absolute_path)]
+    approval_socket: PathBuf,
+    /// Configuration file (otherwise SIGRUND_CONFIG or /etc/sigrund/config.toml)
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    config: Option<PathBuf>,
+    /// Signer policy (otherwise SIGRUND_SIGNERS or /etc/sigrund/signers.toml)
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    signers: Option<PathBuf>,
+    /// Persistent daemon state directory
+    #[arg(long, default_value = "/var/lib/sigrund", value_name = "PATH", value_parser = absolute_path)]
+    state_dir: PathBuf,
+    /// Local audit log
+    #[arg(long, default_value = "/var/log/sigrund/audit.jsonl", value_name = "PATH", value_parser = absolute_path)]
+    log_path: PathBuf,
+}
+
 impl DaemonArgs {
-    pub fn parse(args: &[String]) -> Result<Self> {
-        let mut result = Self {
-            mode: DaemonMode::Foreground,
-            authorization_only: false,
-            socket: CLIENT_SOCKET.into(),
-            approval_socket: APPROVAL_SOCKET.into(),
-            config: None,
-            signers: None,
-            state_dir: "/var/lib/sigrund".into(),
-            log_path: "/var/log/sigrund/audit.jsonl".into(),
-        };
-        let mut mode_set = false;
-        let mut seen = BTreeSet::new();
-        let mut args = args.iter();
-        while let Some(arg) = args.next() {
-            if !seen.insert(arg) {
-                return Err(invalid("duplicate option"));
-            }
-            match arg.as_str() {
-                "--authorization-only" => result.authorization_only = true,
-                "--socket" => result.socket = path_value(&mut args)?,
-                "--approval-socket" => result.approval_socket = path_value(&mut args)?,
-                "--config" => result.config = Some(path_value(&mut args)?),
-                "--signers" => result.signers = Some(path_value(&mut args)?),
-                "--state-dir" => result.state_dir = path_value(&mut args)?,
-                "--log-path" => result.log_path = path_value(&mut args)?,
-                "--foreground" | "--check-config" | "--check-cgroup" | "--help" => {
-                    if mode_set {
-                        return Err(invalid("conflicting daemon modes"));
-                    }
-                    mode_set = true;
-                    result.mode = match arg.as_str() {
-                        "--foreground" => DaemonMode::Foreground,
-                        "--check-config" => DaemonMode::CheckConfig,
-                        "--check-cgroup" => DaemonMode::CheckCgroup(path_value(&mut args)?),
-                        _ => DaemonMode::Help,
-                    };
-                }
-                _ => return Err(invalid("unknown daemon option")),
-            }
+    pub fn parse(args: &[String]) -> clap::error::Result<Self> {
+        let cli = DaemonCli::try_parse_from(
+            std::iter::once("sigrund").chain(args.iter().map(String::as_str)),
+        )?;
+        Self::from_cli(cli)
+    }
+
+    pub fn parse_env() -> clap::error::Result<Self> {
+        Self::from_cli(DaemonCli::try_parse()?)
+    }
+
+    fn from_cli(cli: DaemonCli) -> clap::error::Result<Self> {
+        if cli.socket == cli.approval_socket {
+            return Err(DaemonCli::command().error(
+                ErrorKind::ValueValidation,
+                "client and approval sockets must differ",
+            ));
         }
-        if result.authorization_only && result.mode != DaemonMode::Foreground {
-            return Err(invalid("--authorization-only requires foreground mode"));
-        }
-        if result.socket == result.approval_socket {
-            return Err(invalid("client and approval sockets must differ"));
-        }
-        Ok(result)
+        Ok(Self {
+            mode: if cli.check_config {
+                DaemonMode::CheckConfig
+            } else if let Some(path) = cli.check_cgroup {
+                DaemonMode::CheckCgroup(path)
+            } else {
+                DaemonMode::Foreground
+            },
+            authorization_only: cli.authorization_only,
+            socket: cli.socket,
+            approval_socket: cli.approval_socket,
+            config: cli.config,
+            signers: cli.signers,
+            state_dir: cli.state_dir,
+            log_path: cli.log_path,
+        })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientArgs {
-    Help,
     ValidateHello(PathBuf),
     EncodeSignal(u8),
     Run {
@@ -98,167 +130,154 @@ pub enum ClientArgs {
     },
 }
 
+#[derive(Parser)]
+#[command(
+    name = "sigrun",
+    version,
+    about = "Request a signed command with explicit credentials and security policy",
+    after_help = "Arguments after -- are passed exactly, without shell evaluation or PATH lookup.\nAPPROVED confirms durable authorization; readiness and execution results follow separately."
+)]
+struct ClientCli {
+    /// Validate a CLIENT_HELLO JSON file without connecting
+    #[arg(long, value_name = "PATH", exclusive = true)]
+    validate_hello: Option<PathBuf>,
+    /// Encode an allowed protocol signal (1, 2, 10, 12, 15)
+    #[arg(long, value_name = "NUMBER", value_parser = signal, exclusive = true)]
+    encode_signal: Option<u8>,
+    /// Submit an existing signed envelope without command construction
+    #[arg(long, value_name = "PATH", value_parser = absolute_path, conflicts_with = "request")]
+    warrant: Option<PathBuf>,
+    /// Client Unix socket
+    #[arg(long, default_value = CLIENT_SOCKET, value_name = "PATH", value_parser = absolute_path)]
+    socket: PathBuf,
+    /// Write machine-readable status to this FD (separate from stdout/stderr)
+    #[arg(long, value_name = "N", value_parser = status_fd)]
+    status_fd: Option<i32>,
+    /// Exit code for authorization denial
+    #[arg(long, default_value = "255", value_name = "CODE", value_parser = exit_code)]
+    auth_fail_exit_code: u8,
+    #[command(flatten)]
+    request: RequestCli,
+}
+
+#[derive(Args)]
+#[group(id = "request", multiple = true)]
+struct RequestCli {
+    /// Execution target: host, self, registered:ID or process:DAEMON_PID
+    #[arg(long, value_name = "SELECTOR", value_parser = target, required_unless_present_any = ["warrant", "validate_hello", "encode_signal"])]
+    target: Option<String>,
+    /// Configured security profile
+    #[arg(long, value_name = "ID", required_unless_present_any = ["warrant", "validate_hello", "encode_signal"])]
+    security_profile: Option<String>,
+    /// Destination account name, as an alternative to numeric UID/GID
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["target_uid", "target_gid", "supplementary_gid"], required_unless_present_any = ["target_uid", "warrant", "validate_hello", "encode_signal"])]
+    account: Option<String>,
+    /// Destination user ID
+    #[arg(long, value_name = "UID", value_parser = identity, requires = "target_gid")]
+    target_uid: Option<u32>,
+    /// Destination primary group ID
+    #[arg(long, value_name = "GID", value_parser = identity, requires = "target_uid")]
+    target_gid: Option<u32>,
+    /// Destination supplementary group ID (repeatable)
+    #[arg(long, value_name = "GID", value_parser = identity)]
+    supplementary_gid: Vec<u32>,
+    /// Requested capability (repeatable)
+    #[arg(long, value_name = "CAP")]
+    capability: Vec<String>,
+    /// Host binding bundle for full preparation
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    binding_bundle: Option<PathBuf>,
+    /// Require host full preparation
+    #[arg(long)]
+    full_only: bool,
+    /// Export a host CSR; implies --full-only
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    export_csr: Option<PathBuf>,
+    /// Destination working directory (default: current directory)
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    cwd: Option<PathBuf>,
+    /// Exact environment entry (repeatable; defaults: LANG=C.UTF-8, PATH=/usr/sbin:/usr/bin)
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = environment)]
+    env: Vec<(String, String)>,
+    /// Destination file creation mask in octal
+    #[arg(long, default_value = "077", value_name = "OCTAL", value_parser = umask)]
+    umask: u32,
+    /// Null input or digest-bound finite input
+    #[arg(long, default_value = "null", value_parser = ["null", "sha256"])]
+    stdin: String,
+    /// Requested authorization lifetime in seconds
+    #[arg(long, default_value = "900", value_name = "SECONDS", value_parser = ttl)]
+    ttl_secs: u64,
+    /// Absolute executable path followed by its arguments
+    #[arg(last = true, num_args = 1.., value_name = "COMMAND", required_unless_present_any = ["warrant", "validate_hello", "encode_signal"])]
+    command: Vec<String>,
+}
+
 impl ClientArgs {
-    pub fn parse(args: &[String]) -> Result<Self> {
-        match args {
-            [flag] if flag == "--help" => return Ok(Self::Help),
-            [flag, path] if flag == "--validate-hello" && !path.is_empty() => {
-                return Ok(Self::ValidateHello(path.into()));
-            }
-            [flag, signal] if flag == "--encode-signal" => {
-                let signal: u8 = signal
-                    .parse()
-                    .map_err(|_| invalid("signal must be an integer"))?;
-                if ![1, 2, 10, 12, 15].contains(&signal) {
-                    return Err(invalid("signal is outside the protocol allowlist"));
-                }
-                return Ok(Self::EncodeSignal(signal));
-            }
-            _ => (),
+    pub fn parse(args: &[String]) -> clap::error::Result<Self> {
+        let cli = ClientCli::try_parse_from(
+            std::iter::once("sigrun").chain(args.iter().map(String::as_str)),
+        )?;
+        Self::from_cli(cli)
+            .map_err(|error| ClientCli::command().error(ErrorKind::ValueValidation, error))
+    }
+
+    pub fn parse_env() -> clap::error::Result<Self> {
+        Self::from_cli(ClientCli::try_parse()?)
+            .map_err(|error| ClientCli::command().error(ErrorKind::ValueValidation, error))
+    }
+
+    fn from_cli(cli: ClientCli) -> Result<Self> {
+        if let Some(path) = cli.validate_hello {
+            return Ok(Self::ValidateHello(path));
         }
-        let mut socket = PathBuf::from(CLIENT_SOCKET);
-        let mut options = RequestOptions::default();
-        let mut seen = BTreeSet::new();
+        if let Some(signal) = cli.encode_signal {
+            return Ok(Self::EncodeSignal(signal));
+        }
+        let request = cli.request;
+        let mut options = RequestOptions {
+            target: request.target,
+            security_profile: request.security_profile,
+            account: request.account,
+            binding_bundle: request.binding_bundle,
+            warrant: cli.warrant,
+            full_only: request.full_only || request.export_csr.is_some(),
+            export_csr: request.export_csr,
+            target_uid: request.target_uid.unwrap_or(0),
+            target_gid: request.target_gid.unwrap_or(0),
+            supplementary_gids: request.supplementary_gid,
+            capabilities: request.capability,
+            cwd: request.cwd,
+            umask: request.umask,
+            stdin_policy: request.stdin,
+            ttl_secs: request.ttl_secs,
+            status_fd: cli.status_fd,
+            auth_fail_exit_code: cli.auth_fail_exit_code,
+            ..RequestOptions::default()
+        };
         let mut env_seen = BTreeSet::new();
-        let mut arguments = args.iter();
-        let mut command = Vec::new();
-        while let Some(flag) = arguments.next() {
-            if flag == "--" {
-                command = arguments.cloned().collect();
-                break;
+        for (name, value) in request.env {
+            if !env_seen.insert(name.clone()) {
+                return Err(invalid("duplicate explicit environment name"));
             }
-            if !matches!(
-                flag.as_str(),
-                "--env" | "--supplementary-gid" | "--capability"
-            ) && !seen.insert(flag)
-            {
-                return Err(invalid("duplicate client option"));
-            }
-            if flag == "--full-only" {
-                options.full_only = true;
-                continue;
-            }
-            let value = arguments
-                .next()
-                .ok_or_else(|| invalid("missing option value"))?;
-            match flag.as_str() {
-                "--target" => {
-                    parse_target(value)?;
-                    options.target = Some(value.clone());
-                }
-                "--security-profile" => options.security_profile = Some(value.clone()),
-                "--account" => options.account = Some(value.clone()),
-                "--binding-bundle" => options.binding_bundle = Some(absolute_path(value)?),
-                "--socket" => socket = absolute_path(value)?,
-                "--warrant" => options.warrant = Some(absolute_path(value)?),
-                "--export-csr" => {
-                    options.export_csr = Some(absolute_path(value)?);
-                    options.full_only = true;
-                }
-                "--target-uid" => options.target_uid = identity(value)?,
-                "--target-gid" => options.target_gid = identity(value)?,
-                "--supplementary-gid" => options.supplementary_gids.push(identity(value)?),
-                "--capability" => options.capabilities.push(value.clone()),
-                "--cwd" => options.cwd = Some(absolute_path(value)?),
-                "--env" => {
-                    let (name, value) = value
-                        .split_once('=')
-                        .ok_or_else(|| invalid("environment entry must be NAME=VALUE"))?;
-                    if !env_seen.insert(name.to_owned()) {
-                        return Err(invalid("duplicate explicit environment name"));
-                    }
-                    options.env_exact.insert(name.to_owned(), value.to_owned());
-                }
-                "--umask" => {
-                    if value.is_empty() || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
-                        return Err(invalid("umask must be octal"));
-                    }
-                    options.umask =
-                        u32::from_str_radix(value, 8).map_err(|_| invalid("invalid umask"))?;
-                }
-                "--stdin" if matches!(value.as_str(), "null" | "sha256") => {
-                    options.stdin_policy = value.clone()
-                }
-                "--ttl-secs" => {
-                    options.ttl_secs = decimal(value)?;
-                    if options.ttl_secs == 0 {
-                        return Err(invalid("TTL must be positive"));
-                    }
-                }
-                "--status-fd" => {
-                    let fd = i32::try_from(decimal(value)?)
-                        .map_err(|_| invalid("status FD outside bounds"))?;
-                    if matches!(fd, 1 | 2) {
-                        return Err(invalid("status FD must be separate from stdout/stderr"));
-                    }
-                    options.status_fd = Some(fd);
-                }
-                "--auth-fail-exit-code" => {
-                    options.auth_fail_exit_code = u8::try_from(decimal(value)?)
-                        .map_err(|_| invalid("exit code outside 0..255"))?
-                }
-                _ => return Err(invalid("unknown or unsupported client option")),
-            }
+            options.env_exact.insert(name, value);
         }
         if options.warrant.is_some() {
-            if !command.is_empty()
-                || seen.iter().any(|flag| {
-                    !matches!(
-                        flag.as_str(),
-                        "--socket" | "--warrant" | "--status-fd" | "--auth-fail-exit-code"
-                    )
-                })
-                || !env_seen.is_empty()
-                || !options.supplementary_gids.is_empty()
-                || !options.capabilities.is_empty()
-            {
-                return Err(invalid(
-                    "--warrant is mutually exclusive with command construction options",
-                ));
-            }
             return Ok(Self::Run {
-                socket,
-                command,
+                socket: cli.socket,
+                command: request.command,
                 options: Box::new(options),
             });
         }
-        if command.is_empty() {
-            return Err(invalid("missing -- and absolute command"));
-        }
-        if options.target.is_none() || options.security_profile.is_none() {
-            return Err(invalid("--target and --security-profile are required"));
-        }
         let selected_target = parse_target(options.target.as_deref().unwrap())?;
         if !matches!(selected_target, sigrund_core::host::Selector::Host {})
-            && (options.full_only
-                || options.export_csr.is_some()
-                || options.binding_bundle.is_some())
+            && (options.full_only || options.binding_bundle.is_some())
         {
             return Err(invalid(
                 "cross-domain full preparation, binding bundles and CSR export are unavailable",
             ));
         }
-        if options.account.is_some() {
-            if !options.supplementary_gids.is_empty()
-                || seen.iter().any(|f| {
-                    matches!(
-                        f.as_str(),
-                        "--target-uid" | "--target-gid" | "--supplementary-gid"
-                    )
-                })
-            {
-                return Err(invalid(
-                    "named and numeric account options are mutually exclusive",
-                ));
-            }
-        } else if !seen.iter().any(|f| f.as_str() == "--target-uid")
-            || !seen.iter().any(|f| f.as_str() == "--target-gid")
-        {
-            return Err(invalid(
-                "select --account or both --target-uid and --target-gid",
-            ));
-        }
-        absolute_path(&command[0])?;
+        absolute_path(&request.command[0])?;
         options.capabilities.sort();
         if options.capabilities.windows(2).any(|p| p[0] == p[1]) {
             return Err(invalid("duplicate capability"));
@@ -267,12 +286,11 @@ impl ClientArgs {
         if options.supplementary_gids.windows(2).any(|p| p[0] == p[1]) {
             return Err(invalid("duplicate supplementary GID"));
         }
-        // Validate all schema bounds before connecting, without depending on
-        // cwd capture (which belongs to request construction).
-        options.hello(&command, std::path::Path::new("/"))?;
+        // Validate schema bounds before connecting; cwd capture belongs to request construction.
+        options.hello(&request.command, std::path::Path::new("/"))?;
         Ok(Self::Run {
-            socket,
-            command,
+            socket: cli.socket,
+            command: request.command,
             options: Box::new(options),
         })
     }
@@ -437,56 +455,86 @@ fn identity(value: &str) -> Result<u32> {
         .ok_or_else(|| invalid("UID/GID outside bounds"))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Parser)]
+#[command(
+    name = "sigrund-approve",
+    version,
+    about = "Review and sign requests on root's controlling terminal",
+    after_help = "Only UID 0 with a controlling TTY may approve and sign. Private evidence must match the live daemon epoch and exact CSR."
+)]
 pub struct ApprovalArgs {
+    /// Approval Unix socket
+    #[arg(long, default_value = APPROVAL_SOCKET, value_name = "PATH", value_parser = absolute_path)]
     pub socket: PathBuf,
+    /// Operator's controlling terminal
+    #[arg(long, default_value = "/dev/tty", value_name = "PATH", value_parser = absolute_path)]
     pub tty: PathBuf,
+    /// Signer policy file
+    #[arg(long, default_value = "/etc/sigrund/signers.toml", value_name = "PATH", value_parser = absolute_path)]
     pub signers: PathBuf,
+    /// Trusted live daemon epoch
+    #[arg(long, default_value = crate::host_registry::DEFAULT_EPOCH_FILE, value_name = "PATH", value_parser = absolute_path)]
     pub epoch_file: PathBuf,
+    /// SSH signing identity
+    #[arg(long, required = true, value_name = "PATH", value_parser = absolute_path)]
     pub identity: Option<PathBuf>,
 }
 
 impl ApprovalArgs {
-    pub fn parse(args: &[String]) -> Result<Self> {
-        let mut result = Self {
-            socket: APPROVAL_SOCKET.into(),
-            tty: "/dev/tty".into(),
-            signers: "/etc/sigrund/signers.toml".into(),
-            epoch_file: crate::host_registry::DEFAULT_EPOCH_FILE.into(),
-            identity: None,
-        };
-        let mut seen = BTreeSet::new();
-        let mut args = args.iter();
-        while let Some(arg) = args.next() {
-            if !seen.insert(arg) {
-                return Err(invalid("duplicate option"));
-            }
-            match arg.as_str() {
-                "--socket" => result.socket = path_value(&mut args)?,
-                "--tty" => result.tty = path_value(&mut args)?,
-                "--signers" => result.signers = path_value(&mut args)?,
-                "--epoch-file" => result.epoch_file = path_value(&mut args)?,
-                "--identity" => result.identity = Some(path_value(&mut args)?),
-                _ => return Err(invalid("unknown approval option")),
-            }
-        }
-        if result.identity.is_none() {
-            return Err(invalid("--identity is required"));
-        }
-        Ok(result)
+    pub fn parse(args: &[String]) -> clap::error::Result<Self> {
+        Self::try_parse_from(
+            std::iter::once("sigrund-approve").chain(args.iter().map(String::as_str)),
+        )
     }
 }
 
-fn path_value<'a>(args: &mut impl Iterator<Item = &'a String>) -> Result<PathBuf> {
-    absolute_path(
-        args.next()
-            .ok_or_else(|| invalid("missing path after option"))?,
-    )
-}
-fn absolute_path(value: &str) -> Result<PathBuf> {
+pub fn absolute_path(value: &str) -> Result<PathBuf> {
     crate::linux::validate_absolute_path(std::path::Path::new(value))
         .map_err(|_| invalid("path must be canonical absolute text and NUL-free"))?;
     Ok(value.into())
+}
+fn target(value: &str) -> Result<String> {
+    parse_target(value)?;
+    Ok(value.into())
+}
+fn environment(value: &str) -> Result<(String, String)> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| invalid("environment entry must be NAME=VALUE"))?;
+    Ok((name.into(), value.into()))
+}
+fn umask(value: &str) -> Result<u32> {
+    if value.is_empty() || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(invalid("umask must be octal"));
+    }
+    u32::from_str_radix(value, 8).map_err(|_| invalid("invalid umask"))
+}
+fn ttl(value: &str) -> Result<u64> {
+    decimal(value).and_then(|v| {
+        if v > 0 {
+            Ok(v)
+        } else {
+            Err(invalid("TTL must be positive"))
+        }
+    })
+}
+fn status_fd(value: &str) -> Result<i32> {
+    i32::try_from(decimal(value)?)
+        .ok()
+        .filter(|v| !matches!(v, 1 | 2))
+        .ok_or_else(|| invalid("status FD must be nonnegative and separate from stdout/stderr"))
+}
+fn exit_code(value: &str) -> Result<u8> {
+    u8::try_from(decimal(value)?).map_err(|_| invalid("exit code outside 0..255"))
+}
+fn signal(value: &str) -> Result<u8> {
+    exit_code(value).and_then(|v| {
+        if [1, 2, 10, 12, 15].contains(&v) {
+            Ok(v)
+        } else {
+            Err(invalid("signal is outside the protocol allowlist"))
+        }
+    })
 }
 fn invalid(message: &str) -> CoreError {
     CoreError::Value(message.into())

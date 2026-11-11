@@ -1,12 +1,12 @@
 use std::{env, fs, process::ExitCode};
 
-use sigrund::cli::{DAEMON_HELP, DaemonArgs, DaemonMode};
+use sigrund::cli::{DaemonArgs, DaemonMode, parse_exit};
 use sigrund::startup::CgroupLayout;
 use sigrund::{daemon::ForegroundDaemon, startup::read_root_file};
 use sigrund_core::config::{DaemonConfig, SignerPolicyFile};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<_> = env::args_os().skip(1).collect();
     if args == ["--internal-namespace-launcher"] {
         return if sigrund::execution::namespace_launcher_main().is_ok() {
             ExitCode::SUCCESS
@@ -37,17 +37,10 @@ fn main() -> ExitCode {
             ExitCode::from(77)
         };
     }
-    let args = match DaemonArgs::parse(&args) {
+    let args = match DaemonArgs::parse_env() {
         Ok(args) => args,
-        Err(error) => {
-            eprintln!("sigrund: {error}\n{DAEMON_HELP}");
-            return ExitCode::from(64);
-        }
+        Err(error) => return parse_exit(error),
     };
-    if args.mode == DaemonMode::Help {
-        println!("{DAEMON_HELP}");
-        return ExitCode::SUCCESS;
-    }
     let config_path = args
         .config
         .or_else(|| env::var_os("SIGRUND_CONFIG").map(Into::into))

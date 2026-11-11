@@ -35,7 +35,12 @@ Build on Linux with rustup, a C compiler and standard build tools:
 cargo build --workspace --locked
 ```
 
-Binaries are in `target/debug/`. The MSRV is Rust **1.89**;
+Binaries are in `target/debug/`. Every binary supports `-h`/`--help` and
+`-V`/`--version`. Use `sigrundctl help` to discover administrative commands,
+or `sigrundctl target register --help` for command-specific options.
+Invalid command lines exit with status 64.
+
+The MSRV is Rust **1.89**;
 `rust-toolchain.toml` pins the development compiler and tools. See
 [maintenance](MAINTENANCE.md) for toolchain setup.
 

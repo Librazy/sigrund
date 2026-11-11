@@ -1,5 +1,5 @@
-use sigrund::cli::{CLIENT_HELP, ClientArgs};
-use std::{env, fs, process::ExitCode};
+use sigrund::cli::{ClientArgs, parse_exit};
+use std::{fs, process::ExitCode};
 
 use sigrund_core::{
     framing::{FrameType, encode_frame},
@@ -7,28 +7,10 @@ use sigrund_core::{
 };
 
 fn main() -> ExitCode {
-    let args: Vec<String> = match env::args_os()
-        .skip(1)
-        .map(|arg| arg.into_string())
-        .collect::<Result<_, _>>()
-    {
-        Ok(args) => args,
-        Err(_) => {
-            eprintln!("sigrun: arguments must be valid UTF-8");
-            return ExitCode::from(64);
-        }
-    };
-    let command = match ClientArgs::parse(&args) {
+    let command = match ClientArgs::parse_env() {
         Ok(command) => command,
-        Err(error) => {
-            eprintln!("sigrun: {error}\n{CLIENT_HELP}");
-            return ExitCode::from(64);
-        }
+        Err(error) => return parse_exit(error),
     };
-    if command == ClientArgs::Help {
-        println!("{CLIENT_HELP}");
-        return ExitCode::SUCCESS;
-    }
     if let ClientArgs::ValidateHello(path) = &command {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,

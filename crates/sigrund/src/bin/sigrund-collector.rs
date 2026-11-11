@@ -1,14 +1,27 @@
-use std::{env, fs, process::ExitCode};
+use clap::Parser;
+use std::{fs, path::PathBuf, process::ExitCode};
 
 use sigrund_core::protocol::{RemoteAuditBatchRequest, parse_strict};
 
+#[derive(Parser)]
+#[command(
+    name = "sigrund-collector",
+    version,
+    about = "Validate audit batches diagnostically",
+    after_help = "The network collector service is not enabled in this build."
+)]
+struct Cli {
+    /// Validate a remote audit batch JSON file
+    #[arg(long, value_name = "PATH")]
+    validate_batch: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if let Some(index) = args.iter().position(|arg| arg == "--validate-batch") {
-        let Some(path) = args.get(index + 1) else {
-            eprintln!("sigrund-collector: --validate-batch requires a JSON path");
-            return ExitCode::from(64);
-        };
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return sigrund::cli::parse_exit(error),
+    };
+    if let Some(path) = cli.validate_batch {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) => {
