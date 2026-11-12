@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::{
@@ -11,190 +10,260 @@ use std::{
     process::ExitCode,
 };
 
+use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use sigrund::cli::{absolute_path, parse_exit};
 use sigrund_core::{
     audit::{entry_hmac, next_ratchet_key},
     crypto::{new_uuidv7, sha256_hex, validate_uuidv7},
 };
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if args.get(1).is_some_and(|arg| arg == "--help") {
-        println!(
-            "Usage: sigrundctl init-host --state-dir PATH --log-path PATH\n       sigrundctl target register ID --pid DAEMON_PID --owner-uid HOST_UID --security-profile ID [--socket PATH]\n       sigrundctl target register-podman ID --pid DAEMON_PID --owner-uid HOST_UID --security-profile ID --podman-endpoint PATH --podman-owner-uid 0 --podman-namespace default --podman-container NAME [--socket PATH]\n       sigrundctl target revoke ID [--socket PATH]\n       sigrundctl target export-binding host --security-profile ID [--epoch-file PATH] --output PATH\n       sigrundctl csr-pae --csr PATH --pae PATH\n       sigrundctl pack-warrant --csr PATH --signature PATH --signer-id ID --output PATH\n       sigrundctl uuidv7 | --validate-uuid UUID\nOffline helpers preserve the exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. Packaging verifies signature binding; the daemon enforces trust and policy."
-        );
-        return ExitCode::SUCCESS;
-    }
-    if args
-        .get(1)
-        .is_some_and(|arg| matches!(arg.as_str(), "csr-pae" | "pack-warrant"))
-    {
-        return match offline_warrant(&args[1..]) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("sigrundctl: {error}");
-                ExitCode::from(65)
-            }
-        };
-    }
-    if args.get(1).is_some_and(|arg| arg == "target") {
-        return match target_command(&args[1..]) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("sigrundctl: {error}");
-                ExitCode::from(65)
-            }
-        };
-    }
-    if args.get(1).is_some_and(|arg| arg == "uuidv7") {
-        println!("{}", new_uuidv7());
-        return ExitCode::SUCCESS;
-    }
-    if args.get(1).is_some_and(|arg| arg == "init-host") {
-        return init_host(&args);
-    }
-    if let Some(index) = args.iter().position(|arg| arg == "--validate-uuid") {
-        let Some(value) = args.get(index + 1) else {
-            eprintln!("sigrundctl: --validate-uuid requires a UUID");
-            return ExitCode::from(64);
-        };
-        return match validate_uuidv7(value) {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("sigrundctl: invalid UUID: {error}");
-                ExitCode::from(65)
-            }
-        };
-    }
-    eprintln!("sigrundctl: provisioning commands are not enabled in this build");
-    ExitCode::from(78)
+#[derive(Parser)]
+#[command(
+    name = "sigrundctl",
+    version,
+    about = "Provision hosts, manage targets and package offline warrants",
+    arg_required_else_help = true,
+    args_conflicts_with_subcommands = true,
+    after_help = "Offline helpers preserve exact canonical CSR bytes. Outputs are new private files; existing files are never overwritten. The daemon enforces trust and policy."
+)]
+struct Cli {
+    /// Validate a UUIDv7 (also available as the validate-uuid subcommand)
+    #[arg(long, value_name = "UUID", exclusive = true)]
+    validate_uuid: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-fn target_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Subcommand)]
+enum Command {
+    /// Create a fresh host identity, audit log and state database (root only)
+    InitHost {
+        /// Empty persistent state directory
+        #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+        state_dir: PathBuf,
+        /// New audit log in an empty directory
+        #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+        log_path: PathBuf,
+    },
+    /// Manage registered execution targets and export host bindings
+    Target {
+        #[command(subcommand)]
+        command: TargetCommand,
+    },
+    /// Extract signing bytes from an exact canonical full CSR
+    CsrPae {
+        /// Input canonical CSR
+        #[arg(long, value_name = "PATH")]
+        csr: PathBuf,
+        /// New output file for DSSE pre-authentication encoding
+        #[arg(long, value_name = "PATH")]
+        pae: PathBuf,
+    },
+    /// Package a CSR and OpenSSH signature into a signed envelope
+    PackWarrant {
+        /// Input canonical CSR
+        #[arg(long, value_name = "PATH")]
+        csr: PathBuf,
+        /// OpenSSH signature file
+        #[arg(long, value_name = "PATH")]
+        signature: PathBuf,
+        /// Configured signer identity
+        #[arg(long, value_name = "ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        signer_id: String,
+        /// New signed envelope file
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Generate a UUIDv7
+    Uuidv7,
+    /// Validate a UUIDv7
+    ValidateUuid { uuid: String },
+}
+
+#[derive(Subcommand)]
+enum TargetCommand {
+    /// Register a process environment using a daemon-visible PID (root only)
+    Register(RegistrationArgs),
+    /// Register a target bound to a local Podman container (root only)
+    RegisterPodman {
+        #[command(flatten)]
+        registration: RegistrationArgs,
+        /// Root-owned local Podman Unix socket
+        #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+        podman_endpoint: PathBuf,
+        /// Podman manager owner (must be 0)
+        #[arg(long, value_name = "UID")]
+        podman_owner_uid: u32,
+        /// Libpod namespace (must be default)
+        #[arg(long, value_name = "NAMESPACE")]
+        podman_namespace: String,
+        /// Container name
+        #[arg(long, value_name = "NAME")]
+        podman_container: String,
+    },
+    /// Revoke a registered target (root only)
+    Revoke {
+        #[arg(value_parser = identifier)]
+        id: String,
+        /// Client socket; management socket is derived from this path
+        #[arg(long, default_value = sigrund::cli::CLIENT_SOCKET, value_name = "PATH", value_parser = absolute_path)]
+        socket: PathBuf,
+    },
+    /// Export a live host binding bundle (root only)
+    ExportBinding {
+        #[command(subcommand)]
+        target: BindingTarget,
+    },
+}
+
+#[derive(Subcommand)]
+enum BindingTarget {
+    /// Export the current host and security profile binding
+    Host {
+        #[arg(long, value_name = "ID", value_parser = identifier)]
+        security_profile: String,
+        #[arg(long, default_value = sigrund::host_registry::DEFAULT_EPOCH_FILE, value_name = "PATH", value_parser = absolute_path)]
+        epoch_file: PathBuf,
+        #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Args)]
+struct RegistrationArgs {
+    /// Target registration ID
+    #[arg(value_parser = identifier)]
+    id: String,
+    /// PID as seen by the daemon
+    #[arg(long, value_name = "DAEMON_PID", value_parser = clap::value_parser!(u32).range(1..=2147483647))]
+    pid: u32,
+    /// Host UID allowed to use this registration
+    #[arg(long, value_name = "HOST_UID")]
+    owner_uid: u32,
+    /// Configured destination security profile
+    #[arg(long, value_name = "ID", value_parser = identifier)]
+    security_profile: String,
+    /// Client socket; management socket is derived from this path
+    #[arg(long, default_value = sigrund::cli::CLIENT_SOCKET, value_name = "PATH", value_parser = absolute_path)]
+    socket: PathBuf,
+}
+
+fn identifier(value: &str) -> sigrund_core::Result<String> {
+    sigrund_core::namespace::identifier(value)?;
+    Ok(value.into())
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return parse_exit(error),
+    };
+    let command = match (cli.command, cli.validate_uuid) {
+        (Some(command), _) => command,
+        (_, Some(uuid)) => Command::ValidateUuid { uuid },
+        _ => unreachable!("clap requires a command or --validate-uuid"),
+    };
+    let result = match command {
+        Command::InitHost {
+            state_dir,
+            log_path,
+        } => return init_host(state_dir, log_path),
+        Command::Target { command } => target_command(command),
+        Command::CsrPae { csr, pae } => offline_pae(&csr, &pae),
+        Command::PackWarrant {
+            csr,
+            signature,
+            signer_id,
+            output,
+        } => offline_pack(&csr, &signature, &signer_id, &output),
+        Command::Uuidv7 => {
+            println!("{}", new_uuidv7());
+            return ExitCode::SUCCESS;
+        }
+        Command::ValidateUuid { uuid } => validate_uuidv7(&uuid).map(|_| ()).map_err(Into::into),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("sigrundctl: {error}");
+            ExitCode::from(65)
+        }
+    }
+}
+
+fn target_command(command: TargetCommand) -> Result<(), Box<dyn std::error::Error>> {
     use sigrund::target_management::{Request, execute, management_path};
-    if args.get(1).is_some_and(|value| value == "export-binding") {
-        return export_binding(args);
+    if let TargetCommand::ExportBinding {
+        target:
+            BindingTarget::Host {
+                security_profile,
+                epoch_file,
+                output,
+            },
+    } = command
+    {
+        return export_binding(&security_profile, &epoch_file, &output);
     }
     if unsafe { libc::geteuid() } != 0 {
         return Err("target management requires effective UID 0".into());
     }
-    let operation = args.get(1).ok_or("missing target operation")?;
-    let id = args.get(2).ok_or("missing target registration ID")?.clone();
-    sigrund_core::namespace::identifier(&id)?;
-    let mut options = BTreeMap::new();
-    for pair in args[3..].chunks(2) {
-        if pair.len() != 2
-            || pair[1].is_empty()
-            || ![
-                "--pid",
-                "--owner-uid",
-                "--security-profile",
-                "--socket",
-                "--podman-endpoint",
-                "--podman-owner-uid",
-                "--podman-namespace",
-                "--podman-container",
-            ]
-            .contains(&pair[0].as_str())
-            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
-        {
-            return Err("invalid or duplicate target management option".into());
-        }
-    }
-    let socket = Path::new(
-        options
-            .remove("--socket")
-            .unwrap_or(sigrund::cli::CLIENT_SOCKET),
-    );
-    sigrund::linux::validate_absolute_path(socket)?;
-    let request = match operation.as_str() {
-        "register" | "register-podman" => {
-            let managed = operation == "register-podman";
-            if options.len() != if managed { 7 } else { 3 } {
-                return Err("register requires --pid, --owner-uid and --security-profile".into());
-            }
-            let daemon_pid = options.get("--pid").ok_or("--pid required")?.parse()?;
-            let owner_uid = options
-                .get("--owner-uid")
-                .ok_or("--owner-uid required")?
-                .parse()?;
-            let security_profile = options
-                .get("--security-profile")
-                .ok_or("--security-profile required")?
-                .to_string();
-            if managed {
-                use sigrund_core::namespace::Contract;
-                let selector = sigrund_core::manager::PodmanSelector {
-                    schema: "sigrund.podman-selector.v1".into(),
-                    endpoint: options
-                        .get("--podman-endpoint")
-                        .ok_or("--podman-endpoint required")?
-                        .to_string(),
-                    owner_uid: options
-                        .get("--podman-owner-uid")
-                        .ok_or("--podman-owner-uid required")?
-                        .parse()?,
-                    manager_namespace: options
-                        .get("--podman-namespace")
-                        .ok_or("--podman-namespace required")?
-                        .to_string(),
-                    container_name: options
-                        .get("--podman-container")
-                        .ok_or("--podman-container required")?
-                        .to_string(),
-                };
-                selector.validate()?;
+    let (socket, request) = match command {
+        TargetCommand::Register(args) => (
+            args.socket,
+            Request::Register {
+                id: args.id,
+                daemon_pid: args.pid,
+                owner_uid: args.owner_uid,
+                security_profile: args.security_profile,
+            },
+        ),
+        TargetCommand::RegisterPodman {
+            registration: args,
+            podman_endpoint,
+            podman_owner_uid,
+            podman_namespace,
+            podman_container,
+        } => {
+            use sigrund_core::namespace::Contract;
+            let selector = sigrund_core::manager::PodmanSelector {
+                schema: "sigrund.podman-selector.v1".into(),
+                endpoint: podman_endpoint
+                    .to_str()
+                    .expect("validated UTF-8 path")
+                    .into(),
+                owner_uid: podman_owner_uid,
+                manager_namespace: podman_namespace,
+                container_name: podman_container,
+            };
+            selector.validate()?;
+            (
+                args.socket,
                 Request::RegisterPodmanV1 {
-                    id,
-                    daemon_pid,
-                    owner_uid,
-                    security_profile,
+                    id: args.id,
+                    daemon_pid: args.pid,
+                    owner_uid: args.owner_uid,
+                    security_profile: args.security_profile,
                     selector,
-                }
-            } else {
-                Request::Register {
-                    id,
-                    daemon_pid,
-                    owner_uid,
-                    security_profile,
-                }
-            }
+                },
+            )
         }
-        "revoke" if options.is_empty() => Request::Revoke { id },
-        _ => return Err("invalid target management operation".into()),
+        TargetCommand::Revoke { id, socket } => (socket, Request::Revoke { id }),
+        TargetCommand::ExportBinding { .. } => unreachable!(),
     };
-    execute(&management_path(socket), &request)?;
+    execute(&management_path(&socket), &request)?;
     Ok(())
 }
 
-fn export_binding(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn export_binding(
+    profile: &str,
+    epoch: &Path,
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     use sigrund_core::host::Record;
     if unsafe { libc::geteuid() } != 0 {
         return Err("binding export requires effective UID 0".into());
     }
-    if args.len() < 3 || args[1] != "export-binding" || args[2] != "host" {
-        return Err("expected target export-binding host".into());
-    }
-    let mut options = BTreeMap::new();
-    for pair in args[3..].chunks(2) {
-        if pair.len() != 2
-            || !["--security-profile", "--epoch-file", "--output"].contains(&pair[0].as_str())
-            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
-        {
-            return Err("invalid or duplicate binding export option".into());
-        }
-    }
-    let profile = options
-        .get("--security-profile")
-        .ok_or("--security-profile is required")?;
-    let output = Path::new(options.get("--output").ok_or("--output is required")?);
-    sigrund::linux::validate_absolute_path(output)?;
-    let epoch = Path::new(
-        options
-            .get("--epoch-file")
-            .copied()
-            .unwrap_or(sigrund::host_registry::DEFAULT_EPOCH_FILE),
-    );
     let bundle = sigrund::host_registry::live_bundle(epoch, profile)?;
     let mut file = OpenOptions::new()
         .write(true)
@@ -213,95 +282,54 @@ fn export_binding(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn offline_warrant(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use sigrund::warrant_tools::{csr_pae, pack_warrant};
-    let expected: &[&str] = if args[0] == "csr-pae" {
-        &["--csr", "--pae"]
-    } else {
-        &["--csr", "--signature", "--signer-id", "--output"]
-    };
-    let mut options = BTreeMap::new();
-    for pair in args[1..].chunks(2) {
-        if pair.len() != 2
-            || !expected.contains(&pair[0].as_str())
-            || pair[1].is_empty()
-            || options.insert(pair[0].as_str(), pair[1].as_str()).is_some()
-        {
-            return Err("invalid, duplicate or incomplete offline option; see --help".into());
-        }
+fn bounded_read(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "input exceeds size bound",
+        ));
     }
-    if options.len() != expected.len() {
-        return Err("missing offline option; see --help".into());
-    }
-    let bounded_read = |path: &str, max: u64| -> std::io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > max {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "input exceeds size bound",
-            ));
-        }
-        Ok(bytes)
-    };
-    let write_new = |path: &str, bytes: &[u8]| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-    };
-    if args[0] == "csr-pae" {
-        let csr = sigrund_core::warrant::CanonicalWarrant::parse(&bounded_read(
-            options["--csr"],
-            65_536,
-        )?)?;
-        csr.warrant().require_client_full()?;
-        write_new(options["--pae"], &csr_pae(&csr))?;
-    } else {
-        let envelope = pack_warrant(
-            &bounded_read(options["--csr"], 65_536)?,
-            &bounded_read(options["--signature"], 34_000)?,
-            options["--signer-id"],
-        )?;
-        write_new(options["--output"], &envelope)?;
-    }
+    Ok(bytes)
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn offline_pae(csr: &Path, pae: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let csr = sigrund_core::warrant::CanonicalWarrant::parse(&bounded_read(csr, 65_536)?)?;
+    csr.warrant().require_client_full()?;
+    write_new(pae, &sigrund::warrant_tools::csr_pae(&csr))?;
     Ok(())
 }
 
-fn init_host(args: &[String]) -> ExitCode {
+fn offline_pack(
+    csr: &Path,
+    signature: &Path,
+    signer_id: &str,
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let envelope = sigrund::warrant_tools::pack_warrant(
+        &bounded_read(csr, 65_536)?,
+        &bounded_read(signature, 34_000)?,
+        signer_id,
+    )?;
+    write_new(output, &envelope)?;
+    Ok(())
+}
+
+fn init_host(state_dir: PathBuf, log_path: PathBuf) -> ExitCode {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("sigrundctl: init-host requires effective UID 0");
         return ExitCode::from(77);
-    }
-    let mut options = BTreeMap::new();
-    for pair in args[2..].chunks(2) {
-        if pair.len() != 2
-            || !["--state-dir", "--log-path"].contains(&pair[0].as_str())
-            || options
-                .insert(pair[0].as_str(), PathBuf::from(&pair[1]))
-                .is_some()
-        {
-            eprintln!("sigrundctl: invalid, duplicate or incomplete provisioning option");
-            return ExitCode::from(64);
-        }
-    }
-    let Some(state_dir) = options.remove("--state-dir") else {
-        eprintln!("sigrundctl: init-host requires explicit --state-dir");
-        return ExitCode::from(64);
-    };
-    let Some(log_path) = options.remove("--log-path") else {
-        eprintln!("sigrundctl: init-host requires explicit --log-path");
-        return ExitCode::from(64);
-    };
-    if [&state_dir, &log_path]
-        .iter()
-        .any(|path| sigrund::linux::validate_absolute_path(path).is_err())
-    {
-        eprintln!("sigrundctl: provisioning paths must be canonical absolute paths");
-        return ExitCode::from(64);
     }
     let key_path = state_dir.join("host_identity.key");
     let state_path = state_dir.join("audit_ratchet.state");

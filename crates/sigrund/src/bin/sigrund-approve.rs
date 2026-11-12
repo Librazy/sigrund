@@ -1,18 +1,11 @@
-use sigrund::cli::{APPROVAL_HELP, ApprovalArgs};
-use std::{env, process::ExitCode};
+use clap::Parser;
+use sigrund::cli::{ApprovalArgs, parse_exit};
+use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args == ["--help"] {
-        println!("{APPROVAL_HELP}");
-        return ExitCode::SUCCESS;
-    }
-    let parsed = match ApprovalArgs::parse(&args) {
+    let parsed = match ApprovalArgs::try_parse() {
         Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("sigrund-approve: {error}\n{APPROVAL_HELP}");
-            return ExitCode::from(64);
-        }
+        Err(error) => return parse_exit(error),
     };
     match sigrund::approver::run(&parsed) {
         Ok(code) => ExitCode::from(code),
