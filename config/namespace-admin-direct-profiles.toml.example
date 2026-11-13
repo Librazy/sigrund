@@ -1,0 +1,43 @@
+# Opt-in administration in environments sharing the host user namespace.
+# Container containment is best effort; host workload LSM policy still applies.
+# Storage is discovered automatically. Trusted host administrators must maintain
+# backing protection and layer identities, prohibit untrusted writable aliases or
+# retained writers, and never modify active backing objects in place.
+# Enable digest_direct in executable_trust_models. No memfd fallback is performed.
+# See IMPLEMENTATION_NOTES.md#rootful-overlayfs-direct-execution.
+
+[[namespace_profiles]]
+apparmor = "unsupported"
+capabilities = []
+executable_model = "digest_direct"
+join_namespaces = ["cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"]
+memory_max = 268435456
+memory_swap_max = 0
+no_new_privs = true
+pids_max = 32
+private_cgroup = true
+private_mount = true
+profile_id = "namespace-admin-direct-v1"
+schema = "sigrund.constraints.namespace-admin-direct.v1"
+seccomp = {kind = "none"}
+securebits = 47
+selinux = {context = "", enforcing = false, policy_change = "unmanaged"}
+verify_exec_stop = true
+
+[[namespace_rules]]
+requester_uids = [1001]
+target_scope = "registered:container-b"
+target_uids = [0]
+target_gids = [0]
+supplementary_gids = []
+profile_sha256 = "f3febb800cbee4af3cfbfe59511076b7d08fac83a1aab8c7225e366c8aa08aa3"
+cross_owner = true
+
+[[namespace_rules]]
+requester_uids = [1001]
+target_scope = "self"
+target_uids = [0]
+target_gids = [0]
+supplementary_gids = []
+profile_sha256 = "f3febb800cbee4af3cfbfe59511076b7d08fac83a1aab8c7225e366c8aa08aa3"
+cross_owner = false

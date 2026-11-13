@@ -18,6 +18,7 @@ mod jobs;
 pub mod linux;
 mod lsm;
 pub mod memfd;
+mod overlay;
 mod preparation;
 pub mod reaper;
 mod runtime;

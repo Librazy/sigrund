@@ -54,6 +54,7 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
         profile_sha256: constraints.sha256().unwrap(),
     };
     let mut review = ProcessReview {
+        executable_storage: None,
         manager: None,
         schema: "sigrund.process-review.v1".into(),
         exec_id: "0192d8f4-0000-7000-8000-000000000004".into(),
@@ -184,6 +185,57 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
                     .unwrap()
                     .contains("container containment is best effort")
             );
+            {
+                use sigrund_core::{executable::ExecutableTrust, namespace::ExecutableStorage};
+                let mut direct = admin.clone();
+                direct.constraints = Constraints::parse(include_bytes!(
+                    "fixtures/namespace/admin-direct-constraints.json"
+                ))
+                .unwrap();
+                assert!(direct.validate().is_err());
+                direct.executable_storage = Some(ExecutableStorage {
+                    kind: "admin_trusted_overlayfs".into(),
+                    mount_id: direct.prepared_executable.mount_id.clone(),
+                    layout_sha256: "22".repeat(32),
+                    backing: direct.prepared_executable.clone(),
+                    administrator_maintained: true,
+                });
+                let binding = direct.binding().unwrap();
+                let mut warrant = root_csr.warrant().clone();
+                warrant.intent.security_profile = direct.constraints.profile_id.clone();
+                warrant.intent_sha256 = warrant.intent.sha256().unwrap();
+                warrant.target_binding = binding.target_binding;
+                warrant.security_constraints = binding.security_constraints;
+                warrant.command.executable_trust = Some(ExecutableTrust::DigestDirect {
+                    sha256: "33".repeat(32),
+                });
+                let csr = Csr::new(warrant).unwrap();
+                direct.csr_sha256 = sha256_hex(csr.as_bytes());
+                direct.verify_csr(&csr).unwrap();
+                let display = direct.render(&csr).unwrap();
+                assert!(display.contains("admin_trusted_overlayfs"));
+                assert!(display.contains("no untrusted writable aliases or retained writers"));
+                for mutation in 0..4 {
+                    let mut bad = direct.clone();
+                    let storage = bad.executable_storage.as_mut().unwrap();
+                    match mutation {
+                        0 => storage.administrator_maintained = false,
+                        1 => storage.mount_id = "99999".into(),
+                        2 => storage.layout_sha256 = "invalid".into(),
+                        3 => storage.kind = "untrusted".into(),
+                        _ => unreachable!(),
+                    }
+                    assert!(bad.render(&csr).is_err());
+                }
+                assert!(
+                    !serde_json::to_string(&admin)
+                        .unwrap()
+                        .contains("executable_storage")
+                );
+                admin.executable_storage = direct.executable_storage;
+                assert!(admin.validate().is_err());
+                admin.executable_storage = None;
+            }
             admin.constraints = own.constraints.clone();
             assert!(admin.verify_csr(&root_csr).is_err());
         }
@@ -453,4 +505,58 @@ fn admin_configuration_examples_bind_the_canonical_profile() {
             ));
         }
     }
+}
+
+#[test]
+fn direct_admin_profile_is_explicit_and_preserves_memfd_contracts() {
+    use sigrund_core::executable::TrustModel;
+    let mut direct = Constraints::parse(include_bytes!(
+        "fixtures/namespace/admin-direct-constraints.json"
+    ))
+    .unwrap();
+    assert!(direct.is_admin() && direct.is_admin_direct() && direct.executes());
+    direct.validate_execution_credentials(0, 0, &[104]).unwrap();
+    for model in [
+        TrustModel::DigestMemfd,
+        TrustModel::Ctime,
+        TrustModel::FsVerity,
+    ] {
+        direct.executable_model = model;
+        assert!(direct.validate().is_err());
+    }
+    direct.executable_model = TrustModel::DigestDirect;
+    direct.capabilities = vec!["CAP_SYS_ADMIN".into()];
+    assert!(direct.validate().is_err());
+    let mut old =
+        Constraints::parse(include_bytes!("fixtures/namespace/admin-constraints.json")).unwrap();
+    old.executable_model = TrustModel::DigestDirect;
+    assert!(old.validate().is_err());
+    let config = include_str!("../../../config/namespace-admin-direct-profiles.toml.example");
+    let tables: toml::Value = toml::from_str(config).unwrap();
+    let profile: Constraints = tables["namespace_profiles"][0].clone().try_into().unwrap();
+    assert_eq!(
+        profile.canonical().unwrap(),
+        Constraints::parse(include_bytes!(
+            "fixtures/namespace/admin-direct-constraints.json"
+        ))
+        .unwrap()
+        .canonical()
+        .unwrap()
+    );
+    assert_eq!(
+        tables["namespace_rules"][0]["profile_sha256"]
+            .as_str()
+            .unwrap(),
+        profile.sha256().unwrap()
+    );
+    let signers: toml::Value = toml::from_str(include_str!(
+        "../../../config/namespace-admin-direct-signers.toml.example"
+    ))
+    .unwrap();
+    assert_eq!(
+        signers["signers"]["namespace_rules"][0]["profile_sha256"]
+            .as_str()
+            .unwrap(),
+        profile.sha256().unwrap()
+    );
 }

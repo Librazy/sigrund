@@ -32,6 +32,7 @@ pub struct Executable {
     direct_digest_limit: u64,
     admin_trusted_composefs_mount: Option<u64>,
     ctime_guard: Option<CtimeGuard>,
+    overlay: Option<crate::overlay::Enrollment>,
     allow_file_capabilities: bool,
 }
 impl From<SealedSnapshot> for Executable {
@@ -48,6 +49,7 @@ impl From<SealedSnapshot> for Executable {
             direct_digest_limit: 0,
             admin_trusted_composefs_mount: None,
             ctime_guard: None,
+            overlay: None,
             allow_file_capabilities: false,
         }
     }
@@ -70,6 +72,9 @@ impl Executable {
     }
     pub fn admin_trusted_composefs(&self) -> bool {
         self.admin_trusted_composefs_mount.is_some()
+    }
+    pub(crate) fn storage_evidence(&self) -> Option<&sigrund_core::namespace::ExecutableStorage> {
+        self.overlay.as_ref().map(|o| o.evidence())
     }
     pub fn matches_command(&self, command: &Command) -> bool {
         command.executable_sha256.is_none() && command.executable_trust == self.trust
@@ -97,10 +102,19 @@ impl Executable {
             return Err(invalid("unexpected executable hash phase"));
         }
         let source = self.source.as_ref().expect("direct source");
+        if let Some(overlay) = &self.overlay {
+            overlay.revalidate(source, &check)?;
+        }
         let version = ctime(&source.metadata()?);
         let sha256 = hash_source(source, self.direct_digest_limit, &check)?;
         if ctime(&source.metadata()?) != version {
             return Err(invalid("executable changed during hashing"));
+        }
+        if let Some(overlay) = &self.overlay {
+            if hash_source(overlay.backing(), self.direct_digest_limit, &check)? != sha256 {
+                return Err(invalid("overlay data resolution differs from source bytes"));
+            }
+            overlay.revalidate(source, &check)?;
         }
         self.trust = Some(ExecutableTrust::DigestDirect { sha256 });
         self.hash_version = Some(version);
@@ -145,7 +159,10 @@ impl Executable {
         let observed = match trust {
             ExecutableTrust::DigestMemfd { .. } => return Err(invalid("not a direct executable")),
             ExecutableTrust::DigestDirect { .. } => {
-                let eligible = if let Some(id) = self.admin_trusted_composefs_mount {
+                let eligible = if let Some(overlay) = &self.overlay {
+                    overlay.revalidate(source, check)?;
+                    true
+                } else if let Some(id) = self.admin_trusted_composefs_mount {
                     crate::composefs::eligible(source, &[id])?
                 } else {
                     local_filesystem(source)?
@@ -156,6 +173,7 @@ impl Executable {
                 let version = ctime(&metadata);
                 if !force_hash
                     && !self.admin_trusted_composefs()
+                    && self.overlay.is_none()
                     && self.hash_version.as_ref() == Some(&version)
                 {
                     trust.clone()
@@ -163,6 +181,14 @@ impl Executable {
                     let sha256 = hash_source(source, self.direct_digest_limit, check)?;
                     if ctime(&source.metadata()?) != version {
                         return Err(invalid("executable changed during verification"));
+                    }
+                    if let Some(overlay) = &self.overlay {
+                        if hash_source(overlay.backing(), self.direct_digest_limit, check)?
+                            != sha256
+                        {
+                            return Err(invalid("overlay backing differs from source"));
+                        }
+                        overlay.revalidate(source, check)?;
                     }
                     ExecutableTrust::DigestDirect { sha256 }
                 }
@@ -209,6 +235,11 @@ impl Executable {
         let source = File::from(self.as_fd().try_clone_to_owned()?).metadata()?;
         if (actual.dev(), actual.ino()) != (source.dev(), source.ino()) {
             return Err(invalid("exec loaded a different inode"));
+        }
+        if let Some(overlay) = &self.overlay {
+            let source = self.source.as_ref().expect("overlay source");
+            overlay.verify_loaded(pid, source, &check)?;
+            overlay.revalidate(source, &check)?;
         }
         // A direct file must not change the credentials/capabilities established
         // by the trusted setup stub. Read a bounded proc status while stopped.
@@ -292,6 +323,41 @@ pub fn prepare(
     config: &DaemonConfig,
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<Executable> {
+    prepare_internal(source, selection, budget, uid, config, None, check)
+}
+
+pub(crate) fn prepare_overlay(
+    source: File,
+    selection: Selection<'_>,
+    config: &DaemonConfig,
+    overlay: crate::overlay::Enrollment,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<Executable> {
+    if config.executable_trust_models != [TrustModel::DigestDirect] || selection.signed.is_some() {
+        return Err(invalid(
+            "overlay trust requires thin direct admin selection",
+        ));
+    }
+    prepare_internal(
+        source,
+        selection,
+        &SnapshotBudget::default(),
+        0,
+        config,
+        Some(overlay),
+        check,
+    )
+}
+
+fn prepare_internal(
+    source: File,
+    selection: Selection<'_>,
+    budget: &SnapshotBudget,
+    uid: u32,
+    config: &DaemonConfig,
+    overlay: Option<crate::overlay::Enrollment>,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<Executable> {
     check()?;
     let mut metadata = source.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 {
@@ -315,12 +381,15 @@ pub fn prepare(
             &metadata,
             *model,
             &selection,
-            config.max_executable_bytes,
-            config.max_direct_digest_bytes,
-            if config.digest_direct.allow_admin_trusted_composefs {
-                &config.admin_trusted_composefs_mounts
-            } else {
-                &[]
+            ModelPolicy {
+                max_memfd: config.max_executable_bytes,
+                max_direct: config.max_direct_digest_bytes,
+                composefs_mounts: if config.digest_direct.allow_admin_trusted_composefs {
+                    &config.admin_trusted_composefs_mounts
+                } else {
+                    &[]
+                },
+                admin_overlay: overlay.is_some(),
             },
         )?
         else {
@@ -361,12 +430,14 @@ pub fn prepare(
             if magic != *b"\x7fELF" {
                 return Err(invalid("direct executable is not ELF"));
             }
-            let admin_trusted_composefs_mount =
-                if *model == TrustModel::DigestDirect && !local_filesystem(&source)? {
-                    Some(crate::composefs::mount_id(&source)?)
-                } else {
-                    None
-                };
+            let admin_trusted_composefs_mount = if *model == TrustModel::DigestDirect
+                && overlay.is_none()
+                && !local_filesystem(&source)?
+            {
+                Some(crate::composefs::mount_id(&source)?)
+            } else {
+                None
+            };
             let executable = Executable {
                 source: Some(source),
                 sealed: None,
@@ -380,6 +451,7 @@ pub fn prepare(
                 direct_digest_limit: config.max_direct_digest_bytes,
                 admin_trusted_composefs_mount,
                 ctime_guard,
+                overlay,
                 allow_file_capabilities: selection.allow_file_capabilities,
             };
             let mut context: ExecutionContext = selection.context.clone().into();
@@ -395,17 +467,21 @@ pub fn prepare(
 
 /// Shared ordering and eligibility rules; inaccessible observations are errors,
 /// whereas conclusively unsupported models permit the next configured candidate.
+struct ModelPolicy<'a> {
+    max_memfd: u64,
+    max_direct: u64,
+    composefs_mounts: &'a [u64],
+    admin_overlay: bool,
+}
 fn inspect_model(
     source: &File,
     metadata: &std::fs::Metadata,
     model: TrustModel,
     selection: &Selection<'_>,
-    max_memfd: u64,
-    max_direct: u64,
-    composefs_mounts: &[u64],
+    policy: ModelPolicy<'_>,
 ) -> io::Result<Option<(ExecutableTrust, CapabilitySets)>> {
     if model == TrustModel::DigestMemfd {
-        return Ok((metadata.len() <= max_memfd).then(|| {
+        return Ok((metadata.len() <= policy.max_memfd).then(|| {
             (
                 ExecutableTrust::DigestMemfd {
                     sha256: String::new(),
@@ -430,9 +506,10 @@ fn inspect_model(
         TrustModel::FsVerity => verity(source)?,
         TrustModel::Ctime if ctime_eligible(source, metadata)? => Some(ctime(metadata)),
         TrustModel::DigestDirect
-            if metadata.len() <= max_direct
+            if metadata.len() <= policy.max_direct
                 && (local_filesystem(source)?
-                    || crate::composefs::eligible(source, composefs_mounts)?) =>
+                    || crate::composefs::eligible(source, policy.composefs_mounts)?
+                    || policy.admin_overlay) =>
         {
             Some(ExecutableTrust::DigestDirect {
                 sha256: String::new(),
@@ -484,9 +561,12 @@ pub(crate) fn client_evidence(
             &metadata,
             *model,
             &selection,
-            public.limits.max_executable_bytes,
-            public.limits.max_direct_digest_bytes,
-            admin_trusted_composefs_mounts,
+            ModelPolicy {
+                max_memfd: public.limits.max_executable_bytes,
+                max_direct: public.limits.max_direct_digest_bytes,
+                composefs_mounts: admin_trusted_composefs_mounts,
+                admin_overlay: false,
+            },
         )?
         else {
             continue;
@@ -656,7 +736,7 @@ fn file_capability_profile(
     profile.ambient.clear();
     Ok(Some(profile))
 }
-fn host_capability_mount(source: &File) -> io::Result<bool> {
+pub(crate) fn host_capability_mount(source: &File) -> io::Result<bool> {
     use std::io::Read;
     let mut map = String::new();
     File::open("/proc/self/uid_map")?
@@ -665,6 +745,9 @@ fn host_capability_mount(source: &File) -> io::Result<bool> {
     if map.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"] {
         return Ok(false);
     }
+    unmapped_mount(source, None)
+}
+pub(crate) fn unmapped_mount(source: &File, namespace: Option<u64>) -> io::Result<bool> {
     // Establish that the retained mount is not idmapped. Older kernels lacking
     // these queries keep the ordinary direct models but decline file caps.
     let mut stat: libc::statx = unsafe { std::mem::zeroed() };
@@ -693,12 +776,14 @@ fn host_capability_mount(source: &File) -> io::Result<bool> {
         spare: u32,
         id: u64,
         mask: u64,
+        namespace: u64,
     }
     let request = Request {
-        size: 24,
+        size: if namespace.is_some() { 32 } else { 24 },
         spare: 0,
         id: stat.stx_mnt_id,
         mask: 2,
+        namespace: namespace.unwrap_or(0),
     };
     let mut mount = [0u64; 64];
     // __NR_statmount on the supported x86_64 and aarch64 Linux ABIs.

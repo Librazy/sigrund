@@ -511,6 +511,13 @@ impl Execution {
             }
             match job.namespace.as_mut().unwrap().poll() {
                 Ok(Some(NamespaceEvent::Bootstrap)) => {
+                    // This event comes from the fresh trusted launcher after
+                    // close_range and exec removed all inherited daemon FDs.
+                    // Its fixed allowlist has a separate child reservation.
+                    // Keep the copies charged on every failure before here.
+                    if let Some(owner) = &mut job.owner {
+                        drop(owner.inherited_target_fds.take());
+                    }
                     if let Err(error) = job.namespace.as_mut().unwrap().protect() {
                         job.failure =
                             Some(format!("namespace bootstrap protection failed: {error}"));

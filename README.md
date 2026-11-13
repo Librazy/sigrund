@@ -86,6 +86,8 @@ use `--target registered:ID` or `--target self` with an explicitly configured
 profile and destination credentials. See [namespace execution](IMPLEMENTATION_NOTES.md#namespace-execution)
 for setup and deployment limits. Rootful container administration is available
 through the opt-in [`namespace-admin-v1` profile](IMPLEMENTATION_NOTES.md#rootful-container-administration).
+The separate [`namespace-admin-direct-v1` profile](IMPLEMENTATION_NOTES.md#rootful-overlayfs-direct-execution)
+supports direct execution from qualified administrator-maintained OverlayFS storage.
 
 ## Security and scope
 

@@ -62,7 +62,8 @@ class ProducerFixture(API['Fixture']):
         self.process = subprocess.Popen(['systemd-run', '--quiet', '--wait', '--collect',
             '--unit=' + self.unit, '--property=Delegate=yes',
             '--property=StandardError=journal', '--property=StandardOutput=journal', '--property=KillMode=control-group',
-            '--property=RuntimeMaxSec=300s', '--property=SELinuxContext=system_u:system_r:sigrund_daemon_t:s0',
+            '--property=RuntimeMaxSec=' + str(getattr(self, 'runtime_max_sec', 300)) + 's',
+            '--property=SELinuxContext=system_u:system_r:sigrund_daemon_t:s0',
             '/usr/libexec/sigrund/sigrund', '--foreground', '--config', str(self.base / 'config'),
             '--signers', str(self.base / 'signers'), '--state-dir', str(self.state), '--log-path', str(self.log),
             '--socket', str(self.client), '--approval-socket', str(self.approval)],
@@ -155,7 +156,7 @@ def inside(args):
     tempfile.tempdir = '/usr/local'
     work = Path(tempfile.mkdtemp(prefix='sigrund-admin-container-', dir='/run'))
     work.chmod(0o755)
-    fixture = (ProducerFixture if args.producer else API['Fixture'])(parent, args.binaries, authorization_timeout_ms=15000)
+    fixture = (ProducerFixture if args.producer else API['Fixture'])(parent, args.binaries, authorization_timeout_ms=15000, models=['digest_direct', 'digest_memfd'] if args.direct else None)
     # Runtime qualification uses the same bounded deadline in both modes;
     # tiny admission fault-test deadlines are sensitive to VM fsync latency.
     def with_timeout(connect):
@@ -169,7 +170,7 @@ def inside(args):
     if args.producer:
         API['submit'] = producer_submit
     containers, cases = [], []
-    result = {'passed': False, 'producer': args.producer, 'cases': cases}
+    result = {'passed': False, 'producer': args.producer, 'direct': args.direct, 'cases': cases}
     try:
         anchor = work / 'anchor'
         subprocess.run(['cc', '-static', '-O2', str(REPO / 'crates/sigrund/tests/fixtures/namespace/anchor-execution.c'),
@@ -181,7 +182,7 @@ def inside(args):
         subprocess.run(['cc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
                         str(REPO / 'crates/sigrund/tests/fixtures/namespace/admin.c'), '-o', str(probe)], check=True)
         shutil.copyfile(probe, container.root / probe.relative_to('/'))
-        profiles = [json.loads((REPO / 'crates/sigrund-core/tests/fixtures/namespace/admin-constraints.json').read_bytes())]
+        profiles = [json.loads((REPO / 'crates/sigrund-core/tests/fixtures/namespace' / ('admin-direct-constraints.json' if args.direct else 'admin-constraints.json')).read_bytes())]
         cap_profile = copy.deepcopy(profiles[0])
         cap_profile.update(profile_id='namespace-admin-cap', capabilities=['CAP_NET_BIND_SERVICE'])
         profiles.append(cap_profile)
@@ -237,6 +238,7 @@ def inside(args):
             subprocess.run(['cc', '-static', '-O2', '-Wall', '-Wextra', '-Werror',
                 str(HERE / 'selinux/security-probe.c'), '-o', str(forgery)], check=True)
             shutil.copyfile(forgery, container.root / forgery.relative_to('/'))
+            (container.root / forgery.relative_to('/')).chmod(0o755)
             forgery_body = request(fixture, profiles[1], caps=('CAP_NET_BIND_SERVICE',))
             forgery_body['intent']['command'].update(executable_path=str(forgery), argv=[str(forgery), 'forgery'])
             _, output = EX['execute'](fixture, forgery_body)
@@ -288,6 +290,7 @@ def main():
     parser.add_argument('--artifacts', type=Path, required=True)
     parser.add_argument('--binaries', type=Path, required=True)
     parser.add_argument('--producer', action='store_true')
+    parser.add_argument('--direct', action='store_true', help='exercise the explicit digest_direct admin profile on local storage')
     parser.add_argument('--inside', action='store_true')
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -305,7 +308,7 @@ def main():
             *(['--property=SELinuxContext=' + Path('/proc/self/attr/current').read_text().strip('\0\n')]
               if Path('/sys/fs/selinux/enforce').exists() else []),
             '/usr/bin/python3', str(Path(__file__).resolve()), '--inside', '--artifacts', str(args.artifacts),
-            '--binaries', str(args.binaries), *(['--producer'] if args.producer else [])], check=True)
+            '--binaries', str(args.binaries), *(['--producer'] if args.producer else []), *(['--direct'] if args.direct else [])], check=True)
     finally:
         REVIEW['SUPPORT']['stop_service'](unit)
 

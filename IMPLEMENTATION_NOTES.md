@@ -118,6 +118,7 @@ capture still requires its supported kernel operations.
 | `registered:ID`, `self` / `namespace-selinux-v1` | Thin online approval, sealed executable/input, exact SELinux workload transition, explicit seccomp and final-child exec verification. |
 | `registered:ID`, `process:DAEMON_PID`, `self` / `namespace-experimental-v1` | Opt-in native execution without a requested LSM transition or seccomp filter. Known nonroot namespace-owner injection authority rejects before review, including experimental self. |
 | `registered:ID`, `self` / `namespace-admin-v1` | Opt-in UID 0, supplementary groups and explicit host-style capability grants in the initial user namespace. Host workload LSM semantics; containment is best effort. |
+| `registered:ID`, `self` / `namespace-admin-direct-v1` | The same administrative authority using `digest_direct` on local storage or qualified, administrator-maintained container OverlayFS. |
 | Preview constraint schema | Private review only; generic TIMEOUT without consumption or execution. |
 
 The enforcing deployment is Fedora 44 x86-64 with cgroup v2/systemd and SELinux.
@@ -180,8 +181,8 @@ To opt in on an already configured host:
      --cwd / -- /usr/bin/id
    ```
 
-Only thin online approval with `digest_memfd` and stdio is supported, with null
-or sealed finite stdin. For registered targets, create a fresh dedicated anchor
+The original admin profile uses `digest_memfd`. Both admin profiles support only
+thin online approval and stdio, with null or sealed finite stdin. For registered targets, create a fresh dedicated anchor
 in the rootful environment and register it with the admin profile using the
 existing `sigrundctl target register` workflow. Do not reuse an anchor captured
 under a different profile. Requester/destination mapped UID separation still
@@ -192,6 +193,81 @@ The disposable systemd harness `scripts/namespace/verify-admin.py` compares
 host/admin credentials and capabilities, self execution, owner file access and
 cancellation. Its `--producer` mode additionally checks the packaged SELinux
 workload transition without broadening policy.
+
+### Rootful OverlayFS direct execution
+
+[`namespace-admin-direct-v1`](config/namespace-admin-direct-profiles.toml.example)
+extends the administrator-maintained storage exception to rootful container
+OverlayFS. It is a separate profile with schema
+`sigrund.constraints.namespace-admin-direct.v1`, accepts only `digest_direct`,
+and inherits the admin identity, groups, capability, securebits, NNP, resource
+and host workload LSM rules. The target must share the host's initial user
+namespace; container root with UID remapping is insufficient. The backing-store
+administrators must be trusted for the actual privileges of the approved job.
+
+Append the profile/daemon rules and the matching
+[signer rules](config/namespace-admin-direct-signers.toml.example), adjust host
+requester IDs and scopes, and enable `digest_direct` in
+`executable_trust_models`. Validate configuration, drain and restart the daemon,
+and recapture/register targets under the new profile. For self requests, use
+`--security-profile namespace-admin-direct-v1`. Both daemon and signer must
+explicitly authorize its canonical profile digest. Qualification failure rejects
+the request; it never switches to memfd. Existing memfd profiles and the host
+ComposeFS switch keep their behavior. Namespace full/export/offline requests
+remain unsupported.
+
+Storage discovery is automatic and private to the captured request. The source
+FD's mount identity selects the captured target's mountinfo record. Upper, work,
+ordered lower and data-only directories are opened in the daemon's host view.
+Protected root-owned management symlinks, including runtime layer abbreviations,
+are resolved with bounded traversal. Layer paths printed by mountinfo are
+discovery hints; trusted administrators must preserve their relationship to the
+actual mounted objects. Stale, detached, ambiguous or inaccessible paths reject
+the request. This is independent of the special booted ComposeFS enrollment.
+
+Only the executable's relevant directory chains and metadata/data objects are
+walked. Resolution accounts for whiteouts, opaque directories, redirects,
+metacopy and data-only references. Retained layer, metadata and data FDs are
+charged to the request's FD budget. Root ownership, no group/other writes and
+no extended access/default ACLs are required on management ancestors, layer
+roots, workdir and relevant backing paths. Supported backing filesystems are
+ext-family, F2FS, Btrfs, XFS and tmpfs. Unknown mount features, userxattr,
+idmapped mounts, nested backing mounts/OverlayFS, command-path symlinks,
+set-ID executables and file capabilities are rejected. Establishing absence of
+idmapping requires kernel statx/statmount support. Discovery is bounded to a
+4 MiB mount table, 128 layers and 32 management-link/redirect expansions, with
+the existing worker deadlines and cancellation checks.
+
+Preparation, final authorization and the exec stop each hash the complete
+retained source and resolved data backing; overlay ctime never skips a hash.
+The stopped child's executable identity, load mappings and ELF PT_LOAD bytes
+must agree with the retained evidence before any loader or command instruction
+runs. ELF64 little-endian images are currently supported on this path.
+Copy-up or layer replacement invalidates retained object identities. Exact
+credentials, capabilities, NNP and expected LSM domain are still checked.
+Private review and AUTH_COMMIT record `executable_storage`, including the
+storage kind, target mount ID, layout digest, backing identity and administrator
+maintenance assumption. Public context exposes no container backing paths.
+
+Administrators must maintain backing protection and layer mappings, expose no
+untrusted writable aliases, retained writable handles or mappings, and never
+modify active backing objects in place, including through privileged jobs.
+Automatic checks establish observable conditions, not historical handle absence
+or future administrator behavior. Merged-path `ETXTBSY` does not protect direct
+backing writes or shared writable mappings retained after closing the merged
+writer FD. This exception provides no kernel write exclusion for backing
+objects and makes no content-immutability claim. Normal OverlayFS updates must
+preserve active backing objects; modifications during approval can reject a job.
+`ctime`, rootless/remapped containers and other namespace profiles are unchanged.
+SELinux may reject the original file label; this feature neither relabels images
+nor broadens policy.
+
+Use `scripts/namespace/verify-overlay.py` on a disposable systemd host for runtime
+qualification, and `verify-admin.py --direct` for the local-filesystem profile.
+Both accept `--producer` to test the installed SELinux producer. Kernel storage
+and load-checkpoint fixtures are the ignored `overlay::tests::rootful_overlay*`
+tests; run them as initial-userns root in a private mount namespace. Runtime
+coverage and remaining limits are recorded in [the qualification record](docs/OVERLAYFS_QUALIFICATION.md).
 
 ### Acquisition, approval and execution
 

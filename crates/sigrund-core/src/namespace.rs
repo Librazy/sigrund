@@ -347,7 +347,14 @@ impl Constraints {
         self.schema == "sigrund.constraints.namespace-selinux.v1"
     }
     pub fn is_admin(&self) -> bool {
-        self.schema == "sigrund.constraints.namespace-admin.v1"
+        matches!(
+            self.schema.as_str(),
+            "sigrund.constraints.namespace-admin.v1"
+                | "sigrund.constraints.namespace-admin-direct.v1"
+        )
+    }
+    pub fn is_admin_direct(&self) -> bool {
+        self.schema == "sigrund.constraints.namespace-admin-direct.v1"
     }
     pub fn executes(&self) -> bool {
         self.is_production()
@@ -374,6 +381,7 @@ impl Contract for Constraints {
                 | "sigrund.constraints.namespace-experimental.v1"
                 | "sigrund.constraints.namespace-selinux.v1"
                 | "sigrund.constraints.namespace-admin.v1"
+                | "sigrund.constraints.namespace-admin-direct.v1"
         ) {
             return Err(invalid("wrong constraint schema"));
         }
@@ -430,7 +438,12 @@ impl Contract for Constraints {
                 ));
             }
         } else if self.is_admin() {
-            if self.executable_model != crate::executable::TrustModel::DigestMemfd
+            let model = if self.is_admin_direct() {
+                crate::executable::TrustModel::DigestDirect
+            } else {
+                crate::executable::TrustModel::DigestMemfd
+            };
+            if self.executable_model != model
                 || self.selinux.executable_context.is_some()
                 || self.selinux.enforcing
                 || !self.selinux.context.is_empty()
@@ -723,6 +736,32 @@ pub struct ProcessReview {
     pub executable_roots: BTreeMap<String, FsIdentity>,
     pub prepared_cwd: FsIdentity,
     pub prepared_executable: FsIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_storage: Option<ExecutableStorage>,
+}
+/// Private, daemon-verified storage evidence. The profile binds the trust contract;
+/// these observations are authenticated with the private review for this exact CSR.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableStorage {
+    pub kind: String,
+    pub mount_id: String,
+    pub layout_sha256: String,
+    pub backing: FsIdentity,
+    pub administrator_maintained: bool,
+}
+impl ExecutableStorage {
+    fn validate(&self) -> Result<()> {
+        if !matches!(
+            (self.kind.as_str(), self.administrator_maintained),
+            ("admin_trusted_overlayfs", true) | ("local_filesystem", false)
+        ) || decimal(&self.mount_id)? == 0
+        {
+            return Err(invalid("invalid executable storage trust contract"));
+        }
+        hex(&self.layout_sha256)?;
+        self.backing.validate()
+    }
 }
 fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
@@ -743,6 +782,19 @@ impl Contract for ProcessReview {
         self.constraints.validate()?;
         self.prepared_cwd.validate()?;
         self.prepared_executable.validate()?;
+        if self.constraints.is_admin_direct() && self.executable_storage.is_none() {
+            return Err(invalid("direct admin review requires storage evidence"));
+        }
+        if let Some(storage) = &self.executable_storage {
+            storage.validate()?;
+            if !self.constraints.is_admin_direct()
+                || storage.mount_id != self.prepared_executable.mount_id
+            {
+                return Err(invalid(
+                    "storage evidence differs from direct admin profile",
+                ));
+            }
+        }
         if !matches!(self.acquisition.capture, Capture::TracedPrivateFsV1) {
             return Err(invalid("process review requires a captured connector"));
         }
@@ -902,6 +954,13 @@ impl ProcessReview {
                 "required by security_constraints"
             },
         });
+        if self.constraints.is_admin_direct() {
+            evidence["executable_storage"] = serde_json::to_value(&self.executable_storage)
+                .map_err(|e| invalid(&e.to_string()))?;
+            evidence["executable_storage_contract"] = serde_json::json!(
+                "Trusted initial-userns administrators maintain backing protection, layer identities and mappings; no untrusted writable aliases or retained writers; no in-place modification of active backing objects"
+            );
+        }
         if let Some(manager) = &self.manager {
             evidence["manager"] = serde_json::json!({
                 "evidence": manager,

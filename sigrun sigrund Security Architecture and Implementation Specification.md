@@ -915,8 +915,9 @@ signing session is provided.
 
 **digest_direct.** Admit only ext-family, F2FS, Btrfs, XFS and tmpfs, whose Linux
 executable write exclusion makes a full hash at the exec stop authoritative.
-Remote, FUSE, generic overlay and unknown filesystems are ineligible. The
-administrator-maintained OSTree ComposeFS exception below is enabled by default. Hash the retained
+Remote, FUSE, unqualified overlay and unknown filesystems are ineligible. The
+administrator-maintained OSTree ComposeFS exception below is enabled by default;
+rootful container OverlayFS requires the separate explicit namespace profile below. Hash the retained
 source with a buffer of at most 64 KiB; never allocate an executable snapshot.
 Sign the full-file SHA-256. An internal dev/inode/size/ctime fingerprint permits
 skipping unchanged pre-consumption rehashes; it is not signed and never replaces
@@ -956,6 +957,58 @@ checks. Record the ComposeFS basis in audit and online approval display. Keep
 the signed evidence as `digest_direct` plus SHA-256; never change models after
 approval. The administrator-maintenance assumption is what prevents changes
 after the last hash; no protection against violating that assumption is claimed.
+
+**Administrator-maintained rootful container OverlayFS exception.**
+The separate `sigrund.constraints.namespace-admin-direct.v1` schema inherits
+the initial-user-namespace admin profile's credential, group, capability, NNP,
+LSM and resource rules, and permits only `digest_direct`. Daemon and signer
+must independently authorize its exact profile digest. No global container
+storage switch is added. Existing profiles and the ComposeFS switch retain
+their contracts. Only thin online `self` and `registered` requests are supported;
+qualification failure cannot fall back or change the signed model. Ordinary
+supported local filesystems remain eligible under this profile.
+
+For OverlayFS, derive the mount identity from the retained source FD and discover
+its layout from the captured target's mount table. Open and pin upper, work,
+ordered ordinary lower and data-only directories in the trusted host view.
+Printed mount paths are hints under the administrator's stable-layer-mapping
+contract, not an authenticated kernel export of backing paths. Reject unavailable,
+stale, ambiguous or changed layouts. Resolve protected root-owned management
+symlinks with bounded traversal; reject magic links. Command paths retain strict
+no-symlink resolution. Resolve relevant metadata and data paths in layer order,
+accounting for whiteout, opacity, redirect, metacopy and data-only references.
+Check root ownership, no group/other write and no extended access/default ACLs
+for management ancestors, layer/work roots and relevant backing chains/objects.
+Reject userxattr, unknown features, idmapping, nested backing mounts, unsupported
+storage, file capabilities and set-ID files. Backing storage is limited to the
+ordinary direct local filesystem set. Require kernel evidence excluding
+idmapping; absence of that evidence rejects the exception.
+
+Hold layer and object FDs under the request's existing quota and cancellation
+ownership. Bound mountinfo to 4 MiB, layers to 128 and symlink/redirect expansion
+to 32. Perform discovery and revalidation on existing bounded workers. Hash the
+complete retained source and resolved data object at preparation, final
+authorization and the exec stop; never cache using overlay ctime. Verify loaded
+inode, load mappings and actual ELF PT_LOAD bytes against the retained evidence
+while stopped before the first user instruction. Current load-byte qualification
+requires little-endian ELF64. Merged dev/ino equality alone is insufficient.
+Retain exact credentials/capabilities/NNP and LSM checkpoint verification.
+
+Extend private process review with optional `executable_storage` evidence;
+require it for this schema and omit it for legacy profiles. Include storage
+kind, mount ID, layout hash, backing identity and administrator-maintenance
+assumption in private approval and durable authorization audit. Never publish
+container storage paths through public context. Profile schema/digest binds the
+maintenance contract; typed signed executable evidence remains `digest_direct`
+and SHA-256. Trusted initial-userns administrators must preserve protection and
+layer mappings, prevent untrusted writable aliases/retained handles/mappings,
+and never modify active backing data in place. Checks do not prove historical
+handle absence or constrain future administrators. Merged-path ETXTBSY is not
+backing-inode write exclusion and does not exclude shared writable mappings
+retained after closing a merged writer FD. The trust assumption covers the actual privileges
+of the execution domain. Ctime leasing, rootless/remapped targets and other
+namespace profile contracts are not weakened. Do not broaden SELinux policy or
+relabel executables to make this exception succeed.
 
 
 `max_direct_digest_bytes` defaults to 256 MiB, maximum 1 GiB;
