@@ -79,6 +79,7 @@ struct NamespacePayload {
     version: u32,
     uid: u32,
     gid: u32,
+    groups: Vec<u32>,
     mask: u32,
     last_cap: u32,
     enter_mask: u32,
@@ -87,6 +88,56 @@ struct NamespacePayload {
     envp: Vec<String>,
     constraints: sigrund_core::namespace::Constraints,
     producer_guard: bool,
+}
+
+/// The access domain is initial-userns-only. Compare retained nsfs handles,
+/// never a requester-supplied ID or an inferred UID mapping.
+pub(crate) fn validate_admin_userns(userns: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    crate::access::domain()?;
+    let own = std::fs::metadata("/proc/self/ns/user")?;
+    let target = userns.metadata()?;
+    if own.dev() != target.dev() || own.ino() != target.ino() {
+        return Err(io::Error::other(
+            "admin execution requires the initial user namespace",
+        ));
+    }
+    Ok(())
+}
+
+impl NamespacePayload {
+    fn validate(&self) -> io::Result<u64> {
+        use sigrund_core::namespace::Contract;
+        self.constraints.validate().map_err(io::Error::other)?;
+        self.constraints
+            .validate_execution_credentials(self.uid, self.gid, &self.groups)
+            .map_err(io::Error::other)?;
+        if self.version != SG_PAYLOAD_VERSION
+            || !self.constraints.executes()
+            || self.mask > 0o777
+            || self.last_cap >= 64
+            || self.enter_mask > 255
+            || self.argv.is_empty()
+            || !self.cwd.starts_with('/')
+            || (self.constraints.is_admin() && self.enter_mask & (1 << 6) != 0)
+        {
+            return Err(io::Error::other("unsupported namespace launcher payload"));
+        }
+        let actual_last_cap: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+            .trim()
+            .parse()
+            .map_err(io::Error::other)?;
+        if self.last_cap != actual_last_cap {
+            return Err(io::Error::other(
+                "launcher capability ceiling differs from kernel",
+            ));
+        }
+        let bits = crate::executable::capability_bits(&self.constraints.capabilities)?;
+        if bits.checked_shr(self.last_cap + 1).unwrap_or(0) != 0 {
+            return Err(io::Error::other("unsupported kernel capability"));
+        }
+        Ok(bits)
+    }
 }
 
 /// Internal fresh-exec entry, reached before loading daemon configuration or
@@ -113,27 +164,19 @@ pub fn namespace_launcher_main() -> io::Result<()> {
         return Err(io::Error::other("oversize namespace launcher payload"));
     }
     let payload: NamespacePayload = serde_json::from_slice(&bytes)?;
-    if payload.version != SG_PAYLOAD_VERSION
-        || payload.uid == 0
-        || payload.uid == u32::MAX
-        || payload.gid == u32::MAX
-        || payload.mask > 0o777
-        || payload.last_cap >= 64
-        || payload.enter_mask > 255
-        || payload.argv.is_empty()
-        || !payload.cwd.starts_with('/')
-    {
-        return Err(io::Error::other("unsupported namespace launcher payload"));
+    let capabilities = payload.validate()?;
+    if payload.constraints.is_admin() {
+        let raw = unsafe { libc::fcntl(22, libc::F_DUPFD_CLOEXEC, 28) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let userns = unsafe { File::from_raw_fd(raw) };
+        validate_admin_userns(&userns)?;
     }
     for fd in 10..=26 {
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
-    }
-    use sigrund_core::namespace::Contract;
-    payload.constraints.validate().map_err(io::Error::other)?;
-    if !payload.constraints.executes() {
-        return Err(io::Error::other("nonexecuting launcher profile"));
     }
     let production = i32::from(payload.constraints.is_production());
     let strings = |values: Vec<String>| -> io::Result<Vec<CString>> {
@@ -149,6 +192,7 @@ pub fn namespace_launcher_main() -> io::Result<()> {
     let mut envp: Vec<_> = environment.iter().map(|v| v.as_ptr()).collect();
     envp.push(std::ptr::null());
     let cwd = CString::new(payload.cwd).map_err(io::Error::other)?;
+    let mut group_check = vec![0; payload.groups.len()];
     let spec = ChildSpec {
         input: 10,
         output: 11,
@@ -159,21 +203,22 @@ pub fn namespace_launcher_main() -> io::Result<()> {
         gid: payload.gid,
         mask: payload.mask,
         last_cap: payload.last_cap,
-        capabilities: 0,
-        groups: std::ptr::null(),
-        groups_len: 0,
+        capabilities,
+        groups: payload.groups.as_ptr(),
+        groups_len: payload.groups.len(),
         cwd: cwd.as_ptr(),
         direct_path: std::ptr::null(),
         argv: argv.as_ptr(),
         envp: envp.as_ptr(),
         mountinfo: std::ptr::null_mut(),
         mountinfo_capacity: 0,
-        group_check: std::ptr::null_mut(),
+        group_check: group_check.as_mut_ptr(),
         isolated: 1,
         gate_read: 15,
         gate_write: -1,
         checkpoint: 1,
         namespace_mode: 1,
+        namespace_admin: i32::from(payload.constraints.is_admin()),
         production,
         producer_guard: i32::from(payload.producer_guard),
     };
@@ -528,6 +573,7 @@ impl PreparedChild {
             gate_write: gate.as_ref().map_or(-1, |g| g.1.as_raw_fd()),
             checkpoint: i32::from(checkpoint),
             namespace_mode: i32::from(target.is_some()),
+            namespace_admin: i32::from(target.as_ref().is_some_and(|t| t.constraints.is_admin())),
             production: i32::from(
                 target
                     .as_ref()
@@ -540,13 +586,22 @@ impl PreparedChild {
         let mut sockets = None;
         let pid = if let Some(target) = target {
             crate::access::domain()?;
+            use sigrund_core::namespace::Contract;
             use std::os::unix::fs::MetadataExt;
+            target.constraints.validate().map_err(io::Error::other)?;
+            target
+                .constraints
+                .validate_execution_credentials(self.uid, self.gid, &self.groups)
+                .map_err(io::Error::other)?;
             if target.namespaces.len() != 8
-                || !self.groups.is_empty()
-                || self.capabilities != 0
-                || self.uid == 0
+                || !target.constraints.executes()
+                || self.capabilities
+                    != crate::executable::capability_bits(&target.constraints.capabilities)?
             {
                 return Err(io::Error::other("unsupported namespace child profile"));
+            }
+            if target.constraints.is_admin() {
+                validate_admin_userns(&target.namespaces[6])?;
             }
             let mut pair = [-1; 2];
             if unsafe {
@@ -590,6 +645,7 @@ impl PreparedChild {
                 version: SG_PAYLOAD_VERSION,
                 uid: self.uid,
                 gid: self.gid,
+                groups: self.groups.clone(),
                 mask: self.mask,
                 last_cap: self.last_cap,
                 enter_mask: namespace.enter_mask,
@@ -1017,6 +1073,62 @@ mod tests {
         launcher.deadline = Instant::now();
         assert!(launcher.poll().is_err());
         assert!(launcher.grant().is_err());
+    }
+
+    #[test]
+    fn admin_launcher_validates_profile_payload_and_namespace_handle() {
+        use sigrund_core::namespace::{Constraints, Contract};
+        let mut payload = NamespacePayload {
+            version: SG_PAYLOAD_VERSION,
+            uid: 0,
+            gid: 0,
+            groups: vec![33, 104],
+            mask: 0o022,
+            last_cap: std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+            enter_mask: 0,
+            cwd: "/".into(),
+            argv: vec!["/usr/bin/id".into()],
+            envp: vec![],
+            constraints: Constraints::parse(include_bytes!(
+                "../../sigrund-core/tests/fixtures/namespace/experimental-constraints.json"
+            ))
+            .unwrap(),
+            producer_guard: false,
+        };
+        assert!(payload.validate().is_err());
+        payload.constraints.schema = "sigrund.constraints.namespace-admin.v1".into();
+        payload.constraints.profile_id = "namespace-admin-v1".into();
+        payload.constraints.securebits = 0x2f;
+        payload.constraints.capabilities = vec!["CAP_CHOWN".into(), "CAP_NET_BIND_SERVICE".into()];
+        assert_eq!(payload.validate().unwrap(), 1 | (1 << 10));
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let roundtrip: NamespacePayload = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(roundtrip.groups, vec![33, 104]);
+        for mutation in 0..7 {
+            let mut bad: NamespacePayload = serde_json::from_slice(&bytes).unwrap();
+            match mutation {
+                0 => bad.enter_mask |= 1 << 6,
+                1 => bad.groups = vec![104, 33],
+                2 => bad.uid = u32::MAX,
+                3 => bad.version -= 1,
+                4 => bad.constraints.capabilities.push("CAP_SYS_ADMIN".into()),
+                5 => bad.last_cap += 1,
+                6 => bad.constraints.securebits = 15,
+                _ => unreachable!(),
+            }
+            assert!(bad.validate().is_err());
+        }
+        if crate::access::domain().is_ok() {
+            validate_admin_userns(&std::fs::File::open("/proc/self/ns/user").unwrap()).unwrap();
+            assert!(
+                validate_admin_userns(&std::fs::File::open("/proc/self/ns/mnt").unwrap()).is_err()
+            );
+            assert!(validate_admin_userns(&std::fs::File::open("/dev/null").unwrap()).is_err());
+        }
     }
 
     #[test]

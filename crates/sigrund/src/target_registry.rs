@@ -679,6 +679,14 @@ impl RegistrationSlot {
             &check,
         )?;
         check()?;
+        if constraints.is_admin() {
+            crate::execution::validate_admin_userns(
+                anchor
+                    .namespace_files()
+                    .get(6)
+                    .ok_or_else(|| invalid("missing admin target user namespace"))?,
+            )?;
+        }
         source
             .verify_capture(anchor.acquisition())
             .map_err(io::Error::other)?;
@@ -733,6 +741,14 @@ impl RegistrationSlot {
                 != Some(&registration.revision)
         {
             return Err(invalid("registration differs from captured owner"));
+        }
+        if constraints.is_admin() {
+            crate::execution::validate_admin_userns(
+                anchor
+                    .namespace_files()
+                    .get(6)
+                    .ok_or_else(|| invalid("missing admin target user namespace"))?,
+            )?;
         }
         let policy = crate::lsm::for_profile(&constraints)?;
         anchor.revalidate()?;

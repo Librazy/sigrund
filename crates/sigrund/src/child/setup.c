@@ -197,9 +197,9 @@ static void run_child(const struct child_spec *s) {
     for (unsigned cap = 0; cap <= s->last_cap; ++cap)
         if (!(s->capabilities & (1ULL << cap)))
             CHECK(3, syscall(SYS_prctl, PR_CAPBSET_DROP, cap, 0, 0, 0));
-    unsigned securebits = s->namespace_mode ? 15 : 0x2f;
+    unsigned securebits = s->namespace_mode && !s->namespace_admin ? 15 : 0x2f;
     CHECK(4, syscall(SYS_prctl, PR_SET_SECUREBITS, securebits, 0, 0, 0));
-    if (!s->namespace_mode) CHECK(5, syscall(SYS_setgroups, s->groups_len, s->groups));
+    if (!s->namespace_mode || s->namespace_admin) CHECK(5, syscall(SYS_setgroups, s->groups_len, s->groups));
     CHECK(5, syscall(SYS_setresgid, s->gid, s->gid, s->gid));
     CHECK(6, syscall(SYS_setresuid, s->uid, s->uid, s->uid));
     if (s->namespace_mode) CHECK(6, syscall(SYS_prctl, PR_SET_DUMPABLE, 0, 0, 0, 0));

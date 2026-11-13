@@ -612,7 +612,7 @@ fn direct_profile(
     file_capability_profile(&bytes[..count as usize], &c.capabilities)
 }
 
-fn capability_bits(names: &[String]) -> io::Result<u64> {
+pub(crate) fn capability_bits(names: &[String]) -> io::Result<u64> {
     names.iter().try_fold(0, |bits, name| {
         crate::authorization::capability_number(name)
             .map(|n| bits | (1u64 << n))

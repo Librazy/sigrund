@@ -117,6 +117,7 @@ capture still requires its supported kernel operations.
 | `host` / configured host profile | Thin, full and offline one-time SSH/stdio; daemon's retained execution environment. The packaged producer transitions commands to `sigrund_host_workload_t`, including host-only configurations. |
 | `registered:ID`, `self` / `namespace-selinux-v1` | Thin online approval, sealed executable/input, exact SELinux workload transition, explicit seccomp and final-child exec verification. |
 | `registered:ID`, `process:DAEMON_PID`, `self` / `namespace-experimental-v1` | Opt-in native execution without a requested LSM transition or seccomp filter. Known nonroot namespace-owner injection authority rejects before review, including experimental self. |
+| `registered:ID`, `self` / `namespace-admin-v1` | Opt-in UID 0, supplementary groups and explicit host-style capability grants in the initial user namespace. Host workload LSM semantics; containment is best effort. |
 | Preview constraint schema | Private review only; generic TIMEOUT without consumption or execution. |
 
 The enforcing deployment is Fedora 44 x86-64 with cgroup v2/systemd and SELinux.
@@ -129,10 +130,68 @@ no sudo or alternate execution path, and remain in enforcing
 administrators. Exposing sockets to an arbitrary unconfined container is insufficient.
 
 Production namespace full/export/offline redemption and process-PID targets are
-excluded. Other namespace topologies, idmapped mounts, target root/capability
-grants, AppArmor/stacked LSMs, executable models and platforms require separate
+excluded. Other namespace topologies, idmapped mounts, root/capability grants in the strict
+profiles, AppArmor/stacked LSMs, executable models and platforms require separate
 integration coverage. Ubuntu kernel 6.8 host authentication and ARM64 builds do
 not establish namespace runtime support on those platforms.
+
+### Rootful container administration
+
+`namespace-admin-v1` is an explicit opt-in profile for environments sharing the
+host's initial user namespace, including rootful Distrobox. Container UID 0 is
+host UID 0. Approval authorizes the command's credentials and capabilities in the
+selected environment; private mounts and resource limits are safety fences, not
+a guarantee that privileged effects remain inside the container. Approved shells,
+interpreters and mutable configuration retain their ordinary delegated authority.
+
+The admin schema `sigrund.constraints.namespace-admin.v1` accepts host-style
+capability sets except `CAP_SYS_ADMIN`, uses securebits 47 and `no_new_privs`, and
+supports exact supplementary groups. Empty capability/group sets are the default.
+Both daemon and signer rules must grant the destination IDs, groups and profile
+digest; the signer's capability ceiling must also permit every capability.
+Child user namespaces and process-PID selectors are rejected. Existing profiles
+retain their previous nonroot, empty-group and empty-capability execution limits.
+
+The packaged producer transitions admin commands to `sigrund_host_workload_t`,
+which the final-child checkpoint verifies. Its existing SELinux permissions still
+apply; accepting a capability in configuration does not grant SELinux permission
+to use it. The packaged workload policy currently allows `CAP_NET_BIND_SERVICE`,
+so this profile does not imply unrestricted package installation. Without the
+packaged producer, ambient host LSM behavior applies, as for host execution.
+
+To opt in on an already configured host:
+
+1. Append [the admin profile and daemon rules](config/namespace-admin-profiles.toml.example)
+   to the daemon configuration, and [the signer rules](config/namespace-admin-signers.toml.example)
+   inside the selected signer's configuration. Replace requester UID 1001 with
+   the actual **host** UID. Enable only the scopes needed for the deployment.
+2. Check that the existing signer permits target UID/GID 0. Keep its capability
+   ceiling empty for the supplied profile. If changing groups or capabilities,
+   update both scoped rules, the signer's ceilings, and the canonical profile
+   digest. Validate using `sigrund --check-config`, then drain and restart the daemon.
+3. Expose the existing `/run/sigrund` socket directory inside the rootful container;
+   the main, context and anchor sockets must all be accessible. Keep the host root
+   approver running with the daemon's current `host-epoch.json`.
+4. From the container, request:
+
+   ```sh
+   sigrun --socket /run/sigrund/client.sock --target self \
+     --security-profile namespace-admin-v1 --target-uid 0 --target-gid 0 \
+     --cwd / -- /usr/bin/id
+   ```
+
+Only thin online approval with `digest_memfd` and stdio is supported, with null
+or sealed finite stdin. For registered targets, create a fresh dedicated anchor
+in the rootful environment and register it with the admin profile using the
+existing `sigrundctl target register` workflow. Do not reuse an anchor captured
+under a different profile. Requester/destination mapped UID separation still
+applies. Test deployment changes on a disposable host before using a development
+container.
+
+The disposable systemd harness `scripts/namespace/verify-admin.py` compares
+host/admin credentials and capabilities, self execution, owner file access and
+cancellation. Its `--producer` mode additionally checks the packaged SELinux
+workload transition without broadening policy.
 
 ### Acquisition, approval and execution
 

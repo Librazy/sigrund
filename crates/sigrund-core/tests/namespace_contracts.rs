@@ -156,6 +156,37 @@ fn process_review_binds_selector_generation_profile_and_exact_csr() {
                 .unwrap()
                 .contains("Authenticated connector")
         );
+        {
+            let mut admin = own.clone();
+            admin.constraints.schema = "sigrund.constraints.namespace-admin.v1".into();
+            admin.constraints.profile_id = "namespace-admin-v1".into();
+            admin.constraints.securebits = 0x2f;
+            let binding = admin.binding().unwrap();
+            let mut root = payload.clone();
+            root.intent.security_profile = admin.constraints.profile_id.clone();
+            root.intent.account = sigrund_core::host::Account::Numeric {
+                uid: 0,
+                gid: 0,
+                supplementary_gids: vec![104],
+            };
+            root.execution_context.target_uid = 0;
+            root.execution_context.target_gid = 0;
+            root.execution_context.supplementary_gids = vec![104];
+            root.intent_sha256 = root.intent.sha256().unwrap();
+            root.target_binding = binding.target_binding;
+            root.security_constraints = binding.security_constraints;
+            let root_csr = Csr::new(root).unwrap();
+            admin.csr_sha256 = sha256_hex(root_csr.as_bytes());
+            admin.verify_csr(&root_csr).unwrap();
+            assert!(
+                admin
+                    .render(&root_csr)
+                    .unwrap()
+                    .contains("container containment is best effort")
+            );
+            admin.constraints = own.constraints.clone();
+            assert!(admin.verify_csr(&root_csr).is_err());
+        }
         let verified = own.clone();
         for mutation in 0..7 {
             let mut substituted = verified.clone();
@@ -316,4 +347,110 @@ fn selinux_profile_binds_complete_confinement_and_independent_digests() {
     .unwrap();
     old["selinux"]["executable_context"] = serde_json::Value::Null;
     assert!(Constraints::parse(&serde_json::to_vec(&old).unwrap()).is_err());
+}
+
+#[test]
+fn admin_constraints_preserve_host_capability_policy_and_old_profiles() {
+    use sigrund_core::host::{Constraints as HostConstraints, Record};
+    let old = Constraints::parse(include_bytes!(
+        "fixtures/namespace/experimental-constraints.json"
+    ))
+    .unwrap();
+    assert!(old.validate_execution_credentials(0, 0, &[]).is_err());
+    assert!(old.validate_execution_credentials(33, 33, &[104]).is_err());
+    let mut admin = old.clone();
+    admin.schema = "sigrund.constraints.namespace-admin.v1".into();
+    admin.profile_id = "namespace-admin-v1".into();
+    admin.securebits = 0x2f;
+    admin.validate().unwrap();
+    assert!(admin.executes());
+    admin
+        .validate_execution_credentials(0, 0, &[33, 104])
+        .unwrap();
+    assert!(
+        admin
+            .validate_execution_credentials(u32::MAX, 0, &[])
+            .is_err()
+    );
+    assert!(
+        admin
+            .validate_execution_credentials(0, 0, &[104, 33])
+            .is_err()
+    );
+    let mut host =
+        HostConstraints::parse(include_bytes!("fixtures/v3-host/constraints.json")).unwrap();
+    for caps in [
+        vec![],
+        vec!["CAP_NET_BIND_SERVICE"],
+        vec!["CAP_CHOWN", "CAP_SETUID"],
+        vec!["CAP_SYS_ADMIN"],
+        vec!["CAP_FAKE"],
+        vec!["CAP_CHOWN", "CAP_CHOWN"],
+        vec!["CAP_SETUID", "CAP_CHOWN"],
+    ] {
+        admin.capabilities = caps.iter().map(|c| (*c).to_owned()).collect();
+        host.capabilities = admin.capabilities.clone();
+        assert_eq!(
+            admin.validate().is_ok(),
+            host.validate().is_ok(),
+            "{caps:?}"
+        );
+    }
+    admin.capabilities.clear();
+    for mutation in 0..5 {
+        let mut bad = admin.clone();
+        match mutation {
+            0 => bad.securebits = 15,
+            1 => bad.no_new_privs = false,
+            2 => bad.selinux.enforcing = true,
+            3 => bad.executable_model = sigrund_core::executable::TrustModel::DigestDirect,
+            4 => bad.private_mount = false,
+            _ => unreachable!(),
+        }
+        assert!(bad.validate().is_err());
+    }
+    assert_ne!(admin.sha256().unwrap(), old.sha256().unwrap());
+}
+
+#[test]
+fn admin_configuration_examples_bind_the_canonical_profile() {
+    let example: toml::Value = toml::from_str(include_str!(
+        "../../../config/namespace-admin-profiles.toml.example"
+    ))
+    .unwrap();
+    let profile: Constraints = example["namespace_profiles"][0].clone().try_into().unwrap();
+    let frozen = include_bytes!("fixtures/namespace/admin-constraints.json");
+    assert_eq!(profile.canonical().unwrap(), frozen);
+    let signers: toml::Value = toml::from_str(include_str!(
+        "../../../config/namespace-admin-signers.toml.example"
+    ))
+    .unwrap();
+    for rules in [
+        example["namespace_rules"].as_array().unwrap(),
+        signers["signers"]["namespace_rules"].as_array().unwrap(),
+    ] {
+        for value in rules {
+            let rule: sigrund_core::namespace::ScopedRule = value.clone().try_into().unwrap();
+            rule.validate().unwrap();
+            assert_eq!(rule.profile_sha256, profile.sha256().unwrap());
+            assert!(rule.permits(
+                1001,
+                &rule.target_scope,
+                0,
+                0,
+                &[],
+                &profile.sha256().unwrap(),
+                1001
+            ));
+            assert!(!rule.permits(
+                1001,
+                &rule.target_scope,
+                0,
+                0,
+                &[104],
+                &profile.sha256().unwrap(),
+                1001
+            ));
+        }
+    }
 }

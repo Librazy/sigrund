@@ -84,7 +84,8 @@ exact values without shell evaluation or PATH lookup. Stdin defaults to null;
 authorization; readiness and exit status follow separately. Namespace requests
 use `--target registered:ID` or `--target self` with an explicitly configured
 profile and destination credentials. See [namespace execution](IMPLEMENTATION_NOTES.md#namespace-execution)
-for setup and deployment limits.
+for setup and deployment limits. Rootful container administration is available
+through the opt-in [`namespace-admin-v1` profile](IMPLEMENTATION_NOTES.md#rootful-container-administration).
 
 ## Security and scope
 
@@ -99,7 +100,7 @@ supported topology, confinement prerequisites and experimental profile.
 
 Approving an interpreter delegates its programmable authority under the selected
 credentials. Executable snapshots do not bind later script, import or library
-reads; see [interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md). Untrusted
+reads; see [interpreter guidance](docs/PRIVILEGED_INTERPRETERS.md). For the strict SELinux profile, untrusted
 namespace owners must remain in the enforcing requester domain. Unconfined host
 accounts and Podman API administrators are trusted. Policy-change handling
 detects changes and terminates work; it does not serialize every instruction

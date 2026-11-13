@@ -346,8 +346,24 @@ impl Constraints {
     pub fn is_production(&self) -> bool {
         self.schema == "sigrund.constraints.namespace-selinux.v1"
     }
+    pub fn is_admin(&self) -> bool {
+        self.schema == "sigrund.constraints.namespace-admin.v1"
+    }
     pub fn executes(&self) -> bool {
-        self.is_production() || self.schema == "sigrund.constraints.namespace-experimental.v1"
+        self.is_production()
+            || self.is_admin()
+            || self.schema == "sigrund.constraints.namespace-experimental.v1"
+    }
+    /// Credential support is a profile contract, independently checked at review
+    /// and launcher admission. Numeric authorization remains in scoped rules.
+    pub fn validate_execution_credentials(&self, uid: u32, gid: u32, groups: &[u32]) -> Result<()> {
+        crate::host::credentials(uid, gid, groups)?;
+        if self.executes() && !self.is_admin() && (uid == 0 || !groups.is_empty()) {
+            return Err(invalid(
+                "namespace execution requires non-root UID and empty groups",
+            ));
+        }
+        Ok(())
     }
 }
 impl Contract for Constraints {
@@ -357,6 +373,7 @@ impl Contract for Constraints {
             "sigrund.constraints.phase0.v1"
                 | "sigrund.constraints.namespace-experimental.v1"
                 | "sigrund.constraints.namespace-selinux.v1"
+                | "sigrund.constraints.namespace-admin.v1"
         ) {
             return Err(invalid("wrong constraint schema"));
         }
@@ -371,16 +388,23 @@ impl Contract for Constraints {
             || !self.private_cgroup
             || !self.no_new_privs
             || !self.verify_exec_stop
-            || self.securebits != 15
+            || self.securebits != if self.is_admin() { 0x2f } else { 15 }
             || self.memory_max == 0
             || self.memory_max > (1 << 40)
             || self.memory_swap_max > self.memory_max
             || !(2..=128).contains(&self.pids_max)
-            || self
-                .capabilities
-                .iter()
-                .any(|c| c != "CAP_NET_BIND_SERVICE")
-            || self.capabilities.len() > 1
+            || if self.is_admin() {
+                self.capabilities
+                    .iter()
+                    .any(|c| c == "CAP_SYS_ADMIN" || !crate::protocol::valid_capability(c))
+                    || self.capabilities.len() > 41
+                    || self.capabilities.windows(2).any(|pair| pair[0] >= pair[1])
+            } else {
+                self.capabilities
+                    .iter()
+                    .any(|c| c != "CAP_NET_BIND_SERVICE")
+                    || self.capabilities.len() > 1
+            }
             || self.apparmor != "unsupported"
             || !matches!(
                 self.executable_model,
@@ -404,6 +428,16 @@ impl Contract for Constraints {
                 return Err(invalid(
                     "unsupported production namespace constraint combination",
                 ));
+            }
+        } else if self.is_admin() {
+            if self.executable_model != crate::executable::TrustModel::DigestMemfd
+                || self.selinux.executable_context.is_some()
+                || self.selinux.enforcing
+                || !self.selinux.context.is_empty()
+                || self.selinux.policy_change != "unmanaged"
+                || !matches!(self.seccomp, Seccomp::None {})
+            {
+                return Err(invalid("unsupported admin constraint combination"));
             }
         } else if self.schema == "sigrund.constraints.namespace-experimental.v1" {
             if self.profile_id != "namespace-experimental-v1"
@@ -793,12 +827,16 @@ impl ProcessReview {
             }
             _ => false,
         };
-        if self.constraints.executes()
-            && (w.execution_context.target_uid == 0
-                || !w.execution_context.supplementary_gids.is_empty())
+        self.constraints.validate_execution_credentials(
+            w.execution_context.target_uid,
+            w.execution_context.target_gid,
+            &w.execution_context.supplementary_gids,
+        )?;
+        if self.constraints.is_admin()
+            && matches!(w.intent.target, crate::host::Selector::Process { .. })
         {
             return Err(invalid(
-                "experimental execution requires non-root UID and empty groups",
+                "admin execution requires a registered or authenticated self target",
             ));
         }
         if !target_matches
@@ -851,10 +889,14 @@ impl ProcessReview {
             "security_constraints": self.constraints,
             "execution_availability": if self.constraints.is_production() {
                 "SELinux-constrained execution; final-child checkpoint required"
+            } else if self.constraints.is_admin() {
+                "Administrative execution; host privilege semantics; container containment is best effort"
             } else if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
                 "Experimental execution; final-child checkpoint required"
             } else { "Private namespace review; execution is disabled" },
-            "workload_lsm_transition": if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
+            "workload_lsm_transition": if self.constraints.is_admin() {
+                "host workload transition when packaged producer is active; otherwise ambient LSM policy"
+            } else if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
                 "none requested; ambient LSM policy still applies"
             } else {
                 "required by security_constraints"

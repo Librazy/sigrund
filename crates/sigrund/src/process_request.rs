@@ -84,7 +84,8 @@ pub(crate) fn prepare(
     let original = request.hello.original_intent().map_err(io::Error::other)?;
     if matches!(original.target, Selector::Process { .. })
         && request.policy.namespace_profiles.iter().any(|profile| {
-            profile.profile_id == original.security_profile && profile.is_production()
+            profile.profile_id == original.security_profile
+                && (profile.is_production() || profile.is_admin())
         })
     {
         return Err(invalid(
@@ -166,6 +167,14 @@ pub(crate) fn prepare(
         || original.execution_context.capabilities != lease.constraints().capabilities
     {
         return Err(invalid("requested profile differs from target owner"));
+    }
+    if lease.constraints().is_admin() {
+        let namespaces = lease.namespace_files()?;
+        crate::execution::validate_admin_userns(
+            namespaces
+                .get(6)
+                .ok_or_else(|| invalid("missing target user namespace"))?,
+        )?;
     }
     // Different mapped workload UIDs do not exclude namespace-owner ptrace
     // authority. Until a workload LSM guard is qualified, reject that authority
@@ -336,13 +345,20 @@ fn check_scoped_policy(
 ) -> io::Result<()> {
     let intent = request.hello.original_intent().map_err(io::Error::other)?;
     let profile_sha256 = constraints.sha256().map_err(io::Error::other)?;
-    let unsupported_numeric = matches!(&intent.account, sigrund_core::host::Account::Numeric { uid, supplementary_gids, .. } if *uid == 0 || !supplementary_gids.is_empty());
-    if constraints.executes()
-        && (unsupported_numeric || credentials.is_some_and(|c| c.uid == 0 || !c.groups.is_empty()))
+    if let sigrund_core::host::Account::Numeric {
+        uid,
+        gid,
+        supplementary_gids,
+    } = &intent.account
     {
-        return Err(invalid(
-            "experimental execution requires non-root UID and empty groups",
-        ));
+        constraints
+            .validate_execution_credentials(*uid, *gid, supplementary_gids)
+            .map_err(|error| invalid(error.to_string()))?;
+    }
+    if let Some(c) = credentials {
+        constraints
+            .validate_execution_credentials(c.uid, c.gid, &c.groups)
+            .map_err(|error| invalid(error.to_string()))?;
     }
     let permits = |rule: &sigrund_core::namespace::ScopedRule| {
         rule.requester_uids.contains(&request.requester_uid)
@@ -857,6 +873,15 @@ pub(crate) fn verify_execution(
         Ok(_) => return Err(invalid("oversized observed LSM context")),
         Err(error) => serde_json::json!({"state":"unreadable", "errno":error.raw_os_error()}),
     };
+    if state.lease.constraints().is_admin()
+        && crate::lsm::producer_active()
+        && lsm.get("context").and_then(|value| value.as_str())
+            != Some(crate::lsm::HOST_WORKLOAD_CONTEXT)
+    {
+        return Err(invalid(
+            "admin workload did not enter the host workload SELinux context",
+        ));
+    }
     if let Some(guard) = state.lease.policy_guard() {
         if lsm.get("context").and_then(|value| value.as_str())
             != Some(state.lease.constraints().selinux.context.as_str())

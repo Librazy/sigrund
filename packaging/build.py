@@ -63,7 +63,7 @@ def stage(root, package, kind):
             if source.suffix in ('.py', '.c'):
                 install(source, docs / 'namespace/podman' / source.name)
         install(REPO / 'crates/sigrund/src/child/launcher_abi.h', docs / 'namespace/selinux/launcher_abi.h')
-        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example'):
+        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example', 'namespace-admin-profiles.toml.example', 'namespace-admin-signers.toml.example'):
             install(REPO / 'config' / name, docs / 'examples' / name)
 
 
