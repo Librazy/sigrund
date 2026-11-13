@@ -1076,6 +1076,39 @@ mod tests {
     }
 
     #[test]
+    fn installed_handoff_fixture_passes_payload_admission() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap").unwrap();
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(concat!(
+                "import json, runpy, sys; ",
+                "fixture = runpy.run_path(sys.argv[1])['handoff_payload']; ",
+                "print(json.dumps(fixture(json.load(open(sys.argv[2])), int(sys.argv[3]), int(sys.argv[4]))))"
+            ))
+            .arg(repo.join("scripts/namespace/selinux/verify-installed.py"))
+            .arg(repo.join("crates/sigrund-core/tests/fixtures/namespace/selinux-constraints.json"))
+            .arg(SG_PAYLOAD_VERSION.to_string())
+            .arg(last_cap.trim())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: NamespacePayload = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(payload.constraints.is_production());
+        assert_eq!(payload.validate().unwrap(), 0);
+        assert!(payload.groups.is_empty());
+        // Both cases use this record unchanged and must pass admission before
+        // the C runner emits BOOTSTRAP and checks their deliberately bad input.
+        let mut missing_groups: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        missing_groups.as_object_mut().unwrap().remove("groups");
+        assert!(serde_json::from_value::<NamespacePayload>(missing_groups).is_err());
+    }
+
+    #[test]
     fn admin_launcher_validates_profile_payload_and_namespace_handle() {
         use sigrund_core::namespace::{Constraints, Contract};
         let mut payload = NamespacePayload {

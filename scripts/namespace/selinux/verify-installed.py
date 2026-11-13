@@ -204,6 +204,13 @@ def requester(owner, unit, command, *, wait=True):
             *(['--wait', '--pipe'] if wait else []), *command]
 
 
+def handoff_payload(profile, version, last_cap):
+    """Base launcher record shared by the installed negative handoff cases."""
+    return {'version': version, 'uid': 12001, 'gid': 12001, 'groups': [], 'mask': 63,
+            'last_cap': last_cap, 'enter_mask': 1, 'cwd': '/',
+            'argv': ['/unreachable'], 'envp': [], 'constraints': profile, 'producer_guard': True}
+
+
 def handoffs(result):
     directory = Path('/var/lib/sigrund-namespace-lab/handoffs')
     directory.mkdir(mode=0o700, exist_ok=True)
@@ -214,9 +221,7 @@ def handoffs(result):
     profile = tomllib.loads(Path('/etc/sigrund/config.toml').read_text())['namespace_profiles'][0]
     # The ABI version is shared with the compiled launcher, never duplicated.
     version = int(re.search(r'#define SG_PAYLOAD_VERSION (\d+)', (HERE / 'launcher_abi.h').read_text()).group(1))
-    base = {'version': version, 'uid': 12001, 'gid': 12001, 'mask': 63,
-            'last_cap': int(Path('/proc/sys/kernel/cap_last_cap').read_text()),
-            'enter_mask': 1, 'cwd': '/', 'argv': ['/unreachable'], 'envp': [], 'constraints': profile, 'producer_guard': True}
+    base = handoff_payload(profile, version, int(Path('/proc/sys/kernel/cap_last_cap').read_text()))
     try:
         for case in ('unsealed', 'truncated', 'wrong-version', 'missing-producer-guard', 'missing-fds', 'bad-bootstrap', 'bad-namespace'):
             payload = dict(base)
