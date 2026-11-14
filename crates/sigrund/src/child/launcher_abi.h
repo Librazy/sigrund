@@ -2,7 +2,7 @@
  * The third field is the C declaration; SG_FIELD ignores Rust tokens in C. */
 #ifndef SIGRUND_LAUNCHER_ABI_H
 #define SIGRUND_LAUNCHER_ABI_H
-#define SG_PAYLOAD_VERSION 4
+#define SG_PAYLOAD_VERSION 5
 #define SG_EVENT_READY 1
 #define SG_EVENT_CHILD 2
 #define SG_EVENT_BOOTSTRAP 3
@@ -38,6 +38,7 @@ SG_FIELD(namespace_mode, i32, int namespace_mode)
 SG_FIELD(namespace_admin, i32, int namespace_admin)
 SG_FIELD(production, i32, int production)
 SG_FIELD(producer_guard, i32, int producer_guard)
+SG_FIELD(workload_context, *const libc::c_char, const char *workload_context)
 SG_END
 SG_STRUCT(NamespaceSpec, namespace_spec)
 SG_FIELD(namespaces, [i32; 8], int namespaces[8])

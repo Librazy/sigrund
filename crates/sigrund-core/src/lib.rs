@@ -20,6 +20,7 @@ mod sqlite_pinned;
 pub mod state;
 pub mod v3;
 pub mod warrant;
+pub mod workload;
 
 use thiserror::Error;
 

@@ -1,5 +1,8 @@
 # SELinux policy
 
+For opt-in data, network, maintenance and full-root profiles on host and namespace
+targets, see [workload tiers](../../docs/SELINUX_WORKLOADS.md).
+
 Fedora release artifacts include optional `sigrund-selinux` and
 `sigrund-selinux-podman` RPMs. CI builds these noarch modules separately against
 the Fedora 44 and 45 policy interfaces. Use packages from the same distribution

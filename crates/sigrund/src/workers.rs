@@ -62,6 +62,13 @@ pub(crate) struct MeasuredSnapshots {
 }
 impl ValidatedRequest {
     pub fn check(&self) -> io::Result<()> {
+        if let Some(workload) = self
+            .host_profile
+            .as_ref()
+            .and_then(|profile| profile.workload)
+        {
+            crate::lsm::check_workload(workload)?;
+        }
         if self.deadline_active {
             check(&self.cancelled, self.deadline)?;
         } else if self.cancelled.load(Ordering::Acquire) {

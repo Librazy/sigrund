@@ -218,6 +218,7 @@ impl Warrant {
         self.validate()?;
         bundle.validate()?;
         let c = &bundle.constraints;
+        c.validate_execution_uid(self.execution_context.target_uid)?;
         if self.host_id != bundle.host_id
             || self.execution_binding()? != bundle.binding()?
             || self.execution_context.capabilities != c.capabilities

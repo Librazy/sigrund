@@ -68,8 +68,8 @@ class Approver:
             if packet[0] == 0:
                 self.transcript.extend(packet[1:])
 
-    def confirm(self, process, approve=True):
-        deadline = time.monotonic() + 15
+    def confirm(self, process, approve=True, timeout=15):
+        deadline = time.monotonic() + timeout
         pending = bytearray()
         flushed = False
         while time.monotonic() < deadline:

@@ -119,6 +119,7 @@ capture still requires its supported kernel operations.
 | `registered:ID`, `process:DAEMON_PID`, `self` / `namespace-experimental-v1` | Opt-in native execution without a requested LSM transition or seccomp filter. Known nonroot namespace-owner injection authority rejects before review, including experimental self. |
 | `registered:ID`, `self` / `namespace-admin-v1` | Opt-in UID 0, supplementary groups and explicit host-style capability grants in the initial user namespace. Host workload LSM semantics; containment is best effort. |
 | `registered:ID`, `self` / `namespace-admin-direct-v1` | The same administrative authority using `digest_direct` on local storage or qualified, administrator-maintained container OverlayFS. |
+| `host`, `registered:ID`, `self` / opt-in workload tiers | Enforcing SELinux data, network, maintenance and full-root domains, independently authorized by daemon and signer profile digests. See [workload profiles](docs/SELINUX_WORKLOADS.md). |
 | Preview constraint schema | Private review only; generic TIMEOUT without consumption or execution. |
 
 The enforcing deployment is Fedora 44 x86-64 with cgroup v2/systemd and SELinux.

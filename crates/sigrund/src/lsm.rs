@@ -85,7 +85,10 @@ impl PolicyGuard {
         format!("{:016x}", self.token)
     }
 }
-pub(crate) fn startup(profiles: &[Constraints]) -> io::Result<()> {
+pub(crate) fn startup(
+    profiles: &[Constraints],
+    hosts: &[sigrund_core::host::Constraints],
+) -> io::Result<()> {
     let actual = match std::fs::read_to_string("/proc/self/attr/current") {
         Ok(value) => value,
         Err(error)
@@ -115,8 +118,30 @@ pub(crate) fn startup(profiles: &[Constraints]) -> io::Result<()> {
             allowed(DAEMON_CONTEXT, HOST_WORKLOAD_CONTEXT, class, permissions)?;
         }
         host.check()?;
+        POLICY
+            .set(Arc::new(host))
+            .map_err(|_| io::Error::other("SELinux epoch already initialized"))?;
     }
     PRODUCER.store(producer, Ordering::Release);
+    for workload in hosts
+        .iter()
+        .filter_map(|profile| profile.workload)
+        .chain(profiles.iter().filter_map(Constraints::workload))
+    {
+        if !producer {
+            return Err(io::Error::other(
+                "explicit workload requires the packaged enforcing SELinux producer",
+            ));
+        }
+        let guard = POLICY.get().expect("producer guard");
+        guard.verify_domain(workload.context())?;
+        for (class, permissions) in [
+            ("process", "transition,ptrace"),
+            ("process2", "nnp_transition,nosuid_transition"),
+        ] {
+            allowed(DAEMON_CONTEXT, workload.context(), class, permissions)?;
+        }
+    }
     let Some(profile) = profiles.iter().find(|profile| profile.is_production()) else {
         return Ok(());
     };
@@ -159,9 +184,7 @@ pub(crate) fn startup(profiles: &[Constraints]) -> io::Result<()> {
             io::Error::last_os_error()
         )));
     }
-    POLICY
-        .set(guard)
-        .map_err(|_| io::Error::other("SELinux epoch already initialized"))
+    guard.check()
 }
 fn allowed(source: &str, target: &str, class: &str, permissions: &str) -> io::Result<()> {
     let values = [source, target, class, permissions].map(|value| CString::new(value).unwrap());
@@ -181,7 +204,7 @@ fn allowed(source: &str, target: &str, class: &str, permissions: &str) -> io::Re
     Ok(())
 }
 pub(crate) fn for_profile(profile: &Constraints) -> io::Result<Option<Arc<PolicyGuard>>> {
-    if !profile.is_production() {
+    if !profile.is_production() && profile.workload().is_none() {
         return Ok(None);
     }
     let guard = POLICY
@@ -190,6 +213,17 @@ pub(crate) fn for_profile(profile: &Constraints) -> io::Result<Option<Arc<Policy
         .clone();
     guard.check()?;
     Ok(Some(guard))
+}
+pub(crate) fn check_workload(_workload: sigrund_core::workload::Workload) -> io::Result<()> {
+    if !producer_active() {
+        return Err(io::Error::other(
+            "explicit workload requires the packaged SELinux producer",
+        ));
+    }
+    POLICY
+        .get()
+        .ok_or_else(|| io::Error::other("SELinux dependency unavailable"))?
+        .check()
 }
 pub(crate) fn image_label(
     image: impl AsFd,

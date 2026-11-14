@@ -58,6 +58,7 @@ pub struct PreparedChild {
     last_cap: u32,
     mountinfo: Vec<u8>,
     group_check: Vec<u32>,
+    workload_context: Option<CString>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/launcher_abi.rs"));
@@ -120,6 +121,7 @@ impl NamespacePayload {
             || self.argv.is_empty()
             || !self.cwd.starts_with('/')
             || (self.constraints.is_admin() && self.enter_mask & (1 << 6) != 0)
+            || (self.constraints.workload().is_some() && !self.producer_guard)
         {
             return Err(io::Error::other("unsupported namespace launcher payload"));
         }
@@ -192,6 +194,10 @@ pub fn namespace_launcher_main() -> io::Result<()> {
     let mut envp: Vec<_> = environment.iter().map(|v| v.as_ptr()).collect();
     envp.push(std::ptr::null());
     let cwd = CString::new(payload.cwd).map_err(io::Error::other)?;
+    let workload_context = payload
+        .constraints
+        .workload()
+        .map(|policy| CString::new(policy.context()).expect("static context"));
     let mut group_check = vec![0; payload.groups.len()];
     let spec = ChildSpec {
         input: 10,
@@ -221,6 +227,9 @@ pub fn namespace_launcher_main() -> io::Result<()> {
         namespace_admin: i32::from(payload.constraints.is_admin()),
         production,
         producer_guard: i32::from(payload.producer_guard),
+        workload_context: workload_context
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr()),
     };
     let namespace = NamespaceSpec {
         namespaces: [16, 17, 18, 19, 20, 21, 22, 23],
@@ -441,6 +450,21 @@ impl NamespaceLauncher {
 }
 
 impl PreparedChild {
+    pub(crate) fn set_host_profile(
+        &mut self,
+        profile: &sigrund_core::host::Constraints,
+    ) -> io::Result<()> {
+        use sigrund_core::host::Record;
+        profile.validate().map_err(io::Error::other)?;
+        profile
+            .validate_execution_uid(self.uid)
+            .map_err(io::Error::other)?;
+        if let Some(policy) = profile.workload {
+            crate::lsm::check_workload(policy)?;
+            self.workload_context = Some(CString::new(policy.context()).expect("static context"));
+        }
+        Ok(())
+    }
     pub fn new(warrant: &sigrund_core::warrant::Warrant, envp: Vec<CString>) -> io::Result<Self> {
         let last_cap: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
             .trim()
@@ -488,6 +512,7 @@ impl PreparedChild {
             last_cap,
             mountinfo: vec![0; 1_048_576],
             group_check: vec![0; warrant.execution_context.supplementary_gids.len()],
+            workload_context: None,
         })
     }
 
@@ -580,6 +605,10 @@ impl PreparedChild {
                     .is_some_and(|target| target.constraints.is_production()),
             ),
             producer_guard: i32::from(crate::lsm::producer_active()),
+            workload_context: self
+                .workload_context
+                .as_ref()
+                .map_or(std::ptr::null(), |s| s.as_ptr()),
         };
         let mut pidfd = -1;
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -843,6 +872,7 @@ pub fn startup_probe(layout: &CgroupLayout) -> io::Result<()> {
             last_cap,
             mountinfo: vec![0; 1_048_576],
             group_check: vec![],
+            workload_context: None,
         };
         let mut child = command.spawn_checkpoint(
             cgroup.fd(),
@@ -1141,6 +1171,14 @@ mod tests {
         let bytes = serde_json::to_vec(&payload).unwrap();
         let roundtrip: NamespacePayload = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(roundtrip.groups, vec![33, 104]);
+        let mut enforcing: NamespacePayload = serde_json::from_slice(&bytes).unwrap();
+        enforcing.constraints.selinux.context =
+            sigrund_core::workload::Workload::Data.context().into();
+        enforcing.constraints.selinux.enforcing = true;
+        enforcing.constraints.selinux.policy_change = "detect_and_terminate".into();
+        assert!(enforcing.validate().is_err());
+        enforcing.producer_guard = true;
+        assert!(enforcing.validate().is_ok());
         for mutation in 0..7 {
             let mut bad: NamespacePayload = serde_json::from_slice(&bytes).unwrap();
             match mutation {

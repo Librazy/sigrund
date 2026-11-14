@@ -137,8 +137,10 @@ static void run_child(const struct child_spec *s) {
     /* A nonroot host command must not inherit the reserved socket producer's
      * authority. Set exec_sid before any private mounts or credential changes.
      * Namespace launchers establish it before entering the destination. */
-    if (s->producer_guard && !s->namespace_mode)
-        set_exec_context(host_workload_context, sizeof(host_workload_context)-1, sync);
+    if (s->producer_guard && !s->namespace_mode) {
+        const char *context = s->workload_context ? s->workload_context : host_workload_context;
+        set_exec_context(context, strlen(context), sync);
+    }
     if (s->checkpoint) {
         syscall(SYS_close, s->gate_write);
         char byte;
@@ -162,7 +164,7 @@ static void run_child(const struct child_spec *s) {
     CHECK(1, syscall(SYS_dup3, sync, 4, O_CLOEXEC));
     sync = 4;
     CHECK(1, syscall(SYS_close_range, 5U, ~0U, 0U));
-    if (s->isolated && !s->namespace_mode) lock_mounts(s, sync);
+    if ((s->isolated || s->workload_context) && !s->namespace_mode) lock_mounts(s, sync);
     if (s->direct_path && s->isolated) {
         /* mnt_may_suid() suppresses file capabilities for an FD whose mount
          * belongs to the parent's namespace. Open an alias in this namespace,
@@ -255,7 +257,7 @@ static void run_child(const struct child_spec *s) {
 int sigrund_spawn(const struct child_spec *spec, int cgroup_fd, int *pidfd) {
     struct clone_args args = {
         .flags = CLONE_INTO_CGROUP | CLONE_PIDFD |
-                 (spec->isolated ? CLONE_NEWNS | CLONE_NEWCGROUP : 0),
+                 ((spec->isolated || spec->workload_context) ? CLONE_NEWNS | CLONE_NEWCGROUP : 0),
         .exit_signal = SIGCHLD,
         .cgroup = cgroup_fd,
         .pidfd = (uintptr_t)pidfd,
@@ -333,7 +335,8 @@ void sigrund_run_namespace_launcher(const struct child_spec *original, const str
         static const char context[] = "system_u:system_r:sigrund_workload_t:s0:c1,c2";
         set_exec_context(context, sizeof(context)-1, sync);
     } else if (s.producer_guard) {
-        set_exec_context(host_workload_context, sizeof(host_workload_context)-1, sync);
+        const char *context = s.workload_context ? s.workload_context : host_workload_context;
+        set_exec_context(context, strlen(context), sync);
     }
     CHECK(13, syscall(SYS_setgroups, 0, NULL));
     static const unsigned order[8] = {6,0,1,2,3,7,5,4};

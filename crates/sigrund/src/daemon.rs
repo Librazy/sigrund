@@ -1054,7 +1054,9 @@ impl ForegroundDaemon {
                 )
                 .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
             target_budget
-                .with_transient_fd_copies(0, || crate::lsm::startup(&config.namespace_profiles))
+                .with_transient_fd_copies(0, || {
+                    crate::lsm::startup(&config.namespace_profiles, &config.host_profiles)
+                })
                 .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))??;
         }
         // Startup recovery/orphan records may themselves cross high water.
