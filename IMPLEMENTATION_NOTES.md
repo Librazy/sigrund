@@ -350,9 +350,10 @@ group are trusted host authority. Rootless/nonroot services, remote APIs,
 nondefault manager namespaces and untrusted rootful container-root sources are excluded.
 Host and real rootless A can request B as nonroot UID/GID 12001 with empty groups.
 
-For this deployment, install Podman and container-selinux, then provision a fresh
+For this deployment, install Podman and the matching `sigrund-selinux-podman` RPM
+(which depends on `container-selinux`), then provision a fresh
 host with `python3 "$NS_DOCS/podman/prepare-installed.py" --requester nsrequester`.
-It loads the optional `sigrund_podman` module for producer API access only. Build
+The policy package loads the optional `sigrund_podman` module for producer API access only. Build
 the host/A/B workloads and create source A using the
 [Quick Start](QUICK_START.md#3-prepare-the-container-demo). Start `sigrund.service` and
 `podman.socket`, run `restorecon -RF /run/podman`, and require a root:root socket

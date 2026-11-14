@@ -24,8 +24,10 @@ class ReleaseTests(unittest.TestCase):
             directory = self.artifacts / f'packages-{distro}-x86_64'
             directory.mkdir(parents=True)
             revision = f'1.{distro.replace("-", "")}.1'
-            for name in ('sigrun', 'sigrund'):
-                filename = (f'{name}-{VERSION}-{revision}.x86_64.rpm' if distro.startswith('fedora')
+            names = ('sigrun', 'sigrund', 'sigrund-selinux', 'sigrund-selinux-podman') if distro.startswith('fedora') else ('sigrun', 'sigrund')
+            for name in names:
+                arch = 'noarch' if name.startswith('sigrund-selinux') else 'x86_64'
+                filename = (f'{name}-{VERSION}-{revision}.{arch}.rpm' if distro.startswith('fedora')
                             else f'{name}_{VERSION}-{revision}_amd64.deb')
                 package = directory / filename
                 package.write_text(f'{distro}: {name}')
@@ -45,10 +47,10 @@ class ReleaseTests(unittest.TestCase):
             '--artifacts', str(self.artifacts), '--output', str(self.output),
         ], text=True, capture_output=True)
 
-    def test_collects_all_eight_packages_and_separate_build_information(self):
+    def test_collects_binaries_and_distribution_specific_policy_packages(self):
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(list(self.output.iterdir())), 13)
+        self.assertEqual(len(list(self.output.iterdir())), 17)
         for source in self.packages:
             self.assertEqual((self.output / source.name).read_bytes(), source.read_bytes())
         for source in self.artifacts.glob('*/build-info.txt'):
@@ -77,7 +79,25 @@ class ReleaseTests(unittest.TestCase):
         self.checksums(package.parent)
         result = self.prepare()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('expected a client and daemon package', result.stderr)
+        self.assertIn('expected the complete deb package set', result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_rejects_a_missing_policy_package(self):
+        package = next(p for p in self.packages if p.name.startswith('sigrund-selinux-podman-'))
+        package.unlink()
+        self.checksums(package.parent)
+        result = self.prepare()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('expected the complete rpm package set', result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_rejects_a_policy_package_with_the_wrong_architecture(self):
+        package = next(p for p in self.packages if p.name.startswith('sigrund-selinux-'))
+        package.rename(package.with_name(package.name.replace('.noarch.rpm', '.x86_64.rpm')))
+        self.checksums(package.parent)
+        result = self.prepare()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unexpected or duplicate package', result.stderr)
         self.assertFalse(self.output.exists())
 
     def test_rejects_packages_from_another_version(self):

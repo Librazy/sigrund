@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import shutil
 
-from build import workspace_version
+from build import package_names, workspace_version
 
 
 def check_tag(tag):
@@ -25,20 +25,27 @@ def prepare_assets(artifacts, output, version):
     for directory in directories:
         packages = sorted([*directory.glob('*.deb'), *directory.glob('*.rpm')])
         names = set()
+        kind = 'rpm' if directory.name.startswith('packages-fedora-') else 'deb'
         sums = ''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n'
                        for path in packages)
         if sums != (directory / 'SHA256SUMS').read_text():
             raise ValueError(f'package checksum mismatch: {directory.name}')
         for package in packages:
-            match = re.fullmatch(
-                rf'(sigrun|sigrund)(?:_{re.escape(version)}-[0-9A-Za-z.]+_amd64\.deb'
-                rf'|-{re.escape(version)}-[0-9A-Za-z.]+\.x86_64\.rpm)', package.name)
+            if kind == 'rpm':
+                match = re.fullmatch(
+                    rf'(sigrun|sigrund|sigrund-selinux|sigrund-selinux-podman)-{re.escape(version)}-'
+                    r'[0-9A-Za-z.]+\.(x86_64|noarch)\.rpm', package.name)
+                if match and (match[2] == 'noarch') != match[1].startswith('sigrund-selinux'):
+                    match = None
+            else:
+                match = re.fullmatch(
+                    rf'(sigrun|sigrund)_{re.escape(version)}-[0-9A-Za-z.]+_amd64\.deb', package.name)
             if match is None or package.name in assets:
                 raise ValueError(f'unexpected or duplicate package: {package.name}')
             names.add(match[1])
             assets[package.name] = package
-        if len(packages) != 2 or names != {'sigrun', 'sigrund'}:
-            raise ValueError(f'expected a client and daemon package: {directory.name}')
+        if len(packages) != len(package_names(kind)) or names != set(package_names(kind)):
+            raise ValueError(f'expected the complete {kind} package set: {directory.name}')
         info = directory / 'build-info.txt'
         if not info.is_file():
             raise ValueError(f'missing build information: {directory.name}')

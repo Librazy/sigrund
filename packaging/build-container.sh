@@ -10,7 +10,9 @@ case "$kind" in
     ;;
   rpm)
     dnf install -y gcc gcc-c++ glibc-devel rpm-build redhat-rpm-config binutils \
-      tar gzip findutils curl-minimal ca-certificates python3
+      tar gzip findutils curl-minimal ca-certificates python3 make \
+      selinux-policy-devel selinux-policy-targeted container-selinux policycoreutils \
+      'pkgconfig(systemd)'
     ;;
   *) exit 64 ;;
 esac
@@ -31,6 +33,10 @@ python3 packaging/build.py --format "$kind" --release "$PACKAGE_REVISION.1" --ou
 rustc --version > /out/packages/build-info.txt
 cargo --version >> /out/packages/build-info.txt
 cat /etc/os-release >> /out/packages/build-info.txt
+if [[ "$kind" == rpm ]]; then
+    rpm -q selinux-policy selinux-policy-devel container-selinux checkpolicy policycoreutils \
+      >> /out/packages/build-info.txt
+fi
 printf 'source=%s\nsource_date_epoch=%s\n' "$SOURCE_COMMIT" "$SOURCE_DATE_EPOCH" >> /out/packages/build-info.txt
 printf 'image_reference=%s\nimage_digest=%s\nimage_id=%s\n' \
   "$IMAGE_REFERENCE" "$IMAGE" "$IMAGE_ID" >> /out/packages/build-info.txt

@@ -50,24 +50,30 @@ jobs:
           FORMAT: ${{ matrix.format }}
         run: |
           mkdir -p "$RUNNER_TEMP/packages"
-          export SOURCE_COMMIT=$(git rev-parse HEAD)
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_COMMIT SOURCE_DATE_EPOCH
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            export PACKAGE_REVISION="1.${DISTRIBUTION//-/}"
+            PACKAGE_REVISION="1.${DISTRIBUTION//-/}"
           else
-            export PACKAGE_REVISION="0.$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S).git${SOURCE_COMMIT:0:12}.${DISTRIBUTION//-/}"
+            PACKAGE_REVISION="0.$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S).git${SOURCE_COMMIT:0:12}.${DISTRIBUTION//-/}"
           fi
+          export PACKAGE_REVISION
           docker run --rm --platform linux/amd64 \
             --env SOURCE_COMMIT --env SOURCE_DATE_EPOCH --env PACKAGE_REVISION \
             --env IMAGE_REFERENCE --env IMAGE --env IMAGE_ID \
             --volume "$GITHUB_WORKSPACE:/src:ro" --volume "$RUNNER_TEMP/packages:/out" \
             "$IMAGE" bash /src/packaging/build-container.sh "$FORMAT"
-      - name: Test daemon-only and combined installation in fresh containers
+      - name: Test packages and optional SELinux policy in fresh containers
         env:
           IMAGE: ${{ steps.target-image.outputs.image }}
           FORMAT: ${{ matrix.format }}
         run: |
-          for scenario in daemon-only combined; do
+          scenarios=(daemon-only combined)
+          if [[ "$FORMAT" == rpm ]]; then
+            scenarios+=(selinux)
+          fi
+          for scenario in "${scenarios[@]}"; do
             docker run --rm --platform linux/amd64 \
               --volume "$GITHUB_WORKSPACE/packaging:/packaging:ro" \
               --volume "$RUNNER_TEMP/packages:/out:ro" \

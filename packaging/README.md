@@ -1,15 +1,16 @@
 # Distribution packages
 
-The project and both packages are MIT licensed. Each DEB ships the license in
+The project and all packages are MIT licensed. Each DEB ships the license in
 `/usr/share/doc/<package>/copyright`; each RPM declares `License: MIT` and ships
 it in `/usr/share/licenses/<package>/LICENSE`.
 
 GitHub Actions builds native **x86-64** packages in Fedora 44/45 and Ubuntu
 24.04/26.04 containers, using the repository's pinned Rust toolchain and locked
 dependencies. Download the `packages-<distribution>-x86_64` artifact from a
-successful **Packages** workflow run. Each archive contains two packages,
-`SHA256SUMS`, and source/toolchain/image information in `build-info.txt`.
-Version tags also create a draft GitHub Release with all eight packages,
+successful **Packages** workflow run. Each Ubuntu archive contains two packages;
+each Fedora archive contains those binaries plus two optional SELinux policy RPMs.
+Both include `SHA256SUMS` and source/toolchain/image information in `build-info.txt`.
+Version tags also create a draft GitHub Release with all twelve packages,
 per-distribution build information and a combined `SHA256SUMS` file. Releases
 become publicly downloadable after a maintainer reviews and publishes the draft.
 
@@ -17,9 +18,11 @@ become publicly downloadable after a maintainer reviews and publishes the draft.
 | --- | --- | --- |
 | `sigrun` | `/usr/bin/sigrun`, documentation and license | Native shared libraries; no daemon, systemd or SSH dependency |
 | `sigrund` | `/usr/libexec/sigrund/sigrund`, `/usr/bin/sigrund-approve`, `/usr/bin/sigrundctl`, `/usr/bin/sigrund-anchor`, systemd unit and configuration examples | Native shared libraries, systemd and OpenSSH client |
+| `sigrund-selinux` (Fedora only, noarch) | Precompiled daemon, workload and restricted requester SELinux modules | Matching daemon package, targeted SELinux policy and policy management tools |
+| `sigrund-selinux-podman` (Fedora only, noarch) | Optional local rootful Podman API policy | Matching `sigrund-selinux` and `container-selinux`; no Podman engine dependency |
 
-Neither package depends on the other. Install both on a machine that will host
-the daemon and run requests locally. The diagnostic-only collector binary is
+The client and daemon do not depend on each other. Install both on a machine that
+will host the daemon and run requests locally. The diagnostic-only collector binary is
 not packaged as a working collector service.
 
 Follow the [Quick Start](https://github.com/Librazy/sigrund/blob/main/QUICK_START.md)
@@ -38,15 +41,26 @@ As root, install only the client, or both packages:
 
 ```sh
 # Fedora: client only
-dnf install ./sigrun-*.rpm
+dnf install ./sigrun-[0-9]*.x86_64.rpm
 # Fedora: add the daemon and operator tools
-dnf install ./sigrund-*.rpm
+dnf install ./sigrund-[0-9]*.x86_64.rpm
 
 # Ubuntu: client only
 apt install ./sigrun_*.deb
 # Ubuntu: add the daemon and operator tools
 apt install ./sigrund_*.deb
 ```
+
+Fedora SELinux integration is an explicit opt-in. Install the matching
+`sigrund-selinux` RPM for the daemon/workload/requester policy; add
+`sigrund-selinux-podman` only for the local rootful Podman adapter. Drain jobs and
+stop the daemon before installing or updating these packages. They load policy
+and restore file contexts, including the daemon entrypoint; they do not enable
+namespace authorization or start/restart the daemon. Host execution also gains
+the packaged workload domain's restrictions. See the
+[SELinux guide](https://github.com/Librazy/sigrund/blob/main/packaging/selinux/README.md)
+for lifecycle and Silverblue instructions.
+No policy development packages or target-side compilation are needed.
 
 Packages are unsigned; there is no signed RPM/APT repository. Checksums detect
 corruption; they do not independently establish authenticity. Both native
@@ -141,7 +155,10 @@ coherent persistent dataset.
 `build-container.sh` installs target-distribution build dependencies and builds
 release binaries. `build.py` stages separate payloads, obtains Debian shared
 library dependencies with `dpkg-shlibdeps`, and uses RPM's automatic dependency
-generator. No setuid executables or file capabilities are installed.
+generator. Fedora builds also compile all four SELinux modules against that
+distribution's policy interfaces and package them separately. Policy/tool
+versions are recorded in `build-info.txt`. No setuid executables or file
+capabilities are installed.
 
 Each job resolves its distribution tag once and uses that immutable repository
 digest for both the build and smoke containers. Artifacts record the original
@@ -162,6 +179,14 @@ These are packaging smoke tests, not execution acceptance: the existing CI
 workflow separately tests actual kernel execution and service supervision on a
 native privileged VM. Per-distribution privileged execution certification and
 ARM64 builds are not included yet.
+
+Each Fedora build additionally runs a fresh optional-policy scenario: installing
+the base modules without the Podman extension, installing that extension,
+upgrading all installed components and removing the policies independently. It
+checks the offline policy store, file-context mappings, preserved operator data,
+and absence of development tools or an implicitly installed Podman engine. No
+host kernel policy is loaded in these containers. Enforcing SELinux execution
+and Silverblue deployment require their native-host integration checks.
 
 For a local build after `cargo build --release --locked -p sigrund --bins`, use
 the matching distro's packaging tools and a fresh output directory:

@@ -14,13 +14,11 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('host root required')
+    subprocess.run(['rpm', '-q', 'sigrund-selinux-podman'], check=True)
     subprocess.run(['python3', str(HERE.parent / 'selinux/prepare-installed.py'),
                     '--requester', args.requester, '--state-dir', '/var/lib/sigrund',
                     '--log-path', '/var/log/sigrund/audit.jsonl'], check=True)
     config = Path('/etc/sigrund/config.toml')
-    policy = Path('/var/lib/sigrund-namespace-lab/policy')
-    subprocess.run(['make', '-C', str(policy), 'podman'], check=True)
-    subprocess.run(['semodule', '-i', str(policy / 'sigrund_podman.pp')], check=True)
     subprocess.run(['/usr/libexec/sigrund/sigrund', '--check-config', '--config', str(config),
                     '--signers', '/etc/sigrund/signers.toml'], check=True)
     print('Fresh Podman qualification set provisioned; start services explicitly.')
