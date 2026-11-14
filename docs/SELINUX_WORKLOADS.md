@@ -177,3 +177,20 @@ requires SIGKILL, single grant consumption and cgroup removal while the daemon
 remains running. It restores enforcement and leaves the daemon stopped. Both
 cases reproduced surviving jobs before the supervision fix and passed afterward
 on the Fedora 44 kernel above.
+
+The direct root/file-capability regression uses the same drained, stopped
+disposable host and a single test signer authorized for the root tier:
+
+```sh
+python3 scripts/namespace/selinux/verify-workload-filecaps.py \
+  --identity /root/test-approver --artifacts /root/filecap-results
+```
+
+It temporarily adds a direct root profile and matching daemon/signer rules,
+compiles a native probe, and checks execution without file capabilities and with
+`CAP_NET_BIND_SERVICE` in `p`, `ep` and `eip` modes. It verifies the actual inode,
+root SID and all five capability sets, as well as the exec checkpoint, single
+grant consumption and cgroup removal. Configuration is restored, the probe is
+removed and the daemon is left stopped. On the Fedora 44 kernel above, all three
+file-capability cases reproduced checkpoint rejection before the alias-reopening
+fix; all four cases passed afterward.
