@@ -74,3 +74,47 @@ See the [implementation notes](../../IMPLEMENTATION_NOTES.md#namespace-execution
 for scope and setup. Packages install those notes at
 `/usr/share/doc/sigrund/IMPLEMENTATION_NOTES.md`, with disposable recipes under
 `/usr/share/doc/sigrund/namespace/{selinux,podman}/`.
+
+## Finite stdin regression
+
+Finite `--stdin sha256` input is sealed and sent as an `O_RDONLY` descriptor.
+Seals and mode `0400` alone do not remove `FMODE_WRITE` from the original memfd
+description. Passing that original `O_RDWR` description across domains makes
+SELinux check both read and write permission during `SCM_RIGHTS` receipt, even
+though the contents cannot change. A Distrobox-style `spc_t` client can create
+`container_file_t` memfds, which the daemon may read but may not write. Reopening
+the sealed input through `/proc/self/fd` removes unnecessary write authority
+while retaining its inode, contents and seals. This needs an updated client;
+the daemon and SELinux policy need no additional permissions.
+
+On a disposable enforcing host with the installed service, configure the `lab`
+UID in host daemon/signer rules, permit `/usr/bin/cat`, and supply a test-only
+root-TTY approver identity. Run as trusted host root:
+
+```sh
+python3 /usr/share/doc/sigrund/namespace/selinux/verify-stdin.py \
+  --identity /root/test-approver --artifacts /root/stdin-results
+```
+
+To cover container clients, prepare a local image with the matching `sigrun`,
+`cat`, their libraries, and the `lab` UID/GID, then add
+`--podman-image localhost/sigrund-stdin:fixed`. The harness mounts the host
+socket and genuine selinuxfs and runs the client in `spc_t:s0`. It never pulls
+an image. Add `--admin-self` after enabling the shipped `namespace-admin-v1`
+daemon and signer examples. Only that self case disables Podman's default
+seccomp: namespace capture requires an unfiltered connector. Each artifacts
+directory must be new. Results include input digest, binary hashes, image ID,
+execution observations, grant consumption and cgroup cleanup; the approver
+transcript and kernel audit log remain private to the root-owned directory.
+
+On 2026-11-14, Fedora 44 x86_64 kernel `6.19.10-300.fc44.x86_64` with enforcing
+SELinux reproduced the original client's daemon-side `{ write }` denial on
+`container_file_t` input. With identical daemon and policy, the updated client
+passed restricted requester-to-host, container-to-host and container-self/admin
+routes. Each completed real TTY approval, returned the binary input unchanged,
+matched its signed SHA-256, consumed one grant and removed the job cgroup. This
+qualifies those routes on that kernel; broader workload permissions are a
+separate profile/policy design. All 226 default Rust tests passed on the VM;
+37 Python harness tests, Clippy with warnings denied, formatting and independent
+host/namespace protocol vectors also passed. Ignored privileged gates were not
+part of this default-suite run.
