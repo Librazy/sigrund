@@ -84,7 +84,8 @@ pub(crate) fn prepare(
     let original = request.hello.original_intent().map_err(io::Error::other)?;
     if matches!(original.target, Selector::Process { .. })
         && request.policy.namespace_profiles.iter().any(|profile| {
-            profile.profile_id == original.security_profile && profile.is_production()
+            profile.profile_id == original.security_profile
+                && (profile.is_production() || profile.is_admin())
         })
     {
         return Err(invalid(
@@ -166,6 +167,14 @@ pub(crate) fn prepare(
         || original.execution_context.capabilities != lease.constraints().capabilities
     {
         return Err(invalid("requested profile differs from target owner"));
+    }
+    if lease.constraints().is_admin() {
+        let namespaces = lease.namespace_files()?;
+        crate::execution::validate_admin_userns(
+            namespaces
+                .get(6)
+                .ok_or_else(|| invalid("missing target user namespace"))?,
+        )?;
     }
     // Different mapped workload UIDs do not exclude namespace-owner ptrace
     // authority. Until a workload LSM guard is qualified, reject that authority
@@ -258,19 +267,34 @@ pub(crate) fn prepare(
     kernel_context.target_uid = numeric.host_uid;
     kernel_context.target_gid = numeric.host_gid;
     kernel_context.supplementary_gids = numeric.host_groups.clone();
-    let executable = crate::executable::prepare(
-        result.source,
-        crate::executable::Selection {
-            signed: None,
-            context: &kernel_context,
-            allow_file_capabilities: false,
-            trace_available: crate::execution::trace_available(),
-        },
-        budget,
-        request.requester_uid,
-        &policy,
-        || request.check(),
-    )?;
+    let selection = crate::executable::Selection {
+        signed: None,
+        context: &kernel_context,
+        allow_file_capabilities: false,
+        trace_available: crate::execution::trace_available(),
+    };
+    let lease = &request.process.as_ref().unwrap().lease;
+    let executable =
+        if lease.constraints().is_admin_direct() && crate::overlay::is_overlay(&result.source)? {
+            let overlay = crate::overlay::Enrollment::discover(
+                &result.source,
+                std::path::Path::new(&original.command.executable_path),
+                lease,
+                &|| request.check(),
+            )?;
+            crate::executable::prepare_overlay(result.source, selection, &policy, overlay, || {
+                request.check()
+            })?
+        } else {
+            crate::executable::prepare(
+                result.source,
+                selection,
+                budget,
+                request.requester_uid,
+                &policy,
+                || request.check(),
+            )?
+        };
     request.snapshots = Some(MeasuredSnapshots { executable, stdin });
     request.pending_preparation = Some(Pending {
         signed: None,
@@ -336,13 +360,20 @@ fn check_scoped_policy(
 ) -> io::Result<()> {
     let intent = request.hello.original_intent().map_err(io::Error::other)?;
     let profile_sha256 = constraints.sha256().map_err(io::Error::other)?;
-    let unsupported_numeric = matches!(&intent.account, sigrund_core::host::Account::Numeric { uid, supplementary_gids, .. } if *uid == 0 || !supplementary_gids.is_empty());
-    if constraints.executes()
-        && (unsupported_numeric || credentials.is_some_and(|c| c.uid == 0 || !c.groups.is_empty()))
+    if let sigrund_core::host::Account::Numeric {
+        uid,
+        gid,
+        supplementary_gids,
+    } = &intent.account
     {
-        return Err(invalid(
-            "experimental execution requires non-root UID and empty groups",
-        ));
+        constraints
+            .validate_execution_credentials(*uid, *gid, supplementary_gids)
+            .map_err(|error| invalid(error.to_string()))?;
+    }
+    if let Some(c) = credentials {
+        constraints
+            .validate_execution_credentials(c.uid, c.gid, &c.groups)
+            .map_err(|error| invalid(error.to_string()))?;
     }
     let permits = |rule: &sigrund_core::namespace::ScopedRule| {
         rule.requester_uids.contains(&request.requester_uid)
@@ -451,6 +482,24 @@ pub(crate) fn finish(
         executable_roots: state.lease.executable_roots(),
         prepared_cwd: state.evidence.cwd.clone(),
         prepared_executable: state.evidence.executable.clone(),
+        executable_storage: if state.lease.constraints().is_admin_direct() {
+            Some(
+                request
+                    .snapshots
+                    .as_ref()
+                    .and_then(|s| s.executable.storage_evidence())
+                    .cloned()
+                    .unwrap_or_else(|| sigrund_core::namespace::ExecutableStorage {
+                        kind: "local_filesystem".into(),
+                        mount_id: state.evidence.executable.mount_id.clone(),
+                        layout_sha256: sha256_hex(b"sigrund.native-direct-filesystem.v1"),
+                        backing: state.evidence.executable.clone(),
+                        administrator_maintained: false,
+                    }),
+            )
+        } else {
+            None
+        },
     };
     let snapshots = request
         .snapshots
@@ -814,6 +863,22 @@ pub(crate) fn verify_execution(
             private_run = true;
         }
         if matches!(fields[separator + 1], "cgroup" | "cgroup2") {
+            // The trusted launcher mounts a fresh, empty tmpfs at /run after
+            // cloning the private tree. Distrobox's /run/host cgroup aliases
+            // remain listed even though that mount hides them. The visible
+            // /run mount is independently verified above and required below;
+            // cwd and setup FD checks exclude retained access beneath it.
+            if fields[4] == "/run" || fields[4].starts_with("/run/") {
+                continue;
+            }
+            // A runtime can also mount its delegated cgroup over an inherited
+            // mount at the same path. Only the object visible to this child
+            // must carry the restrictions applied by the launcher.
+            if fields[4] == "/sys/fs/cgroup"
+                && fields[0] != destination_helper::identity(&pin("root/sys/fs/cgroup")?)?.mount_id
+            {
+                continue;
+            }
             let flags: Vec<_> = fields[5].split(',').collect();
             if ["ro", "nosuid", "nodev", "noexec"]
                 .iter()
@@ -857,6 +922,15 @@ pub(crate) fn verify_execution(
         Ok(_) => return Err(invalid("oversized observed LSM context")),
         Err(error) => serde_json::json!({"state":"unreadable", "errno":error.raw_os_error()}),
     };
+    if state.lease.constraints().is_admin()
+        && crate::lsm::producer_active()
+        && lsm.get("context").and_then(|value| value.as_str())
+            != Some(crate::lsm::HOST_WORKLOAD_CONTEXT)
+    {
+        return Err(invalid(
+            "admin workload did not enter the host workload SELinux context",
+        ));
+    }
     if let Some(guard) = state.lease.policy_guard() {
         if lsm.get("context").and_then(|value| value.as_str())
             != Some(state.lease.constraints().selinux.context.as_str())

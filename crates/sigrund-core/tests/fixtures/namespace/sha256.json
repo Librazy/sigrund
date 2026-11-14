@@ -4,5 +4,6 @@
   "intent": "333c94c2f213efa59a7947a23093a8fe882d7dd48c3c27f645519d5f287c05c4",
   "bundle": "85ed689234b23dca83c1d9aa9d5964303281ec35b71993b6ed8ecbc2c053ec94",
   "warrant": "f16ba859c90c5660053ce123966c9329c45780473a197a39dec45124592c5c1a",
-  "execution-binding": "8a8ff2e2a7d895b94db9d9b134b8a989aaf8a536beca42b786371bd765fb7455"
+  "execution-binding": "8a8ff2e2a7d895b94db9d9b134b8a989aaf8a536beca42b786371bd765fb7455",
+  "admin-direct-constraints": "f3febb800cbee4af3cfbfe59511076b7d08fac83a1aab8c7225e366c8aa08aa3"
 }

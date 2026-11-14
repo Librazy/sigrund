@@ -953,7 +953,7 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "sigrund"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64",
  "cc",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "sigrund-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",

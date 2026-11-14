@@ -376,6 +376,15 @@ fn authorize(
                     fields["approved_target"]["manager"] =
                         serde_json::to_value(manager).map_err(|error| error.to_string())?;
                 }
+                if process.lease.constraints().is_admin_direct() {
+                    fields["executable_storage"] = serde_json::to_value(
+                        process
+                            .review
+                            .as_ref()
+                            .and_then(|r| r.executable_storage.as_ref()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
                 fields["execution_observed"] = serde_json::Value::Null;
             }
             append_event(
@@ -474,6 +483,15 @@ fn authorize(
         if let Some(manager) = process.lease.manager_evidence() {
             fields["approved_target"]["manager"] =
                 serde_json::to_value(manager).map_err(|error| error.to_string())?;
+        }
+        if process.lease.constraints().is_admin_direct() {
+            fields["executable_storage"] = serde_json::to_value(
+                process
+                    .review
+                    .as_ref()
+                    .and_then(|r| r.executable_storage.as_ref()),
+            )
+            .map_err(|e| e.to_string())?;
         }
         fields["execution_observed"] = serde_json::Value::Null;
     }

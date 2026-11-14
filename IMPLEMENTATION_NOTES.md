@@ -117,6 +117,8 @@ capture still requires its supported kernel operations.
 | `host` / configured host profile | Thin, full and offline one-time SSH/stdio; daemon's retained execution environment. The packaged producer transitions commands to `sigrund_host_workload_t`, including host-only configurations. |
 | `registered:ID`, `self` / `namespace-selinux-v1` | Thin online approval, sealed executable/input, exact SELinux workload transition, explicit seccomp and final-child exec verification. |
 | `registered:ID`, `process:DAEMON_PID`, `self` / `namespace-experimental-v1` | Opt-in native execution without a requested LSM transition or seccomp filter. Known nonroot namespace-owner injection authority rejects before review, including experimental self. |
+| `registered:ID`, `self` / `namespace-admin-v1` | Opt-in UID 0, supplementary groups and explicit host-style capability grants in the initial user namespace. Host workload LSM semantics; containment is best effort. |
+| `registered:ID`, `self` / `namespace-admin-direct-v1` | The same administrative authority using `digest_direct` on local storage or qualified, administrator-maintained container OverlayFS. |
 | Preview constraint schema | Private review only; generic TIMEOUT without consumption or execution. |
 
 The enforcing deployment is Fedora 44 x86-64 with cgroup v2/systemd and SELinux.
@@ -129,10 +131,143 @@ no sudo or alternate execution path, and remain in enforcing
 administrators. Exposing sockets to an arbitrary unconfined container is insufficient.
 
 Production namespace full/export/offline redemption and process-PID targets are
-excluded. Other namespace topologies, idmapped mounts, target root/capability
-grants, AppArmor/stacked LSMs, executable models and platforms require separate
+excluded. Other namespace topologies, idmapped mounts, root/capability grants in the strict
+profiles, AppArmor/stacked LSMs, executable models and platforms require separate
 integration coverage. Ubuntu kernel 6.8 host authentication and ARM64 builds do
 not establish namespace runtime support on those platforms.
+
+### Rootful container administration
+
+`namespace-admin-v1` is an explicit opt-in profile for environments sharing the
+host's initial user namespace, including rootful Distrobox. Container UID 0 is
+host UID 0. Approval authorizes the command's credentials and capabilities in the
+selected environment; private mounts and resource limits are safety fences, not
+a guarantee that privileged effects remain inside the container. Approved shells,
+interpreters and mutable configuration retain their ordinary delegated authority.
+
+The admin schema `sigrund.constraints.namespace-admin.v1` accepts host-style
+capability sets except `CAP_SYS_ADMIN`, uses securebits 47 and `no_new_privs`, and
+supports exact supplementary groups. Empty capability/group sets are the default.
+Both daemon and signer rules must grant the destination IDs, groups and profile
+digest; the signer's capability ceiling must also permit every capability.
+Child user namespaces and process-PID selectors are rejected. Existing profiles
+retain their previous nonroot, empty-group and empty-capability execution limits.
+
+The packaged producer transitions admin commands to `sigrund_host_workload_t`,
+which the final-child checkpoint verifies. Its existing SELinux permissions still
+apply; accepting a capability in configuration does not grant SELinux permission
+to use it. The packaged workload policy currently allows `CAP_NET_BIND_SERVICE`,
+so this profile does not imply unrestricted package installation. Without the
+packaged producer, ambient host LSM behavior applies, as for host execution.
+
+To opt in on an already configured host:
+
+1. Append [the admin profile and daemon rules](config/namespace-admin-profiles.toml.example)
+   to the daemon configuration, and [the signer rules](config/namespace-admin-signers.toml.example)
+   inside the selected signer's configuration. Replace requester UID 1001 with
+   the actual **host** UID. Enable only the scopes needed for the deployment.
+2. Check that the existing signer permits target UID/GID 0. Keep its capability
+   ceiling empty for the supplied profile. If changing groups or capabilities,
+   update both scoped rules, the signer's ceilings, and the canonical profile
+   digest. Validate using `sigrund --check-config`, then drain and restart the daemon.
+3. Expose the existing `/run/sigrund` socket directory inside the rootful container;
+   the main, context and anchor sockets must all be accessible. Keep the host root
+   approver running with the daemon's current `host-epoch.json`.
+4. From the container, request:
+
+   ```sh
+   sigrun --socket /run/sigrund/client.sock --target self \
+     --security-profile namespace-admin-v1 --target-uid 0 --target-gid 0 \
+     --cwd / -- /usr/bin/id
+   ```
+
+The original admin profile uses `digest_memfd`. Both admin profiles support only
+thin online approval and stdio, with null or sealed finite stdin. For registered targets, create a fresh dedicated anchor
+in the rootful environment and register it with the admin profile using the
+existing `sigrundctl target register` workflow. Do not reuse an anchor captured
+under a different profile. Requester/destination mapped UID separation still
+applies. Test deployment changes on a disposable host before using a development
+container.
+
+The disposable systemd harness `scripts/namespace/verify-admin.py` compares
+host/admin credentials and capabilities, self execution, owner file access and
+cancellation. Its `--producer` mode additionally checks the packaged SELinux
+workload transition without broadening policy.
+
+### Rootful OverlayFS direct execution
+
+[`namespace-admin-direct-v1`](config/namespace-admin-direct-profiles.toml.example)
+extends the administrator-maintained storage exception to rootful container
+OverlayFS. It is a separate profile with schema
+`sigrund.constraints.namespace-admin-direct.v1`, accepts only `digest_direct`,
+and inherits the admin identity, groups, capability, securebits, NNP, resource
+and host workload LSM rules. The target must share the host's initial user
+namespace; container root with UID remapping is insufficient. The backing-store
+administrators must be trusted for the actual privileges of the approved job.
+
+Append the profile/daemon rules and the matching
+[signer rules](config/namespace-admin-direct-signers.toml.example), adjust host
+requester IDs and scopes, and enable `digest_direct` in
+`executable_trust_models`. Validate configuration, drain and restart the daemon,
+and recapture/register targets under the new profile. For self requests, use
+`--security-profile namespace-admin-direct-v1`. Both daemon and signer must
+explicitly authorize its canonical profile digest. Qualification failure rejects
+the request; it never switches to memfd. Existing memfd profiles and the host
+ComposeFS switch keep their behavior. Namespace full/export/offline requests
+remain unsupported.
+
+Storage discovery is automatic and private to the captured request. The source
+FD's mount identity selects the captured target's mountinfo record. Upper, work,
+ordered lower and data-only directories are opened in the daemon's host view.
+Protected root-owned management symlinks, including runtime layer abbreviations,
+are resolved with bounded traversal. Layer paths printed by mountinfo are
+discovery hints; trusted administrators must preserve their relationship to the
+actual mounted objects. Stale, detached, ambiguous or inaccessible paths reject
+the request. This is independent of the special booted ComposeFS enrollment.
+
+Only the executable's relevant directory chains and metadata/data objects are
+walked. Resolution accounts for whiteouts, opaque directories, redirects,
+metacopy and data-only references. Retained layer, metadata and data FDs are
+charged to the request's FD budget. Root ownership, no group/other writes and
+no extended access/default ACLs are required on management ancestors, layer
+roots, workdir and relevant backing paths. Supported backing filesystems are
+ext-family, F2FS, Btrfs, XFS and tmpfs. Unknown mount features, userxattr,
+idmapped mounts, nested backing mounts/OverlayFS, command-path symlinks,
+set-ID executables and file capabilities are rejected. Establishing absence of
+idmapping requires kernel statx/statmount support. Discovery is bounded to a
+4 MiB mount table, 128 layers and 32 management-link/redirect expansions, with
+the existing worker deadlines and cancellation checks.
+
+Preparation, final authorization and the exec stop each hash the complete
+retained source and resolved data backing; overlay ctime never skips a hash.
+The stopped child's executable identity, load mappings and ELF PT_LOAD bytes
+must agree with the retained evidence before any loader or command instruction
+runs. ELF64 little-endian images are currently supported on this path.
+Copy-up or layer replacement invalidates retained object identities. Exact
+credentials, capabilities, NNP and expected LSM domain are still checked.
+Private review and AUTH_COMMIT record `executable_storage`, including the
+storage kind, target mount ID, layout digest, backing identity and administrator
+maintenance assumption. Public context exposes no container backing paths.
+
+Administrators must maintain backing protection and layer mappings, expose no
+untrusted writable aliases, retained writable handles or mappings, and never
+modify active backing objects in place, including through privileged jobs.
+Automatic checks establish observable conditions, not historical handle absence
+or future administrator behavior. Merged-path `ETXTBSY` does not protect direct
+backing writes or shared writable mappings retained after closing the merged
+writer FD. This exception provides no kernel write exclusion for backing
+objects and makes no content-immutability claim. Normal OverlayFS updates must
+preserve active backing objects; modifications during approval can reject a job.
+`ctime`, rootless/remapped containers and other namespace profiles are unchanged.
+SELinux may reject the original file label; this feature neither relabels images
+nor broadens policy.
+
+Use `scripts/namespace/verify-overlay.py` on a disposable systemd host for runtime
+qualification, and `verify-admin.py --direct` for the local-filesystem profile.
+Both accept `--producer` to test the installed SELinux producer. Kernel storage
+and load-checkpoint fixtures are the ignored `overlay::tests::rootful_overlay*`
+tests; run them as initial-userns root in a private mount namespace. Runtime
+coverage and remaining limits are recorded in [the qualification record](docs/OVERLAYFS_QUALIFICATION.md).
 
 ### Acquisition, approval and execution
 

@@ -1,0 +1,20 @@
+# Append inside the selected signer configuration after its existing fields.
+# A daemon rule and one signer rule must each independently permit the job.
+
+[[signers.namespace_rules]]
+requester_uids = [1001]
+target_scope = "registered:container-b"
+target_uids = [0]
+target_gids = [0]
+supplementary_gids = []
+profile_sha256 = "1c0cdd8c0bf5645b5bbceefda175afe1e7370b07988dfb023069f605d8f32ab4"
+cross_owner = true
+
+[[signers.namespace_rules]]
+requester_uids = [1001]
+target_scope = "self"
+target_uids = [0]
+target_gids = [0]
+supplementary_gids = []
+profile_sha256 = "1c0cdd8c0bf5645b5bbceefda175afe1e7370b07988dfb023069f605d8f32ab4"
+cross_owner = false

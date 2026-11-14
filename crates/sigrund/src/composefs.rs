@@ -118,7 +118,7 @@ fn root_mount(line: &str) -> Option<u64> {
     fields[0].parse().ok().filter(|id| *id > 0)
 }
 
-fn trusted(file: &File) -> io::Result<bool> {
+pub(crate) fn trusted(file: &File) -> io::Result<bool> {
     let m = file.metadata()?;
     if m.uid() != 0 || m.mode() & 0o022 != 0 || !(m.is_dir() || m.is_file()) {
         return Ok(false);

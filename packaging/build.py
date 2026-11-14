@@ -47,10 +47,14 @@ def stage(root, package, kind):
             guide = docs / name
             install(REPO / name, guide)
             text = guide.read_text().replace('(packaging/README.md', '(README.md')
+            text = text.replace('(config/', '(examples/')
             for target in ('docs/PRIVILEGED_INTERPRETERS.md', 'MAINTENANCE.md'):
                 text = text.replace('](' + target + ')', '](' + upstream + target + ')')
             text = text.replace('](<' + specification + '>)', '](' + upstream + specification.replace(' ', '%20') + ')')
             guide.write_text(text)
+        qualification = docs / 'docs/OVERLAYFS_QUALIFICATION.md'
+        install(REPO / 'docs/OVERLAYFS_QUALIFICATION.md', qualification)
+        qualification.write_text(qualification.read_text().replace('(../config/', '(../examples/'))
         for source in sorted((REPO / 'packaging/selinux').iterdir()):
             if source.suffix in ('.te', '.fc', '.md') or source.name == 'Makefile':
                 install(source, docs / 'selinux' / source.name)
@@ -63,7 +67,7 @@ def stage(root, package, kind):
             if source.suffix in ('.py', '.c'):
                 install(source, docs / 'namespace/podman' / source.name)
         install(REPO / 'crates/sigrund/src/child/launcher_abi.h', docs / 'namespace/selinux/launcher_abi.h')
-        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example'):
+        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example', 'namespace-admin-profiles.toml.example', 'namespace-admin-signers.toml.example', 'namespace-admin-direct-profiles.toml.example', 'namespace-admin-direct-signers.toml.example'):
             install(REPO / 'config' / name, docs / 'examples' / name)
 
 
