@@ -161,3 +161,19 @@ ignored). All three workload authorization contract tests also passed, including
 the later-added check that a lower-tier rule cannot authorize root or changed
 constraints. All 37 Python harness tests, Clippy with warnings denied, formatting
 and independent host/namespace protocol vectors passed.
+
+To verify that already-running host jobs retain their policy dependency, drain
+and stop the disposable daemon, then run:
+
+```sh
+python3 scripts/namespace/selinux/verify-workload-supervision.py \
+  --identity /root/test-approver --artifacts /root/supervision-results
+```
+
+This test reloads the installed SELinux policy and temporarily disables global
+enforcement in separate cases. Each case starts and approves a long-running
+host data job, changes policy only after its execution-ready audit record, and
+requires SIGKILL, single grant consumption and cgroup removal while the daemon
+remains running. It restores enforcement and leaves the daemon stopped. Both
+cases reproduced surviving jobs before the supervision fix and passed afterward
+on the Fedora 44 kernel above.

@@ -612,11 +612,19 @@ impl Execution {
                     job.outcome = Some(SyncOutcome::SpawnFailed);
                 }
             }
-            if let Some(owner) = &job.owner
-                && owner.job.lease.request().process.is_some()
-                && owner.job.lease.request().check().is_err()
-            {
-                job.lifecycle.cancel();
+            if let Some(owner) = &job.owner {
+                let request = owner.job.lease.request();
+                // Explicit host workloads retain a policy dependency even
+                // though they have no namespace target or target watch.
+                if (request.process.is_some()
+                    || request
+                        .host_profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.workload.is_some()))
+                    && request.check().is_err()
+                {
+                    job.lifecycle.cancel();
+                }
             }
             if !job.cleanup
                 && job
