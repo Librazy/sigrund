@@ -61,6 +61,16 @@ pub(crate) fn seal(mut file: File, mode: libc::mode_t) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Send finite input with read-only descriptor authority as well as inode seals.
+/// chmod and F_SEAL_WRITE do not clear FMODE_WRITE on the original memfd, so
+/// SELinux would still require write access when another domain receives it.
+pub(crate) fn seal_input(file: File) -> io::Result<OwnedFd> {
+    let sealed = seal(file, 0o400)?;
+    // The live descriptor pins this procfd link to the sealed inode. Reopening
+    // creates an O_RDONLY description; dup would retain the original O_RDWR.
+    Ok(File::open(format!("/proc/self/fd/{}", sealed.as_raw_fd()))?.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +89,41 @@ mod tests {
             Some(libc::EPERM)
         );
         assert_eq!(MFD_EXEC, libc::MFD_EXEC);
+    }
+
+    #[test]
+    fn sealed_input_is_read_only_and_retains_content_and_seals() {
+        use std::os::unix::fs::MetadataExt;
+
+        for bytes in [b"".as_slice(), b"finite input\0with binary bytes\xff"] {
+            let mut source = create("input-test", false).unwrap();
+            source.write_all(bytes).unwrap();
+            let inode = source.metadata().unwrap().ino();
+            let fd = seal_input(source).unwrap();
+            assert_eq!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+            assert_ne!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let seals =
+                F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+            assert_eq!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), F_GET_SEALS) } & seals,
+                seals
+            );
+            let mut input = File::from(fd);
+            assert_eq!(input.metadata().unwrap().ino(), inode);
+            assert_eq!(input.metadata().unwrap().mode() & 0o777, 0o400);
+            let mut observed = Vec::new();
+            input.read_to_end(&mut observed).unwrap();
+            assert_eq!(observed, bytes);
+            assert_eq!(
+                input.write(b"x").unwrap_err().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
     }
 }

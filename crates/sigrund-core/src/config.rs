@@ -683,9 +683,9 @@ impl DaemonConfig {
                 || !self
                     .executable_trust_models
                     .contains(&profile.executable_model)
-                || profile.memory_max != self.job_memory_max_bytes
-                || profile.memory_swap_max != self.job_memory_swap_max_bytes
-                || u64::from(profile.pids_max) != self.job_pids_max
+                || profile.memory_max > self.job_memory_max_bytes
+                || profile.memory_swap_max > self.job_memory_swap_max_bytes
+                || u64::from(profile.pids_max) > self.job_pids_max
             {
                 return Err(CoreError::Config(
                     "host profile differs from enforced job configuration".into(),

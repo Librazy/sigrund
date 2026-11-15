@@ -345,6 +345,9 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<Spawned> {
         owner.job.authorized.warrant.warrant(),
         owner.job.authorized.envp.clone(),
     )?;
+    if let Some(profile) = &request.host_profile {
+        command.set_host_profile(profile)?;
+    }
     let snapshot = request
         .snapshots
         .as_ref()
@@ -451,10 +454,13 @@ pub(crate) fn prepare_job(
             u64::from(profile.pids_max),
         )
     } else {
+        let Some(profile) = job.lease.request().host_profile.as_ref() else {
+            return (None, "missing enforced host profile".into());
+        };
         (
-            p.job_memory_max_bytes,
-            p.job_memory_swap_max_bytes,
-            p.job_pids_max,
+            profile.memory_max,
+            profile.memory_swap_max,
+            u64::from(profile.pids_max),
         )
     };
     match layout.create_job(&job.exec_id, memory, swap, pids) {

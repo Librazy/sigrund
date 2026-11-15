@@ -118,7 +118,8 @@ git push origin v0.4.0
 
 The Release workflow rejects tags that do not match the workspace version,
 builds and smoke-tests the client and daemon packages on all four distributions,
-then creates a **draft** GitHub Release. It attaches eight x86-64 RPM/DEB packages,
+then creates a **draft** GitHub Release. It attaches eight x86-64 RPM/DEB packages
+and four distribution-specific noarch SELinux policy RPMs,
 four distribution build-info files and a combined `SHA256SUMS`. Review the draft
 and its checks before publishing it. Creating the tag does not publish the
 release publicly or upload crates to crates.io.

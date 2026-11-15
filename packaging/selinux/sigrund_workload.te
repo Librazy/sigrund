@@ -1,4 +1,4 @@
-policy_module(sigrund_workload, 1.0.0)
+policy_module(sigrund_workload, 1.1.0)
 gen_require(`
     type sigrund_daemon_t;
     type sigrund_runtime_t;
@@ -92,3 +92,120 @@ libs_use_shared_libs(sigrund_host_workload_t)
 kernel_read_system_state(sigrund_host_workload_t)
 dev_rw_null(sigrund_host_workload_t)
 miscfiles_read_localization(sigrund_host_workload_t)
+
+# Administrator opt-in workload domains. Loading these types grants no request
+# authority: daemon and independent signer rules must authorize profile digests.
+# Keep them out of `domain`: generic user transitions must not bypass approval.
+attribute sigrund_optin_workload;
+
+type sigrund_data_workload_t;
+role system_r types sigrund_data_workload_t;
+typeattribute sigrund_data_workload_t sigrund_optin_workload;
+
+type sigrund_network_workload_t;
+role system_r types sigrund_network_workload_t;
+typeattribute sigrund_network_workload_t sigrund_optin_workload;
+
+type sigrund_maintenance_workload_t;
+role system_r types sigrund_maintenance_workload_t;
+typeattribute sigrund_maintenance_workload_t sigrund_optin_workload;
+
+type sigrund_root_workload_t;
+role system_r types sigrund_root_workload_t;
+typeattribute sigrund_root_workload_t sigrund_optin_workload;
+
+allow sigrund_daemon_t sigrund_optin_workload:process { transition ptrace signal sigkill sigstop signull getattr sigchld };
+allow sigrund_daemon_t sigrund_optin_workload:process2 { nnp_transition nosuid_transition };
+allow sigrund_daemon_t sigrund_optin_workload:dir { search read open getattr };
+allow sigrund_daemon_t sigrund_optin_workload:file { read open getattr };
+allow sigrund_daemon_t sigrund_optin_workload:lnk_file { read getattr };
+allow init_t sigrund_optin_workload:process { signal sigkill sigstop signull getattr getsched };
+allow sigrund_optin_workload { init_t sigrund_daemon_t }:process sigchld;
+allow sigrund_optin_workload sigrund_daemon_t:fd use;
+allow sigrund_optin_workload sigrund_daemon_t:file { entrypoint execute read open getattr map };
+allow sigrund_optin_workload file_type:file { entrypoint execute execute_no_trans read open getattr map ioctl lock };
+allow sigrund_optin_workload self:process { fork sigchld signal sigkill sigstop signull getcap getsched };
+allow sigrund_optin_workload self:dir { read open search getattr };
+allow sigrund_optin_workload self:file { read open getattr };
+allow sigrund_optin_workload self:lnk_file { read getattr };
+allow sigrund_optin_workload self:fifo_file rw_fifo_file_perms;
+allow sigrund_optin_workload self:unix_stream_socket create_stream_socket_perms;
+allow sigrund_optin_workload self:unix_stream_socket connectto;
+allow sigrund_optin_workload domain:fd use;
+allow sigrund_optin_workload domain:fifo_file rw_fifo_file_perms;
+allow sigrund_optin_workload domain:file { read write append getattr ioctl };
+allow sigrund_optin_workload sigrund_workload_data_t:dir manage_dir_perms;
+allow sigrund_optin_workload sigrund_workload_data_t:file manage_file_perms;
+allow sigrund_optin_workload sigrund_workload_data_t:lnk_file manage_lnk_file_perms;
+allow sigrund_optin_workload sigrund_workload_data_t:sock_file manage_sock_file_perms;
+files_search_all(sigrund_optin_workload)
+files_read_all_files(sigrund_optin_workload)
+files_read_all_symlinks(sigrund_optin_workload)
+libs_use_ld_so(sigrund_optin_workload)
+libs_use_shared_libs(sigrund_optin_workload)
+kernel_read_system_state(sigrund_optin_workload)
+dev_read_urand(sigrund_optin_workload)
+dev_rw_null(sigrund_optin_workload)
+miscfiles_read_localization(sigrund_optin_workload)
+
+# Data/network workloads cannot write the host configuration or relabel files.
+# TCP/UDP clients and servers may use all ports; raw sockets/network management
+# remain outside this tier. DAC and the signed capabilities still apply.
+attribute sigrund_network_workload;
+typeattribute sigrund_network_workload_t sigrund_network_workload;
+typeattribute sigrund_maintenance_workload_t sigrund_network_workload;
+allow sigrund_network_workload self:tcp_socket create_stream_socket_perms;
+allow sigrund_network_workload self:udp_socket create_socket_perms;
+allow sigrund_network_workload self:capability net_bind_service;
+corenet_all_recvfrom_unlabeled(sigrund_network_workload)
+corenet_all_recvfrom_netlabel(sigrund_network_workload)
+corenet_tcp_sendrecv_generic_if(sigrund_network_workload)
+corenet_udp_sendrecv_generic_if(sigrund_network_workload)
+corenet_tcp_sendrecv_generic_node(sigrund_network_workload)
+corenet_udp_sendrecv_generic_node(sigrund_network_workload)
+corenet_tcp_bind_all_nodes(sigrund_network_workload)
+corenet_udp_bind_all_nodes(sigrund_network_workload)
+corenet_tcp_bind_all_ports(sigrund_network_workload)
+corenet_udp_bind_all_ports(sigrund_network_workload)
+corenet_tcp_connect_all_ports(sigrund_network_workload)
+corenet_tcp_sendrecv_all_ports(sigrund_network_workload)
+corenet_udp_sendrecv_all_ports(sigrund_network_workload)
+sysnet_dns_name_resolve(sigrund_network_workload)
+
+# System maintenance/package installation: broad ordinary filesystem writes and
+# relabeling. This is trusted administration, not an application sandbox.
+files_manage_non_security_dirs(sigrund_maintenance_workload_t)
+files_manage_non_security_files(sigrund_maintenance_workload_t)
+files_relabel_non_security_files(sigrund_maintenance_workload_t)
+allow sigrund_maintenance_workload_t self:capability { chown dac_override dac_read_search fowner fsetid kill setgid setuid setpcap sys_chroot sys_resource setfcap net_bind_service };
+allow sigrund_maintenance_workload_t self:process { setcap setrlimit };
+allow sigrund_maintenance_workload_t self:file manage_file_perms;
+fs_getattr_all_fs(sigrund_maintenance_workload_t)
+kernel_read_all_sysctls(sigrund_maintenance_workload_t)
+selinux_get_enforce_mode(sigrund_maintenance_workload_t)
+selinux_read_security_files(sigrund_maintenance_workload_t)
+selinux_read_policy(sigrund_maintenance_workload_t)
+selinux_compute_access_vector(sigrund_maintenance_workload_t)
+selinux_validate_context(sigrund_maintenance_workload_t)
+
+# Full initial-userns administrator authority. Fedora's unconfined interfaces
+# include policy loading and enforcement control: this tier can replace these
+# protections, modify the daemon, or create a host service. Treat its mandator as
+# host root. No permissive domain or global enforcement switch is installed.
+unconfined_domain(sigrund_root_workload_t)
+allow sigrund_root_workload_t self:capability *;
+allow sigrund_root_workload_t self:capability2 *;
+allow sigrund_root_workload_t self:cap_userns *;
+allow sigrund_root_workload_t self:process *;
+allow sigrund_root_workload_t self:process2 *;
+allow sigrund_root_workload_t self:socket_class_set *;
+allow sigrund_root_workload_t self:file manage_file_perms;
+allow sigrund_root_workload_t self:dir manage_dir_perms;
+allow sigrund_root_workload_t self:anon_inode *;
+allow sigrund_root_workload_t self:user_namespace create;
+
+# Even admin execution does not directly inherit the reserved producer SID.
+# Full root may deliberately replace policy; these assertions protect ordinary
+# transitions, not the system against an administrator who controls policy.
+neverallow { sigrund_data_workload_t sigrund_network_workload_t sigrund_maintenance_workload_t } *:process { transition dyntransition };
+neverallow sigrund_optin_workload sigrund_daemon_t:process { ptrace transition dyntransition };

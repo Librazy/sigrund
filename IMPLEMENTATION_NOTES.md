@@ -119,6 +119,7 @@ capture still requires its supported kernel operations.
 | `registered:ID`, `process:DAEMON_PID`, `self` / `namespace-experimental-v1` | Opt-in native execution without a requested LSM transition or seccomp filter. Known nonroot namespace-owner injection authority rejects before review, including experimental self. |
 | `registered:ID`, `self` / `namespace-admin-v1` | Opt-in UID 0, supplementary groups and explicit host-style capability grants in the initial user namespace. Host workload LSM semantics; containment is best effort. |
 | `registered:ID`, `self` / `namespace-admin-direct-v1` | The same administrative authority using `digest_direct` on local storage or qualified, administrator-maintained container OverlayFS. |
+| `host`, `registered:ID`, `self` / opt-in workload tiers | Enforcing SELinux data, network, maintenance and full-root domains, independently authorized by daemon and signer profile digests. See [workload profiles](docs/SELINUX_WORKLOADS.md). |
 | Preview constraint schema | Private review only; generic TIMEOUT without consumption or execution. |
 
 The enforcing deployment is Fedora 44 x86-64 with cgroup v2/systemd and SELinux.
@@ -350,9 +351,10 @@ group are trusted host authority. Rootless/nonroot services, remote APIs,
 nondefault manager namespaces and untrusted rootful container-root sources are excluded.
 Host and real rootless A can request B as nonroot UID/GID 12001 with empty groups.
 
-For this deployment, install Podman and container-selinux, then provision a fresh
+For this deployment, install Podman and the matching `sigrund-selinux-podman` RPM
+(which depends on `container-selinux`), then provision a fresh
 host with `python3 "$NS_DOCS/podman/prepare-installed.py" --requester nsrequester`.
-It loads the optional `sigrund_podman` module for producer API access only. Build
+The policy package loads the optional `sigrund_podman` module for producer API access only. Build
 the host/A/B workloads and create source A using the
 [Quick Start](QUICK_START.md#3-prepare-the-container-demo). Start `sigrund.service` and
 `podman.socket`, run `restorecon -RF /run/podman`, and require a root:root socket

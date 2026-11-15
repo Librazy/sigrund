@@ -772,7 +772,7 @@ pub fn run(path: &Path, command: &[String], options: &RequestOptions) -> io::Res
             return Ok(128 + signal);
         }
         let digest = digest?;
-        Some((crate::memfd::seal(output, 0o400)?, digest))
+        Some((crate::memfd::seal_input(output)?, digest))
     } else {
         None
     };

@@ -1,4 +1,4 @@
-policy_module(sigrund_requester, 1.0.0)
+policy_module(sigrund_requester, 1.1.0)
 
 # The qualified deployment starts the untrusted account through a host-owned
 # systemd unit in this domain. Do not add domain or unconfined attributes:
@@ -19,6 +19,7 @@ gen_require(`
     type tmp_t;
     attribute domain;
     attribute file_type;
+    attribute sigrund_optin_workload;
     role system_r;
 ')
 role system_r types sigrund_requester_t;
@@ -98,3 +99,9 @@ dev_read_urand(sigrund_requester_t)
 dev_rw_null(sigrund_requester_t)
 init_use_fds(sigrund_requester_t)
 init_use_notify(sigrund_requester_t)
+
+allow sigrund_optin_workload sigrund_requester_t:fd use;
+allow sigrund_optin_workload sigrund_requester_t:fifo_file rw_fifo_file_perms;
+allow sigrund_optin_workload sigrund_requester_t:file { read write append getattr ioctl };
+neverallow sigrund_requester_t sigrund_optin_workload:process { ptrace transition dyntransition };
+neverallow sigrund_optin_workload { sigrund_execution_socket_t sigrund_context_socket_t sigrund_anchor_socket_t }:unix_stream_socket { create relabelfrom relabelto };

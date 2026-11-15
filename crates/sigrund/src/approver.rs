@@ -609,6 +609,13 @@ fn render_request(
     if admin_trusted_composefs {
         out.push_str("executable_storage = administrator-maintained ComposeFS; backing objects must remain unchanged during execution\n");
     }
+    if let Some(workload) = bundle.constraints.workload {
+        out.push_str(&format!(
+            "workload_authority = {}\nworkload_selinux_context = {}\n",
+            quote(workload.authority()),
+            quote(workload.context())
+        ));
+    }
     out.push_str(&format!(
         "umask_octal = {:03o}\n",
         csr.warrant().execution_context.umask

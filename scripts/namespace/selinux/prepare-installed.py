@@ -11,7 +11,6 @@ import json
 import os
 from pathlib import Path
 import pwd
-import shutil
 import subprocess
 
 ROOT = Path('/var/lib/sigrund-namespace-lab')
@@ -46,15 +45,12 @@ def main():
     account = pwd.getpwnam(args.requester)
     if account.pw_uid == 0 or account.pw_gid == 0 or account.pw_shell not in ('/sbin/nologin', '/usr/sbin/nologin'):
         parser.error('the requester must be a locked nonroot account with a nologin shell')
-    for name in ('sigrun', 'sigrund'):
+    for name in ('sigrun', 'sigrund', 'sigrund-selinux'):
         run('rpm', '-q', name)
     os.umask(0o077)
     ROOT.mkdir(mode=0o700)
     write(ROOT / 'status.json', json.dumps({'stage': 'preparing', 'requester_uid': account.pw_uid}) + '\n')
-    policy = ROOT / 'policy'
-    shutil.copytree(DOCS / 'selinux', policy)
-    run('make', '-C', policy)
-    run('semodule', '-i', policy / 'sigrund_daemon.pp', policy / 'sigrund_workload.pp', policy / 'sigrund_requester.pp')
+    policy = Path('/usr/share/selinux/packages/targeted')
     run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', ROOT / 'approver')
     key = (ROOT / 'approver.pub').read_text().strip()
     roots = '["/usr/bin", "/usr/local/libexec/sigrund-namespace"]'
@@ -99,7 +95,7 @@ def main():
     with (ROOT / 'provisioning.private.json').open('xb') as output:
         os.fchmod(output.fileno(), 0o600)
         run('sigrundctl', 'init-host', '--state-dir', args.state_dir, '--log-path', args.log_path, stdout=output)
-    run('restorecon', '-RF', CONFIG, args.state_dir, args.log_path.parent, '/usr/libexec/sigrund/sigrund')
+    run('restorecon', '-RF', CONFIG, args.state_dir, args.log_path.parent)
     record = {'stage': 'provisioned', 'requester_uid': account.pw_uid, 'requester_gid': account.pw_gid,
               'state_dir': str(args.state_dir), 'log_path': str(args.log_path),
               'policy_sha256': {name: hashlib.sha256((policy / name).read_bytes()).hexdigest()

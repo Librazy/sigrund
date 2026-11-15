@@ -228,8 +228,8 @@ impl Record for Acquisition {
     }
 }
 
-/// Describes only the existing native host setup. Required LSM transitions and
-/// inherited seccomp equivalence cannot be expressed by this profile version.
+/// Native host setup, optionally requiring an explicitly selected enforcing
+/// SELinux workload. Inherited seccomp equivalence is not claimed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Constraints {
@@ -248,6 +248,16 @@ pub struct Constraints {
     pub seccomp: String,
     pub executable_model: crate::executable::TrustModel,
     pub verify_exec_stop: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<crate::workload::Workload>,
+}
+impl Constraints {
+    pub fn validate_execution_uid(&self, uid: u32) -> Result<()> {
+        if self.workload == Some(crate::workload::Workload::Root) && uid != 0 {
+            return Err(invalid("root workload requires UID 0"));
+        }
+        Ok(())
+    }
 }
 impl Record for Constraints {
     fn validate(&self) -> Result<()> {
@@ -263,10 +273,16 @@ impl Record for Constraints {
             || self.memory_max > (1 << 40)
             || self.memory_swap_max > self.memory_max
             || !(1..=128).contains(&self.pids_max)
-            || self.lsm != "no_transition_required"
+            || self.lsm
+                != if self.workload.is_some() {
+                    "selinux_workload_required"
+                } else {
+                    "no_transition_required"
+                }
             || self.seccomp != "no_filter_required"
             || self.verify_exec_stop != direct
-            || self.capabilities.iter().any(|c| c == "CAP_SYS_ADMIN")
+            || (self.capabilities.iter().any(|c| c == "CAP_SYS_ADMIN")
+                && self.workload != Some(crate::workload::Workload::Root))
             || self.capabilities.len() > 41
             || self.capabilities.windows(2).any(|p| p[0] >= p[1])
             || self
@@ -275,6 +291,9 @@ impl Record for Constraints {
                 .any(|c| !crate::protocol::valid_capability(c))
         {
             return Err(invalid("unsupported host security constraints"));
+        }
+        if let Some(workload) = self.workload {
+            workload.validate_capabilities(&self.capabilities)?;
         }
         Ok(())
     }

@@ -343,6 +343,9 @@ pub enum Seccomp {
     },
 }
 impl Constraints {
+    pub fn workload(&self) -> Option<crate::workload::Workload> {
+        crate::workload::Workload::from_context(&self.selinux.context)
+    }
     pub fn is_production(&self) -> bool {
         self.schema == "sigrund.constraints.namespace-selinux.v1"
     }
@@ -365,6 +368,9 @@ impl Constraints {
     /// and launcher admission. Numeric authorization remains in scoped rules.
     pub fn validate_execution_credentials(&self, uid: u32, gid: u32, groups: &[u32]) -> Result<()> {
         crate::host::credentials(uid, gid, groups)?;
+        if self.workload() == Some(crate::workload::Workload::Root) && uid != 0 {
+            return Err(invalid("root workload requires UID 0"));
+        }
         if self.executes() && !self.is_admin() && (uid == 0 || !groups.is_empty()) {
             return Err(invalid(
                 "namespace execution requires non-root UID and empty groups",
@@ -402,10 +408,11 @@ impl Contract for Constraints {
             || self.memory_swap_max > self.memory_max
             || !(2..=128).contains(&self.pids_max)
             || if self.is_admin() {
-                self.capabilities
-                    .iter()
-                    .any(|c| c == "CAP_SYS_ADMIN" || !crate::protocol::valid_capability(c))
-                    || self.capabilities.len() > 41
+                self.capabilities.iter().any(|c| {
+                    (c == "CAP_SYS_ADMIN"
+                        && self.workload() != Some(crate::workload::Workload::Root))
+                        || !crate::protocol::valid_capability(c)
+                }) || self.capabilities.len() > 41
                     || self.capabilities.windows(2).any(|pair| pair[0] >= pair[1])
             } else {
                 self.capabilities
@@ -445,9 +452,14 @@ impl Contract for Constraints {
             };
             if self.executable_model != model
                 || self.selinux.executable_context.is_some()
-                || self.selinux.enforcing
-                || !self.selinux.context.is_empty()
-                || self.selinux.policy_change != "unmanaged"
+                || if let Some(workload) = self.workload() {
+                    workload.validate_capabilities(&self.capabilities)?;
+                    !self.selinux.enforcing || self.selinux.policy_change != "detect_and_terminate"
+                } else {
+                    self.selinux.enforcing
+                        || !self.selinux.context.is_empty()
+                        || self.selinux.policy_change != "unmanaged"
+                }
                 || !matches!(self.seccomp, Seccomp::None {})
             {
                 return Err(invalid("unsupported admin constraint combination"));
@@ -947,7 +959,11 @@ impl ProcessReview {
                 "Experimental execution; final-child checkpoint required"
             } else { "Private namespace review; execution is disabled" },
             "workload_lsm_transition": if self.constraints.is_admin() {
-                "host workload transition when packaged producer is active; otherwise ambient LSM policy"
+                if self.constraints.workload().is_some() {
+                    "explicit enforcing SELinux workload; root policy grants full host administration"
+                } else {
+                    "host workload transition when packaged producer is active; otherwise ambient LSM policy"
+                }
             } else if self.constraints.schema == "sigrund.constraints.namespace-experimental.v1" {
                 "none requested; ambient LSM policy still applies"
             } else {
@@ -960,6 +976,9 @@ impl ProcessReview {
             evidence["executable_storage_contract"] = serde_json::json!(
                 "Trusted initial-userns administrators maintain backing protection, layer identities and mappings; no untrusted writable aliases or retained writers; no in-place modification of active backing objects"
             );
+        }
+        if let Some(workload) = self.constraints.workload() {
+            evidence["workload_authority"] = serde_json::json!(workload.authority());
         }
         if let Some(manager) = &self.manager {
             evidence["manager"] = serde_json::json!({

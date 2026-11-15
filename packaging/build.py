@@ -14,6 +14,10 @@ import tomllib
 REPO = Path(__file__).resolve().parent.parent
 
 
+def package_names(kind):
+    return ('sigrun', 'sigrund', 'sigrund-selinux', 'sigrund-selinux-podman') if kind == 'rpm' else ('sigrun', 'sigrund')
+
+
 def workspace_version():
     return tomllib.loads((REPO / 'Cargo.toml').read_text())['workspace']['package']['version']
 
@@ -28,9 +32,9 @@ def install(source, destination, mode=0o644):
     destination.chmod(mode)
 
 
-def stage(root, package, kind):
+def stage(root, package, kind, policy=None):
     binaries = {'sigrun': ['sigrun'], 'sigrund': ['sigrund', 'sigrundctl', 'sigrund-approve', 'sigrund-anchor']}
-    for binary in binaries[package]:
+    for binary in binaries.get(package, []):
         path = 'usr/libexec/sigrund/sigrund' if binary == 'sigrund' else 'usr/bin/' + binary
         install(REPO / 'target/release' / binary, root / path, 0o755)
         run('strip', '--strip-unneeded', str(root / path))
@@ -38,6 +42,14 @@ def stage(root, package, kind):
     install(REPO / 'packaging/README.md', docs / 'README.md')
     license_path = docs / 'copyright' if kind == 'deb' else root / 'usr/share/licenses' / package / 'LICENSE'
     install(REPO / 'LICENSE', license_path)
+    if package.startswith('sigrund-selinux'):
+        modules = ('sigrund_podman',) if package.endswith('-podman') else (
+            'sigrund_daemon', 'sigrund_workload', 'sigrund_requester')
+        for module in modules:
+            install(policy / (module + '.pp'), root / 'usr/share/selinux/packages/targeted' / (module + '.pp'))
+        install(REPO / 'packaging/selinux/README.md', docs / 'README.md')
+        notes = docs / 'README.md'
+        notes.write_text(notes.read_text().replace('../../IMPLEMENTATION_NOTES.md', '../sigrund/IMPLEMENTATION_NOTES.md').replace('../../docs/SELINUX_WORKLOADS.md', '../sigrund/docs/SELINUX_WORKLOADS.md'))
     if package == 'sigrund':
         (root / 'etc/sigrund').mkdir(parents=True, mode=0o755)
         install(REPO / 'packaging/sigrund.service', root / 'usr/lib/systemd/system/sigrund.service')
@@ -52,6 +64,7 @@ def stage(root, package, kind):
                 text = text.replace('](' + target + ')', '](' + upstream + target + ')')
             text = text.replace('](<' + specification + '>)', '](' + upstream + specification.replace(' ', '%20') + ')')
             guide.write_text(text)
+        install(REPO / 'docs/SELINUX_WORKLOADS.md', docs / 'docs/SELINUX_WORKLOADS.md')
         qualification = docs / 'docs/OVERLAYFS_QUALIFICATION.md'
         install(REPO / 'docs/OVERLAYFS_QUALIFICATION.md', qualification)
         qualification.write_text(qualification.read_text().replace('(../config/', '(../examples/'))
@@ -59,15 +72,15 @@ def stage(root, package, kind):
             if source.suffix in ('.te', '.fc', '.md') or source.name == 'Makefile':
                 install(source, docs / 'selinux' / source.name)
         policy_notes = docs / 'selinux/README.md'
-        policy_notes.write_text(policy_notes.read_text().replace('../../IMPLEMENTATION_NOTES.md', '../IMPLEMENTATION_NOTES.md'))
+        policy_notes.write_text(policy_notes.read_text().replace('../../IMPLEMENTATION_NOTES.md', '../IMPLEMENTATION_NOTES.md').replace('../../docs/SELINUX_WORKLOADS.md', '../docs/SELINUX_WORKLOADS.md'))
         for source in sorted((REPO / 'scripts/namespace/selinux').iterdir()):
-            if source.suffix in ('.py', '.c'):
+            if source.suffix in ('.py', '.c', '.spec'):
                 install(source, docs / 'namespace/selinux' / source.name)
         for source in sorted((REPO / 'scripts/namespace/podman').iterdir()):
-            if source.suffix in ('.py', '.c'):
+            if source.suffix in ('.py', '.c', '.spec'):
                 install(source, docs / 'namespace/podman' / source.name)
         install(REPO / 'crates/sigrund/src/child/launcher_abi.h', docs / 'namespace/selinux/launcher_abi.h')
-        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example', 'namespace-admin-profiles.toml.example', 'namespace-admin-signers.toml.example', 'namespace-admin-direct-profiles.toml.example', 'namespace-admin-direct-signers.toml.example'):
+        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example', 'namespace-admin-profiles.toml.example', 'namespace-admin-signers.toml.example', 'namespace-admin-direct-profiles.toml.example', 'namespace-admin-direct-signers.toml.example', 'workload-profiles.toml.example', 'workload-signers.toml.example'):
             install(REPO / 'config' / name, docs / 'examples' / name)
 
 
@@ -105,13 +118,17 @@ def deb(work, output, version, release):
 
 
 def rpm(work, output, version, release):
+    # Compile against this distribution's policy interfaces; no host policy is loaded.
+    policy = work / 'policy'
+    shutil.copytree(REPO / 'packaging/selinux', policy)
+    run('make', '-C', str(policy), 'all', 'podman')
     payload = work / 'payload'
-    for name in ('sigrun', 'sigrund'):
-        stage(payload / name, name, 'rpm')
+    for name in package_names('rpm'):
+        stage(payload / name, name, 'rpm', policy)
     sources = work / 'SOURCES'
     sources.mkdir()
     with tarfile.open(sources / 'payload.tar.gz', 'w:gz') as archive:
-        for name in ('sigrun', 'sigrund'):
+        for name in package_names('rpm'):
             archive.add(payload / name, arcname=name)
     run('rpmbuild', '-bb', '--define', f'_topdir {work}',
         '--define', f'package_version {version}', '--define', f'package_release {release}',
@@ -136,8 +153,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix='sigrund-packages-') as temporary:
         {'deb': deb, 'rpm': rpm}[args.format](Path(temporary), output, version, args.release)
     packages = sorted(output.glob('*.' + args.format))
-    if len(packages) != 2:
-        raise RuntimeError('expected exactly one client and one daemon package')
+    if len(packages) != len(package_names(args.format)):
+        raise RuntimeError('unexpected number of native packages')
     (output / 'SHA256SUMS').write_text(''.join(
         hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in packages))
 

@@ -923,6 +923,7 @@ pub(crate) fn verify_execution(
         Err(error) => serde_json::json!({"state":"unreadable", "errno":error.raw_os_error()}),
     };
     if state.lease.constraints().is_admin()
+        && state.lease.constraints().workload().is_none()
         && crate::lsm::producer_active()
         && lsm.get("context").and_then(|value| value.as_str())
             != Some(crate::lsm::HOST_WORKLOAD_CONTEXT)

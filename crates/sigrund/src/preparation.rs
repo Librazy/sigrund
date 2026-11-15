@@ -213,6 +213,11 @@ fn capture_target(request: &mut ValidatedRequest, context: &Context) -> io::Resu
         if profile.capabilities != original.execution_context.capabilities {
             return Err(fail("POLICY_VIOLATION", "profile capability mismatch"));
         }
+        if let sigrund_core::host::Account::Numeric { uid, .. } = &original.account {
+            profile
+                .validate_execution_uid(*uid)
+                .map_err(io::Error::other)?;
+        }
         request.host_profile = Some(profile.clone());
     }
     Ok(())

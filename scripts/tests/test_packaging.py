@@ -22,7 +22,7 @@ class PackageBuildTests(unittest.TestCase):
             def build(work, output, version, release):
                 self.assertEqual(version, '9.8.7')
                 self.assertEqual(release, '1.test.1')
-                for name in ('sigrun', 'sigrund'):
+                for name in PACKAGING['package_names'](kind):
                     (output / f'{name}.{kind}').write_text(version)
 
             for kind in ('deb', 'rpm'):
@@ -33,7 +33,8 @@ class PackageBuildTests(unittest.TestCase):
                     '--output', str(base / kind),
                 ]):
                     main()
-                    self.assertEqual(len((base / kind / 'SHA256SUMS').read_text().splitlines()), 2)
+                    self.assertEqual(len((base / kind / 'SHA256SUMS').read_text().splitlines()),
+                                     4 if kind == 'rpm' else 2)
 
     def test_clean_container_build_supplies_both_package_payloads(self):
         script = (REPO / 'packaging/build-container.sh').read_text().replace('\\\n', ' ')
@@ -65,6 +66,29 @@ class PackageBuildTests(unittest.TestCase):
                                 anchor = output / 'usr/bin/sigrund-anchor'
                                 self.assertEqual(anchor.read_text(), 'sigrund-anchor')
                                 self.assertEqual(anchor.stat().st_mode & 0o777, 0o755)
+
+    def test_policy_payloads_require_built_modules_and_keep_podman_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            policy = base / 'policy'
+            policy.mkdir()
+            for name in ('sigrund_daemon', 'sigrund_workload', 'sigrund_requester', 'sigrund_podman'):
+                (policy / (name + '.pp')).write_bytes(name.encode())
+            for package, expected in (
+                ('sigrund-selinux', {'sigrund_daemon.pp', 'sigrund_workload.pp', 'sigrund_requester.pp'}),
+                ('sigrund-selinux-podman', {'sigrund_podman.pp'}),
+            ):
+                root = base / package
+                PACKAGING['stage'](root, package, 'rpm', policy)
+                modules = root / 'usr/share/selinux/packages/targeted'
+                self.assertEqual({p.name for p in modules.iterdir()}, expected)
+                for module in modules.iterdir():
+                    self.assertEqual(module.read_bytes(), (policy / module.name).read_bytes())
+                    self.assertEqual(module.stat().st_mode & 0o777, 0o644)
+                self.assertFalse((root / 'usr/bin').exists())
+            (policy / 'sigrund_workload.pp').unlink()
+            with self.assertRaises(FileNotFoundError):
+                PACKAGING['stage'](base / 'missing', 'sigrund-selinux', 'rpm', policy)
 
 
 if __name__ == '__main__':

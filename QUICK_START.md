@@ -34,7 +34,7 @@ run and extract it. In that directory, run as **host root**:
 ```sh
 sha256sum --check SHA256SUMS
 # Fedora:
-dnf install ./sigrun-*.rpm ./sigrund-*.rpm
+dnf install ./sigrun-[0-9]*.x86_64.rpm ./sigrund-[0-9]*.x86_64.rpm
 # Ubuntu, instead:
 apt install ./sigrun_*.deb ./sigrund_*.deb
 ```
@@ -127,7 +127,8 @@ enforcing `sigrund_requester_t` domain; unconfined host accounts are trusted
 administrators. An ordinary container with the socket mounted is insufficient.
 
 ```sh
-dnf install python3 gcc glibc-static make selinux-policy-devel \
+dnf install ./sigrund-selinux-[0-9]*.noarch.rpm
+dnf install python3 gcc glibc-static \
   policycoreutils-python-utils setools-console shadow-utils util-linux
 getenforce
 export NS_DOCS=/usr/share/doc/sigrund/namespace
@@ -149,8 +150,9 @@ sed -i 's/^authorization_timeout_ms = 5000$/authorization_timeout_ms = 120000/' 
 /usr/libexec/sigrund/sigrund --check-config
 ```
 
-The helper creates scoped daemon/signer policy, a disposable unencrypted SSH key,
-local-only collector placeholders, fresh state and the SELinux modules. It starts
+The helper uses the precompiled SELinux modules installed by the policy package
+and creates scoped daemon/signer policy, a disposable unencrypted SSH key,
+local-only collector placeholders and fresh state. It starts
 no service. Use these generated credentials only for this disposable demo.
 
 Build the same command path with distinct host/A/B output, then create the two
