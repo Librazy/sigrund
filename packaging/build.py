@@ -78,7 +78,7 @@ def stage(root, package, kind, policy=None):
         policy_notes = docs / 'selinux/README.md'
         policy_notes.write_text(policy_notes.read_text().replace('../../IMPLEMENTATION_NOTES.md', '../IMPLEMENTATION_NOTES.md').replace('../../docs/SELINUX_WORKLOADS.md', '../docs/SELINUX_WORKLOADS.md'))
         for source in sorted((REPO / 'scripts/namespace/selinux').iterdir()):
-            if source.suffix in ('.py', '.c', '.spec'):
+            if source.suffix in ('.py', '.c', '.spec', '.te'):
                 install(source, docs / 'namespace/selinux' / source.name)
         for source in sorted((REPO / 'scripts/namespace/podman').iterdir()):
             if source.suffix in ('.py', '.c', '.spec'):
