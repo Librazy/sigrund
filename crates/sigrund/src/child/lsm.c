@@ -96,3 +96,31 @@ int sigrund_lsm_allowed(const char *source, const char *target, const char *clas
     if (result < 0) errno = EPERM;
     return result;
 }
+
+int sigrund_lsm_forbidden(const char *source, const char *target, const char *class_name, const char *permissions) {
+    struct decision { uint32_t allowed, decided, auditallow, auditdeny, seqno, flags; } decision;
+    void *library = dlopen("libselinux.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!library) { errno = ENOTSUP; return -1; }
+    unsigned short (*class_number)(const char *) = dlsym(library, "string_to_security_class");
+    uint32_t (*permission_number)(unsigned short, const char *) = dlsym(library, "string_to_av_perm");
+    int (*compute)(const char *, const char *, unsigned short, unsigned, struct decision *) =
+        dlsym(library, "security_compute_av_flags_raw");
+    int result = -1;
+    if (class_number && permission_number && compute && strlen(permissions) < 256) {
+        unsigned short cls = class_number(class_name);
+        uint32_t requested = 0;
+        char names[256]; strcpy(names, permissions);
+        char *cursor = NULL;
+        int valid = cls != 0;
+        for (char *name = strtok_r(names, ",", &cursor); name; name = strtok_r(NULL, ",", &cursor)) {
+            uint32_t bit = permission_number(cls, name);
+            if (!bit) valid = 0;
+            requested |= bit;
+        }
+        if (valid && requested && compute(source, target, cls, requested, &decision) == 0 &&
+            !(decision.flags & 1) && (decision.allowed & requested) == 0) result = 0;
+    }
+    dlclose(library);
+    if (result < 0) errno = EPERM;
+    return result;
+}

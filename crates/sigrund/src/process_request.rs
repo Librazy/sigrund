@@ -923,7 +923,7 @@ pub(crate) fn verify_execution(
         Err(error) => serde_json::json!({"state":"unreadable", "errno":error.raw_os_error()}),
     };
     if state.lease.constraints().is_admin()
-        && state.lease.constraints().workload().is_none()
+        && state.lease.constraints().workload_context().is_none()
         && crate::lsm::producer_active()
         && lsm.get("context").and_then(|value| value.as_str())
             != Some(crate::lsm::HOST_WORKLOAD_CONTEXT)
@@ -945,7 +945,7 @@ pub(crate) fn verify_execution(
     state.lease.revalidate()?;
     check()?;
     Ok(
-        serde_json::json!({"child_pid":pid,"namespaces":observed,"root":root,"cwd":cwd,"host_credentials":state.evidence.credentials,"job_placement_verified":true,"setup_descriptors_closed":true,"private_run_verified":true,"seccomp":if production {2} else {0},"exact_seccomp_program_verified":production,"ambient_lsm":lsm,"selinux_policy_token":state.lease.policy_guard().map(|guard|guard.token())}),
+        serde_json::json!({"child_pid":pid,"namespaces":observed,"root":root,"cwd":cwd,"host_credentials":state.evidence.credentials,"job_placement_verified":true,"setup_descriptors_closed":true,"private_run_verified":true,"seccomp":if production {2} else {0},"exact_seccomp_program_verified":production,"custom_domain":state.lease.constraints().custom_domain.as_ref().map(|d| serde_json::json!({"context":d.context,"registration_sha256":d.sha256().expect("validated domain"),"policy_sha256":d.policy_sha256})),"ambient_lsm":lsm,"selinux_policy_token":state.lease.policy_guard().map(|guard|guard.token())}),
     )
 }
 

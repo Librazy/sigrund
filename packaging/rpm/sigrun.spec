@@ -137,6 +137,7 @@ fi
 %license /usr/share/licenses/sigrund/LICENSE
 
 %files -n sigrund-selinux
+%{_datadir}/selinux/devel/include/apps/sigrund_custom.if
 %{_datadir}/selinux/packages/%{selinuxtype}/sigrund_daemon.pp
 %{_datadir}/selinux/packages/%{selinuxtype}/sigrund_workload.pp
 %{_datadir}/selinux/packages/%{selinuxtype}/sigrund_requester.pp

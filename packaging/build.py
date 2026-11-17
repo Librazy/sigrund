@@ -48,6 +48,9 @@ def stage(root, package, kind, policy=None):
         for module in modules:
             install(policy / (module + '.pp'), root / 'usr/share/selinux/packages/targeted' / (module + '.pp'))
         install(REPO / 'packaging/selinux/README.md', docs / 'README.md')
+        if not package.endswith('-podman'):
+            install(REPO / 'packaging/selinux/sigrund_custom.if', docs / 'sigrund_custom.if')
+            install(REPO / 'packaging/selinux/sigrund_custom.if', root / 'usr/share/selinux/devel/include/apps/sigrund_custom.if')
         notes = docs / 'README.md'
         notes.write_text(notes.read_text().replace('../../IMPLEMENTATION_NOTES.md', '../sigrund/IMPLEMENTATION_NOTES.md').replace('../../docs/SELINUX_WORKLOADS.md', '../sigrund/docs/SELINUX_WORKLOADS.md'))
     if package == 'sigrund':
@@ -65,11 +68,12 @@ def stage(root, package, kind, policy=None):
             text = text.replace('](<' + specification + '>)', '](' + upstream + specification.replace(' ', '%20') + ')')
             guide.write_text(text)
         install(REPO / 'docs/SELINUX_WORKLOADS.md', docs / 'docs/SELINUX_WORKLOADS.md')
+        install(REPO / 'docs/CUSTOM_SELINUX_DOMAINS.md', docs / 'docs/CUSTOM_SELINUX_DOMAINS.md')
         qualification = docs / 'docs/OVERLAYFS_QUALIFICATION.md'
         install(REPO / 'docs/OVERLAYFS_QUALIFICATION.md', qualification)
         qualification.write_text(qualification.read_text().replace('(../config/', '(../examples/'))
         for source in sorted((REPO / 'packaging/selinux').iterdir()):
-            if source.suffix in ('.te', '.fc', '.md') or source.name == 'Makefile':
+            if source.suffix in ('.te', '.fc', '.md', '.if') or source.name == 'Makefile':
                 install(source, docs / 'selinux' / source.name)
         policy_notes = docs / 'selinux/README.md'
         policy_notes.write_text(policy_notes.read_text().replace('../../IMPLEMENTATION_NOTES.md', '../IMPLEMENTATION_NOTES.md').replace('../../docs/SELINUX_WORKLOADS.md', '../docs/SELINUX_WORKLOADS.md'))
@@ -80,7 +84,7 @@ def stage(root, package, kind, policy=None):
             if source.suffix in ('.py', '.c', '.spec'):
                 install(source, docs / 'namespace/podman' / source.name)
         install(REPO / 'crates/sigrund/src/child/launcher_abi.h', docs / 'namespace/selinux/launcher_abi.h')
-        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example', 'namespace-admin-profiles.toml.example', 'namespace-admin-signers.toml.example', 'namespace-admin-direct-profiles.toml.example', 'namespace-admin-direct-signers.toml.example', 'workload-profiles.toml.example', 'workload-signers.toml.example'):
+        for name in ('sigrund.toml.example', 'signers.toml.example', 'namespace-selinux-profiles.toml.example', 'namespace-selinux-signers.toml.example', 'namespace-admin-profiles.toml.example', 'namespace-admin-signers.toml.example', 'namespace-admin-direct-profiles.toml.example', 'namespace-admin-direct-signers.toml.example', 'workload-profiles.toml.example', 'workload-signers.toml.example', 'selinux-domain.toml.example'):
             install(REPO / 'config' / name, docs / 'examples' / name)
 
 

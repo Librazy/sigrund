@@ -250,8 +250,17 @@ pub struct Constraints {
     pub verify_exec_stop: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload: Option<crate::workload::Workload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_domain: Option<crate::workload::RegisteredDomain>,
 }
 impl Constraints {
+    pub fn workload_context(&self) -> Option<&str> {
+        self.custom_domain
+            .as_ref()
+            .map(|d| d.context.as_str())
+            .or_else(|| self.workload.map(|w| w.context()))
+    }
+
     pub fn validate_execution_uid(&self, uid: u32) -> Result<()> {
         if self.workload == Some(crate::workload::Workload::Root) && uid != 0 {
             return Err(invalid("root workload requires UID 0"));
@@ -263,7 +272,12 @@ impl Record for Constraints {
     fn validate(&self) -> Result<()> {
         identifier(&self.profile_id)?;
         let direct = self.executable_model != crate::executable::TrustModel::DigestMemfd;
-        if self.schema != "sigrund.host-constraints.v1"
+        if self.schema
+            != if self.custom_domain.is_some() {
+                "sigrund.host-custom-domain.v1"
+            } else {
+                "sigrund.host-constraints.v1"
+            }
             || !self.join_namespaces.is_empty()
             || !self.private_mount
             || !self.private_cgroup
@@ -274,13 +288,13 @@ impl Record for Constraints {
             || self.memory_swap_max > self.memory_max
             || !(1..=128).contains(&self.pids_max)
             || self.lsm
-                != if self.workload.is_some() {
+                != if self.workload_context().is_some() {
                     "selinux_workload_required"
                 } else {
                     "no_transition_required"
                 }
             || self.seccomp != "no_filter_required"
-            || self.verify_exec_stop != direct
+            || self.verify_exec_stop != (direct || self.custom_domain.is_some())
             || (self.capabilities.iter().any(|c| c == "CAP_SYS_ADMIN")
                 && self.workload != Some(crate::workload::Workload::Root))
             || self.capabilities.len() > 41
@@ -291,6 +305,14 @@ impl Record for Constraints {
                 .any(|c| !crate::protocol::valid_capability(c))
         {
             return Err(invalid("unsupported host security constraints"));
+        }
+        if let Some(domain) = &self.custom_domain {
+            domain.validate()?;
+            if self.workload.is_some() {
+                return Err(invalid(
+                    "built-in and custom domains are mutually exclusive",
+                ));
+            }
         }
         if let Some(workload) = self.workload {
             workload.validate_capabilities(&self.capabilities)?;

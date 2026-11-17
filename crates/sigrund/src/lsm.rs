@@ -26,6 +26,12 @@ unsafe extern "C" {
         class: *const libc::c_char,
         permissions: *const libc::c_char,
     ) -> i32;
+    fn sigrund_lsm_forbidden(
+        source: *const libc::c_char,
+        target: *const libc::c_char,
+        class: *const libc::c_char,
+        permissions: *const libc::c_char,
+    ) -> i32;
     fn sigrund_domain_enforcing(context: *const libc::c_char) -> i32;
     fn sigrund_policy_map() -> *mut libc::c_void;
     fn sigrund_policy_token(page: *const u32, token: *mut u64) -> i32;
@@ -43,7 +49,7 @@ impl Drop for PolicyGuard {
     }
 }
 impl PolicyGuard {
-    fn open(context: &str) -> io::Result<Self> {
+    pub(crate) fn open(context: &str) -> io::Result<Self> {
         let page = unsafe { sigrund_policy_map() };
         if page == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
@@ -125,8 +131,8 @@ pub(crate) fn startup(
     PRODUCER.store(producer, Ordering::Release);
     for workload in hosts
         .iter()
-        .filter_map(|profile| profile.workload)
-        .chain(profiles.iter().filter_map(Constraints::workload))
+        .filter_map(|profile| profile.workload_context())
+        .chain(profiles.iter().filter_map(Constraints::workload_context))
     {
         if !producer {
             return Err(io::Error::other(
@@ -134,13 +140,39 @@ pub(crate) fn startup(
             ));
         }
         let guard = POLICY.get().expect("producer guard");
-        guard.verify_domain(workload.context())?;
+        guard.verify_domain(workload)?;
         for (class, permissions) in [
             ("process", "transition,ptrace"),
             ("process2", "nnp_transition,nosuid_transition"),
         ] {
-            allowed(DAEMON_CONTEXT, workload.context(), class, permissions)?;
+            allowed(DAEMON_CONTEXT, workload, class, permissions)?;
         }
+    }
+    let mut registered = std::collections::BTreeMap::new();
+    for domain in hosts
+        .iter()
+        .filter_map(|p| p.custom_domain.as_ref())
+        .chain(profiles.iter().filter_map(|p| p.custom_domain.as_ref()))
+    {
+        if let Some(previous) = registered.insert(&domain.id, domain)
+            && previous != domain
+        {
+            return Err(io::Error::other(
+                "conflicting registration descriptors for one domain ID",
+            ));
+        }
+    }
+    if !registered.is_empty() {
+        let registry = crate::selinux_domains::list()?;
+        for domain in registered.values() {
+            if !registry.iter().any(|entry| entry == *domain) {
+                return Err(io::Error::other(
+                    "signed domain differs from host registration",
+                ));
+            }
+            crate::selinux_domains::check(domain)?;
+        }
+        POLICY.get().expect("custom producer guard").check()?;
     }
     let Some(profile) = profiles.iter().find(|profile| profile.is_production()) else {
         return Ok(());
@@ -186,7 +218,12 @@ pub(crate) fn startup(
     }
     guard.check()
 }
-fn allowed(source: &str, target: &str, class: &str, permissions: &str) -> io::Result<()> {
+pub(crate) fn allowed(
+    source: &str,
+    target: &str,
+    class: &str,
+    permissions: &str,
+) -> io::Result<()> {
     let values = [source, target, class, permissions].map(|value| CString::new(value).unwrap());
     if unsafe {
         sigrund_lsm_allowed(
@@ -204,7 +241,7 @@ fn allowed(source: &str, target: &str, class: &str, permissions: &str) -> io::Re
     Ok(())
 }
 pub(crate) fn for_profile(profile: &Constraints) -> io::Result<Option<Arc<PolicyGuard>>> {
-    if !profile.is_production() && profile.workload().is_none() {
+    if !profile.is_production() && profile.workload_context().is_none() {
         return Ok(None);
     }
     let guard = POLICY
@@ -214,7 +251,7 @@ pub(crate) fn for_profile(profile: &Constraints) -> io::Result<Option<Arc<Policy
     guard.check()?;
     Ok(Some(guard))
 }
-pub(crate) fn check_workload(_workload: sigrund_core::workload::Workload) -> io::Result<()> {
+pub(crate) fn check_context() -> io::Result<()> {
     if !producer_active() {
         return Err(io::Error::other(
             "explicit workload requires the packaged SELinux producer",
@@ -321,6 +358,31 @@ pub(crate) fn public_socket(role: crate::client::PeerRole) -> io::Result<std::os
         return Err(io::Error::last_os_error());
     }
     fd.ok_or(error)
+}
+
+pub(crate) fn forbidden(
+    source: &str,
+    target: &str,
+    class: &str,
+    permissions: &str,
+) -> io::Result<()> {
+    let values =
+        [source, target, class, permissions].map(|s| CString::new(s).map_err(io::Error::other));
+    let [source, target, class, permissions] = values;
+    if unsafe {
+        sigrund_lsm_forbidden(
+            source?.as_ptr(),
+            target?.as_ptr(),
+            class?.as_ptr(),
+            permissions?.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::other(
+            "custom domain violates producer or requester isolation",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
