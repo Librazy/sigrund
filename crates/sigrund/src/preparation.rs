@@ -1208,6 +1208,10 @@ mod tests {
                     .ino()
             );
             let snapshots = request.snapshots.as_ref().unwrap();
+            if let Some(stdin) = &snapshots.stdin {
+                let flags = unsafe { libc::fcntl(stdin.as_fd().as_raw_fd(), libc::F_GETFL) };
+                assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+            }
             for snapshot in [snapshots.executable.sealed(), snapshots.stdin.as_ref()]
                 .into_iter()
                 .flatten()

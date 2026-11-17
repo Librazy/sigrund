@@ -64,7 +64,15 @@ fn snapshots_are_sealed_rewound_and_accounted_until_owner_cleanup() {
         unsafe { libc::write(stdin.as_fd().as_raw_fd(), b"x".as_ptr().cast(), 1) },
         -1
     );
-    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    assert_eq!(
+        unsafe { libc::fcntl(stdin.as_fd().as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+        libc::O_RDONLY
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(stdin.as_fd().as_raw_fd(), libc::F_GET_SEALS) } & 0x1f,
+        0x1f
+    );
     let (send, recv) = std::sync::mpsc::channel();
     std::thread::spawn(move || send.send(executable).unwrap())
         .join()
