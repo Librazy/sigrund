@@ -194,3 +194,9 @@ grant consumption and cgroup removal. Configuration is restored, the probe is
 removed and the daemon is left stopped. On the Fedora 44 kernel above, all three
 file-capability cases reproduced checkpoint rejection before the alias-reopening
 fix; all four cases passed afterward.
+
+## Existing administrator-maintained domains
+
+See [Administrator-registered SELinux domains](CUSTOM_SELINUX_DOMAINS.md) for
+registering an existing enforcing domain, adapting its execution entry, and
+independently authorizing custom host and rootful namespace profiles.

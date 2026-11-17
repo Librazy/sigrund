@@ -620,7 +620,7 @@ impl Execution {
                     || request
                         .host_profile
                         .as_ref()
-                        .is_some_and(|profile| profile.workload.is_some()))
+                        .is_some_and(|profile| profile.workload_context().is_some()))
                     && request.check().is_err()
                 {
                     job.lifecycle.cancel();

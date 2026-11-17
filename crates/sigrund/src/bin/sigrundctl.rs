@@ -37,6 +37,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect and manage host-administrator SELinux domain registrations
+    SelinuxDomain {
+        #[command(subcommand)]
+        command: DomainCommand,
+    },
+    /// Export a fully resolved signed execution profile
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
     /// Create a fresh host identity, audit log and state database (root only)
     InitHost {
         /// Empty persistent state directory
@@ -79,6 +89,109 @@ enum Command {
     Uuidv7,
     /// Validate a UUIDv7
     ValidateUuid { uuid: String },
+}
+
+#[derive(Subcommand)]
+enum DomainCommand {
+    Check {
+        descriptor: PathBuf,
+    },
+    Register {
+        descriptor: PathBuf,
+        #[arg(long)]
+        replace: bool,
+    },
+    List,
+    Remove {
+        id: String,
+    },
+    /// Print the current loaded-policy fingerprint for a valid enforcing context
+    Fingerprint {
+        context: String,
+    },
+}
+#[derive(Subcommand)]
+enum ProfileCommand {
+    Export {
+        id: String,
+        #[arg(long, default_value = "/etc/sigrund/config.toml")]
+        config: PathBuf,
+    },
+}
+fn domain_command(command: DomainCommand) -> std::io::Result<()> {
+    use sigrund::selinux_domains as domains;
+    match command {
+        DomainCommand::Check { descriptor } => {
+            let domain = domains::parse(&fs::read(descriptor)?)?;
+            domains::check(&domain)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&domains::export(&domain)?)?
+            );
+        }
+        DomainCommand::Register {
+            descriptor,
+            replace,
+        } => {
+            let domain = domains::parse(&fs::read(descriptor)?)?;
+            domains::register(&domain, replace)?;
+            println!(
+                "Registered {}. Restart the daemon to load changes; authorize daemon and signer rules separately.",
+                domain.id
+            );
+        }
+        DomainCommand::List => println!("{}", serde_json::to_string_pretty(&domains::list()?)?),
+        DomainCommand::Remove { id } => {
+            domains::remove(&id)?;
+            println!(
+                "Removed {id} for the next startup. Active configuration and running tasks are unaffected; drain or terminate jobs and restart the daemon."
+            );
+        }
+        DomainCommand::Fingerprint { context } => {
+            println!("{}", domains::policy_fingerprint(&context)?)
+        }
+    }
+    Ok(())
+}
+fn profile_command(command: ProfileCommand) -> std::io::Result<()> {
+    use sigrund_core::{host::Record, namespace::Contract};
+    let ProfileCommand::Export { id, config } = command;
+    // Export candidate profiles before their new digest has been authorized.
+    #[derive(serde::Deserialize)]
+    struct Candidates {
+        #[serde(default)]
+        host_profiles: Vec<sigrund_core::host::Constraints>,
+        #[serde(default)]
+        namespace_profiles: Vec<sigrund_core::namespace::Constraints>,
+        #[serde(default)]
+        host_rules: Vec<sigrund_core::host::ScopedRule>,
+        #[serde(default)]
+        namespace_rules: Vec<sigrund_core::namespace::ScopedRule>,
+    }
+    let config: Candidates =
+        toml::from_str(&fs::read_to_string(config)?).map_err(std::io::Error::other)?;
+    let mut profiles = Vec::new();
+    for p in &config.host_profiles {
+        if p.profile_id == id {
+            profiles.push(serde_json::json!({"target":"host","constraints":p,"profile_sha256":p.sha256().map_err(std::io::Error::other)?,"registration":p.custom_domain.as_ref().map(sigrund::selinux_domains::export).transpose()?}));
+        }
+    }
+    for p in &config.namespace_profiles {
+        if p.profile_id == id {
+            profiles.push(serde_json::json!({"target":"namespace","constraints":p,"profile_sha256":p.sha256().map_err(std::io::Error::other)?,"registration":p.custom_domain.as_ref().map(sigrund::selinux_domains::export).transpose()?}));
+        }
+    }
+    if profiles.len() != 1 {
+        return Err(std::io::Error::other("profile ID missing or ambiguous"));
+    }
+    let digest = profiles[0]["profile_sha256"].clone();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &serde_json::json!({"profile":profiles[0],"daemon_rules":config.host_rules.iter().filter(|r| r.profile_sha256 == digest.as_str().unwrap()).map(|r| serde_json::to_value(r).unwrap()).chain(config.namespace_rules.iter().filter(|r| r.profile_sha256 == digest.as_str().unwrap()).map(|r| serde_json::to_value(r).unwrap())).collect::<Vec<_>>(),"signer_authorization":"Independently authorize this exact profile_sha256, scopes, identities and capabilities; registration alone grants no authority."})
+        )?
+    );
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -165,6 +278,8 @@ fn main() -> ExitCode {
         _ => unreachable!("clap requires a command or --validate-uuid"),
     };
     let result = match command {
+        Command::SelinuxDomain { command } => domain_command(command).map_err(Into::into),
+        Command::Profile { command } => profile_command(command).map_err(Into::into),
         Command::InitHost {
             state_dir,
             log_path,

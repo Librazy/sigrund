@@ -1,0 +1,42 @@
+policy_module(acme_backup, 1.0.0)
+
+type acme_backup_job_t;
+role system_r types acme_backup_job_t;
+sigrund_custom_domain(acme_backup_job_t)
+
+type acme_backup_source_t;
+files_type(acme_backup_source_t)
+type acme_backup_archive_t;
+files_type(acme_backup_archive_t)
+type acme_backup_secret_t;
+# Deliberately no file_type attribute: ordinary-file read interfaces cannot
+# accidentally grant access to the negative-test secret.
+fs_associate(acme_backup_secret_t)
+
+gen_require(`type unconfined_t; attribute file_type;')
+allow unconfined_t { acme_backup_source_t acme_backup_archive_t acme_backup_secret_t }:file manage_file_perms;
+allow unconfined_t { acme_backup_source_t acme_backup_archive_t acme_backup_secret_t }:dir manage_dir_perms;
+allow unconfined_t { acme_backup_source_t acme_backup_archive_t acme_backup_secret_t }:file { relabelto relabelfrom };
+allow unconfined_t { acme_backup_source_t acme_backup_archive_t acme_backup_secret_t }:dir { relabelto relabelfrom };
+allow sigrund_daemon_t acme_backup_secret_t:dir { search read open getattr };
+allow sigrund_daemon_t acme_backup_secret_t:file { read open getattr };
+files_search_all(acme_backup_job_t)
+libs_use_ld_so(acme_backup_job_t)
+libs_use_shared_libs(acme_backup_job_t)
+miscfiles_read_localization(acme_backup_job_t)
+dev_rw_null(acme_backup_job_t)
+allow acme_backup_job_t file_type:file entrypoint;
+corecmd_exec_bin(acme_backup_job_t)
+allow acme_backup_job_t acme_backup_source_t:dir { search read open getattr };
+allow acme_backup_job_t acme_backup_source_t:file { read open getattr };
+manage_dirs_pattern(acme_backup_job_t, acme_backup_archive_t, acme_backup_archive_t)
+manage_files_pattern(acme_backup_job_t, acme_backup_archive_t, acme_backup_archive_t)
+neverallow acme_backup_job_t acme_backup_secret_t:file { read write execute };
+
+# Rootful images normally label their loader/libraries container_file_t rather
+# than host lib_t/ld_so_t. This example explicitly permits reading/executing
+# ordinary image contents. Bind-mounted secrets retain their separate labels.
+optional_policy(`
+    gen_require(`type container_file_t, container_ro_file_t;')
+    allow acme_backup_job_t { container_file_t container_ro_file_t }:file { read open getattr map execute execute_no_trans };
+')
