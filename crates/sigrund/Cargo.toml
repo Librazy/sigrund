@@ -18,6 +18,7 @@ sha2.workspace = true
 subtle.workspace = true
 ssh-key.workspace = true
 serde.workspace = true
+toml.workspace = true
 sigrund-core = { path = "../sigrund-core" }
 
 [build-dependencies]
@@ -26,7 +27,6 @@ cc = "1"
 [dev-dependencies]
 tempfile = "3"
 rusqlite.workspace = true
-toml.workspace = true
 
 [[bin]]
 name = "sigrund"

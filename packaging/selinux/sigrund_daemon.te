@@ -118,3 +118,6 @@ init_use_notify(sigrund_daemon_t)
 logging_send_syslog_msg(sigrund_daemon_t)
 logging_stream_connect_syslog(sigrund_daemon_t)
 miscfiles_read_localization(sigrund_daemon_t)
+
+# Registered domains bind the actual kernel policy snapshot.
+selinux_read_policy(sigrund_daemon_t)

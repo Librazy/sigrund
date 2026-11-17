@@ -73,3 +73,5 @@ pub mod destination_helper;
 
 mod podman;
 mod process_request;
+
+pub mod selinux_domains;

@@ -107,3 +107,53 @@ impl Workload {
         capabilities
     }
 }
+
+/// Administrator-supplied identity and policy binding, carried in signed profiles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredDomain {
+    pub schema: String,
+    pub id: String,
+    pub context: String,
+    pub summary: String,
+    pub enforcing: bool,
+    pub policy_change: String,
+    pub policy_sha256: String,
+}
+impl RegisteredDomain {
+    pub fn validate(&self) -> crate::Result<()> {
+        crate::host::identifier(&self.id)?;
+        let parts: Vec<_> = self.context.splitn(4, ':').collect();
+        if self.schema != "sigrund.selinux-domain.v1"
+            || !self.enforcing
+            || self.policy_change != "detect_and_terminate"
+            || parts.len() != 4
+            || parts.iter().any(|p| p.is_empty())
+            || self.context.len() > 4096
+            || self
+                .context
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+            || parts[2].starts_with("sigrund_")
+            || self.summary.is_empty()
+            || self.summary.len() > 4096
+            || self.summary.chars().any(char::is_control)
+            || self.policy_sha256.len() != 64
+            || !self
+                .policy_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(crate::CoreError::Protocol(
+                "invalid registered SELinux domain".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn sha256(&self) -> crate::Result<String> {
+        self.validate()?;
+        Ok(crate::crypto::sha256_hex(&crate::json::canonical_bytes(
+            self,
+        )?))
+    }
+}

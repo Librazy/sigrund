@@ -885,6 +885,9 @@ fn render_request(
     if admin_trusted_composefs {
         out.push_str("executable_storage = administrator-maintained ComposeFS; backing objects must remain unchanged during execution\n");
     }
+    if let Some(domain) = &bundle.constraints.custom_domain {
+        out.push_str(&format!("custom_domain_source = host-administrator registration\ncustom_domain_declaration = {}\ncustom_domain_context = {}\ncustom_domain_registration_sha256 = {}\ncustom_domain_policy_sha256 = {}\ncustom_domain_enforcing = required\ncustom_domain_description_assurance = administrator declaration, not a verified permission summary\n", quote(&domain.summary), quote(&domain.context), domain.sha256().map_err(io::Error::other)?, quote(&domain.policy_sha256)));
+    }
     if let Some(workload) = bundle.constraints.workload {
         out.push_str(&format!(
             "workload_authority = {}\nworkload_selinux_context = {}\n",
