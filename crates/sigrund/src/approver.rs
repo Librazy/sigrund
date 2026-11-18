@@ -290,14 +290,22 @@ impl Exchange<'_> {
     }
 
     pub(crate) fn wait_input(&self, tty: &File, refresh: Instant) -> io::Result<()> {
-        poll(
-            &mut [
-                event(tty.as_raw_fd(), libc::POLLIN),
-                event(self.socket.as_raw_fd(), libc::POLLIN),
-                event(self.signals.fd.as_raw_fd(), libc::POLLIN),
-            ],
-            Some(self.deadline.min(refresh)),
-        )
+        self.wait_terminal(tty, libc::POLLIN, refresh)
+    }
+
+    pub(crate) fn wait_terminal(
+        &self,
+        tty: &File,
+        interest: i16,
+        until: Instant,
+    ) -> io::Result<()> {
+        let mut events = [
+            event(tty.as_raw_fd(), interest),
+            event(self.socket.as_raw_fd(), libc::POLLIN),
+            event(self.signals.fd.as_raw_fd(), libc::POLLIN),
+        ];
+        poll(&mut events, Some(self.deadline.min(until)))?;
+        check_terminal_event(events[0])
     }
 }
 
@@ -314,7 +322,7 @@ pub(crate) trait Frontend {
         review: &Review,
         exchange: &Exchange<'_>,
     ) -> io::Result<Decision>;
-    fn before_signing(&mut self) -> io::Result<()> {
+    fn before_signing(&mut self, _exchange: &Exchange<'_>) -> io::Result<()> {
         Ok(())
     }
     fn decision_sent(&mut self) {}
@@ -643,7 +651,7 @@ fn respond(
     if !valid_now(&review.csr) {
         return Ok(Some(refused("warrant expired while awaiting confirmation")));
     }
-    frontend.before_signing()?;
+    frontend.before_signing(exchange)?;
     let signature = sign_payload(identity, tty, signer, review.csr.as_bytes(), || {
         exchange.check()
     })?;
@@ -1223,7 +1231,7 @@ mod tests {
                 assert!(!screen.idle(false).unwrap());
             } else {
                 assert!(matches!(result, Ok(Decision::Approve)));
-                screen.before_signing().unwrap();
+                screen.before_signing(&exchange).unwrap();
                 assert_eq!(attributes().c_lflag, original.c_lflag);
             }
         }

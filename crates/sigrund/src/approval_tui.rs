@@ -1,6 +1,7 @@
 //! The renderer writes to the verified TTY. Terminal input never uses stdin.
 use crate::approver::{
-    Decision, Exchange, Frontend, Review, discard_confirmation_input, event, poll, quote,
+    Decision, Exchange, Frontend, Review, check_terminal_event, discard_confirmation_input, event,
+    poll, quote,
 };
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
@@ -21,6 +22,7 @@ use std::{
 const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?2004h";
 const LEAVE: &[u8] = b"\x18\x1b[0m\x1b[?2004l\x1b[?1049l\x1b[?25h";
 const REFRESH: Duration = Duration::from_millis(100);
+const OUTPUT_STALL: Duration = Duration::from_millis(250);
 const ESCAPE_WAIT: Duration = Duration::from_millis(40);
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 9;
@@ -76,7 +78,7 @@ impl<'a> Screen<'a> {
         ))
     }
 
-    fn enter(&mut self, area: Rect) -> io::Result<()> {
+    fn enter(&mut self, exchange: Option<&Exchange<'_>>) -> io::Result<()> {
         let mut original = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(self.tty.as_raw_fd(), &mut original) } < 0 {
             return Err(io::Error::last_os_error());
@@ -87,14 +89,7 @@ impl<'a> Screen<'a> {
         set_attributes(self.tty, &raw)?;
         discard_confirmation_input(self.tty)?;
         self.input = Input::default();
-        write_terminal(self.tty, ENTER)?;
-        self.renderer = Some(Terminal::with_options(
-            CrosstermBackend::new(self.output.clone()),
-            TerminalOptions {
-                viewport: Viewport::Fixed(area),
-            },
-        )?);
-        self.renderer.as_mut().unwrap().clear()?;
+        write_terminal(self.tty, ENTER, exchange)?;
         Ok(())
     }
 
@@ -104,7 +99,7 @@ impl<'a> Screen<'a> {
         if let Some(original) = self.original {
             let input = discard_confirmation_input(self.tty);
             let attributes = set_attributes(self.tty, &original);
-            let display = write_terminal(self.tty, LEAVE);
+            let display = write_terminal(self.tty, LEAVE, None);
             if attributes.is_ok() && display.is_ok() {
                 self.original = None;
             }
@@ -113,23 +108,49 @@ impl<'a> Screen<'a> {
         Ok(())
     }
 
-    fn paint(&mut self, area: Rect, draw: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
+    fn paint(
+        &mut self,
+        area: Rect,
+        exchange: Option<&Exchange<'_>>,
+        draw: impl FnOnce(&mut Frame<'_>),
+    ) -> io::Result<()> {
+        if self.original.is_none() {
+            self.enter(exchange)?;
+        }
         if self.renderer.is_none() {
-            self.enter(area)?;
+            let mut terminal = Terminal::with_options(
+                CrosstermBackend::new(self.output.clone()),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(area),
+                },
+            )?;
+            terminal.clear()?;
+            self.renderer = Some(terminal);
         }
         let terminal = self.renderer.as_mut().expect("active renderer");
         if terminal.get_frame().area() != area {
             terminal.resize(area)?;
         }
         terminal.draw(draw)?;
-        let mut output = self.output.0.borrow_mut();
-        let result = write_terminal(self.tty, &output);
-        output.clear();
+        let result = write_terminal(self.tty, &self.output.0.borrow(), exchange);
+        self.output.0.borrow_mut().clear();
+        if result.is_err() {
+            self.renderer = None;
+            let mut output = self.output.0.borrow_mut();
+            output.clear();
+            // Cancel a partial escape sequence and force a full redraw.
+            output.push(0x18);
+        }
         result
     }
 
-    fn paint_prompt(&mut self, area: Rect, draw: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
-        self.paint(area, draw)?;
+    fn paint_prompt(
+        &mut self,
+        area: Rect,
+        exchange: Option<&Exchange<'_>>,
+        draw: impl FnOnce(&mut Frame<'_>),
+    ) -> io::Result<()> {
+        self.paint(area, exchange, draw)?;
         self.discard_keys()
     }
 
@@ -189,7 +210,7 @@ impl Frontend for Screen<'_> {
     fn idle(&mut self, connected: bool) -> io::Result<bool> {
         let status = self.status;
         let area = self.size()?;
-        self.paint(area, |frame| draw_idle(frame, connected, status))?;
+        self.paint(area, None, |frame| draw_idle(frame, connected, status))?;
         match self.key()? {
             Some(Key::Interrupt) => Err(io::ErrorKind::Interrupted.into()),
             Some(Key::Char(b'q')) => Ok(true),
@@ -211,7 +232,7 @@ impl Frontend for Screen<'_> {
             let area = self.size()?;
             view.resize(&display, area);
             let remaining = exchange.deadline.saturating_duration_since(Instant::now());
-            self.paint(area, |frame| {
+            self.paint(area, Some(exchange), |frame| {
                 view.draw(frame, review.target, review.full_host_root, remaining);
             })?;
             if previous_size.replace(area) != Some(area) {
@@ -222,7 +243,7 @@ impl Frontend for Screen<'_> {
                 Some(key) if fits(area) => match view.handle(key) {
                     Interaction::Continue => {}
                     Interaction::Prompt => {
-                        self.paint_prompt(area, |frame| {
+                        self.paint_prompt(area, Some(exchange), |frame| {
                             view.draw(frame, review.target, review.full_host_root, remaining);
                         })?;
                     }
@@ -235,10 +256,15 @@ impl Frontend for Screen<'_> {
         }
     }
 
-    fn before_signing(&mut self) -> io::Result<()> {
+    fn before_signing(&mut self, exchange: &Exchange<'_>) -> io::Result<()> {
+        exchange.check()?;
         self.leave()?;
         discard_confirmation_input(self.tty)?;
-        write_terminal(self.tty, b"sigrund-approve-tui: signing with OpenSSH\n")
+        write_terminal(
+            self.tty,
+            b"sigrund-approve-tui: signing with OpenSSH\n",
+            Some(exchange),
+        )
     }
 
     fn decision_sent(&mut self) {
@@ -249,7 +275,7 @@ impl Frontend for Screen<'_> {
         self.status = "Submission unconfirmed";
         if let Ok(area) = self.size() {
             let status = self.status;
-            let _ = self.paint(area, |frame| draw_idle(frame, false, status));
+            let _ = self.paint(area, None, |frame| draw_idle(frame, false, status));
         }
     }
 
@@ -280,17 +306,33 @@ fn set_attributes(tty: &File, attributes: &libc::termios) -> io::Result<()> {
     }
 }
 
-fn write_terminal(mut tty: &File, mut bytes: &[u8]) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_millis(250);
+fn write_terminal(
+    mut tty: &File,
+    mut bytes: &[u8],
+    exchange: Option<&Exchange<'_>>,
+) -> io::Result<()> {
+    let mut stalled_at = Instant::now() + OUTPUT_STALL;
     while !bytes.is_empty() {
-        if Instant::now() >= deadline {
+        if let Some(exchange) = exchange {
+            exchange.check()?;
+        }
+        if Instant::now() >= stalled_at {
             return Err(io::Error::other("operator terminal output stalled"));
         }
         match tty.write(bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(count) => bytes = &bytes[count..],
+            Ok(count) => {
+                bytes = &bytes[count..];
+                stalled_at = Instant::now() + OUTPUT_STALL;
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                poll(&mut [event(tty.as_raw_fd(), libc::POLLOUT)], Some(deadline))?;
+                if let Some(exchange) = exchange {
+                    exchange.wait_terminal(tty, libc::POLLOUT, stalled_at)?;
+                } else {
+                    let mut events = [event(tty.as_raw_fd(), libc::POLLOUT)];
+                    poll(&mut events, Some(stalled_at))?;
+                    check_terminal_event(events[0])?;
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -668,6 +710,43 @@ mod tests {
     use std::os::fd::FromRawFd;
 
     #[test]
+    fn terminal_write_keeps_running_while_slow_output_drains() {
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let [mut reader, writer] = descriptors.map(|fd| unsafe { File::from_raw_fd(fd) });
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) },
+            4096
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let payload = vec![b'x'; 4096 * 8];
+        std::thread::scope(|scope| {
+            let drain = scope.spawn(move || {
+                let mut received = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let count = reader.read(&mut chunk).unwrap();
+                    if count == 0 {
+                        return received;
+                    }
+                    received.extend_from_slice(&chunk[..count]);
+                    std::thread::sleep(Duration::from_millis(60));
+                }
+            });
+            let result = write_terminal(&writer, &payload, None);
+            drop(writer);
+            assert_eq!(drain.join().unwrap(), payload);
+            result.unwrap();
+        });
+    }
+
+    #[test]
     fn prompt_discards_input_arriving_during_render_and_keeps_partial_paste() {
         let (mut master, mut slave) = (-1, -1);
         assert_eq!(
@@ -690,10 +769,10 @@ mod tests {
         let mut screen = Screen::new(&tty);
         let area = Rect::new(0, 0, 48, 10);
         screen
-            .paint(area, |frame| draw_idle(frame, true, ""))
+            .paint(area, None, |frame| draw_idle(frame, true, ""))
             .unwrap();
         screen
-            .paint_prompt(area, |frame| {
+            .paint_prompt(area, None, |frame| {
                 master.write_all(b"yes\r\x1b[200").unwrap();
                 line(frame, 1, "Type yes + Enter", Style::default());
             })
