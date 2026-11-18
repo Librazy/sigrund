@@ -112,6 +112,7 @@ fn diagnostic_reader_rejects_malformed_complete_records() {
     read_diagnostic_events(&path);
 }
 
+#[track_caller]
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {

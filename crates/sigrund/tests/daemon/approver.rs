@@ -293,6 +293,7 @@ fn namespace_fixture() {
     tty_until(&mut terminal, b"y");
     drop(socket);
     wait_for_reconnect(&fixture, before, &mut approver);
+    text_approval_output(&mut terminal, b"");
     fixture.wait_for_cleanup(before);
     let before = fixture.diagnostic_count();
     let mut socket = fixture.admitted_client();
@@ -401,6 +402,13 @@ fn launch_approval_binary(
     );
     let master = unsafe { File::from_raw_fd(master) };
     let slave = unsafe { File::from_raw_fd(slave) };
+    if binary == env!("CARGO_BIN_EXE_sigrund-approve") {
+        let enabled: libc::c_int = 1;
+        assert_eq!(
+            unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCPKT, &enabled) },
+            0
+        );
+    }
     for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
         assert_eq!(
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
@@ -439,17 +447,24 @@ fn launch_approval_binary(
     (master, DaemonChild(command.spawn().unwrap()), original)
 }
 fn prompt(terminal: &mut File) -> String {
+    text_approval_output(terminal, b"Approve and sign? [y/yes/n/no] ")
+}
+
+#[track_caller]
+fn text_approval_output(terminal: &mut File, target: &[u8]) -> String {
+    const TIOCPKT_FLUSHREAD: u8 = 1;
     let mut bytes = Vec::new();
+    let mut flushed = false;
     wait_for(|| {
         let mut chunk = [0; 4096];
         match terminal.read(&mut chunk) {
-            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Ok(0) => panic!("TTY closed before input flush"),
+            Ok(n) if chunk[0] == 0 => bytes.extend_from_slice(&chunk[1..n]),
+            Ok(_) => flushed |= chunk[0] & TIOCPKT_FLUSHREAD != 0,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             r => panic!("TTY read failed {r:?}: {}", String::from_utf8_lossy(&bytes)),
         }
-        bytes
-            .windows(b"Approve and sign? [y/yes/n/no] ".len())
-            .any(|w| w == b"Approve and sign? [y/yes/n/no] ")
+        flushed && (target.is_empty() || bytes.windows(target.len()).any(|w| w == target))
     });
     String::from_utf8(bytes).unwrap()
 }
@@ -867,21 +882,48 @@ fn tty_until(terminal: &mut File, target: &[u8]) -> String {
     tty_until_checked(terminal, target, || {})
 }
 fn tty_until_checked(terminal: &mut File, target: &[u8], check: impl Fn()) -> String {
+    terminal_until(terminal, target, true, check)
+}
+
+#[track_caller]
+fn tui_until(terminal: &mut File, target: &[u8]) {
+    terminal_until(terminal, target, false, || {});
+}
+
+#[track_caller]
+fn terminal_until(
+    terminal: &mut File,
+    target: &[u8],
+    packet_mode: bool,
+    check: impl Fn(),
+) -> String {
     let mut bytes = Vec::new();
-    wait_for(|| {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "TTY timed out waiting for {:?}; output: {:?}",
+            String::from_utf8_lossy(target),
+            String::from_utf8_lossy(&bytes)
+        );
         check();
         let mut chunk = [0u8; 4096];
         match terminal.read(&mut chunk) {
-            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Ok(0) => panic!("TTY closed while waiting for {target:?}"),
+            Ok(n) if !packet_mode => bytes.extend_from_slice(&chunk[..n]),
+            Ok(n) if chunk[0] == 0 => bytes.extend_from_slice(&chunk[1..n]),
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             error => panic!(
                 "TTY read failed {error:?}: {}",
                 String::from_utf8_lossy(&bytes)
             ),
         }
-        bytes.windows(target.len()).any(|window| window == target)
-    });
-    String::from_utf8(bytes).unwrap()
+        if bytes.windows(target.len()).any(|window| window == target) {
+            return String::from_utf8(bytes).unwrap();
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn wrong_operator_identity(fixture: &Fixture) {
@@ -1016,32 +1058,34 @@ fn tui_review_and_signing(fixture: &Fixture, identity: &Path) {
         },
     );
     wait_for_reconnect(fixture, admission, &mut approver);
-    tty_until(&mut terminal, b"Waiting for a request");
+    // Ratatui omits unchanged cells, including spaces, from its output.
+    tui_until(&mut terminal, b"Waiting");
     for action in *b"ra" {
         let before = fixture.diagnostic_count();
         let mut client = fixture.admitted_client();
         send_hello(&mut client, &fixture.executable);
-        tty_until(&mut terminal, b"a Approve");
+        tui_until(&mut terminal, b"Approve");
         if action == b'r' {
             terminal.write_all(b"r\ryes\r").unwrap();
-            tty_until(&mut terminal, b"Enter rejects");
+            tui_until(&mut terminal, b"rejects");
             thread::sleep(Duration::from_millis(50));
             terminal.write_all(b"\r").unwrap();
-            tty_until(&mut terminal, b"Decision sent");
+            tui_until(&mut terminal, b"Decision");
             assert_eq!(decision(&mut client).status, "TIMEOUT");
         } else {
             terminal.write_all(b"ayes\r").unwrap();
-            tty_until(&mut terminal, b"Type yes + Enter");
+            tui_until(&mut terminal, b"Type");
             thread::sleep(Duration::from_millis(50));
             terminal
                 .write_all(b"\x1b[200~yes\r\x1b[201~\ryes\r")
                 .unwrap();
-            tty_until(&mut terminal, b"Enter passphrase");
+            tui_until(&mut terminal, b"Enter passphrase");
             wait_for(|| tty_attributes(&terminal).c_lflag & libc::ECHO == 0);
             let attributes = tty_attributes(&terminal);
             assert_ne!(attributes.c_lflag & libc::ICANON, 0);
             terminal.write_all(b"approver-test\n").unwrap();
             assert_eq!(decision(&mut client).status, "APPROVED");
+            tui_until(&mut terminal, b"Waiting");
         }
         drop(client);
         fixture.wait_for_cleanup(before);
@@ -1049,15 +1093,16 @@ fn tui_review_and_signing(fixture: &Fixture, identity: &Path) {
     let before = fixture.diagnostic_count();
     let mut client = fixture.admitted_client();
     send_hello(&mut client, &fixture.executable);
-    tty_until(&mut terminal, b"a Approve");
+    tui_until(&mut terminal, b"Approve");
     terminal.write_all(b"a").unwrap();
-    tty_until(&mut terminal, b"Type yes + Enter");
+    tui_until(&mut terminal, b"Type");
     thread::sleep(Duration::from_millis(50));
     terminal.write_all(b"yes\r").unwrap();
-    tty_until(&mut terminal, b"Enter passphrase");
+    tui_until(&mut terminal, b"Enter passphrase");
     drop(client);
     wait_for_reconnect(fixture, before, &mut approver);
     fixture.wait_for_cleanup(before);
+    tui_until(&mut terminal, b"Waiting");
     terminal.write_all(b"q").unwrap();
     wait_for(|| approver.0.try_wait().unwrap().is_some());
     assert!(approver.0.wait().unwrap().success());

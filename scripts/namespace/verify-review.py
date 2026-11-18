@@ -258,7 +258,7 @@ def tty_review(args, f, profile, artifacts, *, tui=False):
             stdin=slave, stdout=slave, stderr=subprocess.PIPE, preexec_fn=controlling_tty)
         wait_for(lambda: f.diagnostics.read_text().count('"broker":true') > before, 'real root TTY approver admission')
         if tui:
-            wait_for_screen(b'Waiting for a request')
+            wait_for_screen(b'Waiting')
         started = time.monotonic()
         client = subprocess.Popen([
             str(f.client_binary), '--socket', str(f.client), '--target', 'registered:container-b',
@@ -267,10 +267,10 @@ def tty_review(args, f, profile, artifacts, *, tui=False):
             preexec_fn=API['SHARED']['unprivileged'], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if tui:
-            wait_for_screen(b'a Approve')
-            assert b'Namespace review (execution disabled)' in rendered
+            wait_for_screen(b'Approve')
+            assert b'Namespace' in rendered and b'disabled)' in rendered
             os.write(master, b'a')
-            wait_for_screen(b'Type yes + Enter')
+            wait_for_screen(b'Type')
             time.sleep(0.05)  # Let the watcher complete its post-render input drain.
         else:
             rendered.extend(API['SHARED']['read_confirmation_prompt'](master, timeout=2))
@@ -282,7 +282,7 @@ def tty_review(args, f, profile, artifacts, *, tui=False):
         assert review['exec_id'].encode() in rendered
         os.write(master, b'yes\n')
         if tui:
-            wait_for_screen(b'Decision sent')
+            wait_for_screen(b'Decision')
         stdout, stderr = client.communicate(timeout=6)
         assert client.returncode == 255 and not stdout, (client.returncode, stdout, stderr)
         assert time.monotonic() - started >= 2.3
