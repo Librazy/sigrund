@@ -67,6 +67,14 @@ pub(crate) fn event(fd: RawFd, events: i16) -> libc::pollfd {
     }
 }
 
+pub(crate) fn check_terminal_event(tty: libc::pollfd) -> io::Result<()> {
+    if tty.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        Err(io::Error::other("operator terminal lost"))
+    } else {
+        Ok(())
+    }
+}
+
 /// The socket must stay quiet while a request is displayed/signed. Peeking
 /// creates no userspace rights; any unexpected input is a terminal fault.
 fn check(socket: &UnixStream, signals: &Signals, deadline: Instant) -> io::Result<()> {
@@ -234,9 +242,7 @@ fn reconnect_broker(
             event(tty.as_raw_fd(), frontend.tty_events()),
         ];
         poll(&mut events, None)?;
-        if events[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Err(io::Error::other("operator terminal lost"));
-        }
+        check_terminal_event(events[1])?;
         if signals.next()?.is_some() {
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -371,14 +377,13 @@ fn watch_broker(
             if let Some(bytes) = reader.read(socket.as_raw_fd(), Instant::now())? {
                 break ApprovalRequest::parse_jcs(&bytes).map_err(|e| invalid(e.to_string()))?;
             }
-            poll(
-                &mut [
-                    event(socket.as_raw_fd(), libc::POLLIN),
-                    event(signals.fd.as_raw_fd(), libc::POLLIN),
-                    event(tty.as_raw_fd(), frontend.tty_events()),
-                ],
-                reader.deadline(),
-            )?;
+            let mut events = [
+                event(socket.as_raw_fd(), libc::POLLIN),
+                event(signals.fd.as_raw_fd(), libc::POLLIN),
+                event(tty.as_raw_fd(), frontend.tty_events()),
+            ];
+            poll(&mut events, reader.deadline())?;
+            check_terminal_event(events[2])?;
         };
         let deadline = Instant::now() + Duration::from_millis(request.remaining_ms.into());
         let signer = credentials
@@ -1078,6 +1083,44 @@ mod tests {
             0
         );
         (master, tty)
+    }
+
+    #[test]
+    fn text_approver_exits_when_idle_terminal_hangs_up() {
+        let (master, tty) = terminal();
+        let directory = tempfile::tempdir().unwrap();
+        let (identity, signer) = identity(directory.path(), "operator");
+        let public = PublicKey::from_openssh(&signer.public_key).unwrap();
+        let credentials = Credentials {
+            identity,
+            public,
+            signers: SignerPolicyFile {
+                signers: vec![signer],
+            },
+        };
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let signals = Signals::new().unwrap();
+        drop(master);
+        std::thread::scope(|scope| {
+            let (done, finished) = std::sync::mpsc::channel();
+            let watchdog = scope.spawn(move || {
+                if finished.recv_timeout(Duration::from_secs(2)).is_err() {
+                    peer.shutdown(std::net::Shutdown::Both).unwrap();
+                }
+            });
+            let error = watch_broker(
+                &tty,
+                &credentials,
+                &socket,
+                &signals,
+                directory.path(),
+                &mut Text,
+            )
+            .unwrap_err();
+            let _ = done.send(());
+            watchdog.join().unwrap();
+            assert_eq!(error.to_string(), "operator terminal lost");
+        });
     }
 
     #[test]
