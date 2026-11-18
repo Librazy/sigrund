@@ -325,6 +325,7 @@ pub(crate) trait Frontend {
     fn before_signing(&mut self, _exchange: &Exchange<'_>) -> io::Result<()> {
         Ok(())
     }
+    fn warrant_invalid(&mut self) {}
     fn decision_sent(&mut self) {}
     fn submission_interrupted(&mut self) {}
     fn reconnecting(&mut self, tty: &File, error: &io::Error) -> io::Result<()>;
@@ -608,15 +609,20 @@ fn write_tty(
     }
     Ok(())
 }
+pub(crate) fn warrant_remaining(csr: &Csr, now: SystemTime) -> Option<Duration> {
+    let elapsed = now.duration_since(UNIX_EPOCH).ok()?;
+    let policy = &csr.warrant().policy;
+    let start = u64::try_from(policy.not_before).ok()?;
+    let end = u64::try_from(policy.not_after?).ok()?;
+    if !(start..=end).contains(&elapsed.as_secs()) {
+        return None;
+    }
+    // The daemon accepts the whole final second of an inclusive not_after.
+    Some(Duration::from_secs(end.checked_add(1)?).saturating_sub(elapsed))
+}
+
 fn valid_now(csr: &Csr) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|v| i64::try_from(v.as_secs()).ok());
-    now.is_some_and(|now| {
-        now >= csr.warrant().policy.not_before
-            && csr.warrant().policy.not_after.is_some_and(|end| now <= end)
-    })
+    warrant_remaining(csr, SystemTime::now()).is_some()
 }
 
 pub(crate) fn discard_confirmation_input(tty: &File) -> io::Result<()> {
@@ -644,18 +650,38 @@ fn respond(
     match decision {
         Decision::Quit => return Ok(None),
         Decision::Reject => return Ok(Some(refused("operator refused approval"))),
-        Decision::InvalidWarrant => return Ok(Some(refused("warrant expired or not yet valid"))),
+        Decision::InvalidWarrant => {
+            frontend.warrant_invalid();
+            return Ok(Some(refused("warrant expired or not yet valid")));
+        }
         Decision::TerminalEof => return Ok(Some(refused("operator terminal EOF"))),
         Decision::Approve => {}
     }
     if !valid_now(&review.csr) {
+        frontend.warrant_invalid();
         return Ok(Some(refused("warrant expired while awaiting confirmation")));
     }
     frontend.before_signing(exchange)?;
-    let signature = sign_payload(identity, tty, signer, review.csr.as_bytes(), || {
-        exchange.check()
-    })?;
     if !valid_now(&review.csr) {
+        frontend.warrant_invalid();
+        return Ok(Some(refused("warrant expired before signing")));
+    }
+    let invalid_during_signing = std::cell::Cell::new(false);
+    let signature = sign_payload(identity, tty, signer, review.csr.as_bytes(), || {
+        exchange.check()?;
+        if !valid_now(&review.csr) {
+            invalid_during_signing.set(true);
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    });
+    if invalid_during_signing.get() {
+        frontend.warrant_invalid();
+        return Ok(Some(refused("warrant expired while signing")));
+    }
+    let signature = signature?;
+    if !valid_now(&review.csr) {
+        frontend.warrant_invalid();
         return Ok(Some(refused("warrant expired while signing")));
     }
     let warrant =
@@ -1093,6 +1119,65 @@ mod tests {
         (master, tty)
     }
 
+    fn approval_test_warrant(not_before: i64) -> Csr {
+        let mut warrant = Csr::parse(include_bytes!(
+            "../../sigrund-core/tests/fixtures/v3-host/warrant.json"
+        ))
+        .unwrap()
+        .warrant()
+        .clone();
+        warrant.policy.not_before = not_before;
+        warrant.policy.not_after = Some(not_before + warrant.intent.policy.ttl_secs as i64);
+        Csr::new(warrant).unwrap()
+    }
+
+    #[test]
+    fn warrant_countdown_respects_inclusive_end_second() {
+        let start = 1_800_000_000;
+        let csr = approval_test_warrant(start);
+        let end = csr.warrant().policy.not_after.unwrap() as u64;
+        assert_eq!(
+            warrant_remaining(&csr, UNIX_EPOCH + Duration::from_secs(start as u64 - 1)),
+            None
+        );
+        assert_eq!(
+            warrant_remaining(
+                &csr,
+                UNIX_EPOCH + Duration::from_secs(end) + Duration::from_millis(999)
+            ),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            warrant_remaining(&csr, UNIX_EPOCH + Duration::from_secs(end + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn tui_refuses_expired_warrant_with_time_left_in_broker_exchange() {
+        let (_master, tty) = terminal();
+        let signals = Signals::new().unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let exchange = Exchange {
+            socket: &socket,
+            signals: &signals,
+            deadline: Instant::now() + Duration::from_secs(20),
+        };
+        let review = Review {
+            exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into(),
+            signer_id: "operator".into(),
+            csr: approval_test_warrant(1_000_000),
+            details: "Verified fixture".into(),
+            target: "Host",
+            full_host_root: false,
+        };
+        let mut screen = crate::approval_tui::Screen::new(&tty);
+        assert!(matches!(
+            screen.review(&tty, &review, &exchange),
+            Ok(Decision::InvalidWarrant)
+        ));
+    }
+
     #[test]
     fn text_approver_exits_when_idle_terminal_hangs_up() {
         let (master, tty) = terminal();
@@ -1177,13 +1262,14 @@ mod tests {
             state
         };
         let original = attributes();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let mut review = Review {
             exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into(),
             signer_id: "operator".into(),
-            csr: Csr::parse(include_bytes!(
-                "../../sigrund-core/tests/fixtures/v3-host/warrant.json"
-            ))
-            .unwrap(),
+            csr: approval_test_warrant(now),
             details: "Verified fixture".into(),
             target: "Host",
             full_host_root: false,

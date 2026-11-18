@@ -1,7 +1,7 @@
 //! The renderer writes to the verified TTY. Terminal input never uses stdin.
 use crate::approver::{
     Decision, Exchange, Frontend, Review, check_terminal_event, discard_confirmation_input, event,
-    poll, quote,
+    poll, quote, warrant_remaining,
 };
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
@@ -16,7 +16,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::fd::AsRawFd,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?2004h";
@@ -28,6 +28,7 @@ const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 9;
 const BODY_TOP: u16 = 3;
 const FOOTER_ROWS: u16 = 3;
+const INVALID_WARRANT: &str = "Warrant expired or not yet valid";
 
 type Renderer = Terminal<CrosstermBackend<FrameOutput>>;
 
@@ -224,6 +225,7 @@ impl Frontend for Screen<'_> {
         review: &Review,
         exchange: &Exchange<'_>,
     ) -> io::Result<Decision> {
+        self.status = "";
         let display = review_text(review);
         let mut view = ReviewView::default();
         let mut previous_size = None;
@@ -231,13 +233,21 @@ impl Frontend for Screen<'_> {
             exchange.check()?;
             let area = self.size()?;
             view.resize(&display, area);
-            let remaining = exchange.deadline.saturating_duration_since(Instant::now());
+            let Some(warrant_left) = warrant_remaining(&review.csr, SystemTime::now()) else {
+                return Ok(Decision::InvalidWarrant);
+            };
+            let remaining =
+                warrant_left.min(exchange.deadline.saturating_duration_since(Instant::now()));
             self.paint(area, Some(exchange), |frame| {
                 view.draw(frame, review.target, review.full_host_root, remaining);
             })?;
             if previous_size.replace(area) != Some(area) {
                 self.discard_keys()?;
             }
+            exchange.check()?;
+            let Some(warrant_left) = warrant_remaining(&review.csr, SystemTime::now()) else {
+                return Ok(Decision::InvalidWarrant);
+            };
             match self.key()? {
                 Some(Key::Interrupt) => return Err(io::ErrorKind::Interrupted.into()),
                 Some(key) if fits(area) => match view.handle(key) {
@@ -252,7 +262,7 @@ impl Frontend for Screen<'_> {
                 },
                 _ => {}
             }
-            exchange.wait_input(self.tty, Instant::now() + REFRESH)?;
+            exchange.wait_input(self.tty, Instant::now() + REFRESH.min(warrant_left))?;
         }
     }
 
@@ -267,8 +277,14 @@ impl Frontend for Screen<'_> {
         )
     }
 
+    fn warrant_invalid(&mut self) {
+        self.status = INVALID_WARRANT;
+    }
+
     fn decision_sent(&mut self) {
-        self.status = "Decision sent";
+        if self.status != INVALID_WARRANT {
+            self.status = "Decision sent";
+        }
     }
 
     fn submission_interrupted(&mut self) {
@@ -280,7 +296,7 @@ impl Frontend for Screen<'_> {
     }
 
     fn reconnecting(&mut self, _tty: &File, error: &io::Error) -> io::Result<()> {
-        if self.status != "Submission unconfirmed" {
+        if !matches!(self.status, "Submission unconfirmed" | INVALID_WARRANT) {
             self.status = if error.kind() == io::ErrorKind::TimedOut {
                 "Approval timed out"
             } else {
