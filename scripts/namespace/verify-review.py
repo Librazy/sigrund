@@ -271,6 +271,7 @@ def tty_review(args, f, profile, artifacts, *, tui=False):
             assert b'Namespace review (execution disabled)' in rendered
             os.write(master, b'a')
             wait_for_screen(b'Type yes + Enter')
+            time.sleep(0.05)  # Let the watcher complete its post-render input drain.
         else:
             rendered.extend(API['SHARED']['read_confirmation_prompt'](master, timeout=2))
             for fragment in (b'namespace preview private review', b'ns_service', b'12001',

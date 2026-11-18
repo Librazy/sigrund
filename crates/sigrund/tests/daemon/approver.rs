@@ -1025,12 +1025,14 @@ fn tui_review_and_signing(fixture: &Fixture, identity: &Path) {
         if action == b'r' {
             terminal.write_all(b"r\ryes\r").unwrap();
             tty_until(&mut terminal, b"Enter rejects");
+            thread::sleep(Duration::from_millis(50));
             terminal.write_all(b"\r").unwrap();
             tty_until(&mut terminal, b"Decision sent");
             assert_eq!(decision(&mut client).status, "TIMEOUT");
         } else {
             terminal.write_all(b"ayes\r").unwrap();
             tty_until(&mut terminal, b"Type yes + Enter");
+            thread::sleep(Duration::from_millis(50));
             terminal
                 .write_all(b"\x1b[200~yes\r\x1b[201~\ryes\r")
                 .unwrap();
@@ -1050,6 +1052,7 @@ fn tui_review_and_signing(fixture: &Fixture, identity: &Path) {
     tty_until(&mut terminal, b"a Approve");
     terminal.write_all(b"a").unwrap();
     tty_until(&mut terminal, b"Type yes + Enter");
+    thread::sleep(Duration::from_millis(50));
     terminal.write_all(b"yes\r").unwrap();
     tty_until(&mut terminal, b"Enter passphrase");
     drop(client);

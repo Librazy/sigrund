@@ -1201,6 +1201,9 @@ mod tests {
                     // on distinct terminal boundaries.
                     master.write_all(b"ayes\r").unwrap();
                     await_text(&mut master, b"Type yes + Enter", deadline);
+                    // The PTY reader can see output before the watcher
+                    // completes its post-render input drain.
+                    std::thread::sleep(Duration::from_millis(50));
                     if disconnect {
                         master.write_all(b"ye").unwrap();
                         peer.shutdown(std::net::Shutdown::Both).unwrap();

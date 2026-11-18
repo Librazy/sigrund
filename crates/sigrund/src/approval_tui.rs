@@ -128,6 +128,11 @@ impl<'a> Screen<'a> {
         result
     }
 
+    fn paint_prompt(&mut self, area: Rect, draw: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
+        self.paint(area, draw)?;
+        self.discard_keys()
+    }
+
     fn read_byte(&self) -> io::Result<Option<u8>> {
         let mut byte = [0];
         let mut tty = self.tty;
@@ -206,19 +211,18 @@ impl Frontend for Screen<'_> {
             let area = self.size()?;
             view.resize(&display, area);
             let remaining = exchange.deadline.saturating_duration_since(Instant::now());
-            if previous_size.replace(area) != Some(area) {
-                self.discard_keys()?;
-            }
             self.paint(area, |frame| {
                 view.draw(frame, review.target, review.full_host_root, remaining);
             })?;
+            if previous_size.replace(area) != Some(area) {
+                self.discard_keys()?;
+            }
             match self.key()? {
                 Some(Key::Interrupt) => return Err(io::ErrorKind::Interrupted.into()),
                 Some(key) if fits(area) => match view.handle(key) {
                     Interaction::Continue => {}
                     Interaction::Prompt => {
-                        self.discard_keys()?;
-                        self.paint(area, |frame| {
+                        self.paint_prompt(area, |frame| {
                             view.draw(frame, review.target, review.full_host_root, remaining);
                         })?;
                     }
@@ -661,6 +665,54 @@ fn review_text(review: &Review) -> String {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use std::os::fd::FromRawFd;
+
+    #[test]
+    fn prompt_discards_input_arriving_during_render_and_keeps_partial_paste() {
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let (mut master, tty) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+        assert_eq!(
+            unsafe { libc::fcntl(tty.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let mut screen = Screen::new(&tty);
+        let area = Rect::new(0, 0, 48, 10);
+        screen
+            .paint(area, |frame| draw_idle(frame, true, ""))
+            .unwrap();
+        screen
+            .paint_prompt(area, |frame| {
+                master.write_all(b"yes\r\x1b[200").unwrap();
+                line(frame, 1, "Type yes + Enter", Style::default());
+            })
+            .unwrap();
+        master.write_all(b"~yes\r\x1b[201~").unwrap();
+        poll(&mut [event(tty.as_raw_fd(), libc::POLLIN)], None).unwrap();
+        assert!(screen.key().unwrap() == Some(Key::Paste));
+        assert!(screen.key().unwrap().is_none());
+        master.write_all(b"yes\r").unwrap();
+        poll(&mut [event(tty.as_raw_fd(), libc::POLLIN)], None).unwrap();
+        for key in [
+            Key::Char(b'y'),
+            Key::Char(b'e'),
+            Key::Char(b's'),
+            Key::Enter,
+        ] {
+            assert!(screen.key().unwrap() == Some(key));
+        }
+    }
 
     fn screen(width: u16, height: u16, draw: impl FnOnce(&mut Frame<'_>)) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
