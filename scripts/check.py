@@ -94,7 +94,7 @@ def main():
         if source_digest() != manifest['source_sha256']:
             raise RuntimeError('source changed during verification; repeat against a stable snapshot')
         binaries = REPO / 'target' / ('release' if args.release else 'debug')
-        names = ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-collector', 'sigrund-anchor')
+        names = ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-approve-tui', 'sigrund-collector', 'sigrund-anchor')
         manifest['build_profile'] = 'release' if args.release else 'debug'
         manifest['unstripped_binaries'] = {name: hashlib.sha256((binaries / name).read_bytes()).hexdigest() for name in names}
         if args.strip_binaries:

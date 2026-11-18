@@ -343,6 +343,7 @@ fn namespace_fixture() {
             .all(|r| !r["event_type"].as_str().unwrap().starts_with("EXEC_"))
     );
     assert!(fixture.state.join("state.sqlite").exists());
+    tui_review_and_signing(&fixture, &identity);
     daemon.stop();
 }
 
@@ -364,7 +365,28 @@ fn launch_approver_with(
     identity: &Path,
     configure: impl FnOnce(&mut Command),
 ) -> (File, DaemonChild) {
+    let (terminal, approver, _) = launch_approval_binary(
+        fixture,
+        identity,
+        env!("CARGO_BIN_EXE_sigrund-approve"),
+        configure,
+    );
+    (terminal, approver)
+}
+
+fn launch_approval_binary(
+    fixture: &Fixture,
+    identity: &Path,
+    binary: &str,
+    configure: impl FnOnce(&mut Command),
+) -> (File, DaemonChild, libc::termios) {
     let (mut master, mut slave) = (-1, -1);
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     assert_eq!(
         unsafe {
             libc::openpty(
@@ -372,7 +394,7 @@ fn launch_approver_with(
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null(),
-                std::ptr::null(),
+                &size,
             )
         },
         0
@@ -391,7 +413,7 @@ fn launch_approver_with(
         0
     );
     let error = fixture.directory.path().join("approver.stderr");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sigrund-approve"));
+    let mut command = Command::new(binary);
     command
         .arg("--socket")
         .arg(&fixture.broker)
@@ -413,7 +435,8 @@ fn launch_approver_with(
             Ok(())
         });
     }
-    (master, DaemonChild(command.spawn().unwrap()))
+    let original = tty_attributes(&master);
+    (master, DaemonChild(command.spawn().unwrap()), original)
 }
 fn prompt(terminal: &mut File) -> String {
     let mut bytes = Vec::new();
@@ -980,4 +1003,60 @@ fn encrypted_signing_cancellation_restores_terminal(fixture: &Fixture, identity:
             drop(approver);
         }
     }
+}
+
+fn tui_review_and_signing(fixture: &Fixture, identity: &Path) {
+    let admission = fixture.diagnostic_count();
+    let (mut terminal, mut approver, original) = launch_approval_binary(
+        fixture,
+        identity,
+        env!("CARGO_BIN_EXE_sigrund-approve-tui"),
+        |command| {
+            command.env_remove("SSH_AUTH_SOCK");
+        },
+    );
+    wait_for_reconnect(fixture, admission, &mut approver);
+    tty_until(&mut terminal, b"Waiting for a request");
+    for action in *b"ra" {
+        let before = fixture.diagnostic_count();
+        let mut client = fixture.admitted_client();
+        send_hello(&mut client, &fixture.executable);
+        tty_until(&mut terminal, b"a Approve");
+        if action == b'r' {
+            terminal.write_all(b"r\ryes\r").unwrap();
+            tty_until(&mut terminal, b"Enter rejects");
+            terminal.write_all(b"\r").unwrap();
+            tty_until(&mut terminal, b"Decision sent");
+            assert_eq!(decision(&mut client).status, "TIMEOUT");
+        } else {
+            terminal.write_all(b"ayes\r").unwrap();
+            tty_until(&mut terminal, b"Type yes + Enter");
+            terminal
+                .write_all(b"\x1b[200~yes\r\x1b[201~\ryes\r")
+                .unwrap();
+            tty_until(&mut terminal, b"Enter passphrase");
+            wait_for(|| tty_attributes(&terminal).c_lflag & libc::ECHO == 0);
+            let attributes = tty_attributes(&terminal);
+            assert_ne!(attributes.c_lflag & libc::ICANON, 0);
+            terminal.write_all(b"approver-test\n").unwrap();
+            assert_eq!(decision(&mut client).status, "APPROVED");
+        }
+        drop(client);
+        fixture.wait_for_cleanup(before);
+    }
+    let before = fixture.diagnostic_count();
+    let mut client = fixture.admitted_client();
+    send_hello(&mut client, &fixture.executable);
+    tty_until(&mut terminal, b"a Approve");
+    terminal.write_all(b"a").unwrap();
+    tty_until(&mut terminal, b"Type yes + Enter");
+    terminal.write_all(b"yes\r").unwrap();
+    tty_until(&mut terminal, b"Enter passphrase");
+    drop(client);
+    wait_for_reconnect(fixture, before, &mut approver);
+    fixture.wait_for_cleanup(before);
+    terminal.write_all(b"q").unwrap();
+    wait_for(|| approver.0.try_wait().unwrap().is_some());
+    assert!(approver.0.wait().unwrap().success());
+    assert_tty_attributes_restored(&terminal, &original);
 }

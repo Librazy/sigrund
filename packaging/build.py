@@ -33,7 +33,7 @@ def install(source, destination, mode=0o644):
 
 
 def stage(root, package, kind, policy=None):
-    binaries = {'sigrun': ['sigrun'], 'sigrund': ['sigrund', 'sigrundctl', 'sigrund-approve', 'sigrund-anchor']}
+    binaries = {'sigrun': ['sigrun'], 'sigrund': ['sigrund', 'sigrundctl', 'sigrund-approve', 'sigrund-approve-tui', 'sigrund-anchor']}
     for binary in binaries.get(package, []):
         path = 'usr/libexec/sigrund/sigrund' if binary == 'sigrund' else 'usr/bin/' + binary
         install(REPO / 'target/release' / binary, root / path, 0o755)

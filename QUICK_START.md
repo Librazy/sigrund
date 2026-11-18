@@ -40,8 +40,9 @@ apt install ./sigrun_*.deb ./sigrund_*.deb
 ```
 
 The client package is `sigrun`. The daemon package includes `sigrund`,
-`sigrund-approve`, `sigrundctl` and `sigrund-anchor`. Installation does not
-provision state or start the service. Use matching versions throughout.
+`sigrund-approve`, `sigrund-approve-tui`, `sigrundctl` and `sigrund-anchor`.
+Installation does not provision state or start the service. Use matching
+versions throughout.
 See the [package guide](packaging/README.md) for upgrades and removal.
 
 ## 2. Host-only setup
@@ -104,6 +105,15 @@ In a separate **host-root terminal**, start the approver:
 sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
   --identity /etc/sigrund/approver --epoch-file /var/lib/sigrund/host-epoch.json
 ```
+
+For a full-screen review, run `sigrund-approve-tui` with the same flags.
+Start your chosen approver before submitting a request. The daemon accepts
+one approver connection and presents one request at a time. In the TUI, scroll
+with the arrow or Page Up/Down keys in a terminal at least 40 columns by 9 rows.
+Press `a`, then type `yes` and press Enter to sign. Press `r` and Enter to reject,
+or Escape to cancel a confirmation.
+OpenSSH prompts appear on the same terminal. “Decision sent” means the client
+wrote its response to the socket. Check the requester's terminal for the result.
 
 In the **requester's terminal**, run:
 

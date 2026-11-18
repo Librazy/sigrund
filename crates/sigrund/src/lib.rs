@@ -1,6 +1,7 @@
 pub mod access;
 pub mod accounts;
 mod admission;
+mod approval_tui;
 pub mod approver;
 mod authorization;
 mod cgroup;
