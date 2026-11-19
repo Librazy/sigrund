@@ -133,8 +133,9 @@ if [[ "$scenario" != combined ]]; then
   test ! -e /usr/bin/sigrun
 fi
 sha256sum --check /tmp/preserved.sha256
+sigrund-approve-tui --help | grep -F 'Usage: sigrund-approve-tui '
 test ! -e /etc/systemd/system/multi-user.target.wants/sigrund.service
-executables=(/usr/bin/sigrund-anchor /usr/bin/sigrundctl /usr/bin/sigrund-approve /usr/libexec/sigrund/sigrund)
+executables=(/usr/bin/sigrund-anchor /usr/bin/sigrundctl /usr/bin/sigrund-approve /usr/bin/sigrund-approve-tui /usr/libexec/sigrund/sigrund)
 if [[ "$scenario" == combined ]]; then
   executables+=(/usr/bin/sigrun)
 fi

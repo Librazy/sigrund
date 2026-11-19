@@ -1,8 +1,9 @@
 # User-Friendly Approval Process
 
-Status: planned epic. Recorded on 2026-11-18. This document defines intended
-outcomes and acceptance criteria; it does not describe implemented features or
-replace the current [implementation notes](../IMPLEMENTATION_NOTES.md).
+Status: milestone 1 implemented. Recorded on 2026-11-18. The basic
+`sigrund-approve-tui` and text approver share a client session for one live
+request. See the [quick start](../QUICK_START.md#2-host-only-setup) for operator
+instructions. Subsequent milestones below describe planned behavior.
 
 ## Goal
 
@@ -16,7 +17,7 @@ Administrator policy, requester intent and signer authority remain distinct.
 Every accepted approval must bind the exact reviewed request and pass the
 daemon's independent policy and signature checks before authorization.
 
-## Current baseline
+## Baseline when the epic was recorded
 
 - `sigrund-approve` combines socket handling, review-evidence validation, text
   rendering, terminal input and OpenSSH signing in
@@ -186,7 +187,7 @@ No GUI toolkit or D-Bus authorization mechanism is selected by this epic.
 
 ## Delivery sequence
 
-1. Extract the common client layer and build the standalone TUI against the
+1. **Implemented:** Extract the common client layer and build the standalone TUI against the
    existing single-request workflow. Establish presentation and terminal tests.
 2. Design and implement the request registry, per-request evidence, lifecycle and
    versioned discovery/decision protocol together. Update both first-party

@@ -43,7 +43,7 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
     }
     Ok(())
 }
-fn poll(descriptors: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Result<()> {
+pub(crate) fn poll(descriptors: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Result<()> {
     let timeout = deadline
         .map(|d| {
             d.saturating_duration_since(Instant::now())
@@ -59,11 +59,19 @@ fn poll(descriptors: &mut [libc::pollfd], deadline: Option<Instant>) -> io::Resu
     }
     Ok(())
 }
-fn event(fd: RawFd, events: i16) -> libc::pollfd {
+pub(crate) fn event(fd: RawFd, events: i16) -> libc::pollfd {
     libc::pollfd {
         fd,
         events,
         revents: 0,
+    }
+}
+
+pub(crate) fn check_terminal_event(tty: libc::pollfd) -> io::Result<()> {
+    if tty.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        Err(io::Error::other("operator terminal lost"))
+    } else {
+        Ok(())
     }
 }
 
@@ -102,6 +110,14 @@ fn check(socket: &UnixStream, signals: &Signals, deadline: Instant) -> io::Resul
 }
 
 pub fn run(args: &ApprovalArgs) -> io::Result<u8> {
+    run_with(args, false)
+}
+
+pub fn run_tui(args: &ApprovalArgs) -> io::Result<u8> {
+    run_with(args, true)
+}
+
+fn run_with(args: &ApprovalArgs, tui: bool) -> io::Result<u8> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -113,47 +129,28 @@ pub fn run(args: &ApprovalArgs) -> io::Result<u8> {
         .as_ref()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--identity is required"))?;
     let tty = open_tty(&args.tty)?;
-    let signers = load_signers(&args.signers)?;
-    let identity_file = open_pinned(identity)?;
-    check_root_metadata(&identity_file, false, None)?;
-    let mut bytes = Vec::new();
-    (&identity_file).take(1_048_577).read_to_end(&mut bytes)?;
-    if bytes.len() > 1_048_576 {
-        return Err(invalid("SSH identity exceeds size bound"));
-    }
-    let public = match PublicKey::from_openssh(
-        std::str::from_utf8(&bytes).map_err(|_| invalid("SSH identity is not UTF-8"))?,
-    ) {
-        Ok(public) => public,
-        Err(_) => {
-            if identity_file.metadata()?.mode() & 0o077 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "private SSH identity must be private to root",
-                ));
-            }
-            let private =
-                PrivateKey::from_openssh(&bytes).map_err(|_| invalid("invalid SSH identity"))?;
-            private.public_key().clone()
-        }
+    let credentials = Credentials::load(&args.signers, identity)?;
+    let signals = if tui {
+        Signals::for_approval_tui()?
+    } else {
+        Signals::new()?
     };
-    bytes.fill(0);
-    // This descriptor's open description is shared with the helper. Rewind it
-    // before use and inherit only this deliberate identity handle.
-    if unsafe { libc::lseek(identity_file.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let signals = Signals::new()?;
     let mut socket = connect_broker(&args.socket, &signals)?;
+    let mut screen;
+    let frontend: &mut dyn Frontend = if tui {
+        screen = crate::approval_tui::Screen::new(&tty);
+        &mut screen
+    } else {
+        &mut Text
+    };
     loop {
         let error = match watch_broker(
             &tty,
-            &identity_file,
-            &signers,
-            &public,
+            &credentials,
             &socket,
             &signals,
             &args.epoch_file,
+            frontend,
         ) {
             Ok(()) => return Ok(0),
             Err(error) if recoverable_connection_error(&error) => error,
@@ -163,9 +160,57 @@ pub fn run(args: &ApprovalArgs) -> io::Result<u8> {
         // retire it before a fresh connection can receive another request.
         let _ = socket.shutdown(std::net::Shutdown::Both);
         drop(socket);
-        discard_confirmation_input(&tty)?;
-        eprintln!("\nsigrund-approve: approval connection ended ({error}); waiting to reconnect");
-        socket = reconnect_broker(&args.socket, &signals, &tty)?;
+        frontend.reconnecting(&tty, &error)?;
+        let Some(connected) = reconnect_broker(&args.socket, &signals, &tty, frontend)? else {
+            return Ok(0);
+        };
+        socket = connected;
+    }
+}
+
+struct Credentials {
+    identity: File,
+    signers: SignerPolicyFile,
+    public: PublicKey,
+}
+
+impl Credentials {
+    fn load(signers: &Path, identity: &Path) -> io::Result<Self> {
+        let signers = load_signers(signers)?;
+        let identity_file = open_pinned(identity)?;
+        check_root_metadata(&identity_file, false, None)?;
+        let mut bytes = Vec::new();
+        (&identity_file).take(1_048_577).read_to_end(&mut bytes)?;
+        if bytes.len() > 1_048_576 {
+            return Err(invalid("SSH identity exceeds size bound"));
+        }
+        let public = match PublicKey::from_openssh(
+            std::str::from_utf8(&bytes).map_err(|_| invalid("SSH identity is not UTF-8"))?,
+        ) {
+            Ok(public) => public,
+            Err(_) => {
+                if identity_file.metadata()?.mode() & 0o077 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "private SSH identity must be private to root",
+                    ));
+                }
+                let private = PrivateKey::from_openssh(&bytes)
+                    .map_err(|_| invalid("invalid SSH identity"))?;
+                private.public_key().clone()
+            }
+        };
+        bytes.fill(0);
+        // This descriptor's open description is shared with the helper. Rewind it
+        // before use and inherit only this deliberate identity handle.
+        if unsafe { libc::lseek(identity_file.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            identity: identity_file,
+            signers,
+            public,
+        })
     }
 }
 
@@ -180,7 +225,12 @@ fn recoverable_connection_error(error: &io::Error) -> bool {
     )
 }
 
-fn reconnect_broker(path: &Path, signals: &Signals, tty: &File) -> io::Result<UnixStream> {
+fn reconnect_broker(
+    path: &Path,
+    signals: &Signals,
+    tty: &File,
+    frontend: &mut dyn Frontend,
+) -> io::Result<Option<UnixStream>> {
     loop {
         if signals.next()?.is_some() {
             return Err(io::ErrorKind::Interrupted.into());
@@ -189,17 +239,18 @@ fn reconnect_broker(path: &Path, signals: &Signals, tty: &File) -> io::Result<Un
         // is restarting. Polling also keeps local cancellation responsive.
         let mut events = [
             event(signals.fd.as_raw_fd(), libc::POLLIN),
-            event(tty.as_raw_fd(), 0),
+            event(tty.as_raw_fd(), frontend.tty_events()),
         ];
         poll(&mut events, None)?;
-        if events[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Err(io::Error::other("operator terminal lost"));
-        }
+        check_terminal_event(events[1])?;
         if signals.next()?.is_some() {
             return Err(io::ErrorKind::Interrupted.into());
         }
+        if frontend.idle(false)? {
+            return Ok(None);
+        }
         match connect_broker(path, signals) {
-            Ok(socket) => return Ok(socket),
+            Ok(socket) => return Ok(Some(socket)),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -210,14 +261,118 @@ fn reconnect_broker(path: &Path, signals: &Signals, tty: &File) -> io::Result<Un
     }
 }
 
+pub(crate) enum Decision {
+    Approve,
+    Reject,
+    InvalidWarrant,
+    TerminalEof,
+    Quit,
+}
+
+pub(crate) struct Review {
+    pub(crate) exec_id: String,
+    pub(crate) signer_id: String,
+    pub(crate) csr: Csr,
+    pub(crate) details: String,
+    pub(crate) target: &'static str,
+    pub(crate) full_host_root: bool,
+}
+
+pub(crate) struct Exchange<'a> {
+    socket: &'a UnixStream,
+    signals: &'a Signals,
+    pub(crate) deadline: Instant,
+}
+
+impl Exchange<'_> {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        check(self.socket, self.signals, self.deadline)
+    }
+
+    pub(crate) fn wait_input(&self, tty: &File, refresh: Instant) -> io::Result<()> {
+        self.wait_terminal(tty, libc::POLLIN, refresh)
+    }
+
+    pub(crate) fn wait_terminal(
+        &self,
+        tty: &File,
+        interest: i16,
+        until: Instant,
+    ) -> io::Result<()> {
+        let mut events = [
+            event(tty.as_raw_fd(), interest),
+            event(self.socket.as_raw_fd(), libc::POLLIN),
+            event(self.signals.fd.as_raw_fd(), libc::POLLIN),
+        ];
+        poll(&mut events, Some(self.deadline.min(until)))?;
+        check_terminal_event(events[0])
+    }
+}
+
+pub(crate) trait Frontend {
+    fn tty_events(&self) -> i16 {
+        0
+    }
+    fn idle(&mut self, _connected: bool) -> io::Result<bool> {
+        Ok(false)
+    }
+    fn review(
+        &mut self,
+        tty: &File,
+        review: &Review,
+        exchange: &Exchange<'_>,
+    ) -> io::Result<Decision>;
+    fn before_signing(&mut self, _exchange: &Exchange<'_>) -> io::Result<()> {
+        Ok(())
+    }
+    fn warrant_invalid(&mut self) {}
+    fn decision_sent(&mut self) {}
+    fn submission_interrupted(&mut self) {}
+    fn reconnecting(&mut self, tty: &File, error: &io::Error) -> io::Result<()>;
+}
+
+struct Text;
+
+impl Frontend for Text {
+    fn review(
+        &mut self,
+        tty: &File,
+        review: &Review,
+        exchange: &Exchange<'_>,
+    ) -> io::Result<Decision> {
+        write_tty(
+            tty,
+            review.details.as_bytes(),
+            exchange.socket,
+            exchange.signals,
+            exchange.deadline,
+        )?;
+        if !valid_now(&review.csr) {
+            return Ok(Decision::InvalidWarrant);
+        }
+        Ok(
+            match confirm(tty, exchange.socket, exchange.signals, exchange.deadline)? {
+                Some(true) => Decision::Approve,
+                Some(false) => Decision::Reject,
+                None => Decision::TerminalEof,
+            },
+        )
+    }
+
+    fn reconnecting(&mut self, tty: &File, error: &io::Error) -> io::Result<()> {
+        discard_confirmation_input(tty)?;
+        eprintln!("\nsigrund-approve: approval connection ended ({error}); waiting to reconnect");
+        Ok(())
+    }
+}
+
 fn watch_broker(
     tty: &File,
-    identity_file: &File,
-    signers: &SignerPolicyFile,
-    public: &PublicKey,
+    credentials: &Credentials,
     socket: &UnixStream,
     signals: &Signals,
     epoch_file: &Path,
+    frontend: &mut dyn Frontend,
 ) -> io::Result<()> {
     loop {
         let mut reader = ApprovalReader::default();
@@ -225,67 +380,108 @@ fn watch_broker(
             if signals.next()?.is_some() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
+            if frontend.idle(true)? {
+                return Ok(());
+            }
             if let Some(bytes) = reader.read(socket.as_raw_fd(), Instant::now())? {
                 break ApprovalRequest::parse_jcs(&bytes).map_err(|e| invalid(e.to_string()))?;
             }
-            poll(
-                &mut [
-                    event(socket.as_raw_fd(), libc::POLLIN),
-                    event(signals.fd.as_raw_fd(), libc::POLLIN),
-                ],
-                reader.deadline(),
-            )?;
+            let mut events = [
+                event(socket.as_raw_fd(), libc::POLLIN),
+                event(signals.fd.as_raw_fd(), libc::POLLIN),
+                event(tty.as_raw_fd(), frontend.tty_events()),
+            ];
+            poll(&mut events, reader.deadline())?;
+            check_terminal_event(events[2])?;
         };
         let deadline = Instant::now() + Duration::from_millis(request.remaining_ms.into());
-        let signer = signers
+        let signer = credentials
+            .signers
             .signers
             .iter()
             .find(|s| s.signer_id == request.signer_id)
             .ok_or_else(|| invalid("requested signer is not configured"))?;
         let configured = PublicKey::from_openssh(&signer.public_key)
             .map_err(|_| invalid("invalid configured SSH key"))?;
-        if configured.key_data() != public.key_data() {
+        if configured.key_data() != credentials.public.key_data() {
             return Err(invalid("explicit identity does not match requested signer"));
         }
         let csr = Csr::parse(request.csr_payload.as_bytes()).map_err(io::Error::other)?;
-        let rendered = if matches!(
+        let (details, target, full_host_root) = if matches!(
             csr.warrant().intent.target,
             sigrund_core::host::Selector::Host {}
         ) {
             let (bundle, composefs) =
                 crate::host_registry::live_review(epoch_file, &request.exec_id, &csr)?;
-            render_request(&request, &csr, signer, &bundle, composefs)?
+            (
+                render_request(&request, &csr, signer, &bundle, composefs)?,
+                "Host",
+                bundle.constraints.workload == Some(sigrund_core::workload::Workload::Root),
+            )
         } else {
             let review =
                 crate::host_registry::live_process_review(epoch_file, &request.exec_id, &csr)?;
-            render_process_request(&request, &csr, signer, &review)?
+            (
+                render_process_request(&request, &csr, signer, &review)?,
+                if review.constraints.executes() {
+                    "Namespace execution"
+                } else {
+                    "Namespace review (execution disabled)"
+                },
+                review.constraints.workload() == Some(sigrund_core::workload::Workload::Root),
+            )
         };
-        let response = approve(
-            tty,
-            identity_file,
-            signer,
-            (&request, rendered.as_str()),
+        let review = Review {
+            exec_id: request.exec_id,
+            signer_id: request.signer_id,
+            csr,
+            details,
+            target,
+            full_host_root,
+        };
+        let exchange = Exchange {
             socket,
             signals,
             deadline,
-        )?;
-        let mut writer = FrameWriter::approval(
-            &response.to_jcs().map_err(|e| invalid(e.to_string()))?,
-            Instant::now(),
-        )?;
-        loop {
-            check(socket, signals, deadline)?;
-            if writer.write(socket.as_raw_fd(), Instant::now())? {
-                break;
-            }
-            poll(
-                &mut [
-                    event(socket.as_raw_fd(), libc::POLLOUT),
-                    event(signals.fd.as_raw_fd(), libc::POLLIN),
-                ],
-                Some(writer.deadline().min(deadline)),
-            )?;
+        };
+        let decision = frontend.review(tty, &review, &exchange)?;
+        let Some(response) = respond(
+            tty,
+            &credentials.identity,
+            signer,
+            &review,
+            decision,
+            &exchange,
+            frontend,
+        )?
+        else {
+            return Ok(());
+        };
+        if let Err(error) = submit(&exchange, &response) {
+            frontend.submission_interrupted();
+            return Err(error);
         }
+        frontend.decision_sent();
+    }
+}
+
+fn submit(exchange: &Exchange<'_>, response: &ApprovalResponse) -> io::Result<()> {
+    let mut writer = FrameWriter::approval(
+        &response.to_jcs().map_err(|e| invalid(e.to_string()))?,
+        Instant::now(),
+    )?;
+    loop {
+        exchange.check()?;
+        if writer.write(exchange.socket.as_raw_fd(), Instant::now())? {
+            return Ok(());
+        }
+        poll(
+            &mut [
+                event(exchange.socket.as_raw_fd(), libc::POLLOUT),
+                event(exchange.signals.fd.as_raw_fd(), libc::POLLIN),
+            ],
+            Some(writer.deadline().min(exchange.deadline)),
+        )?;
     }
 }
 
@@ -413,18 +609,23 @@ fn write_tty(
     }
     Ok(())
 }
-fn valid_now(csr: &Csr) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|v| i64::try_from(v.as_secs()).ok());
-    now.is_some_and(|now| {
-        now >= csr.warrant().policy.not_before
-            && csr.warrant().policy.not_after.is_some_and(|end| now <= end)
-    })
+pub(crate) fn warrant_remaining(csr: &Csr, now: SystemTime) -> Option<Duration> {
+    let elapsed = now.duration_since(UNIX_EPOCH).ok()?;
+    let policy = &csr.warrant().policy;
+    let start = u64::try_from(policy.not_before).ok()?;
+    let end = u64::try_from(policy.not_after?).ok()?;
+    if !(start..=end).contains(&elapsed.as_secs()) {
+        return None;
+    }
+    // The daemon accepts the whole final second of an inclusive not_after.
+    Some(Duration::from_secs(end.checked_add(1)?).saturating_sub(elapsed))
 }
 
-fn discard_confirmation_input(tty: &File) -> io::Result<()> {
+fn valid_now(csr: &Csr) -> bool {
+    warrant_remaining(csr, SystemTime::now()).is_some()
+}
+
+pub(crate) fn discard_confirmation_input(tty: &File) -> io::Result<()> {
     // Drop complete lines and unfinished canonical input (for example a lone
     // 'y' left by a cancelled request). Pre-prompt input is not confirmation.
     if unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) } < 0 {
@@ -433,45 +634,58 @@ fn discard_confirmation_input(tty: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn approve(
+fn respond(
     tty: &File,
     identity: &File,
     signer: &SignerConfig,
-    review: (&ApprovalRequest, &str),
-    socket: &UnixStream,
-    signals: &Signals,
-    deadline: Instant,
-) -> io::Result<ApprovalResponse> {
-    let (request, rendered) = review;
-    let csr = Csr::parse(request.csr_payload.as_bytes()).map_err(|e| invalid(e.to_string()))?;
+    review: &Review,
+    decision: Decision,
+    exchange: &Exchange<'_>,
+    frontend: &mut dyn Frontend,
+) -> io::Result<Option<ApprovalResponse>> {
     let refused = |reason: &str| ApprovalResponse::Rejected {
-        exec_id: request.exec_id.clone(),
+        exec_id: review.exec_id.clone(),
         reason: reason.into(),
     };
-    write_tty(tty, rendered.as_bytes(), socket, signals, deadline)?;
-    if !valid_now(&csr) {
-        return Ok(refused("warrant expired or not yet valid"));
+    match decision {
+        Decision::Quit => return Ok(None),
+        Decision::Reject => return Ok(Some(refused("operator refused approval"))),
+        Decision::InvalidWarrant => {
+            frontend.warrant_invalid();
+            return Ok(Some(refused("warrant expired or not yet valid")));
+        }
+        Decision::TerminalEof => return Ok(Some(refused("operator terminal EOF"))),
+        Decision::Approve => {}
     }
-    match confirm(tty, socket, signals, deadline)? {
-        Some(true) => {}
-        Some(false) => return Ok(refused("operator refused approval")),
-        None => return Ok(refused("operator terminal EOF")),
+    if !valid_now(&review.csr) {
+        frontend.warrant_invalid();
+        return Ok(Some(refused("warrant expired while awaiting confirmation")));
     }
-    if !valid_now(&csr) {
-        return Ok(refused("warrant expired while awaiting confirmation"));
+    frontend.before_signing(exchange)?;
+    if !valid_now(&review.csr) {
+        frontend.warrant_invalid();
+        return Ok(Some(refused("warrant expired before signing")));
     }
-    let signature = sign_payload(
-        identity,
-        tty,
-        signer,
-        request.csr_payload.as_bytes(),
-        || check(socket, signals, deadline),
-    )?;
-    if !valid_now(&csr) {
-        return Ok(refused("warrant expired while signing"));
+    let invalid_during_signing = std::cell::Cell::new(false);
+    let signature = sign_payload(identity, tty, signer, review.csr.as_bytes(), || {
+        exchange.check()?;
+        if !valid_now(&review.csr) {
+            invalid_during_signing.set(true);
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    });
+    if invalid_during_signing.get() {
+        frontend.warrant_invalid();
+        return Ok(Some(refused("warrant expired while signing")));
     }
-    let warrant = CanonicalWarrant::parse(request.csr_payload.as_bytes())
-        .map_err(|e| invalid(e.to_string()))?;
+    let signature = signature?;
+    if !valid_now(&review.csr) {
+        frontend.warrant_invalid();
+        return Ok(Some(refused("warrant expired while signing")));
+    }
+    let warrant =
+        CanonicalWarrant::parse(review.csr.as_bytes()).map_err(|e| invalid(e.to_string()))?;
     let envelope = sigrund_core::protocol::DsseEnvelope::from_warrant(
         &warrant,
         vec![sigrund_core::protocol::DsseSignature {
@@ -480,10 +694,10 @@ fn approve(
         }],
     )
     .map_err(|e| invalid(e.to_string()))?;
-    Ok(ApprovalResponse::Approved {
-        exec_id: request.exec_id.clone(),
+    Ok(Some(ApprovalResponse::Approved {
+        exec_id: review.exec_id.clone(),
         dsse_envelope: envelope,
-    })
+    }))
 }
 
 fn confirm(
@@ -655,7 +869,7 @@ fn render_process_request(
     Ok(out)
 }
 
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     let mut result = String::from("\"");
     for c in value.chars() {
         match c {
@@ -903,6 +1117,216 @@ mod tests {
             0
         );
         (master, tty)
+    }
+
+    fn approval_test_warrant(not_before: i64) -> Csr {
+        let mut warrant = Csr::parse(include_bytes!(
+            "../../sigrund-core/tests/fixtures/v3-host/warrant.json"
+        ))
+        .unwrap()
+        .warrant()
+        .clone();
+        warrant.policy.not_before = not_before;
+        warrant.policy.not_after = Some(not_before + warrant.intent.policy.ttl_secs as i64);
+        Csr::new(warrant).unwrap()
+    }
+
+    #[test]
+    fn warrant_countdown_respects_inclusive_end_second() {
+        let start = 1_800_000_000;
+        let csr = approval_test_warrant(start);
+        let end = csr.warrant().policy.not_after.unwrap() as u64;
+        assert_eq!(
+            warrant_remaining(&csr, UNIX_EPOCH + Duration::from_secs(start as u64 - 1)),
+            None
+        );
+        assert_eq!(
+            warrant_remaining(
+                &csr,
+                UNIX_EPOCH + Duration::from_secs(end) + Duration::from_millis(999)
+            ),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            warrant_remaining(&csr, UNIX_EPOCH + Duration::from_secs(end + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn tui_refuses_expired_warrant_with_time_left_in_broker_exchange() {
+        let (_master, tty) = terminal();
+        let signals = Signals::new().unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let exchange = Exchange {
+            socket: &socket,
+            signals: &signals,
+            deadline: Instant::now() + Duration::from_secs(20),
+        };
+        let review = Review {
+            exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into(),
+            signer_id: "operator".into(),
+            csr: approval_test_warrant(1_000_000),
+            details: "Verified fixture".into(),
+            target: "Host",
+            full_host_root: false,
+        };
+        let mut screen = crate::approval_tui::Screen::new(&tty);
+        assert!(matches!(
+            screen.review(&tty, &review, &exchange),
+            Ok(Decision::InvalidWarrant)
+        ));
+    }
+
+    #[test]
+    fn text_approver_exits_when_idle_terminal_hangs_up() {
+        let (master, tty) = terminal();
+        let directory = tempfile::tempdir().unwrap();
+        let (identity, signer) = identity(directory.path(), "operator");
+        let public = PublicKey::from_openssh(&signer.public_key).unwrap();
+        let credentials = Credentials {
+            identity,
+            public,
+            signers: SignerPolicyFile {
+                signers: vec![signer],
+            },
+        };
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let signals = Signals::new().unwrap();
+        drop(master);
+        std::thread::scope(|scope| {
+            let (done, finished) = std::sync::mpsc::channel();
+            let watchdog = scope.spawn(move || {
+                if finished.recv_timeout(Duration::from_secs(2)).is_err() {
+                    peer.shutdown(std::net::Shutdown::Both).unwrap();
+                }
+            });
+            let error = watch_broker(
+                &tty,
+                &credentials,
+                &socket,
+                &signals,
+                directory.path(),
+                &mut Text,
+            )
+            .unwrap_err();
+            let _ = done.send(());
+            watchdog.join().unwrap();
+            assert_eq!(error.to_string(), "operator terminal lost");
+        });
+    }
+
+    #[test]
+    fn tui_pty_discards_queued_decisions_and_restores_terminal_after_disconnect() {
+        fn await_text(master: &mut File, fragment: &[u8], deadline: Instant) {
+            let mut output = Vec::new();
+            while !output
+                .windows(fragment.len())
+                .any(|bytes| bytes == fragment)
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "missing terminal text: {}",
+                    String::from_utf8_lossy(fragment)
+                );
+                let mut chunk = [0; 4096];
+                match master.read(&mut chunk) {
+                    Ok(count) => output.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        poll(
+                            &mut [event(master.as_raw_fd(), libc::POLLIN)],
+                            Some(deadline),
+                        )
+                        .unwrap();
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        }
+        let (mut master, tty) = terminal();
+        nonblocking(tty.as_raw_fd()).unwrap();
+        nonblocking(master.as_raw_fd()).unwrap();
+        let size = libc::winsize {
+            ws_row: 15,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        let attributes = || {
+            let mut state: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut state) }, 0);
+            state
+        };
+        let original = attributes();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut review = Review {
+            exec_id: "0192d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into(),
+            signer_id: "operator".into(),
+            csr: approval_test_warrant(now),
+            details: "Verified fixture".into(),
+            target: "Host",
+            full_host_root: false,
+        };
+        let signals = Signals::new().unwrap();
+        let mut screen = crate::approval_tui::Screen::new(&tty);
+        assert!(!screen.idle(true).unwrap());
+        for disconnect in [true, false] {
+            if !disconnect {
+                review.exec_id = "0193d8f4-7c1b-7000-8a01-9f8b3c4d5e6f".into();
+            }
+            let (socket, peer) = UnixStream::pair().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let exchange = Exchange {
+                socket: &socket,
+                signals: &signals,
+                deadline,
+            };
+            let result = std::thread::scope(|scope| {
+                let operator = scope.spawn(|| {
+                    await_text(&mut master, b"a Approve", deadline);
+                    // Read buffered input and a freshly displayed confirmation
+                    // on distinct terminal boundaries.
+                    master.write_all(b"ayes\r").unwrap();
+                    await_text(&mut master, b"Type yes + Enter", deadline);
+                    // The PTY reader can see output before the watcher
+                    // completes its post-render input drain.
+                    std::thread::sleep(Duration::from_millis(50));
+                    if disconnect {
+                        master.write_all(b"ye").unwrap();
+                        peer.shutdown(std::net::Shutdown::Both).unwrap();
+                    } else {
+                        master.write_all(b"s\ryes\r").unwrap();
+                    }
+                });
+                let result = screen.review(&tty, &review, &exchange);
+                operator.join().unwrap();
+                result
+            });
+            if disconnect {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::UnexpectedEof);
+                screen
+                    .reconnecting(&tty, &io::ErrorKind::UnexpectedEof.into())
+                    .unwrap();
+                assert!(!screen.idle(false).unwrap());
+            } else {
+                assert!(matches!(result, Ok(Decision::Approve)));
+                screen.before_signing(&exchange).unwrap();
+                assert_eq!(attributes().c_lflag, original.c_lflag);
+            }
+        }
+        drop(screen);
+        let restored = attributes();
+        assert_eq!(restored.c_lflag, original.c_lflag);
+        assert_eq!(restored.c_iflag, original.c_iflag);
+        assert_eq!(restored.c_oflag, original.c_oflag);
+        assert_eq!(restored.c_cc, original.c_cc);
     }
 
     fn identity(dir: &Path, name: &str) -> (File, SignerConfig) {

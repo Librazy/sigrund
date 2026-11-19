@@ -892,7 +892,7 @@ def prerequisites(binaries, platform_binary):
             problems.append('missing command: ' + command)
     if not Path('/run/systemd/system').is_dir() or not Path('/sys/fs/cgroup/cgroup.controllers').is_file():
         problems.append('requires booted systemd and unified cgroup v2')
-    for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-collector'):
+    for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-approve-tui', 'sigrund-collector'):
         if not os.access(binaries / name, os.X_OK):
             problems.append('build executable: ' + str(binaries / name))
     if not os.access(platform_binary, os.X_OK):
@@ -920,7 +920,7 @@ def inside(args):
     evidence.manifest['ordinary_checks'] = json.loads(args.checks.read_bytes())
     evidence.manifest['delegated_parent'] = str(parent)
     evidence.manifest['binaries'] = {name: hashlib.sha256((args.binaries / name).read_bytes()).hexdigest()
-                                     for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-collector')}
+                                     for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-approve-tui', 'sigrund-collector')}
     evidence.save()
     try:
         strace = shutil.which('strace')

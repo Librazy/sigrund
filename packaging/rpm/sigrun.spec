@@ -128,6 +128,7 @@ fi
 
 %files -n sigrund
 /usr/bin/sigrund-approve
+/usr/bin/sigrund-approve-tui
 /usr/bin/sigrundctl
 /usr/bin/sigrund-anchor
 /usr/libexec/sigrund
