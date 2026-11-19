@@ -209,6 +209,14 @@ impl Frontend for Screen<'_> {
     }
 
     fn idle(&mut self, connected: bool) -> io::Result<bool> {
+        if connected
+            && matches!(
+                self.status,
+                "Approval connection ended" | "Approval timed out"
+            )
+        {
+            self.status = "";
+        }
         let status = self.status;
         let area = self.size()?;
         self.paint(area, None, |frame| draw_idle(frame, connected, status))?;
@@ -724,6 +732,43 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn reconnect_clears_connection_errors_and_preserves_request_results() {
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let (_master, tty) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+        assert_eq!(
+            unsafe { libc::fcntl(tty.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let mut screen = Screen::new(&tty);
+        for kind in [io::ErrorKind::UnexpectedEof, io::ErrorKind::TimedOut] {
+            screen.reconnecting(&tty, &kind.into()).unwrap();
+            let disconnected = screen.status;
+            assert!(!disconnected.is_empty());
+            assert!(!screen.idle(false).unwrap());
+            assert_eq!(screen.status, disconnected);
+            assert!(!screen.idle(true).unwrap());
+            assert_eq!(screen.status, "");
+        }
+        for status in ["Submission unconfirmed", INVALID_WARRANT, "Decision sent"] {
+            screen.status = status;
+            assert!(!screen.idle(true).unwrap());
+            assert_eq!(screen.status, status);
+        }
+    }
 
     #[test]
     fn terminal_write_keeps_running_while_slow_output_drains() {
