@@ -152,6 +152,8 @@ coherent persistent dataset.
 
 ## Build and validation
 
+The package workflow exports the recorded source commit with `git archive` and
+mounts the extracted tree read-only in the build container.
 `build-container.sh` installs target-distribution build dependencies and builds
 release binaries. `build.py` stages separate payloads, obtains Debian shared
 library dependencies with `dpkg-shlibdeps`, and uses RPM's automatic dependency

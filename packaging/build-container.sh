@@ -18,7 +18,8 @@ case "$kind" in
 esac
 
 mkdir /build
-tar -C /src --exclude=.git --exclude=target --exclude=__pycache__ -cf - . | tar -C /build -xf -
+# /src is the read-only source exported by the package workflow.
+cp -a /src/. /build/
 cd /build
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
   https://sh.rustup.rs -o /tmp/rustup-init.sh
