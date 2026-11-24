@@ -40,8 +40,9 @@ apt install ./sigrun_*.deb ./sigrund_*.deb
 ```
 
 The client package is `sigrun`. The daemon package includes `sigrund`,
-`sigrund-approve`, `sigrundctl` and `sigrund-anchor`. Installation does not
-provision state or start the service. Use matching versions throughout.
+`sigrund-approve`, `sigrund-approve-tui`, `sigrundctl` and `sigrund-anchor`.
+Installation does not provision state or start the service. Use matching
+versions throughout.
 See the [package guide](packaging/README.md) for upgrades and removal.
 
 ## 2. Host-only setup
@@ -104,6 +105,22 @@ In a separate **host-root terminal**, start the approver:
 sigrund-approve --socket /run/sigrund/approve.sock --tty /dev/tty \
   --identity /etc/sigrund/approver --epoch-file /var/lib/sigrund/host-epoch.json
 ```
+
+For a full-screen review, run `sigrund-approve-tui` with the same flags.
+Start your chosen approver before submitting a request. The daemon accepts
+one approver connection and presents one request at a time. In the TUI, scroll
+with the arrow or Page Up/Down keys in a terminal at least 40 columns by 9 rows.
+The default review page highlights the executable, argument preview, target
+identity and namespace, working directory and authority. Use `1` for Review,
+`2` for all indexed Arguments, `3` for Environment, `4` for Access constraints,
+and `5` for complete verified Evidence. Partial argument previews are marked;
+the Arguments page preserves every argument in full. Colors and labels identify
+host/namespace scope and elevated authority, without classifying command behavior.
+Press `a`, then type `yes` and press Enter to sign. Press `r` and Enter to reject,
+or Escape to cancel a confirmation. Confirmations return to the review page.
+The signing view prints the full executable and signer before the OpenSSH prompt.
+These fields and signing diagnostics remain in the terminal’s scrollback. “Decision sent” means the client
+wrote its response to the socket. Check the requester's terminal for the result.
 
 In the **requester's terminal**, run:
 

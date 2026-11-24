@@ -228,9 +228,31 @@ def management(args, f, operation, container=None, profile=None, *, succeeds=Tru
     return result
 
 
-def tty_review(args, f, profile, artifacts):
+def wait_for_tui_screen(master, rendered, expected, *, retry_key=None, timeout=2):
+    deadline = time.monotonic() + timeout
+    start = len(rendered)
+    next_key = 0
+    while expected not in rendered[start:]:
+        now = time.monotonic()
+        assert now < deadline, expected
+        if retry_key is not None and now >= next_key:
+            # A fresh review or confirmation frame can precede its input drain.
+            os.write(master, retry_key)
+            next_key = now + 0.1
+        until = deadline if retry_key is None else min(deadline, next_key)
+        if select.select([master], [], [], until - now)[0]:
+            chunk = os.read(master, 8192)
+            assert chunk and len(rendered) < 1_048_576
+            rendered.extend(chunk)
+
+
+def tty_review(args, f, profile, artifacts, *, tui=False):
     master, slave = pty.openpty()
-    API['SHARED']['enable_confirmation_packets'](master)
+    if tui:
+        # Leave enough rows for the prompt while keeping the review scrollable.
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 120, 0, 0))
+    else:
+        API['SHARED']['enable_confirmation_packets'](master)
     operator = client = None
     rendered = bytearray()
     def controlling_tty():
@@ -239,11 +261,14 @@ def tty_review(args, f, profile, artifacts):
     try:
         before = f.diagnostics.read_text().count('"broker":true')
         operator = subprocess.Popen([
-            str(args.binaries / 'sigrund-approve'), '--socket', str(f.approval),
+            str(args.binaries / ('sigrund-approve-tui' if tui else 'sigrund-approve')),
+            '--socket', str(f.approval),
             '--signers', str(f.base / 'signers'), '--identity', str(f.key),
             '--epoch-file', str(f.state / 'host-epoch.json')],
             stdin=slave, stdout=slave, stderr=subprocess.PIPE, preexec_fn=controlling_tty)
         wait_for(lambda: f.diagnostics.read_text().count('"broker":true') > before, 'real root TTY approver admission')
+        if tui:
+            wait_for_tui_screen(master, rendered, b'Waiting')
         started = time.monotonic()
         client = subprocess.Popen([
             str(f.client_binary), '--socket', str(f.client), '--target', 'registered:container-b',
@@ -251,20 +276,35 @@ def tty_review(args, f, profile, artifacts):
             '--cwd', '/srv/service', '--ttl-secs', '120', '--', str(f.commands / 'tool')],
             preexec_fn=API['SHARED']['unprivileged'], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        rendered.extend(API['SHARED']['read_confirmation_prompt'](master, timeout=2))
+        if tui:
+            wait_for_tui_screen(master, rendered, b'Approve')
+            assert b'[NS REVIEW ONLY]' in rendered
+        else:
+            rendered.extend(API['SHARED']['read_confirmation_prompt'](master, timeout=2))
+            for fragment in (b'namespace preview private review', b'ns_service', b'12001',
+                             b'verified_acquisition', b'mapped_host_credentials', b'security_constraints',
+                             b'daemon_expanded_thin', b'container-b'):
+                assert fragment in rendered, fragment
         review = json.loads((f.state / 'host-epoch.json').read_bytes())['process_review']
-        for fragment in (b'namespace preview private review', b'ns_service', b'12001',
-                         b'verified_acquisition', b'mapped_host_credentials', b'security_constraints',
-                         b'daemon_expanded_thin', b'container-b'):
-            assert fragment in rendered, fragment
+        exec_id = review['exec_id'].encode()
+        if tui:
+            wait_for_tui_screen(master, rendered, exec_id, retry_key=b'5')
+            os.write(master, b'a')
+            wait_for_tui_screen(master, rendered, b'Type')
+            wait_for_tui_screen(master, rendered, b'Live evidence matched', retry_key=b'\x1b[F')
+        else:
+            assert exec_id in rendered
         os.write(master, b'yes\n')
+        if tui:
+            wait_for_tui_screen(master, rendered, b'Decision')
         stdout, stderr = client.communicate(timeout=6)
         assert client.returncode == 255 and not stdout, (client.returncode, stdout, stderr)
         assert time.monotonic() - started >= 2.3
         wait_for(lambda: any(r.get('exec_id') == review['exec_id']
                              and r.get('status') == 'NAMESPACE_EXECUTION_DISABLED' for r in f.records()),
                  'real TTY signature reaches the private namespace preview gate')
-        with open(artifacts / 'approval-display.private.txt', 'xb') as output:
+        display_name = 'approval-tui.private.txt' if tui else 'approval-display.private.txt'
+        with open(artifacts / display_name, 'xb') as output:
             os.fchmod(output.fileno(), 0o600)
             output.write(rendered)
     finally:
@@ -301,7 +341,7 @@ def inside(args):
                 'kernel': platform.release(), 'selinux_enforcing': Path('/sys/fs/selinux/enforce').read_text().strip(),
                 'os_release': Path('/etc/os-release').read_text(),
                 'binaries_sha256': {name: hashlib.sha256((args.binaries / name).read_bytes()).hexdigest()
-                                    for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-collector')},
+                                    for name in ('sigrund', 'sigrun', 'sigrundctl', 'sigrund-approve', 'sigrund-approve-tui', 'sigrund-collector')},
                 'cases': []}
     try:
         anchor = work / 'anchor'
@@ -567,6 +607,7 @@ def inside(args):
         manifest['cases'].append({'name': 'same-owner-and-equal-local-UID-policy-use-composed-host-identities', 'result': 'passed'})
 
         tty_review(args, f, profile, args.artifacts)
+        tty_review(args, f, profile, args.artifacts, tui=True)
         manifest['cases'].append({'name': 'real-client-and-root-TTY-display-signature-private-gate', 'result': 'passed'})
 
         case = reviewed_request(f, body)

@@ -17,7 +17,7 @@ become publicly downloadable after a maintainer reviews and publishes the draft.
 | Package | Installed components | Runtime dependencies |
 | --- | --- | --- |
 | `sigrun` | `/usr/bin/sigrun`, documentation and license | Native shared libraries; no daemon, systemd or SSH dependency |
-| `sigrund` | `/usr/libexec/sigrund/sigrund`, `/usr/bin/sigrund-approve`, `/usr/bin/sigrundctl`, `/usr/bin/sigrund-anchor`, systemd unit and configuration examples | Native shared libraries, systemd and OpenSSH client |
+| `sigrund` | `/usr/libexec/sigrund/sigrund`, `/usr/bin/sigrund-approve`, `/usr/bin/sigrund-approve-tui`, `/usr/bin/sigrundctl`, `/usr/bin/sigrund-anchor`, systemd unit and configuration examples | Native shared libraries, systemd and OpenSSH client |
 | `sigrund-selinux` (Fedora only, noarch) | Precompiled daemon, workload and restricted requester SELinux modules | Matching daemon package, targeted SELinux policy and policy management tools |
 | `sigrund-selinux-podman` (Fedora only, noarch) | Optional local rootful Podman API policy | Matching `sigrund-selinux` and `container-selinux`; no Podman engine dependency |
 

@@ -18,6 +18,26 @@ fn production_records_match_independent_frozen_vectors() {
 }
 
 #[test]
+fn workload_authority_requires_namespace_execution() {
+    use sigrund_core::workload::Workload;
+    let mut review_only =
+        Constraints::parse(include_bytes!("fixtures/namespace/constraints.json")).unwrap();
+    review_only.selinux.context = Workload::Root.context().into();
+    review_only.validate().unwrap();
+    assert_eq!(review_only.workload(), Some(Workload::Root));
+    assert_eq!(review_only.execution_workload(), None);
+
+    let mut executable =
+        Constraints::parse(include_bytes!("fixtures/namespace/admin-constraints.json")).unwrap();
+    executable.selinux.context = Workload::Root.context().into();
+    executable.selinux.enforcing = true;
+    executable.selinux.policy_change = "detect_and_terminate".into();
+    executable.capabilities = Workload::root_capabilities();
+    executable.validate().unwrap();
+    assert_eq!(executable.execution_workload(), Some(Workload::Root));
+}
+
+#[test]
 fn registration_and_acquisition_reject_ambiguous_records() {
     let raw = include_bytes!("fixtures/namespace/acquisition.json");
     let mut value: serde_json::Value = serde_json::from_slice(raw).unwrap();

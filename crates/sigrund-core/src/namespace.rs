@@ -364,6 +364,10 @@ impl Constraints {
             || self.is_admin()
             || self.schema == "sigrund.constraints.namespace-experimental.v1"
     }
+    /// The workload authority that approval can grant.
+    pub fn execution_workload(&self) -> Option<crate::workload::Workload> {
+        self.executes().then(|| self.workload()).flatten()
+    }
     /// Credential support is a profile contract, independently checked at review
     /// and launcher admission. Numeric authorization remains in scoped rules.
     pub fn validate_execution_credentials(&self, uid: u32, gid: u32, groups: &[u32]) -> Result<()> {
@@ -977,7 +981,7 @@ impl ProcessReview {
                 "Trusted initial-userns administrators maintain backing protection, layer identities and mappings; no untrusted writable aliases or retained writers; no in-place modification of active backing objects"
             );
         }
-        if let Some(workload) = self.constraints.workload() {
+        if let Some(workload) = self.constraints.execution_workload() {
             evidence["workload_authority"] = serde_json::json!(workload.authority());
         }
         if let Some(manager) = &self.manager {

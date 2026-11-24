@@ -372,15 +372,38 @@ fn client_args(values: &[&str]) -> Vec<String> {
     result
 }
 
-fn binaries() -> [&'static str; 6] {
+fn binaries() -> [&'static str; 7] {
     [
         env!("CARGO_BIN_EXE_sigrun"),
         env!("CARGO_BIN_EXE_sigrund"),
         env!("CARGO_BIN_EXE_sigrund-approve"),
+        env!("CARGO_BIN_EXE_sigrund-approve-tui"),
         env!("CARGO_BIN_EXE_sigrundctl"),
         env!("CARGO_BIN_EXE_sigrund-collector"),
         env!("CARGO_BIN_EXE_sigrund-anchor"),
     ]
+}
+
+#[test]
+fn tui_help_names_the_binary_and_exposes_operator_options() {
+    let binary = env!("CARGO_BIN_EXE_sigrund-approve-tui");
+    let output = Command::new(binary).arg("--help").output().unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("Usage: sigrund-approve-tui "));
+    for flag in [
+        "--socket",
+        "--tty",
+        "--signers",
+        "--epoch-file",
+        "--identity",
+    ] {
+        assert!(help.contains(flag), "missing {flag}: {help}");
+    }
+    assert_eq!(
+        Command::new(binary).output().unwrap().status.code(),
+        Some(64)
+    );
 }
 
 #[test]
