@@ -23,6 +23,7 @@ container-to-container examples.
 | `sigrun` | Request commands and relay stdin, stdout, stderr, status and cancellation. |
 | `sigrund` | Authenticate peers, prepare requests, enforce policy, persist authorization and supervise execution. |
 | `sigrund-approve` | Review and sign requests on root's controlling terminal using OpenSSH. |
+| `sigrund-approve-tui` | Scroll through and decide a live approval request in a full-screen terminal interface. |
 | `sigrundctl` | Provision state, manage registrations, export host bindings and package offline warrants. |
 | `sigrund-anchor` | Supply a disposable capture anchor inside an existing environment. |
 | `sigrund-collector` | Validate audit/binding records diagnostically. |
@@ -89,8 +90,9 @@ through the opt-in [`namespace-admin-v1` profile](IMPLEMENTATION_NOTES.md#rootfu
 The separate [`namespace-admin-direct-v1` profile](IMPLEMENTATION_NOTES.md#rootful-overlayfs-direct-execution)
 supports direct execution from qualified administrator-maintained OverlayFS storage.
 
-Planned TUI, concurrent-request, shared-approval and desktop integration work is
-tracked in the [User-Friendly Approval Process epic](docs/USER_FRIENDLY_APPROVAL_PROCESS.md).
+The TUI reviews one live request at a time. The
+[User-Friendly Approval Process epic](docs/USER_FRIENDLY_APPROVAL_PROCESS.md)
+tracks planned concurrent requests, shared approval and desktop integration.
 
 ## Security and scope
 

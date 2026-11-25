@@ -18,14 +18,15 @@ case "$kind" in
 esac
 
 mkdir /build
-tar -C /src --exclude=.git --exclude=target --exclude=__pycache__ -cf - . | tar -C /build -xf -
+# /src is the read-only source exported by the package workflow.
+cp -a /src/. /build/
 cd /build
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
   https://sh.rustup.rs -o /tmp/rustup-init.sh
 sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none --no-modify-path
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release --locked -p sigrund \
-  --bin sigrun --bin sigrund --bin sigrundctl --bin sigrund-approve --bin sigrund-anchor
+  --bin sigrun --bin sigrund --bin sigrundctl --bin sigrund-approve --bin sigrund-approve-tui --bin sigrund-anchor
 
 # Two revisions of the same build exercise a real package-manager upgrade.
 python3 packaging/build.py --format "$kind" --release "$PACKAGE_REVISION.0" --output /out/previous

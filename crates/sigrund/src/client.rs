@@ -32,11 +32,19 @@ pub(crate) struct Signals {
 }
 impl Signals {
     pub(crate) fn new() -> io::Result<Self> {
+        Self::with_extra(&[])
+    }
+
+    pub(crate) fn for_approval_tui() -> io::Result<Self> {
+        Self::with_extra(&[libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU])
+    }
+
+    fn with_extra(extra: &[libc::c_int]) -> io::Result<Self> {
         let mut mask = unsafe { zeroed() };
         let mut previous = unsafe { zeroed() };
         unsafe {
             libc::sigemptyset(&mut mask);
-            for signal in [1, 2, 10, 12, 15] {
+            for signal in [1, 2, 10, 12, 15].into_iter().chain(extra.iter().copied()) {
                 libc::sigaddset(&mut mask, signal);
             }
         }
