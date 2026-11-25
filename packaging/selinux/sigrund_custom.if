@@ -1,0 +1,35 @@
+## Minimal sigrund integration. The caller supplies its existing business type.
+## This interface grants execution plumbing, never business file/network access.
+interface(`sigrund_custom_domain',`
+    gen_require(`
+        type sigrund_daemon_t, sigrund_requester_t, sigrund_runtime_t;
+        type sigrund_execution_socket_t, sigrund_context_socket_t, sigrund_anchor_socket_t;
+        attribute sigrund_custom_workload;
+        attribute domain;
+        attribute file_type;
+        type init_t;
+    ')
+    typeattribute $1 sigrund_custom_workload;
+    allow sigrund_daemon_t $1:process { transition ptrace signal sigkill sigstop signull getattr sigchld };
+    allow sigrund_daemon_t $1:process2 { nnp_transition nosuid_transition };
+    allow sigrund_daemon_t $1:dir { search read open getattr };
+    allow sigrund_daemon_t $1:file { read open getattr };
+    allow sigrund_daemon_t $1:lnk_file { read getattr };
+    allow init_t $1:process { signal sigkill sigstop signull getattr getsched };
+    allow $1 { init_t sigrund_daemon_t }:process sigchld;
+    allow $1 { domain sigrund_daemon_t sigrund_requester_t }:fd use;
+    allow $1 { domain sigrund_daemon_t sigrund_requester_t }:fifo_file rw_fifo_file_perms;
+    allow $1 { domain sigrund_requester_t }:file { read write append getattr ioctl };
+    allow $1 sigrund_daemon_t:file { entrypoint execute read open getattr map };
+    allow $1 sigrund_runtime_t:file { entrypoint execute read open getattr map };
+    # memfd images may carry the runtime or producer label. Direct images use their
+    # existing file labels, whose business policy must permit execution.
+    allow $1 self:process { fork sigchld signal sigkill sigstop signull getcap getsched };
+    allow $1 self:dir { read search open getattr };
+    allow $1 self:file { read open getattr };
+    allow $1 self:lnk_file { read getattr };
+    allow $1 self:fifo_file rw_fifo_file_perms;
+    neverallow sigrund_requester_t $1:process { transition dyntransition ptrace };
+    neverallow $1 sigrund_daemon_t:process { transition dyntransition ptrace };
+    neverallow $1 { sigrund_execution_socket_t sigrund_context_socket_t sigrund_anchor_socket_t }:unix_stream_socket { create relabelfrom relabelto };
+')

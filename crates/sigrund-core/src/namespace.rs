@@ -308,6 +308,8 @@ pub struct Constraints {
     pub memory_max: u64,
     pub memory_swap_max: u64,
     pub pids_max: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_domain: Option<crate::workload::RegisteredDomain>,
     pub selinux: Selinux,
     pub apparmor: String,
     pub seccomp: Seccomp,
@@ -343,6 +345,13 @@ pub enum Seccomp {
     },
 }
 impl Constraints {
+    pub fn workload_context(&self) -> Option<&str> {
+        self.custom_domain
+            .as_ref()
+            .map(|d| d.context.as_str())
+            .or_else(|| self.workload().map(|w| w.context()))
+    }
+
     pub fn workload(&self) -> Option<crate::workload::Workload> {
         crate::workload::Workload::from_context(&self.selinux.context)
     }
@@ -354,10 +363,16 @@ impl Constraints {
             self.schema.as_str(),
             "sigrund.constraints.namespace-admin.v1"
                 | "sigrund.constraints.namespace-admin-direct.v1"
+                | "sigrund.constraints.namespace-custom-domain.v1"
+                | "sigrund.constraints.namespace-custom-domain-direct.v1"
         )
     }
     pub fn is_admin_direct(&self) -> bool {
-        self.schema == "sigrund.constraints.namespace-admin-direct.v1"
+        matches!(
+            self.schema.as_str(),
+            "sigrund.constraints.namespace-admin-direct.v1"
+                | "sigrund.constraints.namespace-custom-domain-direct.v1"
+        )
     }
     pub fn executes(&self) -> bool {
         self.is_production()
@@ -392,8 +407,21 @@ impl Contract for Constraints {
                 | "sigrund.constraints.namespace-selinux.v1"
                 | "sigrund.constraints.namespace-admin.v1"
                 | "sigrund.constraints.namespace-admin-direct.v1"
+                | "sigrund.constraints.namespace-custom-domain.v1"
+                | "sigrund.constraints.namespace-custom-domain-direct.v1"
         ) {
             return Err(invalid("wrong constraint schema"));
+        }
+        let custom_schema = self.schema == "sigrund.constraints.namespace-custom-domain.v1"
+            || self.schema == "sigrund.constraints.namespace-custom-domain-direct.v1";
+        if custom_schema != self.custom_domain.is_some() {
+            return Err(invalid("custom domain requires its own schema"));
+        }
+        if let Some(domain) = &self.custom_domain {
+            domain.validate()?;
+            if self.selinux.context != domain.context {
+                return Err(invalid("custom domain context mismatch"));
+            }
         }
         identifier(&self.profile_id)?;
         if self
@@ -456,7 +484,9 @@ impl Contract for Constraints {
             };
             if self.executable_model != model
                 || self.selinux.executable_context.is_some()
-                || if let Some(workload) = self.workload() {
+                || if self.custom_domain.is_some() {
+                    !self.selinux.enforcing || self.selinux.policy_change != "detect_and_terminate"
+                } else if let Some(workload) = self.workload() {
                     workload.validate_capabilities(&self.capabilities)?;
                     !self.selinux.enforcing || self.selinux.policy_change != "detect_and_terminate"
                 } else {
@@ -963,7 +993,7 @@ impl ProcessReview {
                 "Experimental execution; final-child checkpoint required"
             } else { "Private namespace review; execution is disabled" },
             "workload_lsm_transition": if self.constraints.is_admin() {
-                if self.constraints.workload().is_some() {
+                if self.constraints.workload_context().is_some() {
                     "explicit enforcing SELinux workload; root policy grants full host administration"
                 } else {
                     "host workload transition when packaged producer is active; otherwise ambient LSM policy"
@@ -980,6 +1010,9 @@ impl ProcessReview {
             evidence["executable_storage_contract"] = serde_json::json!(
                 "Trusted initial-userns administrators maintain backing protection, layer identities and mappings; no untrusted writable aliases or retained writers; no in-place modification of active backing objects"
             );
+        }
+        if let Some(domain) = &self.constraints.custom_domain {
+            evidence["custom_domain"] = serde_json::json!({"source":"host administrator registration", "descriptor":domain, "registration_sha256":domain.sha256()?, "description_assurance":"administrator declaration, not a verified permission summary"});
         }
         if let Some(workload) = self.constraints.execution_workload() {
             evidence["workload_authority"] = serde_json::json!(workload.authority());

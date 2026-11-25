@@ -165,6 +165,14 @@ impl JobSupervisor {
                                                 owner.cgroup.as_ref().expect("job placement"),
                                                 check,
                                             )
+                                        } else if let Some(domain) = request.host_profile.as_ref().and_then(|p| p.custom_domain.as_ref()) {
+                                            check()?;
+                                            let actual = std::fs::read_to_string(format!("/proc/{pid}/attr/current"))?;
+                                            if actual.trim_end_matches(['\0', '\n']) != domain.context {
+                                                return Err(io::Error::other("actual SELinux context differs from approved domain"));
+                                            }
+                                            check()?;
+                                            Ok(serde_json::json!({"selinux_context":domain.context,"registration_sha256":domain.sha256().map_err(io::Error::other)?,"policy_sha256":domain.policy_sha256}))
                                         } else {
                                             Ok(serde_json::Value::Null)
                                         }
@@ -403,7 +411,11 @@ fn spawn(owner: &mut PreparedJob) -> io::Result<Spawned> {
                 .spawn_checkpoint(
                     owner.cgroup.as_ref().expect("prepared cgroup").fd(),
                     fds,
-                    snapshot.executable.needs_checkpoint(),
+                    snapshot.executable.needs_checkpoint()
+                        || request
+                            .host_profile
+                            .as_ref()
+                            .is_some_and(|p| p.custom_domain.is_some()),
                 )
                 .map(Spawned::Child)
         }

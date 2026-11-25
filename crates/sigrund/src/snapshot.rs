@@ -173,10 +173,15 @@ fn snapshot(
         }
     }
     check()?;
-    let fd = memfd::seal(
-        work.destination.take().expect("destination"),
-        if executable { 0o111 } else { 0o400 },
-    )?;
+    let destination = work.destination.take().expect("destination");
+    let fd = if executable {
+        memfd::seal(destination, 0o111)?
+    } else {
+        // SELinux revalidates inherited FD access on exec. A sealed O_RDWR
+        // description still requires write permission and can be replaced by
+        // /dev/null when entering a domain with read-only producer-file access.
+        memfd::seal_input(destination)?
+    };
     // Source close may block: keep the RAM and I/O reservations until it ends.
     drop(work.source.take());
     check()?;

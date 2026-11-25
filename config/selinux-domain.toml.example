@@ -1,0 +1,9 @@
+# Compute policy_sha256 AFTER installing all policy modules:
+# sigrundctl selinux-domain fingerprint system_u:system_r:acme_backup_job_t:s0
+schema = "sigrund.selinux-domain.v1"
+id = "acme-backup"
+context = "system_u:system_r:acme_backup_job_t:s0"
+summary = "Read labeled backup sources and write labeled archives; no IP networking"
+enforcing = true
+policy_change = "detect_and_terminate"
+policy_sha256 = "REPLACE_WITH_CURRENT_POLICY_FINGERPRINT"

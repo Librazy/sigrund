@@ -66,6 +66,13 @@ class PackageBuildTests(unittest.TestCase):
                                 anchor = output / 'usr/bin/sigrund-anchor'
                                 self.assertEqual(anchor.read_text(), 'sigrund-anchor')
                                 self.assertEqual(anchor.stat().st_mode & 0o777, 0o755)
+                                examples = output / 'usr/share/doc/sigrund/namespace/selinux'
+                                for name in ('acme_backup.te', 'verify-custom-domains.py'):
+                                    installed = examples / name
+                                    self.assertEqual(installed.read_bytes(),
+                                                     (REPO / 'scripts/namespace/selinux' / name).read_bytes())
+                                    self.assertEqual(installed.stat().st_mode & 0o777, 0o644)
+
 
     def test_policy_payloads_require_built_modules_and_keep_podman_separate(self):
         with tempfile.TemporaryDirectory() as directory:

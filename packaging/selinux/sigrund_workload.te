@@ -209,3 +209,6 @@ allow sigrund_root_workload_t self:user_namespace create;
 # transitions, not the system against an administrator who controls policy.
 neverallow { sigrund_data_workload_t sigrund_network_workload_t sigrund_maintenance_workload_t } *:process { transition dyntransition };
 neverallow sigrund_optin_workload sigrund_daemon_t:process { ptrace transition dyntransition };
+
+# Separate from opt-in workloads: no implicit business permissions.
+attribute sigrund_custom_workload;

@@ -121,7 +121,7 @@ impl NamespacePayload {
             || self.argv.is_empty()
             || !self.cwd.starts_with('/')
             || (self.constraints.is_admin() && self.enter_mask & (1 << 6) != 0)
-            || (self.constraints.workload().is_some() && !self.producer_guard)
+            || (self.constraints.workload_context().is_some() && !self.producer_guard)
         {
             return Err(io::Error::other("unsupported namespace launcher payload"));
         }
@@ -196,8 +196,8 @@ pub fn namespace_launcher_main() -> io::Result<()> {
     let cwd = CString::new(payload.cwd).map_err(io::Error::other)?;
     let workload_context = payload
         .constraints
-        .workload()
-        .map(|policy| CString::new(policy.context()).expect("static context"));
+        .workload_context()
+        .map(|context| CString::new(context).expect("validated context"));
     let mut group_check = vec![0; payload.groups.len()];
     let spec = ChildSpec {
         input: 10,
@@ -459,9 +459,9 @@ impl PreparedChild {
         profile
             .validate_execution_uid(self.uid)
             .map_err(io::Error::other)?;
-        if let Some(policy) = profile.workload {
-            crate::lsm::check_workload(policy)?;
-            self.workload_context = Some(CString::new(policy.context()).expect("static context"));
+        if let Some(context) = profile.workload_context() {
+            crate::lsm::check_context()?;
+            self.workload_context = Some(CString::new(context).expect("validated context"));
         }
         Ok(())
     }
